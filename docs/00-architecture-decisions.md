@@ -56,6 +56,12 @@ protection free.
 
 ## ADR-003 — "Settle-once claim" is the universal stock-restoration primitive
 
+> ⚠️ **SUPERSEDED by [ADR-019](#adr-019--one-claim-in-postgresql--supersedes-adr-003).** The
+> principle — restore exactly once, by whoever wins an atomic claim — still holds. The *mechanism*
+> changed: the claim moved from Redis (`GETDEL holdmeta`) into PostgreSQL, because a Redis mutation
+> inside the order transaction cannot roll back and leaked inventory. `holdmeta` no longer exists.
+> Kept here for the record.
+
 **Decision.** A held quantity is returned to stock exactly once, by whoever wins an atomic claim.
 
 * **Phase 2+ (Redis):** every hold writes a companion key
@@ -132,10 +138,16 @@ keeps every synchronous edge one-directional.
 
 ## ADR-006 — Three nested timers, each with a hard ceiling
 
+> ⚠️ **AMENDED by [ADR-020](#adr-020--three-tier-timer-model-add-the-admission-session--amends-adr-006).**
+> A middle tier — the 600 s admission session — now sits between the pass and the hold, and the pass
+> is revoked when it is exchanged for that session rather than at hold creation. Ceilings below are
+> unchanged.
+
 | Timer | Value | Single-use | Expiry behaviour |
 | :--- | :--- | :--- | :--- |
-| Queue pass (`queue:pass:{sid}`) | **120 s** | yes — revoked on first successful hold | user returns to the queue |
-| Seat hold (`hold:{token}`) | **300 s** | yes | stock restored via ADR-003 |
+| Queue pass (`queue:pass:{sid}`) | **120 s** | yes — revoked on exchange for an admission session | user returns to the queue |
+| **Admission session** (ADR-020) | **600 s** | no | user returns to the queue |
+| Seat hold (`hold:{token}`) | **300 s** | yes | stock restored via ADR-019 |
 | Payment grace | **+120 s, once**, ceiling 420 s from hold creation | yes | hold expires normally |
 
 **Why.** Three problems:
@@ -343,3 +355,198 @@ complexity for no throughput.
 
 *If Cluster ever becomes necessary*, hash-tag the hold keys as `hold:{e:t}:{token}` so every key a
 script touches shares a slot.
+
+---
+
+# Second-pass decisions (ADR-019 – ADR-025)
+
+> Produced by the Best Practice & Architecture Alignment Audit. ADR-019 **supersedes ADR-003** and
+> ADR-020 **amends ADR-006**; both originals are kept for the record.
+
+---
+
+## ADR-019 — One claim, in PostgreSQL — *supersedes ADR-003*
+
+**Decision.** `ticket_holds.status` in PostgreSQL is the **sole authority** for a hold's lifecycle.
+Every terminal transition is one conditional statement:
+
+```sql
+UPDATE ticket_holds SET status = ?, settled_at = now(), settle_reason = ?
+ WHERE hold_token = ? AND status = 'ACTIVE';     -- rowcount = 1 ⇒ you won the claim
+```
+
+Stock is restored only by the caller that gets `rowcount = 1`. Redis holds the **timer** and hot
+metadata; it is never the authority.
+
+Consequences:
+
+* **`holdmeta:{holdToken}` and `GETDEL` are deleted.** They existed only because a Redis expiry
+  event carries no payload — but if PostgreSQL is the authority, the expiry handler simply reads
+  the row by token.
+* **`consumeHold` runs inside the order transaction** and rolls back with it.
+* **Redis cleanup moves after the commit**, via `@TransactionalEventListener(AFTER_COMMIT)`, and is
+  explicitly best-effort.
+* **Phase 1 and Phase 2 now use the identical mechanism.** Phase 1 already did.
+
+**Why.** ADR-003 put the claim in Redis (`GETDEL holdmeta`), which meant `consumeHold` mutated Redis
+*inside* the SQL transaction. Redis does not roll back. If the commit failed after a successful
+consume, the claim ticket and the timer key were both gone, no order existed, and **the stock was
+never restored** — those seats became permanently unsellable. A non-transactional side effect inside
+a transactional block, and a silent inventory leak.
+
+Moving the claim into the transaction removes the failure mode by construction rather than
+compensating for it.
+
+**Still correct across replicas.** All three receive the expiry event and all three run the
+`UPDATE`; PostgreSQL row-locks and exactly one gets `rowcount = 1`.
+
+**Cost.** One indexed `UPDATE` per settle instead of one `GETDEL`. We were already performing that
+`UPDATE` for the audit row, so the true cost is zero. Expiry rate is bounded by hold-creation rate.
+
+**Ordering guarantee.** If a concurrent expiry wins first, the order transaction's `UPDATE` returns
+`rowcount = 0`, the transaction rolls back, and the already-settled charge is refunded via the
+ADR-012 path. The grace extension (ADR-006) exists to make this rare.
+
+---
+
+## ADR-020 — Three-tier timer model: add the admission session — *amends ADR-006*
+
+**Decision.** Insert a middle tier between the queue pass and the seat hold:
+
+| Tier | Key | TTL | Single-use | Purpose |
+| :--- | :--- | :--- | :--- | :--- |
+| 1. Queue pass | `queue:pass:{sid}` | 120 s | yes | proves you left the queue |
+| 2. **Admission session** | `queue:admit:{eventId}:{sid}` | **600 s** | no | **you are inside the sale** |
+| 3. Seat hold | `hold:{token}` | 300 s | yes | these seats are yours |
+
+The pass is exchanged for an admission session at `POST /api/v1/queue/admit` and revoked there —
+**not** at hold creation. `POST /holds` now requires a live *admission session*, not a pass. A hold
+that is released or expires leaves the admission session intact, so the buyer can pick a different
+tier without re-queueing.
+
+Admission control counts sessions rather than passes, with an oversubscription factor:
+
+```
+pending    = ZCOUNT queue:passes:{eventId}     now +inf
+admitted   = ZCOUNT queue:admissions:{eventId} now +inf
+admittable = min(batchSize, floor(remainingStock × oversubscribeFactor) − pending − admitted)
+```
+
+`oversubscribeFactor` defaults to **1.5**: hold-to-order conversion is well under 100 %, so
+admitting exactly `remainingStock` buyers under-fills the sale. Every real waiting room tunes this.
+
+**Why.** Industry (Ticketmaster, AXS, Queue-it) runs three tiers; we had two. A buyer promoted at
+t=0 had 120 seconds to choose a tier or return to the queue — but real buyers compare tiers, check
+prices, and consult someone. The 1st pass surfaced this as "changing tier means re-entering the
+queue, possibly too harsh"; it is not a harshness problem but a **missing concept**.
+
+One addition fixes tier changes, browse time, the back button, refresh recovery, and gives the
+promoter a materially better admission signal.
+
+**Revocation.** The admission session is revoked when an order reaches `CONFIRMED`.
+
+---
+
+## ADR-021 — RFC 7807 `ProblemDetail`, per-module advice, and a shared kernel
+
+**Decision.** All errors are `application/problem+json` per RFC 7807, with the fixed extension
+schema and canonical code registry in [`05-global-standards.md`](05-global-standards.md) §1–§2.
+**No `ApiResponse<T>` envelope.**
+
+Each module owns a `@RestControllerAdvice` for its own exceptions; one global fallback advice lives
+in a new shared kernel module, `com.flashseats.shared`, declared to Spring Modulith as an **open
+module**.
+
+**Why.** Seven module docs had each invented their own error shapes and code names
+(`HOLD_EXPIRED_OR_INVALID`, `INSUFFICIENT_STOCK`, `BOT_VERIFICATION_FAILED`) with no shared
+contract, so no frontend could switch on them reliably. Boot 4 supports `ProblemDetail` natively;
+an envelope would fight HTTP semantics, break caching, and force a double unwrap on every client.
+
+A shared kernel is *required*, not optional: error codes, session identity, and money types are
+needed by all seven modules, and without a declared open module they would either be duplicated or
+create cross-module dependencies that `ApplicationModules.verify()` rejects. §8 of the standards
+document fixes what may and may not live there.
+
+---
+
+## ADR-022 — Drop Redisson; use PostgreSQL advisory locks
+
+**Decision.** Remove the Redisson dependency. The stock-rebuild lock becomes
+`pg_try_advisory_xact_lock(hash(eventId))`.
+
+**Why.** After ADR-019 moved the hold claim into PostgreSQL, Redisson's only remaining use was one
+lock on a rare admin path. That does not justify a dependency that ships its own Netty stack — and
+its `synchronized`-heavy internals risk **pinning virtual threads** on JDK 21, which under a
+flash-sale spike presents as a throughput collapse that looks like a Redis problem.
+
+`pg_try_advisory_xact_lock` is transaction-scoped, released automatically on commit or rollback,
+cannot leak, and needs no new dependency. The rebuild already reads PostgreSQL, so the lock lives
+where the data does.
+
+---
+
+## ADR-023 — A SQL transaction may contain only SQL
+
+**Decision.** No HTTP, SMTP, RabbitMQ, Redis write, PDF rendering, sleep, or retry inside
+`@Transactional`. Three sanctioned patterns — external call before the transaction, side effects
+via `AFTER_COMMIT`, and the outbox relay as **three short transactions** rather than one. Full rules
+in [`05-global-standards.md`](05-global-standards.md) §4.
+
+**Why.** A transaction holds row locks and a pooled connection, and under virtual threads the
+connection pool is the system's real concurrency limit — one slow call inside a transaction
+throttles everything. Two concrete violations existed: `consumeHold` mutating Redis inside the
+order transaction (ADR-019), and an outbox poller that would have held `FOR UPDATE SKIP LOCKED`
+locks across a RabbitMQ publish.
+
+The relay's crash window between claim and mark re-publishes on the next sweep — at-least-once,
+which the consumer's unique constraint absorbs (ADR-015).
+
+---
+
+## ADR-024 — Queue ordering is configurable; FIFO by default, randomized available
+
+**Decision.** `flashseats.queue.ordering` takes `FIFO` (default) or `RANDOM`.
+
+* `FIFO` — score is arrival epoch-millis. Intuitive, explicable, and correct.
+* `RANDOM` — score is a uniform random draw taken at join time, seeded per event.
+
+**Why.** Ticketmaster Verified Fan, SNKRS and DICE have largely abandoned arrival-order for
+high-demand drops, because FIFO by arrival millisecond rewards whoever has the lowest network
+latency and the most aggressive automation — everybody fires at `t = 0.000` and the winner is
+decided by RTT, not intent. A randomized draw removes the thundering herd's advantage entirely and
+is fairer for human buyers.
+
+FIFO stays the default because it is easier to explain to users and to reason about while building.
+The change is one line — the ZSET score — so this is a configuration decision, not an architecture
+one.
+
+---
+
+## ADR-025 — `saleflow`: a read-only composition module
+
+**Decision.** Add an eighth module, `com.flashseats.saleflow`. It owns **no storage and performs no
+writes**. Its sole responsibility is `GET /api/v1/sale/{eventId}/state`, which aggregates
+`QueueFacade`, `HoldFacade`, `OrderFacade` and `CatalogFacade` into one rehydration payload:
+
+```json
+{
+  "windowStatus": "OPEN",
+  "serverTime": "2026-08-30T10:04:12Z",
+  "queue":     { "state": "ADMITTED", "position": null, "admissionExpiresAt": "…" },
+  "hold":      { "holdToken": "hld_…", "tierId": 501, "quantity": 2, "expiresAt": "…" },
+  "order":     { "orderNumber": "TK-98213", "status": "PENDING" }
+}
+```
+
+Nothing depends on `saleflow`; `saleflow` depends on four facades. The graph stays acyclic.
+
+**Why.** A tab reload at any point in the journey previously lost everything — there was no way for
+the SPA to discover that this session is admitted, holds seats, and has a payment in flight. Every
+production ticketing SPA calls exactly one state endpoint on mount.
+
+It cannot live in an existing module: `queue` would need `HoldFacade`, but `hold → queue` already
+exists, so that would create a cycle. A leaf composition module — depended on by nothing, depending
+on many — is the standard Modulith answer and is architecturally cheap.
+
+**Side benefit.** It gives `OrderFacade` its first real caller, resolving the YAGNI finding that
+`OrderFacade`'s only stated consumers were tools that do not exist.

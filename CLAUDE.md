@@ -9,17 +9,21 @@ FlashSeats — a high-concurrency ticket flash-sale engine. Modular monolith, Ja
 production code exists yet.
 
 **Read [`docs/00-architecture-decisions.md`](docs/00-architecture-decisions.md) before changing
-anything.** It contains 18 ADRs, each recording a defect found in the first design pass and the fix.
+anything.** It contains 25 ADRs across two review passes, each recording a defect and its fix.
 Several look like over-engineering until you read the failure they prevent.
 
 ## Document precedence
 
 ```
-00-architecture-decisions.md      ← highest authority
+00-architecture-decisions.md      ← highest authority (25 ADRs)
+05-global-standards.md            ← cross-cutting contract; module docs conform to it
 03-end-to-end-flow.md             ← the authoritative user journey
 01 / 02 (architecture, HLD)
-docs/modules/*.md                 ← lowest; a second pass is still pending
+docs/modules/*.md                 ← lowest; structural rewrite still pending
 ```
+
+**ADR-019 supersedes ADR-003** and **ADR-020 amends ADR-006** — the originals are kept for the
+record but do not describe the current design.
 
 When a module spec contradicts an ADR, the ADR wins and the module spec is stale — fix the module
 spec rather than the code.
@@ -35,21 +39,27 @@ spec rather than the code.
   starters were deliberately removed; only `spring-modulith-starter-core` and `-starter-test`
   remain, purely for `ApplicationModules.verify()` (ADR-009). Do not re-add them casually.
 - `spring.threads.virtual.enabled=true` is load-bearing, not decoration.
+- **Redisson is gone** (ADR-022). Distributed locks are `pg_try_advisory_xact_lock`.
+- There are **nine** modules: seven domain + `shared` (open) + `saleflow` (read-only leaf).
 
 ## Module boundaries — enforced, not advisory
 
 ```
-filter  ──► bot
-hold    ──► queue, catalog
-order   ──► hold, catalog, payment
-payment ──( PaymentSettledEvent · webhook path only )──► order
-order   ──( outbox → RabbitMQ )──► notification
+                    shared        ← open module; everyone may depend on it
+
+filter   ──► bot
+hold     ──► queue, catalog
+order    ──► hold, catalog, payment, queue
+saleflow ──► queue, hold, order, catalog     ← read-only leaf; nothing depends on it
+payment  ──( PaymentSettledEvent · webhook path only )──► order
+order    ──( outbox → RabbitMQ )──► notification
 ```
 
 Rules:
 
 - Cross-module calls go through a `*Facade` interface. Never touch another module's `service`,
-  `repository`, or `model` package.
+  `repository`, or `model` package. Full facade rules: `05-global-standards.md` §5 — synchronous,
+  never `@Transactional` itself, records not entities, module-owned exceptions only.
 - A module reads only its own tables and its own Redis key prefixes.
 - **The single exception:** `catalog:stock:{eventId}:{tierId}` is owned by `catalog` and mutated by
   `hold`, exclusively through `hold_reserve.lua` / `hold_restore.lua`. Nothing else may touch it.
@@ -61,8 +71,9 @@ Rules:
 
 1. `confirmed_sold + active_holds + remaining == total_capacity`, always. This is the
    `flashseats.stock.drift` metric; non-zero is a page-worthy alarm.
-2. Stock is restored **exactly once** per hold, via the settle-once claim:
-   `GETDEL holdmeta:{token}` (Phase 2+) or a conditional `UPDATE … WHERE status='ACTIVE'` (Phase 1).
+2. Stock is restored **exactly once** per hold, via one conditional `UPDATE` on `ticket_holds`
+   `WHERE status='ACTIVE'` — in **every** phase. PostgreSQL is the authority; Redis holds the timer.
+   There is no `holdmeta` key and no `GETDEL` (ADR-019).
 3. `UNIQUE(hold_token)` on `orders` — one hold can never become two orders.
 4. **Charge before consuming the hold.** There is no `CONSUMED → RELEASED` transition (ADR-001).
 5. A missing stock counter is a **fault** (`-2` → `503` → alarm → locked rebuild), never a cache
@@ -72,6 +83,13 @@ Rules:
    custom header (ADR-010).
 8. Outbox polling uses `FOR UPDATE SKIP LOCKED`; notification dedupe is
    `UNIQUE(order_number, kind)` with insert-then-send. A `SELECT`-based check is a race.
+9. **A SQL transaction may contain only SQL** (ADR-023). No HTTP, SMTP, broker, Redis write, PDF
+   rendering, or sleep inside `@Transactional`. Side effects go in `AFTER_COMMIT`; the outbox relay
+   is three short transactions.
+10. All errors are RFC 7807 `ProblemDetail` with a `code` from the `05-global-standards.md` §2
+    registry. No `ApiResponse<T>` envelope.
+11. `synchronized` **pins virtual threads** on JDK 21. Use `ReentrantLock`. Distributed locks are
+    `pg_try_advisory_xact_lock` — Redisson was removed for exactly this reason (ADR-022).
 
 ## Traps this design already stepped in once
 
@@ -88,6 +106,12 @@ Do not reintroduce these — each cost a real defect in the first pass:
 | Tight per-IP rate limits | Blocks entire NAT populations during the spike |
 | Consuming the hold before charging | Requires a state transition that does not exist |
 | `SELECT`-then-send for email idempotency | Two workers both pass the check |
+| **Mutating Redis inside a SQL transaction** | Redis cannot roll back — a failed commit leaks inventory permanently |
+| Publishing to RabbitMQ inside the outbox transaction | Holds row locks across a broker round trip |
+| Charging before confirming the hold extension | Takes money for seats we no longer hold |
+| An `ApiResponse<T>` envelope | Fights HTTP; breaks status codes and caching |
+| `synchronized` on a blocking path | Pins the carrier thread; looks like a Redis outage |
+| A `@Scheduled` job that is neither idempotent nor lock-guarded | Runs three times, once per replica |
 
 ## Implementation order
 
@@ -142,6 +166,7 @@ implemented naively — a single-instance test cannot see either bug.
   what created most of the defects in the first pass.
 - New concurrency-sensitive code: state the failure mode you are guarding against, and which
   invariant above covers it.
-- Adding a dependency: check Boot 4 compatibility. Redisson and Resilience4j ship Boot-3-targeted
-  starters; we use the plain artifacts and declare beans ourselves.
+- Adding a dependency: check Boot 4 compatibility and virtual-thread safety. Resilience4j ships a
+  Boot-3-targeted starter, so we use the plain artifacts and declare beans ourselves. A library that
+  blocks inside `synchronized` pins carrier threads on JDK 21 — that is why Redisson was dropped.
 - Do not add a cross-module facade edge without checking the graph stays acyclic.

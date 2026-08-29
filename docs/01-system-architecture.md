@@ -6,14 +6,15 @@
 
 ## 1. Pattern: Modular Monolith
 
-One Spring Boot deployable, divided into seven domain-isolated Java packages. This removes
+One Spring Boot deployable, divided into seven domain-isolated Java packages plus two supporting
+ones (`shared`, `saleflow`). This removes
 distributed-transaction and service-discovery complexity while keeping the boundaries strict enough
 that any module could later be extracted into its own service.
 
 The boundaries are not honour-system. `spring-modulith-starter-core` plus a single
 `ApplicationModules.verify()` test fails the build if any module reaches past another module's
 `facade` package. A module reads only its own tables and its own Redis key prefixes — the one
-deliberate, documented exception is described in
+deliberate, documented exception (the shared inventory counter, single-writer contract) is described in
 [`03-end-to-end-flow.md`](03-end-to-end-flow.md#the-one-shared-key-and-its-contract).
 
 The application is **stateless**. All state lives in Redis and PostgreSQL, so any replica can serve
@@ -35,6 +36,9 @@ replica's heap, which is why queue promotions fan out over Redis Pub/Sub (ADR-00
 | **Redis** | 7 | Stock counters, queue ZSET, hold TTLs, rate-limit buckets, idempotency, promotion pub/sub. |
 | **RabbitMQ** | 3.13 | Async fulfilment between `order` and `notification`. |
 | **springdoc-openapi** | 3.1.0 | Live API documentation. |
+| **Actuator + Micrometer** | managed | `/actuator/health` is the container healthcheck; Prometheus scrape for the metric set in `05-global-standards.md` §9. |
+| **Flyway** | managed | Schema migrations. `ddl-auto=validate` means the schema has to come from somewhere. |
+| **Testcontainers** | 1.21.3 | Lua scripts, keyspace notifications and row-lock semantics cannot be tested against embedded fakes. |
 | **Lombok** | managed | Boilerplate reduction. |
 
 > Earlier drafts of these documents said "Spring Boot 3.x". The build is on **Boot 4.1.1** with
@@ -45,7 +49,7 @@ replica's heap, which is why queue promotions fan out over Redis Pub/Sub (ADR-00
 
 | Technology | Coordinates | Phase | Why |
 | :--- | :--- | :--- | :--- |
-| **Redisson** | `org.redisson:redisson:3.50.0` | 2 | Distributed locks for stock rebuild and reconciliation. Plain artifact, not the Boot-3 starter. |
+| **Spring Security** | `spring-boot-starter-security` | 3 | Enforces `ROLE_ADMIN` — "Admin Only" is now a guard, not a comment. |
 | **Bucket4j** | `com.bucket4j:bucket4j_jdk17-core` + `bucket4j_jdk17-lettuce:8.14.0` | 3 | Token-bucket rate limiting, **Redis-backed** so limits are global across replicas. |
 | **Stripe** | `com.stripe:stripe-java:29.2.0` | 3 | Payment gateway (test mode). |
 | **Resilience4j** | `io.github.resilience4j:resilience4j-circuitbreaker` + `-retry:2.3.0` | 3 | Circuit breaking and retry around Stripe. Core modules, wired programmatically. |
@@ -56,9 +60,12 @@ replica's heap, which is why queue promotions fan out over Redis Pub/Sub (ADR-00
 Frontend: React + TypeScript (Vite), MUI, and the browser-native `EventSource` API for the queue
 stream.
 
-> **Boot 4 compatibility note.** `resilience4j-spring-boot3` and `redisson-spring-boot-starter`
-> target Boot 3.x autoconfiguration. We use the plain library artifacts and declare the beans
-> ourselves — a few lines of `@Configuration` in exchange for not fighting autoconfiguration.
+> **Boot 4 compatibility note.** `resilience4j-spring-boot3` targets Boot 3.x autoconfiguration, so
+> we use the plain library artifacts and declare the beans ourselves.
+>
+> **Redisson was removed** (ADR-022). Once ADR-019 moved the hold claim into PostgreSQL, its only
+> remaining use was one lock on a rare admin path — and its `synchronized`-heavy internals risk
+> pinning virtual threads on JDK 21. The stock-rebuild lock is now `pg_try_advisory_xact_lock()`.
 
 ---
 
@@ -68,20 +75,25 @@ stream.
 | :--- | :--- | :--- | :--- | :--- |
 | 1 | **`bot`** | Signed `fsid` cookie, Redis-backed rate limits, reCAPTCHA v3, IP reputation | `ip_rules`, `bot_audit_logs` | `bot:rate:session:*`, `bot:rate:ip:*`, `bot:block:*`, `bot:captcha:*` |
 | 2 | **`catalog`** | Event metadata, tiers, sale windows, **inventory ownership** | `events`, `ticket_tiers`, `tier_inventory` | `catalog:stock:{e}:{t}` |
-| 3 | **`queue`** | Virtual waiting room, SSE streaming, HMAC passes, admission control | *none* | `queue:waiting:*` (ZSET), `queue:pass:*`, `queue:passes:*`, `queue:hb:*`, `queue:events:*` (pub/sub) |
-| 4 | **`hold`** | Time-bound reservations, atomic stock movement, settle-once restoration | `ticket_holds` | `hold:{token}`, `holdmeta:{token}` |
+| 3 | **`queue`** | Virtual waiting room, SSE streaming, HMAC passes, **admission sessions**, admission control | *none* | `queue:waiting:*` (ZSET), `queue:pass:*`, `queue:passes:*`, `queue:admit:*`, `queue:admissions:*`, `queue:hb:*`, `queue:events:*` (pub/sub) |
+| 4 | **`hold`** | Time-bound reservations, atomic stock movement, settle-once restoration | `ticket_holds` **(authority)** | `hold:{token}` (timer only) |
 | 5 | **`payment`** | Stripe integration, idempotency, webhook reconciliation, refunds | `payment_transactions` | `payment:inflight:{holdToken}` |
 | 6 | **`order`** | ACID ledger, checkout orchestration, transactional outbox | `orders`, `order_items`, `outbox_events` | *none* |
 | 7 | **`notification`** | PDF rendering, email delivery, DLQ replay | `notification_logs` | *none* (RabbitMQ + SMTP) |
+| 8 | **`saleflow`** | Read-only rehydration endpoint (ADR-025) | *none* | *none* |
+| — | **`shared`** | Open module: `ProblemDetail`, `ErrorCode`, `SessionId`, `Money` (ADR-021) | *none* | *none* |
 
 ### Dependency graph
 
 ```
-filter  ──► bot
-hold    ──► queue, catalog
-order   ──► hold, catalog, payment
-payment ──( PaymentSettledEvent · webhook only )──► order
-order   ──( outbox → RabbitMQ )──► notification
+                    shared        ← open module; everyone may depend on it
+
+filter   ──► bot
+hold     ──► queue, catalog
+order    ──► hold, catalog, payment, queue
+saleflow ──► queue, hold, order, catalog     ← read-only leaf; nothing depends on it
+payment  ──( PaymentSettledEvent · webhook only )──► order
+order    ──( outbox → RabbitMQ )──► notification
 ```
 
 Acyclic by construction. `payment` deliberately does **not** call `HoldFacade`: grace extension is
@@ -96,7 +108,11 @@ Removing that one edge is what keeps the graph verifiable (ADR-005).
 | :--- | :--- |
 | Atomic Redis Lua reserve (Phase 2+) / conditional `UPDATE` (Phase 1) | Overbooking under concurrency |
 | `UNIQUE(hold_token)` on `orders` | One hold producing two orders |
-| **Settle-once claim** (`GETDEL holdmeta` / conditional `UPDATE`) | Stock restored 3× by 3 replicas |
+| **Settle-once claim** — conditional `UPDATE` in PostgreSQL | Stock restored 3× by 3 replicas |
+| Consume inside the order transaction | Inventory leaked permanently on a failed commit |
+| No external call inside `@Transactional` | Slow dependencies throttling the connection pool |
+| Three-tier timers (pass → admission → hold) | Losing your place for browsing too long |
+| RFC 7807 + canonical error codes | Seven modules inventing seven error shapes |
 | Reserve returns `-2` on a missing counter | Silently resurrecting sold inventory |
 | `maxmemory-policy noeviction` | An LRU policy evicting a `TTL = −1` stock key |
 | Post-restart stock reconciliation | AOF `everysec` losing a second of decrements |

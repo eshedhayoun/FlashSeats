@@ -1,7 +1,8 @@
 # Module: `payment`
 
-> **Status:** first-pass correction. Aligned to [`../00-architecture-decisions.md`](../00-architecture-decisions.md).
-> A detailed second pass is planned before implementation.
+> **Status:** aligned to [`../00-architecture-decisions.md`](../00-architecture-decisions.md) and
+> [`../05-global-standards.md`](../05-global-standards.md). Structural rewrite to the §10 template
+> is pending.
 
 **Package:** `com.flashseats.payment` · **Phase:** 1 (stub) → 3 (Stripe) · **Storage:** PostgreSQL + Redis
 
@@ -175,8 +176,20 @@ order in the background", which could confirm an order for seats another buyer a
 Resilience4j around every Stripe call: circuit breaker (50 % failure rate over 20 calls, 30 s open),
 retry (3 attempts, exponential backoff, **only** on network/5xx — never on a decline), 10 s timeout.
 
-When the circuit is open, `order` returns `503` with retry guidance and **holds are retained** — a
-gateway outage must not cost buyers their seats.
+When the circuit is open, `order` returns `503` with `retryAfterSeconds` and **holds are retained** —
+a gateway outage must not cost buyers their seats.
+
+**Circuit breakers belong only here**, at the external boundary. Wrapping an in-process facade call
+in one adds latency and a failure mode while protecting nothing (`05-global-standards.md` §6).
+
+**Retry classification.** A card decline is a *correct answer*, not a fault: retrying it triples the
+fraud signal against the customer's card and changes nothing. Retry connect/read timeouts and `5xx`
+only — never `4xx`, never declines.
+
+**Fail closed.** Unlike reCAPTCHA, payment failures never degrade into an implicit success.
+
+**No `@Transactional` around a Stripe call**, ever (ADR-023). Persist `INITIATED`, commit, call the
+gateway, then persist the outcome in a second short transaction.
 
 ---
 
@@ -212,3 +225,12 @@ gateway outage must not cost buyers their seats.
 7. `currency`, `attempt_number`, `failure_code`, `refunded_amount_cents` columns added.
 8. Webhook may no longer confirm an order whose hold is gone (ADR-012).
 9. Retry policy narrowed: network/5xx only, never declines.
+
+### Added in the 2nd pass
+
+10. **3-D Secure second leg specified**: `requiresAction` → `402 PAYMENT_ACTION_REQUIRED` with a
+    `resumeUrl`; the client runs `stripe.handleNextAction()` then calls
+    `POST /api/v1/orders/checkout/resume`. v1 returned `requiresAction` and defined nothing after it.
+11. Gateway calls explicitly excluded from every transaction boundary (ADR-023).
+12. Circuit-breaker placement restricted to external boundaries; fail-closed stated (std §6).
+13. Error codes aligned to the canonical registry (std §2).

@@ -1,7 +1,8 @@
 # Module: `notification`
 
-> **Status:** first-pass correction. Aligned to [`../00-architecture-decisions.md`](../00-architecture-decisions.md).
-> A detailed second pass is planned before implementation.
+> **Status:** aligned to [`../00-architecture-decisions.md`](../00-architecture-decisions.md) and
+> [`../05-global-standards.md`](../05-global-standards.md). Structural rewrite to the §10 template
+> is pending.
 
 **Package:** `com.flashseats.notification` · **Phase:** 4 · **Storage:** PostgreSQL + RabbitMQ + SMTP
 
@@ -84,15 +85,23 @@ Manual acknowledgement mode. Prefetch 10. Retry: 3 attempts at 5 s / 30 s / 2 mi
 ## 5. Consumption
 
 ```
-1. INSERT notification_logs (order_number, kind, recipient_email, status='PENDING')
-      └─ unique violation ⇒ already handled ⇒ basicAck, stop.        ← the idempotency guard
+tx1 (short):  INSERT notification_logs (order_number, kind, recipient_email, status='PENDING')
+                └─ unique violation ⇒ already handled ⇒ basicAck, stop   ← idempotency guard
+              COMMIT
+
+   NO TRANSACTION OPEN for any of the following:
 2. PDFBox renders the ticket in memory (one page per line item)
 3. Thymeleaf renders the HTML body
 4. JavaMailSender → SMTP (Mailpit locally)
-5. UPDATE status='SENT', sent_at=now()
-6. basicAck
+
+tx2 (short):  UPDATE notification_logs SET status='SENT', sent_at=now()
+5. basicAck
 ✗ exception ⇒ basicNack(requeue=false) ⇒ retry chain ⇒ DLQ, status='DLQ'
 ```
+
+**Steps 2–4 must not run inside a transaction** (ADR-023). PDF rendering is CPU-bound and SMTP is a
+network call; holding a pooled connection across either would starve checkout, because under virtual
+threads the connection pool is the system's real concurrency ceiling.
 
 **Insert first, send second.** The unique-constraint violation — not a `SELECT` — is what stops a
 duplicate, because it is atomic and a `SELECT` is not.
@@ -187,3 +196,11 @@ public interface NotificationFacade {
 5. Invalid recipients dead-letter immediately instead of burning three retries.
 6. At-least-once delivery documented explicitly as an accepted property.
 7. DLQ inspection endpoint added.
+
+### Added in the 2nd pass
+
+8. **Rendering and SMTP explicitly moved outside any transaction**; the consumer is now two short
+   transactions with the slow work between them (ADR-023).
+9. Consumer declared to run on all replicas, made safe by the unique constraint rather than by
+   coordination.
+10. Error codes aligned to the canonical registry (std §2).

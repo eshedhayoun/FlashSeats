@@ -40,7 +40,9 @@ UPDATE ticket_holds SET status = :s WHERE hold_token = :t AND status = 'ACTIVE';
 -- restore stock only when rowcount = 1
 ```
 
-`HoldReconciliationSweeper` every 10 s for expiry. **No Redis, no TTL listener, no Redisson.**
+`HoldReconciliationSweeper` every 10 s for expiry. **No Redis, no TTL listener, no distributed
+locks.** This conditional `UPDATE` is the claim mechanism for every later phase too — it does not
+get replaced, only accelerated (ADR-019).
 
 **`payment`** — `PaymentFacade` returning `SUCCEEDED`, plus `payment_transactions` rows. A stub
 behind the real interface, in the real position in the sequence.
@@ -82,22 +84,27 @@ rebuild procedure (`00-architecture-decisions.md` ADR-004). Redis configured wit
 `maxmemory-policy noeviction`, AOF `everysec`, and `notify-keyspace-events **Ex**` — all three
 already shipped in [`docker/redis/redis.conf`](../docker/redis/redis.conf).
 
-**`hold`** — `hold_reserve.lua` and `hold_restore.lua`. `holdmeta:{token}` written inside the
-reserve script with a 24 h TTL. Settle-once claim becomes `GETDEL holdmeta:{token}`. Keyspace
-listener added as a latency optimisation; the sweeper (now 30 s) remains the correctness
-guarantee. Redisson for the rebuild lock only. `extendHold()` — once, +120 s, ceiling 420 s,
-pushing `ticket_holds.expires_at`.
+**`hold`** — `hold_reserve.lua` and `hold_restore.lua`. **The claim stays exactly where it was in
+Phase 1**: a conditional `UPDATE` on `ticket_holds` (ADR-019). Redis gains the TTL timer and the
+keyspace listener as a latency optimisation; the sweeper (now 30 s) remains the correctness
+guarantee. `extendHold()` — once, +120 s, ceiling 420 s, pushing `ticket_holds.expires_at`, and
+**failing the checkout rather than charging** if it cannot win the claim.
 
-**`queue`** — ZSET with `ZADD NX`; `GET /api/v1/queue/stream` with a 15 s heartbeat and
-`Last-Event-ID`; `GET /api/v1/queue/status` returning the pass as a polling fallback; HMAC passes
-(120 s, single-use, revoked on first hold); promotion worker bounded by
-`min(batchSize, remainingStock − livePasses)`; **Redis Pub/Sub fan-out on
-`queue:events:{eventId}`**; `sale-exhausted` and `sale-closed` frames.
+**`queue`** — ZSET with `ZADD NX` (`FIFO` or `RANDOM` score — ADR-024); `GET /api/v1/queue/stream`
+with a 15 s heartbeat and `Last-Event-ID`; `GET /api/v1/queue/status` returning the pass as a
+polling fallback; HMAC passes (120 s, single-use); **`POST /api/v1/queue/admit` exchanging a pass
+for a 600 s admission session** (ADR-020); promotion worker bounded by
+`min(batchSize, floor(remainingStock × 1.5) − pendingPasses − liveAdmissions)`; **Redis Pub/Sub
+fan-out on `queue:events:{eventId}`**; `sale-exhausted` and `sale-closed` frames; monotonic
+position clamping.
+
+**`saleflow`** — `GET /api/v1/sale/{eventId}/state` rehydration endpoint (ADR-025).
 
 ### Traps this phase exists to avoid
 1. **Repopulating stock from `total_capacity`** on a cache miss — resurrects sold tickets. Return
    `-2`, alarm, rebuild.
-2. **Restoring stock once per replica** — keyspace expiry is broadcast pub/sub. `GETDEL` claim.
+2. **Restoring stock once per replica** — keyspace expiry is broadcast pub/sub. The conditional
+   `UPDATE` claim handles it; do **not** reach for a distributed lock.
 3. **Testing SSE on one instance.** Promotion fan-out works perfectly on one replica and drops
    two-thirds of passes on three. Test with ≥ 2 replicas or the bug stays hidden until Phase 4.
 

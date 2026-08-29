@@ -101,7 +101,7 @@ Redis's execution model:
 ```lua
 if stock == false then return -2 end          -- FAULT: counter missing
 if tonumber(stock) < qty then return -1 end   -- genuinely sold out
-DECRBY stock qty;  HSET hold:{token} …;  EXPIRE 300;  SET holdmeta:{token} … EX 86400
+DECRBY stock qty;  HSET hold:{token} …;  EXPIRE 300
 ```
 
 The `-2` branch is the most important line in the system. The original design treated a missing
@@ -118,15 +118,20 @@ hold three times.
 
 The fix is one primitive, the **settle-once claim**:
 
-```
-Phase 2+ :  GETDEL holdmeta:{holdToken}     -- atomic; exactly one caller gets the value
-Phase 1  :  UPDATE ticket_holds SET status=? WHERE hold_token=? AND status='ACTIVE'
+```sql
+UPDATE ticket_holds SET status = ?, settled_at = now()
+ WHERE hold_token = ? AND status = 'ACTIVE';     -- rowcount = 1 ⇒ you won
 ```
 
-Whoever wins the claim restores the stock. Everyone else gets `nil` (or `rowcount = 0`) and does
-nothing. No locks, no coordination, correct across any number of replicas — and it simultaneously
-resolves the undefined "shadow record" the expiry listener was supposed to read, since `holdmeta`
-outlives the hold by design (ADR-003).
+The same statement in **every phase**. PostgreSQL is the authority; Redis holds the timer.
+
+Whoever wins restores the stock; everyone else gets `rowcount = 0` and does nothing. No distributed
+lock, correct across any number of replicas.
+
+Putting the claim in PostgreSQL rather than Redis is what makes **consume transactional**: the
+`UPDATE` participates in the order transaction and rolls back with it. The earlier Redis-side claim
+(`GETDEL holdmeta`) could not roll back, so a failed commit left the claim spent and the seats
+permanently unsellable (ADR-019, superseding ADR-003).
 
 ### Why the queue exists
 
@@ -136,8 +141,23 @@ quickly instead of slowly.
 
 That reframing has a consequence: admission must be bounded by *real* remaining capacity, or the
 queue is just a slower way to deliver a `409`. Each tick admits
-`min(batchSize, remainingStock − livePasses)`, and when stock is gone the queue broadcasts
-`sale-exhausted` and drains (ADR-008).
+
+```
+min(batchSize, floor(remainingStock × oversubscribeFactor) − pendingPasses − liveAdmissions)
+```
+
+and when stock is gone the queue broadcasts `sale-exhausted` and drains (ADR-008, ADR-020).
+
+`oversubscribeFactor` defaults to 1.5 because hold-to-order conversion is well under 100 %: admitting
+exactly `remainingStock` buyers leaves the sale under-filled. Every real waiting room tunes this.
+
+### Three timers, not two
+
+Industry runs **queue pass → admission session → hold**. We originally had only the first and third,
+which meant a promoted buyer had 120 seconds to choose a tier or go back to the queue. The middle
+tier — a 600 s admission session, created by exchanging the pass — is what gives buyers room to
+compare tiers, change their mind, reload the tab, or release a hold and pick again without losing
+their place (ADR-020).
 
 ---
 
@@ -158,13 +178,14 @@ runs on the server's clock, not the device's. Seeds counters via `SETNX` **only 
 and owns the rebuild procedure.
 
 ### `queue` — waiting room
-Redis ZSET ordered by arrival millisecond, `ZADD NX` so a refresh preserves position. Streams
-positions over SSE with a 15 s heartbeat and `Last-Event-ID` reconnect. Mints single-use HMAC passes
-(120 s) and fans them to the right replica over Redis Pub/Sub. Stores nothing in PostgreSQL.
+Redis ZSET ordered by arrival millisecond (or a random draw — ADR-024), `ZADD NX` so a refresh
+preserves position. Streams positions over SSE with a 15 s heartbeat and `Last-Event-ID` reconnect.
+Mints single-use HMAC passes (120 s), exchanges them for **600 s admission sessions**, and fans
+promotions to the right replica over Redis Pub/Sub. Stores nothing in PostgreSQL.
 
 ### `hold` — reservations
 Atomically moves stock and creates a 300 s reservation in one Lua script. Owns the hold state
-machine and the settle-once claim. Runs a keyspace-expiry listener as a latency optimisation and a
+machine, whose authority is `ticket_holds` in PostgreSQL — Redis holds only the timer. Runs a keyspace-expiry listener as a latency optimisation and a
 30 s reconciliation sweeper as the correctness guarantee — keyspace pub/sub is at-most-once, so the
 sweeper, not the listener, is what makes expiry reliable.
 
@@ -172,6 +193,15 @@ sweeper, not the listener, is what makes expiry reliable.
 Stripe behind Resilience4j. Idempotency anchored to the hold, not to a client-chosen string
 (ADR-014). Verifies webhook signatures and publishes `PaymentSettledEvent`. Calls **no** other
 module's facade.
+
+### `saleflow` — rehydration
+One read-only endpoint, `GET /api/v1/sale/{eventId}/state`, composing four facades so the SPA can
+recover its full position after a tab reload. No storage, no writes, and nothing depends on it
+(ADR-025).
+
+### `shared` — the kernel
+A Modulith *open module*: RFC 7807 machinery, the canonical `ErrorCode` enum, `SessionId`, `Money`,
+and the global fallback advice. No entities, no business rules (ADR-021).
 
 ### `order` — the ledger and the orchestrator
 The single checkout entry point. Validates the hold, prices server-side, reserves the
@@ -195,7 +225,11 @@ t=0    sale opens ────────────────────�
        │                            │
        │                    promotion tick (1 s)
        │                            ▼
-       ├─ pass issued ──► [ 120 s · single-use · revoked on first hold ]
+       ├─ pass issued ──► [ 120 s · single-use ]
+       │                            │
+       │                   POST /queue/admit          (exchanges + revokes the pass)
+       │                            ▼
+       ├─ admitted ─────► [ 600 s · browse freely · SURVIVES a released hold ]
        │                            │
        │                     POST /holds
        │                            ▼
@@ -219,8 +253,8 @@ ceiling — the original `extendHold` had none, which made permanent seat-squatt
 | Defect | Fix | ADR |
 | :--- | :--- | :--- |
 | Cache miss repopulated stock from `total_capacity` | Missing counter = fault; locked rebuild from PostgreSQL | 004 |
-| Keyspace expiry restored stock once per replica | Settle-once claim via `GETDEL` | 003 |
-| Expiry listener read an undefined "shadow record" | `holdmeta:{token}`, written in the same Lua script, 24 h TTL | 003 |
+| Keyspace expiry restored stock once per replica | Settle-once claim, conditional `UPDATE` | 019 |
+| Expiry listener read an undefined "shadow record" | Listener reads `ticket_holds` by token; no shadow key needed | 019 |
 | Two contradictory checkout flows | One: `order` orchestrates, charge first, consume second | 001 |
 | No `hold_token` on `orders` | `UNIQUE(hold_token)` + find-or-create retry semantics | 002 |
 | Webhook finalised orders whose seats were re-sold | Attempt consume; auto-refund + notify on failure | 012 |
@@ -246,3 +280,24 @@ ceiling — the original `extendHold` had none, which made permanent seat-squatt
 | Redis Cluster + multi-key Lua = `CROSSSLOT` | Single primary + Sentinel | 018 |
 | Two competing outbox mechanisms on the classpath | Hand-rolled table; Modulith kept for verification only | 009 |
 | No metrics, no kill switch | Metric set + `stock.drift` alarm + pause/rebuild endpoints | — |
+
+### Found by the 2nd-pass audit
+
+| Defect | Fix | ADR |
+| :--- | :--- | :--- |
+| **`consumeHold` mutated Redis inside the SQL transaction** — a failed commit spent the claim, deleted the timer, and leaked the seats permanently | Claim moved into PostgreSQL; it now rolls back with the transaction | **019** |
+| `holdmeta` + `GETDEL` existed only to carry an expiry payload | Deleted — the listener reads `ticket_holds` by token | 019 |
+| A promoted buyer had 120 s to choose a tier or re-queue | 600 s admission session between pass and hold | **020** |
+| Releasing a hold cost you your place in the sale | Admission session outlives the hold | 020 |
+| A tab reload lost the entire journey | `GET /api/v1/sale/{eventId}/state` | **025** |
+| Seven modules inventing seven error shapes | RFC 7807 + one canonical code registry | **021** |
+| No home for cross-cutting types | `shared` open module | 021 |
+| Outbox publish would have held row locks across a broker round trip | Three short transactions | **023** |
+| PDF + SMTP inside a transaction | Claim, render outside, record | 023 |
+| `extendHold` failure did not abort the charge | Abort with `410`; nothing charged | 023 |
+| Redisson for one lock, with virtual-thread pinning risk | `pg_try_advisory_xact_lock` | **022** |
+| `/actuator/health` was the healthcheck with no actuator dependency | Added; `--profile cluster` would have hung forever | 022 |
+| Arrival-order FIFO rewards the lowest-latency bot | `RANDOM` ordering available; FIFO stays default | **024** |
+| Queue position could jump backwards | Clamped monotonic | 008 |
+| `OrderFacade` had no caller | `saleflow` is its consumer | 025 |
+| 3-D Secure had no second leg | `POST /orders/checkout/resume` + `resumeUrl` | 021 |

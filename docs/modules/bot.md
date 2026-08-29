@@ -1,7 +1,8 @@
 # Module: `bot`
 
-> **Status:** first-pass correction. Aligned to [`../00-architecture-decisions.md`](../00-architecture-decisions.md).
-> A detailed second pass is planned before implementation.
+> **Status:** aligned to [`../00-architecture-decisions.md`](../00-architecture-decisions.md) and
+> [`../05-global-standards.md`](../05-global-standards.md). Structural rewrite to the §10 template
+> is pending.
 
 **Package:** `com.flashseats.bot` · **Phase:** 3 · **Storage:** PostgreSQL + Redis
 
@@ -199,3 +200,14 @@ fail-open policy — it feeds the alarm, so the trade-off is visible rather than
 7. Public `verify-captcha` endpoint removed.
 8. Audit logging made async and restricted to non-`ALLOWED` outcomes.
 9. `UNIQUE(ip_address, rule_type)` and a retention policy added.
+
+### Added in the 2nd pass
+
+10. Filters registered via `FilterRegistrationBean` ahead of the Spring Security chain, and stated
+    to live **outside** the Modulith module graph for HTTP concerns — they are servlet filters, not
+    facade callers.
+11. Admin endpoints now enforced by Spring Security (`ROLE_ADMIN`). "Admin Only" was previously an
+    assertion with no mechanism behind it.
+12. reCAPTCHA fail-open surfaced as `degraded=true` and wired to an alarm, so the trade is visible
+    rather than silent (std §6).
+13. Error codes aligned to the canonical registry (std §2).

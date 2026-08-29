@@ -1,7 +1,8 @@
 # Module: `queue`
 
-> **Status:** first-pass correction. Aligned to [`../00-architecture-decisions.md`](../00-architecture-decisions.md).
-> A detailed second pass is planned before implementation.
+> **Status:** aligned to [`../00-architecture-decisions.md`](../00-architecture-decisions.md) and
+> [`../05-global-standards.md`](../05-global-standards.md). Structural rewrite to the §10 template
+> is pending.
 
 **Package:** `com.flashseats.queue` · **Phase:** 2 · **Storage:** Redis only
 
@@ -9,8 +10,9 @@
 
 ## 1. Scope
 
-The virtual waiting room. Orders arrivals by millisecond, streams live positions over SSE, and mints
-single-use HMAC passes at a rate the rest of the system can absorb.
+The virtual waiting room. Orders arrivals, streams live positions over SSE, mints single-use HMAC
+passes at a rate the rest of the system can absorb, and exchanges those passes for **admission
+sessions** that let a buyer browse the sale without losing their place.
 
 **The queue does not prevent overbooking — `hold` does.** The queue exists so the thousands who will
 not get tickets do not all hit checkout at once, and so they find out quickly rather than slowly.
@@ -43,14 +45,16 @@ com.flashseats.queue
 | Key | Type | TTL | Purpose |
 | :--- | :--- | :--- | :--- |
 | `queue:waiting:{eventId}` | ZSET — score `epochMillis`, member `sid` | until sale end | the line |
-| `queue:pass:{sid}` | String — signed token | **120 s** | active pass (ADR-006) |
+| `queue:pass:{sid}` | String — signed token | **120 s** | single-use pass; exchanged at `/queue/admit` |
+| `queue:admit:{eventId}:{sid}` | String — signed token | **600 s** | **admission session** — you are inside the sale (ADR-020) |
+| `queue:admissions:{eventId}` | ZSET — score = expiry | until sale end | live-admission count for admission control |
 | `queue:passes:{eventId}` | ZSET — score = pass expiry | until sale end | live-pass count for admission control |
 | `queue:hb:{sid}` | String | 30 s | liveness; lets abandoned entries be evicted |
 | `queue:events:{eventId}` | Pub/Sub channel | — | promotion fan-out across replicas (ADR-007) |
 
-`queue:passes` exists so `livePasses` can be counted with
-`ZCOUNT queue:passes:{eventId} <now> +inf` — self-cleaning, no leak, no separate counter to
-decrement.
+The two ZSETs exist so live counts can be taken with `ZCOUNT … <now> +inf` — self-cleaning, no leak,
+and no separate counter to decrement. Nothing here is authoritative: the queue holds no state that
+matters after the sale.
 
 ---
 
@@ -64,9 +68,16 @@ decrement.
 3. Place in line:
 
 ```redis
-ZADD queue:waiting:{eventId} NX <epochMillis> <sessionId>
+# score = epochMillis          when flashseats.queue.ordering = FIFO   (default)
+# score = uniform random draw  when flashseats.queue.ordering = RANDOM (ADR-024)
+ZADD queue:waiting:{eventId} NX <score> <sessionId>
 SET  queue:hb:{sessionId} 1 EX 30
 ```
+
+**Ordering is configurable.** FIFO by arrival millisecond is intuitive and stays the default, but it
+rewards whoever has the lowest network latency and the most aggressive automation — everyone fires
+at `t = 0.000` and RTT decides the winner. Ticketmaster Verified Fan, SNKRS and DICE have largely
+moved to a randomized draw for exactly this reason. The change is one line: the ZSET score.
 
 **`NX` is essential.** Plain `ZADD` *updates* an existing member's score, so a page refresh or a
 double-click on "Join Sale" reset the timestamp and sent the user to the **back** of the line —
@@ -80,8 +91,8 @@ directly contradicting v1's own stated FIFO fairness guarantee (ADR-008).
 
 | Event | Payload | Cadence |
 | :--- | :--- | :--- |
-| `position-update` | `{position, aheadOfYou, estWaitSeconds}` | 2 s |
-| `queue-promoted` | `{passToken, expiresInSeconds: 120}` | on promotion |
+| `position-update` | `{position, aheadOfYou, estWaitSeconds}` | 2 s — **monotonic non-increasing** |
+| `queue-promoted` | `{passToken, expiresInSeconds: 120}` | on promotion — client immediately calls `/queue/admit` |
 | `sale-exhausted` | `{soldOutAt}` | terminal |
 | `sale-closed` | `{saleEndTime}` | terminal |
 | *(comment)* | `:hb` | 15 s |
@@ -103,10 +114,13 @@ Emitters are held in a per-replica registry keyed by `sessionId`, with `onComple
 Once per second per active event:
 
 ```
-livePasses = ZCOUNT queue:passes:{eventId} <now> +inf
-admittable = min(batchSize, remainingStock − livePasses)
+pendingPasses  = ZCOUNT queue:passes:{eventId}     <now> +inf
+liveAdmissions = ZCOUNT queue:admissions:{eventId} <now> +inf
+admittable = min(batchSize,
+                 floor(remainingStock × oversubscribeFactor)
+                   − pendingPasses − liveAdmissions)     -- factor defaults to 1.5 (ADR-020)
 
-if remainingStock == 0 and livePasses == 0:
+if remainingStock == 0 and pendingPasses == 0 and liveAdmissions == 0:
     PUBLISH sale-exhausted ; drain the ZSET ; stop
 if admittable <= 0: skip this tick
 
@@ -117,6 +131,10 @@ for sid in ZRANGE queue:waiting:{eventId} 0 admittable-1:
     ZADD queue:passes:{eventId} <now+120s> <sid>
     ZREM queue:waiting:{eventId} <sid>
     PUBLISH queue:events:{eventId} {sid, passToken}
+
+# The promotion worker is a @Scheduled job and therefore runs on ALL replicas.
+# It takes pg_try_advisory_xact_lock(hash('promote', eventId)) and skips the tick
+# if it cannot acquire it — singleton by lock (05-global-standards.md section 7).
 ```
 
 Two load-bearing details:
@@ -141,24 +159,29 @@ unavailable), promotion pauses rather than guessing.
 | Method | Path | Access |
 | :--- | :--- | :--- |
 | `POST` | `/api/v1/queue/join` | public + reCAPTCHA |
+| `POST` | `/api/v1/queue/admit` | `X-Queue-Pass-Token` + `fsid` — exchanges the pass for a 600 s admission session |
 | `GET` | `/api/v1/queue/status` | public — includes the pass if minted |
 | `GET` | `/api/v1/queue/stream` | public — SSE |
 
 ```java
 public interface QueueFacade {
-    /** HMAC signature + live queue:pass:{sid}. Used by hold before reserving. */
-    boolean verifyPassToken(String passToken, String userSessionId, long eventId);
+    /** HMAC signature + live queue:admit:{eventId}:{sid}. Used by `hold` before reserving. */
+    boolean verifyAdmission(String admissionToken, String userSessionId, long eventId);
 
-    /** Single-use enforcement: called by hold immediately after a successful reservation.
-     *  Deletes queue:pass:{sid} and removes the entry from queue:passes:{eventId}. */
-    void revokePassToken(String userSessionId);
+    /** Called by `order` from AFTER_COMMIT once an order reaches CONFIRMED. */
+    void revokeAdmission(String userSessionId, long eventId);
+
+    /** Read-only rehydration for saleflow (ADR-025). */
+    QueueStateDTO getQueueState(String userSessionId, long eventId);
 }
 ```
 
-`revokePassToken` existed in v1 but **no flow ever called it**. A pass therefore remained valid for
-its full lifetime and could mint unlimited holds — enough for one promoted session to drain a tier.
-It is now invoked on the first successful hold, and the TTL dropped from 300 s to 120 s so it no
-longer shadows the hold window (ADR-006).
+`verifyPassToken` / `revokePassToken` are no longer facade methods — the pass is consumed inside
+this module at `POST /api/v1/queue/admit`, so no other module ever sees it.
+
+In v1 `revokePassToken` existed but **no flow called it**: a pass stayed valid for its full lifetime
+and could mint unlimited holds, enough for one promoted session to drain a tier. The pass is now
+single-use by construction, spent the moment it becomes an admission session (ADR-006, ADR-020).
 
 **Events:** `UserPromotedEvent(sid, eventId, at)` · `SaleExhaustedEvent(eventId, at)` — monitoring
 only.
@@ -171,6 +194,9 @@ only.
 | :--- | :--- |
 | Refresh mid-queue | `ZADD NX` preserves position; SSE reconnects with `Last-Event-ID` |
 | Tab closed after promotion | Pass expires in 120 s, unused. No stock was touched |
+| Buyer wants a different tier | Release the hold; the **admission session survives**, so no re-queue (ADR-020) |
+| Admission expires while browsing | `410 ADMISSION_EXPIRED`; rejoin the queue |
+| Position jumps backwards after evictions | Clamped monotonic non-increasing before it is sent |
 | Promotion while SSE is down | Pass is in Redis; `/queue/status` returns it on reconnect |
 | Promoter on replica A, SSE on replica B | Pub/Sub fan-out (ADR-007) |
 | Abandoned entries inflating estimates | `queue:hb:{sid}` heartbeat; lazy `ZREM` during promotion |
@@ -178,7 +204,7 @@ only.
 | Sale window closes | `sale-closed`, queue drains |
 | Redis down | `503 QueueUnavailable`; SSE closes; client retries with backoff |
 | Forged pass token | HMAC verification fails → `403` |
-| Replayed pass after use | Key deleted by `revokePassToken` → `403` |
+| Replayed pass after use | Key deleted at `/queue/admit` → `403` |
 | Stock counter unavailable | Promotion pauses rather than over-admitting |
 
 **Exceptions:** `InvalidQueueToken` 403 · `NotInQueue` 404 · `SaleNotOpen` 409 ·
@@ -200,3 +226,17 @@ only.
 8. SSE heartbeat, `Last-Event-ID` reconnect, polling fallback, and required Nginx settings
    documented.
 9. "Position #1" prose replaced with the batch-promotion reality it always was.
+
+### Added in the 2nd pass
+
+10. **Admission sessions** (600 s) between pass and hold — the industry-standard middle tier
+    (ADR-020). `POST /api/v1/queue/admit` added.
+11. Admission control counts admissions and applies a **1.5× oversubscribe factor**, because
+    hold-to-order conversion is well under 100 % (ADR-020).
+12. **Configurable ordering**: `FIFO` (default) or `RANDOM`. Arrival-millisecond FIFO rewards the
+    lowest-latency bot; a random draw is what modern high-demand drops use (ADR-024).
+13. Position clamped **monotonic non-increasing** — evictions ahead of you must never make the
+    number go up.
+14. Promotion worker declared **singleton by advisory lock** — it is `@Scheduled` and would
+    otherwise run on all three replicas.
+15. `getQueueState` added for `saleflow` rehydration (ADR-025).

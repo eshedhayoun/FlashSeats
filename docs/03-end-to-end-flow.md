@@ -29,9 +29,10 @@
 | inventory      |   |                |          |                |    |                |
 +----------------+   +----------------+          +----------------+    +----------------+
 | PG: events,    |   | PG: none       |          | PG: ticket_    |    | PG: orders,    |
-|  ticket_tiers, |   | Redis: ZSET,   |          |     holds      |    | order_items,   |
-|  tier_inventory|   |  pass, pubsub  |          | Redis: hold:,  |    | outbox_events  |
-| Redis: stock   |   |                |          |  holdmeta:     |    |                |
+|  ticket_tiers, |   | Redis: ZSET,   |          |  holds (AUTH-  |    | order_items,   |
+|  tier_inventory|   |  pass, admit,  |          |  ORITY)        |    | outbox_events  |
+| Redis: stock   |   |  pubsub        |          | Redis: hold:   |    |                |
+|                |   |                |          |  (timer only)  |    |                |
 +----------------+   +----------------+          +----------------+    +----------------+
                                                                               |
                                                              +----------------+---------+
@@ -46,19 +47,34 @@
                                                      +----------------+        +------------------+
 ```
 
-### Facade graph (acyclic — see ADR-005)
+### Facade graph (acyclic — see ADR-005, ADR-025)
 
 ```
-filter  ──► bot
-hold    ──► queue, catalog
-order   ──► hold, catalog, payment
-payment ──( PaymentSettledEvent — webhook path only )──► order
-order   ──( outbox → RabbitMQ )──► notification
+                    shared          ← open module: ProblemDetail, ErrorCode, SessionId
+                 (everyone may depend on it)
+
+filter   ──► bot
+hold     ──► queue, catalog
+order    ──► hold, catalog, payment, queue
+saleflow ──► queue, hold, order, catalog        ← read-only leaf; nothing depends on it
+payment  ──( PaymentSettledEvent — webhook path only )──► order
+order    ──( outbox → RabbitMQ )──► notification
 ```
 
 `ApplicationModules.verify()` enforces this at build time. There is no illegal cross-module
 database access anywhere in the design: a module reads only its own tables and its own Redis
 key prefixes.
+
+Two additions from the 2nd-pass audit:
+
+* **`shared`** — a Modulith *open module* holding the RFC 7807 machinery, the canonical error-code
+  enum, and value types (`SessionId`, `Money`). Required, not optional: without it, seven modules
+  would either duplicate error codes or take dependencies on each other that `verify()` rejects
+  (ADR-021).
+* **`saleflow`** — a read-only composition module owning one endpoint,
+  `GET /api/v1/sale/{eventId}/state`, which rehydrates the SPA after a tab reload. It cannot live in
+  `queue`, because `queue` would then need `HoldFacade` while `hold → queue` already exists — a
+  cycle. A leaf that depends on many and is depended on by none is the standard answer (ADR-025).
 
 ### The one shared key, and its contract
 
@@ -192,6 +208,8 @@ Two things are load-bearing here:
   two-thirds of promotions would silently vanish (ADR-007).
 
 Abandoned entries are evicted by a `queue:hb:{sid}` heartbeat so `estWaitSeconds` stays honest.
+Position is clamped **monotonic non-increasing** client-side: evictions ahead of you can make a raw
+`ZRANK` jump backwards, and a number that goes *up* reads as a broken queue.
 
 > **Phase 1 (MVP):** no queue module at all. The user goes straight from the landing page to seat
 > selection. Nothing downstream depends on the queue for correctness — the pass is an
@@ -199,9 +217,34 @@ Abandoned entries are evicted by a `queue:hb:{sid}` heartbeat so `estWaitSeconds
 
 ---
 
+### Step 2b — Admission *(the middle tier)*
+
+`POST /api/v1/queue/admit`, header `X-Queue-Pass-Token`. The browser calls this immediately on
+landing in the seat-selection view.
+
+```
+1. QueueFacade.verifyPassToken(token, sid, eventId)
+2. SET  queue:admit:{eventId}:{sid} <signed admission token> EX 600
+3. ZADD queue:admissions:{eventId} <now+600s> <sid>
+4. revoke the pass: DEL queue:pass:{sid}; ZREM queue:passes:{eventId} <sid>
+```
+
+**Why this tier exists.** The pass proves you left the queue; the admission session means *you are
+inside the sale*. Without it, a buyer promoted at t=0 had 120 seconds to choose a tier or return to
+the queue — but real buyers compare tiers, check prices, and consult someone. Ten minutes of browse
+time is the industry norm (Ticketmaster, AXS, Queue-it all run this three-tier model).
+
+It also means **a released or expired hold does not cost you your place.** You can switch from VIP
+to Section A without re-queueing, because the admission session outlives the hold. That single
+property fixes tier changes, the back button, and refresh recovery at once (ADR-020).
+
+The admission session is revoked when an order reaches `CONFIRMED`.
+
+---
+
 ### Step 3 — Seat selection and holding
 
-`POST /api/v1/holds`, header `X-Queue-Pass-Token`:
+`POST /api/v1/holds`, header `X-Admission-Token`:
 
 ```json
 { "eventId": 10024, "tierId": 501, "quantity": 2 }
@@ -210,15 +253,15 @@ Abandoned entries are evicted by a `queue:hb:{sid}` heartbeat so `estWaitSeconds
 `userSessionId` is **not** in the body. It comes from the signed `fsid` cookie; a client-supplied
 identity would let anyone act as anyone (ADR-010).
 
-1. `QueueFacade.verifyPassToken(token, sid, eventId)` — HMAC signature plus a live
-   `queue:pass:{sid}`.
+1. `QueueFacade.verifyAdmission(admissionToken, sid, eventId)` — HMAC plus a live
+   `queue:admit:{eventId}:{sid}`. **Not** the pass: that was already spent in Step 2b.
 2. `CatalogFacade.getTierSummary(eventId, tierId)` — tier exists, belongs to the event, window is
    `OPEN`.
 3. Limits: `quantity ≤ 6`; at most one `ACTIVE` hold per session per event (ADR-017).
 4. `hold_reserve.lua` — one atomic script:
 
 ```lua
-local stockKey, holdKey, metaKey = KEYS[1], KEYS[2], KEYS[3]
+local stockKey, holdKey = KEYS[1], KEYS[2]
 local qty, ttl = tonumber(ARGV[1]), tonumber(ARGV[2])
 
 local stock = redis.call('GET', stockKey)
@@ -230,15 +273,17 @@ redis.call('HSET', holdKey,
     'userSessionId', ARGV[3], 'eventId', ARGV[4], 'tierId', ARGV[5],
     'quantity', tostring(qty), 'status', 'ACTIVE', 'expiresAt', ARGV[6])
 redis.call('EXPIRE', holdKey, ttl)
--- the settle-once claim ticket; outlives the hold so expiry can still be settled (ADR-003)
-redis.call('SET', metaKey, ARGV[4]..':'..ARGV[5]..':'..qty..':'..ARGV[3], 'EX', 86400)
 return 1
 ```
 
-5. `QueueFacade.revokePassToken(sid)` — **the pass is single-use.** It was never revoked in the
-   original design, so one promoted session could mint holds for a full five minutes and drain a
-   tier (ADR-006).
-6. Async: insert the `ticket_holds` audit row.
+> There is no `holdmeta` key any more. ADR-019 moved the settle-once claim into PostgreSQL, and
+> `holdmeta` only ever existed because a Redis expiry event carries no payload — a problem that
+> disappears once the expiry handler reads `ticket_holds` by token.
+
+5. Insert the `ticket_holds` row with `status = ACTIVE`. **This row is the authority**, not the
+   Redis key.
+
+The admission session is **not** revoked here — that is the whole point of Step 2b.
 
 | Script result | Response |
 | :--- | :--- |
@@ -280,38 +325,58 @@ takes card details.
 `order` orchestrates. There is exactly one checkout endpoint (ADR-001):
 
 ```
-1. HoldFacade.getActiveHold(holdToken, sid)      → 409 if missing/expired/not yours
-2. CatalogFacade.getTierSummary(eventId,tierId)  → price snapshot, SERVER-SIDE (ADR-013)
-3. find-or-create orders row, hold_token UNIQUE, status = PENDING (ADR-002)
-4. HoldFacade.extendHold(holdToken, 120s)        → once, ceiling 420s total (ADR-006)
-5. PaymentFacade.authorize(orderNumber, amountCents, currency, pmId, idempotencyKey)
-6. @Transactional {
-       HoldFacade.consumeHold(holdToken)         → settle-once claim
-       orders.status = CONFIRMED
-       INSERT order_items
-       INSERT outbox_events (ORDER_CONFIRMED, PENDING)
-   }
-7. 201 Created + OrderReceiptDTO
+ 1. HoldFacade.getActiveHold(holdToken, sid)      → 409 if missing/expired/not yours
+ 2. CatalogFacade.getTierSummary(eventId,tierId)  → price snapshot, SERVER-SIDE (ADR-013)
+ 3. find-or-create orders row, hold_token UNIQUE, status = PENDING (ADR-002)
+ 4. HoldFacade.extendHold(holdToken, 120s)        → once, ceiling 420s (ADR-006)
+       └─ FAILS ⇒ ABORT with 410 HOLD_EXPIRED. Do NOT charge.       ← see below
+ 5. PaymentFacade.authorize(orderNumber, amountCents, currency, pmId, idempotencyKey)
+                                                  ← OUTSIDE any transaction (ADR-023)
+ 6. @Transactional {          ← SQL ONLY. No Redis, no HTTP, no broker.
+        UPDATE ticket_holds SET status='CONSUMED'
+          WHERE hold_token=? AND status='ACTIVE'   → rowcount 0 ⇒ roll back + refund
+        orders.status = CONFIRMED
+        INSERT order_items
+        INSERT outbox_events (ORDER_CONFIRMED, PENDING)
+    }
+ 7. AFTER_COMMIT (best-effort, safe to lose):
+        DEL hold:{holdToken}                       ← Redis cleanup only
+        QueueFacade.revokeAdmission(sid, eventId)
+ 8. 201 Created + OrderReceiptDTO
 ```
 
-**Charge first, consume second.** Consuming the hold before charging would require a
+**Charge first, consume second.** Consuming before charging would require a
 `CONSUMED → RELEASED` transition the state machine forbids, and would briefly release inventory the
-buyer is actively paying for. Here a hold is only ever destroyed by a transaction that is about to
-commit.
+buyer is actively paying for. Here a hold is only ever destroyed by a transaction about to commit.
+
+**Consume is a SQL statement inside the transaction, and that is the whole point.** The claim is an
+`UPDATE … WHERE status='ACTIVE'`; it rolls back with the transaction. The earlier design mutated
+Redis here (`GETDEL holdmeta`), which cannot roll back — so a failed commit left the claim spent,
+the timer key deleted, and no order, and **those seats became permanently unsellable** (ADR-019).
+
+**Redis cleanup is deliberately after the commit and deliberately best-effort.** If step 7 never
+runs, `hold:{token}` expires on its own, the expiry handler finds `status = CONSUMED`, and correctly
+does nothing.
+
+**Step 4 must abort on failure.** If the extension returns `rowcount = 0` the hold has just been
+settled by a concurrent expiry — charging at that point would take money for seats we no longer
+hold. This abort was missing from the first pass and is the phantom-hold race closed.
 
 #### Edge cases
 
 | Scenario | Handling |
 | :--- | :--- |
-| **Card declined** | Order → `FAILED`. **The hold stays `ACTIVE`.** `402` with `retryable: true` and `attemptsRemaining`. The user retries on the same hold and the same `order_number`. Max 3 attempts. |
-| **Double-click / double submit** | Layer 1: `SETNX payment:inflight:{holdToken}` (90 s). Layer 2: `UNIQUE(hold_token)` — the second request sees a `PENDING` row and gets `409`. Layer 3: the client `idempotencyKey` reaches Stripe as its `Idempotency-Key` (ADR-014). |
-| **Timer expires mid-3DS** | Step 4 already extended the hold by 120 s and pushed `ticket_holds.expires_at`. Without the `expires_at` push the sweeper would reclaim the seat mid-challenge. |
-| **Timer expires before submit** | `409 HOLD_EXPIRED_OR_INVALID`. The UI shows "your reservation expired" and offers re-entry to the queue. Nothing was charged. |
-| **Network drops after charge** | Stripe still settles. `payment_intent.succeeded` → `POST /api/v1/payments/webhook` (signature-verified) → `PaymentSettledEvent` → `order` finalises the still-`PENDING` order by `hold_token`. |
-| **Webhook arrives, hold already gone** | `order` refunds automatically, sets `REFUNDED`, and writes a `REFUND_NOTICE` outbox event so the buyer is told. **This is the case the original design got wrong** — it would have charged a customer for seats another buyer already owned (ADR-012). |
-| **Charge succeeds, commit fails** | Compensating refund via `PaymentFacade.refund()`, order → `REFUNDED`, `REFUND_NOTICE` queued. |
-| **User cancels** | `DELETE /api/v1/holds/{holdToken}` → settle-once claim → stock restored immediately. |
+| **Card declined** | Order → `FAILED`. **The hold stays `ACTIVE`.** `402 PAYMENT_DECLINED` with `retryable: true` and `attemptsRemaining`. Retry on the same hold and the same `order_number`. Max 3. |
+| **Double-click / double submit** | Layer 1: `SETNX payment:inflight:{holdToken}` (90 s). Layer 2: `UNIQUE(hold_token)` — the second request sees `PENDING` and gets `409`. Layer 3: the client `idempotencyKey` reaches Stripe as its `Idempotency-Key` (ADR-014). |
+| **3-D Secure required** | `402 PAYMENT_ACTION_REQUIRED` + `resumeUrl`. Client runs `stripe.handleNextAction()`, then calls `POST /api/v1/orders/checkout/resume` with the same `holdToken`. The order stays `PENDING` throughout; the grace extension from step 4 covers the challenge. |
+| **Extension fails at step 4** | `410 HOLD_EXPIRED`, **nothing charged**. |
+| **Timer expires before submit** | `410 HOLD_EXPIRED`. UI offers re-entry — and the admission session may still be live, so the buyer often does not have to re-queue at all. |
+| **Network drops after charge** | Stripe still settles. `payment_intent.succeeded` → webhook (signature-verified) → `PaymentSettledEvent` → `order` finalises the still-`PENDING` order by `hold_token`. |
+| **Webhook arrives, hold already gone** | `order` refunds automatically, sets `REFUNDED`, writes a `REFUND_NOTICE` outbox event. The original design would have confirmed an order for seats another buyer already owned (ADR-012). |
+| **Charge succeeds, commit fails** | Compensating refund, order → `REFUNDED`, `REFUND_NOTICE` queued. |
+| **User cancels** | `DELETE /api/v1/holds/{holdToken}` → claim → stock restored. **Admission session survives**, so they can pick another tier (ADR-020). |
 | **User abandons silently** | TTL expires → §4.2. No action needed from anyone. |
+| **Tab reloaded anywhere** | `GET /api/v1/sale/{eventId}/state` rehydrates queue position, admission, hold and pending order in one call (ADR-025). |
 
 Note what is *absent*: `payment` never calls `HoldFacade`. Grace extension is requested by `order`;
 a decline deliberately retains the hold; abandonment is handled by the TTL. Removing that edge is
@@ -354,16 +419,23 @@ that endpoint was public and returned the buyer's email against a guessable `TK-
 
 ### Step 6 — Asynchronous fulfilment
 
+The relay runs as **three short transactions, never one** (ADR-023):
+
 ```
-outbox_events(PENDING)
-   │  poller, every 1s:
-   │  SELECT … WHERE status='PENDING' ORDER BY created_at
-   │  FOR UPDATE SKIP LOCKED LIMIT 100
-   ▼
+tx1 (short):  UPDATE outbox_events SET status='PROCESSING', claimed_at=now()
+               WHERE id IN (SELECT id FROM outbox_events WHERE status='PENDING'
+                             ORDER BY created_at FOR UPDATE SKIP LOCKED LIMIT 100)
+               RETURNING *;                              -- COMMIT immediately
+      ↓
+publish to RabbitMQ                                       -- OUTSIDE any transaction
+      ↓
+tx2 (short):  UPDATE outbox_events SET status='PROCESSED', processed_at=now()
+               WHERE id = ANY(?);
+
 order.events.exchange  (topic)  ── order.confirmed ──►  notification.order-confirmed.queue
                                 └─ order.refunded  ──►  notification.order-refunded.queue
-   ▼
-OrderConfirmedConsumer
+      ↓
+OrderConfirmedConsumer                                    -- no @Transactional around 2-4
    1. INSERT notification_logs (order_number, kind='TICKET_DELIVERY', status='PENDING')
         └─ unique violation ⇒ already handled ⇒ ack and stop
    2. PDFBox renders the ticket in memory
@@ -374,8 +446,16 @@ OrderConfirmedConsumer
 ```
 
 **`FOR UPDATE SKIP LOCKED`** stops three replicas from publishing the same event three times.
+
+**Publishing sits outside every transaction.** Doing it inside `tx1` would hold row locks across a
+network round trip to the broker — and under virtual threads the connection pool is the system's
+real concurrency ceiling, so one slow broker would throttle checkout itself. A crash between `tx1`
+and `tx2` re-publishes on the next sweep of stale `PROCESSING` rows: at-least-once, which the
+consumer's unique constraint absorbs.
+
 **Insert-then-send** is what makes the consumer idempotent: the `UNIQUE(order_number, kind)`
 violation is the guard, not a preceding `SELECT`, which two workers could both pass (ADR-015).
+PDF rendering and SMTP likewise run outside any transaction.
 
 The payload is a complete snapshot — event name, venue, date, all line items as an array, and the
 `receiptToken`. `notification` calls no facade and knows nothing about `catalog`. The original
@@ -405,17 +485,30 @@ Admin replay: `POST /api/v1/admin/notifications/resend/{orderNumber}`.
                  └── TTL / sweeper ─► EXPIRED   (terminal)
 ```
 
-No transition leaves a terminal state. Every transition begins with the **settle-once claim**:
+No transition leaves a terminal state. Every transition is **one conditional statement in
+PostgreSQL** — the same statement in every phase (ADR-019):
 
-* Phase 2+: `GETDEL holdmeta:{holdToken}` — atomic, so exactly one caller across all replicas
-  receives the value; everyone else gets `nil` and does nothing.
-* Phase 1: `UPDATE ticket_holds SET status=? WHERE hold_token=? AND status='ACTIVE'` — restore only
-  when `rowcount = 1`.
+```sql
+UPDATE ticket_holds SET status = ?, settled_at = now(), settle_reason = ?
+ WHERE hold_token = ? AND status = 'ACTIVE';      -- rowcount = 1 ⇒ you won the claim
+```
 
-Stock is restored **only by the claim winner**. This single primitive fixes three separate bugs at
-once: triple-restoration from replica-wide keyspace pub/sub, the undefined "shadow record" the
-expiry listener was supposed to read, and the race between `releaseHold` and a concurrent TTL
-expiry (ADR-003).
+Stock is restored **only by the caller that gets `rowcount = 1`**. Everyone else gets `0` and does
+nothing.
+
+**PostgreSQL is the authority; Redis holds the timer.** That ordering is what makes the whole
+lifecycle safe:
+
+* **Correct across replicas** — all three receive the expiry event, all three run the `UPDATE`,
+  PostgreSQL row-locks, exactly one wins. No distributed lock needed.
+* **Consume is transactional** — it participates in the order transaction and rolls back with it.
+* **Redis needs no claim ticket.** The earlier `holdmeta` + `GETDEL` design existed only because a
+  Redis expiry event carries no payload; once PostgreSQL is the authority the handler just reads
+  the row. One fewer key, one fewer TTL, one fewer failure mode.
+* **Phases 1 and 2 are identical here.** Phase 1 always worked this way.
+
+This replaces ADR-003, whose Redis-side claim mutated state inside the SQL transaction and could
+leak inventory permanently when a commit failed.
 
 ### Order
 
@@ -441,7 +534,8 @@ expiry (ADR-003).
 ### 4.1 Redis loss during a live sale
 
 1. Reserve script returns `-2`; holds return `503`; the alarm fires.
-2. Acquire `RedissonLock:stock-rebuild:{eventId}`.
+2. Acquire `pg_try_advisory_xact_lock(hash('stock-rebuild', eventId))` — transaction-scoped, so it
+   cannot leak if the rebuild crashes, and it needs no extra dependency (ADR-022).
 3. Recompute per tier:
 
    ```sql
@@ -462,9 +556,13 @@ lose up to a second of `DECRBY`s — which reads as inventory that does not exis
 
 ### 4.2 Hold expiry
 
-Redis TTL fires → `__keyevent@0__:expired` reaches **all** replicas → each attempts
-`GETDEL holdmeta:{token}` → exactly one wins → `INCRBY catalog:stock:{e}:{t} qty`, audit row to
-`EXPIRED`, `TicketHoldExpiredEvent`.
+Redis TTL fires → `__keyevent@0__:expired` reaches **all** replicas → each runs
+`UPDATE ticket_holds SET status='EXPIRED' WHERE hold_token=? AND status='ACTIVE'` → PostgreSQL
+row-locks and exactly one gets `rowcount = 1` → that one issues
+`INCRBY catalog:stock:{e}:{t} qty` and publishes `TicketHoldExpiredEvent`.
+
+If the row is already `CONSUMED` — the normal case when step 7 of checkout did not get to clean up —
+every replica gets `rowcount = 0` and nothing happens. Correct by construction.
 
 `HoldReconciliationSweeper` runs every 30 s over
 `ticket_holds WHERE status='ACTIVE' AND expires_at < now()` and performs the identical claim. The
@@ -491,21 +589,33 @@ Shipped in [`docker/redis/redis.conf`](../docker/redis/redis.conf).
 
 ## 5. Facade contracts
 
+Rules every facade obeys — synchronous, never `@Transactional` itself, records not entities,
+module-owned exceptions only — are in
+[`05-global-standards.md`](05-global-standards.md#5-facade-contract-rules) §5.
+
 | Caller | Facade | Method | Purpose |
 | :--- | :--- | :--- | :--- |
 | filter | `BotFacade` | `authorize(ip, sid, path)` | buckets + block flags |
-| filter | `BotFacade` | `verifyCaptcha(token, action)` | cached reCAPTCHA score |
-| `hold` | `QueueFacade` | `verifyPassToken(token, sid, eventId)` | HMAC + live pass key |
-| `hold` | `QueueFacade` | `revokePassToken(sid)` | single-use enforcement |
+| filter | `BotFacade` | `verifyCaptcha(token, action, sid)` | cached reCAPTCHA score |
+| `hold` | `QueueFacade` | `verifyAdmission(token, sid, eventId)` | live admission session (ADR-020) |
 | `hold` | `CatalogFacade` | `getTierSummary(eventId, tierId)` | validity, price, window |
 | `order` | `HoldFacade` | `getActiveHold(token, sid)` | read-only, ownership-checked |
-| `order` | `HoldFacade` | `extendHold(token, seconds)` | bounded grace |
-| `order` | `HoldFacade` | `consumeHold(token)` | settle-once claim |
-| `order` | `HoldFacade` | `releaseHold(token, reason)` | settle-once claim |
+| `order` | `HoldFacade` | `extendHold(token, seconds)` | bounded grace; **fails ⇒ abort** |
+| `order` | `HoldFacade` | `consumeHold(token)` | claim — **joins the caller's transaction** |
+| `order` | `HoldFacade` | `releaseHold(token, reason)` | claim |
 | `order` | `CatalogFacade` | `getTierSummary(eventId, tierId)` | price snapshot |
 | `order` | `PaymentFacade` | `authorize(orderNumber, amount, currency, pm, key)` | charge |
-| `order` | `PaymentFacade` | `refund(txnRef, reason)` | compensation |
-| admin | `NotificationFacade` | `resend(orderNumber)` | DLQ replay |
+| `order` | `PaymentFacade` | `refund(txnRef, amount, reason)` | compensation |
+| `order` | `QueueFacade` | `revokeAdmission(sid, eventId)` | after `CONFIRMED`, post-commit |
+| `saleflow` | `QueueFacade` | `getQueueState(sid, eventId)` | rehydration (ADR-025) |
+| `saleflow` | `HoldFacade` | `findActiveHold(sid, eventId)` | rehydration |
+| `saleflow` | `OrderFacade` | `findPendingOrder(sid, eventId)` | rehydration |
+| `saleflow` | `CatalogFacade` | `getEventDetail(eventId)` | rehydration |
+| admin | `NotificationFacade` | `resend(orderNumber, kind)` | DLQ replay |
+
+`verifyPassToken` / `revokePassToken` moved off `hold` and onto the `POST /api/v1/queue/admit`
+handler inside `queue` itself — the pass is now exchanged for an admission session rather than
+consumed at hold creation (ADR-020).
 
 Events — the only asynchronous couplings:
 
@@ -522,9 +632,14 @@ Events — the only asynchronous couplings:
 
 ## 6. Tunables
 
+Every value below is a named property in `application.properties`.
+
 | Setting | Value | ADR |
 | :--- | :--- | :--- |
-| Queue pass TTL | 120 s, single-use | 006 |
+| Queue pass TTL | 120 s, single-use | 006 / 020 |
+| **Admission session TTL** | **600 s**, reusable | **020** |
+| **Admission oversubscribe factor** | **1.5** | **020** |
+| **Queue ordering** | **`FIFO` (default) or `RANDOM`** | **024** |
 | Hold TTL | 300 s | 006 |
 | Payment grace | +120 s once, ceiling 420 s | 006 |
 | Checkout after `sale_end_time` | 15 min | 016 |
@@ -534,10 +649,11 @@ Events — the only asynchronous couplings:
 | `payment:inflight` TTL | 90 s | 014 |
 | Promotion tick | 1 s | 008 |
 | SSE position push / heartbeat | 2 s / 15 s | 007 |
-| Sweeper interval | 30 s (Phase 2+); 10 s (Phase 1) | 003 |
-| Outbox poll / batch | 1 s / 100, `SKIP LOCKED` | 009 |
+| Sweeper interval | 30 s (Phase 2+); 10 s (Phase 1) | 019 |
+| Outbox poll / batch | 1 s / 100, `SKIP LOCKED` | 009 / 023 |
 | Session bucket | 20 burst, 10/s | 011 |
 | IP bucket | 300 burst, 150/s | 011 |
+| HikariCP pool | 30 max, 10 idle | std §7 |
 | reCAPTCHA threshold / cache | 0.5 / 30 min | 011 |
 
 ---

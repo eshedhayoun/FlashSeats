@@ -1,7 +1,8 @@
 # Module: `hold`
 
-> **Status:** first-pass correction. Aligned to [`../00-architecture-decisions.md`](../00-architecture-decisions.md).
-> A detailed second pass is planned before implementation.
+> **Status:** aligned to [`../00-architecture-decisions.md`](../00-architecture-decisions.md) and
+> [`../05-global-standards.md`](../05-global-standards.md). Structural rewrite to the §10 template
+> is pending.
 
 **Package:** `com.flashseats.hold` · **Phase:** 1 (PostgreSQL) → 2 (Redis) · **Storage:** PostgreSQL + Redis
 
@@ -56,27 +57,35 @@ com.flashseats.hold
 **No transition leaves a terminal state.** In particular there is no `CONSUMED → RELEASED`, which
 is why checkout charges *before* consuming (ADR-001).
 
-### The settle-once claim
+### The settle-once claim (ADR-019)
 
-Every terminal transition begins by claiming the right to restore stock. Exactly one caller —
-across every replica, across every code path — wins.
+Every terminal transition **is** one conditional statement in PostgreSQL — the same statement in
+every phase:
 
-| Phase | Primitive | Winner |
-| :--- | :--- | :--- |
-| 2+ | `GETDEL holdmeta:{holdToken}` | the caller that receives a non-nil value |
-| 1 | `UPDATE ticket_holds SET status=? WHERE hold_token=? AND status='ACTIVE'` | `rowcount = 1` |
+```sql
+UPDATE ticket_holds SET status = ?, settled_at = now(), settle_reason = ?
+ WHERE hold_token = ? AND status = 'ACTIVE';      -- rowcount = 1 ⇒ you won
+```
 
-Everyone else receives `nil` / `rowcount = 0` and does nothing. No locks, no coordination.
+Stock is restored only by the caller that gets `rowcount = 1`. Everyone else gets `0` and does
+nothing. No distributed lock, no coordination.
 
-This one primitive fixes three separate defects in v1:
+**PostgreSQL is the authority. Redis holds the timer.** That is the whole design, and it fixes four
+separate defects:
 
 1. **Triple restoration.** Redis keyspace expiry is pub/sub — **all three replicas** receive
-   `__keyevent@0__:expired`, and each restored the stock. A 2-ticket hold returned 6 tickets.
-2. **The undefined shadow record.** v1 told the listener to "read the shadow backup record or
-   extract metadata", but that record was never specified anywhere — and a key's Hash fields are
-   already gone when its expiry event fires. `holdmeta` is that record, written inside the same Lua
-   script and outliving the hold by 24 hours.
+   `__keyevent@0__:expired`. All three now run the `UPDATE`; PostgreSQL row-locks and exactly one
+   wins.
+2. **The undefined shadow record.** v1 told the listener to "read the shadow backup record", which
+   was never specified — and a key's Hash fields are gone by the time its expiry event fires. The
+   listener now reads `ticket_holds` by token, so no shadow key is needed at all.
 3. **The release/expire race.** `releaseHold` and a concurrent TTL expiry could both restore.
+4. **The transactional leak** *(found in the 2nd-pass audit)*. The interim design put the claim in
+   Redis (`GETDEL holdmeta`), which meant `consumeHold` mutated Redis **inside** the order's SQL
+   transaction. Redis does not roll back. A failed commit left the claim spent, the timer key
+   deleted, and no order — and **the stock was never restored**. Those seats became permanently
+   unsellable. Moving the claim into PostgreSQL removes the failure mode by construction: the
+   `UPDATE` rolls back with the transaction.
 
 ---
 
@@ -115,11 +124,11 @@ than a check that races.
 
 | Key | Type | TTL | Purpose |
 | :--- | :--- | :--- | :--- |
-| `hold:{holdToken}` | Hash | **300 s** | drives expiry timing; serves `GET /holds/{token}` |
-| `holdmeta:{holdToken}` | String `"{eventId}:{tierId}:{qty}:{sid}"` | **86400 s** | the settle-once claim ticket |
+| `hold:{holdToken}` | Hash | **300 s** | **timer only** — fires expiry; serves `GET /holds/{token}` fast |
 | `catalog:stock:{e}:{t}` | String | none | owned by `catalog`; mutated here only |
 
-`holdmeta` must outlive `hold:` — it is what makes the expiry event actionable at all.
+Redis holds **no authority**. If every key in this table vanished, `ticket_holds` plus the rebuild
+procedure would reconstruct the correct state. There is no `holdmeta` key: ADR-019 removed it.
 
 ---
 
@@ -138,7 +147,7 @@ Row-locked by PostgreSQL, guarded by `CHECK (remaining >= 0)`. Overbooking is im
 ### Phase 2+ — `hold_reserve.lua`
 
 ```lua
-local stockKey, holdKey, metaKey = KEYS[1], KEYS[2], KEYS[3]
+local stockKey, holdKey = KEYS[1], KEYS[2]
 local qty, ttl = tonumber(ARGV[1]), tonumber(ARGV[2])
 local sid, eventId, tierId, expiresAt = ARGV[3], ARGV[4], ARGV[5], ARGV[6]
 
@@ -151,7 +160,6 @@ redis.call('HSET', holdKey,
     'userSessionId', sid, 'eventId', eventId, 'tierId', tierId,
     'quantity', tostring(qty), 'status', 'ACTIVE', 'expiresAt', expiresAt)
 redis.call('EXPIRE', holdKey, ttl)
-redis.call('SET', metaKey, eventId..':'..tierId..':'..qty..':'..sid, 'EX', 86400)
 return 1
 ```
 
@@ -166,12 +174,16 @@ what lets the system detect Redis loss instead of quietly telling every buyer th
 
 ### Request flow
 
-1. `QueueFacade.verifyPassToken(token, sid, eventId)` → 401
+1. `QueueFacade.verifyAdmission(admissionToken, sid, eventId)` → 401 `ADMISSION_REQUIRED` /
+   410 `ADMISSION_EXPIRED`. **Not the pass** — that was spent at `POST /queue/admit` (ADR-020).
 2. `CatalogFacade.getTierSummary()` → 404; `windowStatus == OPEN` → 409
 3. `quantity ≤ min(6, tier.maxPerOrder)`; no existing `ACTIVE` hold for this session → 409
 4. reserve (above)
-5. `QueueFacade.revokePassToken(sid)` — **the pass is single-use** (ADR-006)
-6. insert the audit row; publish `TicketHeldEvent`
+5. insert the `ticket_holds` row — **this row, not the Redis key, is the authority**
+6. publish `TicketHeldEvent`
+
+The admission session is deliberately **not** revoked here. A buyer who releases this hold keeps
+their place in the sale and can pick a different tier (ADR-020).
 
 ---
 
@@ -181,11 +193,16 @@ what lets the system detect Redis loss instead of quietly telling every buyer th
 
 ```
 Redis TTL fires → __keyevent@0__:expired → EVERY replica receives it
-  → each attempts GETDEL holdmeta:{token}
-  → exactly one wins → INCRBY catalog:stock:{e}:{t} qty
-  → UPDATE ticket_holds SET status='EXPIRED', settled_at=now(), settle_reason='TTL'
-  → publish TicketHoldExpiredEvent
+  → each runs: UPDATE ticket_holds SET status='EXPIRED', settled_at=now(),
+                    settle_reason='TTL'
+                WHERE hold_token=? AND status='ACTIVE'
+  → PostgreSQL row-locks; exactly one gets rowcount = 1
+  → that one: INCRBY catalog:stock:{e}:{t} qty ; publish TicketHoldExpiredEvent
+  → the others: rowcount = 0, do nothing
 ```
+
+If the row is already `CONSUMED` — the normal case when checkout's post-commit cleanup did not run —
+**every** replica gets `rowcount = 0` and no stock is returned for seats that were sold.
 
 Requires `notify-keyspace-events Ex` (off by default in Redis). `E` selects the key-**event**
 channel `__keyevent@0__:expired`, whose message is the expired key's name. `K` selects the keyspace
@@ -213,7 +230,7 @@ Phase 2 exit criterion.
 
 | Method | Path | Auth | Notes |
 | :--- | :--- | :--- | :--- |
-| `POST` | `/api/v1/holds` | `X-Queue-Pass-Token` + `fsid` | `201` |
+| `POST` | `/api/v1/holds` | `X-Admission-Token` + `fsid` | `201` |
 | `GET` | `/api/v1/holds/{holdToken}` | `fsid` must own it | status + `ttlRemainingSeconds` |
 | `DELETE` | `/api/v1/holds/{holdToken}` | `fsid` must own it | immediate release |
 
@@ -231,14 +248,25 @@ public interface HoldFacade {
     /** Read-only, ownership-checked. Does NOT mutate. */
     HoldSummaryDTO getActiveHold(String holdToken, String userSessionId);
 
-    /** Settle-once claim → CONSUMED. Idempotent: a second call throws HoldAlreadySettled. */
+    /** Settle-once claim -> CONSUMED, as a conditional UPDATE.
+     *  MUST run inside the caller's transaction so it rolls back with the order (ADR-019).
+     *  Never mutates Redis: cleanup is the caller's AFTER_COMMIT concern.
+     *  Throws HoldAlreadySettled when rowcount = 0. */
     HoldSummaryDTO consumeHold(String holdToken);
+
+    /** Best-effort Redis cleanup. Called from AFTER_COMMIT; safe to lose entirely. */
+    void discardTimer(String holdToken);
+
+    /** Read-only lookup for saleflow rehydration (ADR-025). */
+    Optional<HoldSummaryDTO> findActiveHold(String userSessionId, long eventId);
 
     /** Settle-once claim → RELEASED, restoring stock. */
     void releaseHold(String holdToken, String reason);
 
-    /** Bounded grace. Once only; ≤ +120s; ceiling 420s from creation.
-     *  Pushes BOTH the Redis TTL and ticket_holds.expires_at. */
+    /** Bounded grace. Once only; <= +120s; ceiling 420s from creation.
+     *  Pushes BOTH the Redis TTL and ticket_holds.expires_at.
+     *  Throws HoldExpiredException if the conditional UPDATE affects 0 rows — the caller
+     *  MUST abort before charging (ADR-023). */
     Instant extendHold(String holdToken, int seconds);
 }
 
@@ -263,13 +291,15 @@ the seat mid-3-D-Secure.
 | :--- | :--- |
 | Two requests, last ticket | Atomic reserve; exactly one `201`, one `409` |
 | Expiry event lost | Sweeper claims within 30 s |
-| Expiry broadcast to 3 replicas | `GETDEL` claim — one restore |
+| Expiry broadcast to 3 replicas | Conditional `UPDATE` — one restore |
 | `releaseHold` racing TTL expiry | Same claim — one restore |
 | Double `consumeHold` | Second call → `HoldAlreadySettled` (409) |
 | Checkout submitted at t=300.1 s | `expires_at` compared server-side; `410 Gone` |
 | Stock counter missing | `-2` → `503`, **never** treated as sold out |
 | Session already holds seats | `409 HOLD_LIMIT_EXCEEDED` (partial unique index) |
-| App crashes between Lua and audit insert | `holdmeta` still expires → sweeper has no PG row, but the keyspace claim restores stock; drift alarm catches any residue |
+| App crashes between Lua and audit insert | Stock decremented with no `ticket_holds` row. The `stock.drift` alarm fires within 60 s and the rebuild corrects it. Bounded and detected — the one window this design does not close atomically. |
+| Order commit rolls back after `consumeHold` | The claim `UPDATE` rolls back with it; the hold returns to `ACTIVE` and expires normally (ADR-019) |
+| Cleanup after commit never runs | `hold:{token}` expires; the handler finds `status='CONSUMED'` and does nothing |
 | User wants a different tier | `DELETE` the hold, then re-hold — but the pass was consumed, so they re-enter the queue. *Flagged for second pass: this may be too harsh.* |
 
 **Exceptions:** `HoldNotFound` 404 · `HoldExpired` 410 · `InsufficientStock` 409 ·
@@ -279,9 +309,10 @@ the seat mid-3-D-Secure.
 
 ## 9. Changes from v1
 
-1. **Settle-once claim** (`GETDEL holdmeta` / conditional `UPDATE`) replaces the Redisson-locked
-   sweeper and fixes triple restoration (ADR-003).
-2. `holdmeta:{token}` defined — v1 referenced an undefined "shadow backup record".
+1. **Settle-once claim** — a conditional `UPDATE` on `ticket_holds`, in every phase. Replaces the
+   Redisson-locked sweeper, fixes triple restoration, and makes consume transactional (ADR-019).
+2. `holdmeta` / `GETDEL` **removed**; the expiry listener reads `ticket_holds` by token (ADR-019).
+   v1's undefined "shadow backup record" is resolved by deleting the need for one.
 3. Reserve script distinguishes `-2` (fault) from `-1` (sold out) (ADR-004).
 4. `extendHold` declared, bounded, and reconciled with the "non-extendable" contradiction (ADR-006).
 5. `consumeHold` naming unified across all documents.
@@ -290,3 +321,15 @@ the seat mid-3-D-Secure.
 8. `userSessionId` removed from the request body; `GET` ownership-checked (ADR-010).
 9. `extended_count`, `settled_at`, `settle_reason` columns added.
 10. Sweeper documented as the correctness guarantee, the listener as an optimisation.
+
+### Added in the 2nd pass
+
+11. **Claim moved from Redis to PostgreSQL** — closes a permanent inventory leak when an order
+    transaction rolled back after `consumeHold` (ADR-019).
+12. `consumeHold` now explicitly joins the caller's transaction; `discardTimer` split out for
+    `AFTER_COMMIT` (ADR-023).
+13. `extendHold` throws on a lost claim so checkout aborts **before** charging (ADR-023).
+14. Holds now require an **admission session**, not a queue pass; releasing a hold no longer costs
+    the buyer their place in the sale (ADR-020).
+15. `findActiveHold` added for `saleflow` rehydration (ADR-025).
+16. Error codes aligned to the canonical registry in `05-global-standards.md` §2.

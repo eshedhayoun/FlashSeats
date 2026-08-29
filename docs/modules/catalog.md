@@ -1,7 +1,8 @@
 # Module: `catalog`
 
-> **Status:** first-pass correction. Aligned to [`../00-architecture-decisions.md`](../00-architecture-decisions.md).
-> A detailed second pass is planned before implementation.
+> **Status:** aligned to [`../00-architecture-decisions.md`](../00-architecture-decisions.md) and
+> [`../05-global-standards.md`](../05-global-standards.md). Structural rewrite to the §10 template
+> is pending.
 
 **Package:** `com.flashseats.catalog` · **Phase:** 1 · **Storage:** PostgreSQL + Redis
 
@@ -130,7 +131,7 @@ Correct behaviour while `OPEN`:
 2. Browse reads degrade to `tier_inventory.remaining` clearly marked as approximate.
 3. Recovery is an explicit locked rebuild.
 
-### Rebuild (`RedissonLock:stock-rebuild:{eventId}`)
+### Rebuild (`pg_try_advisory_xact_lock(hash('stock-rebuild', eventId))`)
 
 ```sql
 remaining = tt.total_capacity
@@ -145,6 +146,10 @@ remaining = tt.total_capacity
 No double counting: a `PENDING` order still has an `ACTIVE` hold; a `CONFIRMED` order's hold is
 `CONSUMED`. Writes both Redis and `tier_inventory`, then publishes `StockRebuiltEvent`.
 
+The lock is a PostgreSQL **transaction-scoped advisory lock**: released automatically on commit or
+rollback, impossible to leak, and needing no extra dependency. Redisson was dropped in ADR-022 once
+this was its only remaining use.
+
 **Mandatory after any Redis restart** — AOF `everysec` can lose a second of `DECRBY`s, which reads
 as inventory that does not exist.
 
@@ -155,7 +160,7 @@ as inventory that does not exist.
 | Method | Path | Access |
 | :--- | :--- | :--- |
 | `GET` | `/api/v1/events` | public |
-| `GET` | `/api/v1/events/{eventId}` | public — includes `windowStatus` + `serverTime` |
+| `GET` | `/api/v1/events/{eventId}` | public — `windowStatus`, `serverTime`, **bucketed** availability |
 | `POST` | `/api/v1/admin/events/{eventId}/prewarm` | admin — `UPCOMING` only |
 | `POST` | `/api/v1/admin/events/{eventId}/rebuild-stock` | admin |
 | `POST` | `/api/v1/admin/events/{eventId}/pause` | admin — halt promotions and new holds |
@@ -216,3 +221,11 @@ and `notification` never needs to call `catalog` (ADR-015).
 6. `maxmemory-policy noeviction` and post-restart reconciliation made explicit.
 7. Prewarm restricted to `UPCOMING`.
 8. Admin `rebuild-stock` and `pause` endpoints added.
+
+### Added in the 2nd pass
+
+9. Rebuild lock is now `pg_try_advisory_xact_lock`, not a Redisson lock (ADR-022).
+10. Public availability is exposed **bucketed** (`PLENTY` / `LIMITED` / `SOLD_OUT`) rather than as an
+    exact integer. Exact counts drive panic-buying and hand scalpers a live inventory feed; industry
+    practice is a coarse indicator. Exact values remain internal, for `hold` and for metrics.
+11. Error codes aligned to the canonical registry in `05-global-standards.md` §2.

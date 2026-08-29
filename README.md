@@ -15,12 +15,13 @@ Read in this order:
 
 | Document | What it covers |
 | :--- | :--- |
-| [`docs/00-architecture-decisions.md`](docs/00-architecture-decisions.md) | **Start here.** 18 ADRs — every non-obvious decision and the failure it prevents |
+| [`docs/00-architecture-decisions.md`](docs/00-architecture-decisions.md) | **Start here.** 25 ADRs — every non-obvious decision and the failure it prevents |
 | [`docs/01-system-architecture.md`](docs/01-system-architecture.md) | Stack, module map, dependency graph, deployment |
 | [`docs/02-high-level-design.md`](docs/02-high-level-design.md) | Infrastructure and the concurrency model |
 | [`docs/03-end-to-end-flow.md`](docs/03-end-to-end-flow.md) | **The authoritative user journey**, step by step |
 | [`docs/04-implementation-roadmap.md`](docs/04-implementation-roadmap.md) | Four phases, each with exit criteria |
-| [`docs/modules/`](docs/modules/) | Per-module specs — `catalog`, `queue`, `hold`, `bot`, `payment`, `order`, `notification` |
+| [`docs/05-global-standards.md`](docs/05-global-standards.md) | **Cross-cutting contract** — RFC 7807, error registry, idempotency, transaction rules, facade rules |
+| [`docs/modules/`](docs/modules/) | Per-module specs — `catalog`, `queue`, `hold`, `bot`, `payment`, `order`, `notification`, `saleflow`, `shared` |
 
 When a module spec disagrees with an ADR, **the ADR wins** and the module spec is stale.
 
@@ -56,15 +57,20 @@ When a module spec disagrees with an ADR, **the ADR wins** and the module spec i
 | `payment` | Stripe, idempotency, webhooks, refunds | PG + Redis |
 | `order` | ACID ledger, **checkout orchestration**, outbox | PG only |
 | `notification` | PDF tickets, email, DLQ replay | PG + RabbitMQ |
+| `saleflow` | Read-only rehydration endpoint | none |
+| `shared` | Open module: error codes, `SessionId`, `Money` | none |
 
 Dependencies are acyclic and verified at build time by `ApplicationModules.verify()`:
 
 ```
-filter  ──► bot
-hold    ──► queue, catalog
-order   ──► hold, catalog, payment
-payment ──( PaymentSettledEvent · webhook only )──► order
-order   ──( outbox → RabbitMQ )──► notification
+                    shared        ← open module; everyone may depend on it
+
+filter   ──► bot
+hold     ──► queue, catalog
+order    ──► hold, catalog, payment, queue
+saleflow ──► queue, hold, order, catalog     ← read-only leaf
+payment  ──( PaymentSettledEvent · webhook only )──► order
+order    ──( outbox → RabbitMQ )──► notification
 ```
 
 ---
@@ -76,11 +82,16 @@ landing (countdown, server clock)
    └─► join sale ──► bot gate (captcha + rate limits)
           └─► waiting room  ── SSE positions ──► promoted
                  └─► queue pass (120 s, single-use)
-                        └─► select tier ──► hold (300 s, atomic stock decrement)
-                               └─► checkout ──► charge ──► consume hold + commit + outbox
-                                      └─► receipt (< 200 ms)
-                                             └─► async: RabbitMQ → PDF → email
+                        └─► admission session (600 s — browse freely)
+                               └─► select tier ──► hold (300 s, atomic decrement)
+                                      └─► checkout ──► charge ──► consume + commit + outbox
+                                             └─► receipt (< 200 ms)
+                                                    └─► async: RabbitMQ → PDF → email
 ```
+
+Three nested timers, not two. The **admission session** is what lets a buyer compare tiers, reload
+the tab, or release a hold and pick again without losing their place in the sale.
+`GET /api/v1/sale/{eventId}/state` rehydrates all of it after a refresh.
 
 Full detail, with every edge case, in [`docs/03-end-to-end-flow.md`](docs/03-end-to-end-flow.md).
 
@@ -94,16 +105,19 @@ Correctness comes from an atomic reserve: a Redis Lua script in Phase 2+, and in
 row-locked statement, `UPDATE tier_inventory SET remaining = remaining - :q WHERE tier_id = :t AND
 remaining >= :q`. Overbooking is impossible from the very first phase.
 
-**2. The settle-once claim.**
+**2. The settle-once claim, in PostgreSQL.**
 A hold ends in one of four ways — consumed, released, expired, swept — and three replicas may all
 try to handle the same ending at once. Redis keyspace expiry is *pub/sub*, so every replica receives
 it. Exactly one caller wins the claim and restores the stock:
 
+```sql
+UPDATE ticket_holds SET status = ?, settled_at = now()
+ WHERE hold_token = ? AND status = 'ACTIVE';    -- rowcount = 1 ⇒ you won
 ```
-Phase 2+ :  GETDEL holdmeta:{holdToken}                        -- atomic, one winner
-Phase 1  :  UPDATE ticket_holds SET status=?
-             WHERE hold_token=? AND status='ACTIVE'            -- rowcount = 1
-```
+
+The same statement in every phase. **PostgreSQL is the authority; Redis holds the timer.** That
+ordering is what makes `consumeHold` roll back with the order transaction — an earlier Redis-side
+claim could not, and a failed commit left the seats permanently unsellable.
 
 **3. A missing stock counter is a fault, not a cache miss.**
 Repopulating from `total_capacity` after a Redis eviction would silently resurrect every ticket
@@ -119,15 +133,18 @@ recovery is an explicit locked rebuild from PostgreSQL. See ADR-004.
 | **Runtime** | Java 21 (virtual threads), Spring Boot 4.1.1, Spring Modulith 2.1.1 |
 | **Data** | PostgreSQL 16, Redis 7 (single primary + Sentinel — **not** Cluster) |
 | **Messaging** | RabbitMQ 3.13 |
-| **Phase 2** | Redisson 3.50.0 |
-| **Phase 3** | Bucket4j 8.14.0 (Redis-backed), Stripe Java 29.2.0, Resilience4j 2.3.0 |
+| **Ops** | Actuator + Micrometer/Prometheus, Flyway, Testcontainers 1.21.3 |
+| **Phase 3** | Spring Security, Bucket4j 8.14.0 (Redis-backed), Stripe Java 29.2.0, Resilience4j 2.3.0 |
 | **Phase 4** | PDFBox 3.0.7, Thymeleaf, Mailpit, Nginx, k6 |
 | **Frontend** | React + TypeScript (Vite), MUI, `EventSource` |
 
 All dependencies are already declared in [`pom.xml`](pom.xml), grouped by phase.
 
-> Redisson and Resilience4j ship Boot-3-targeted autoconfiguration starters. We use the plain
-> library artifacts and declare the beans ourselves rather than fight autoconfiguration on Boot 4.
+> Resilience4j ships a Boot-3-targeted autoconfiguration starter, so we use the plain library
+> artifacts and declare the beans ourselves. **Redisson was dropped** (ADR-022): once the hold claim
+> moved into PostgreSQL its only remaining use was one lock on a rare admin path, and its
+> `synchronized`-heavy internals risk pinning virtual threads on JDK 21. The stock-rebuild lock is
+> now `pg_try_advisory_xact_lock()`.
 
 ---
 
@@ -212,6 +229,13 @@ non-zero.
 
 ## Project status
 
-Design phase. The documentation set has been through one full correction pass — 18 ADRs record the
-defects found and how each was fixed. A detailed second pass over the per-module specs is planned
-before implementation begins.
+Design phase, two review passes complete.
+
+- **Pass 1 — correctness.** ADR-001…018: overbooking holes, contradictory checkout flows,
+  cross-replica bugs, missing constraints.
+- **Pass 2 — best-practice alignment.** ADR-019…025: benchmarked against Ticketmaster / Queue-it /
+  AXS. Found a permanent inventory leak (a Redis mutation inside a SQL transaction), a missing
+  admission-session tier, no shared error contract, and three transaction-boundary violations.
+
+25 ADRs record every decision and the failure it prevents. The per-module specs are aligned to them;
+a structural rewrite to the `05-global-standards.md` §10 template is the remaining work.

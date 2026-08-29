@@ -1,7 +1,8 @@
 # Module: `order`
 
-> **Status:** first-pass correction. Aligned to [`../00-architecture-decisions.md`](../00-architecture-decisions.md).
-> A detailed second pass is planned before implementation.
+> **Status:** aligned to [`../00-architecture-decisions.md`](../00-architecture-decisions.md) and
+> [`../05-global-standards.md`](../05-global-standards.md). Structural rewrite to the §10 template
+> is pending.
 
 **Package:** `com.flashseats.order` · **Phase:** 1 · **Storage:** PostgreSQL only
 
@@ -134,14 +135,21 @@ grew forever. Purge `PROCESSED` rows older than 7 days.
  4. amountCents = priceCents × quantity              SERVER-SIDE ONLY (ADR-013)
  5. find-or-create orders row on hold_token, status = PENDING
  6. HoldFacade.extendHold(holdToken, 120)            once; ceiling 420s
+       └─ throws ⇒ ABORT 410 HOLD_EXPIRED. DO NOT CHARGE.          ← ADR-023
  7. PaymentFacade.authorize(orderNumber, amountCents, currency, pmId, idempotencyKey)
- 8. @Transactional {
-        HoldFacade.consumeHold(holdToken)            settle-once claim
+                                                     ← OUTSIDE any transaction
+ 8. @Transactional {          ← SQL ONLY. No Redis, no HTTP, no broker.
+        HoldFacade.consumeHold(holdToken)            conditional UPDATE; joins THIS tx
+             └─ rowcount 0 ⇒ throw ⇒ rollback ⇒ refund (step 10)
         orders.status = CONFIRMED, payment refs recorded
         INSERT order_items
         INSERT outbox_events (ORDER_CONFIRMED, PENDING)
     }
- 9. 201 Created + OrderReceiptDTO
+ 9. @TransactionalEventListener(AFTER_COMMIT)  — best-effort, safe to lose:
+        HoldFacade.discardTimer(holdToken)           DEL hold:{token}
+        QueueFacade.revokeAdmission(sid, eventId)
+10. on rollback after a settled charge: PaymentFacade.refund(...) → REFUNDED
+11. 201 Created + OrderReceiptDTO
 ```
 
 ### Find-or-create (ADR-002)
@@ -162,6 +170,25 @@ only ever destroyed by a transaction that is about to commit.
 
 v1 specified **both** orderings across two different documents, and also specified two competing
 orchestrators (`order` driving, and `PaymentSucceededEvent → order`). ADR-001 settles it.
+
+### Transaction boundaries (ADR-023)
+
+| Step | Inside `@Transactional`? | Why |
+| :--- | :--- | :--- |
+| Hold lookup, pricing, order row | short tx each | SQL only |
+| **Stripe charge** | **no** | an HTTP call holding row locks would throttle the connection pool |
+| `consumeHold` | **yes — deliberately** | it is a conditional `UPDATE`; it must roll back with the order |
+| `order_items`, `outbox_events` | yes | same tx as the status flip |
+| `DEL hold:{token}`, `revokeAdmission` | **no — `AFTER_COMMIT`** | Redis cannot roll back |
+| Outbox publish to RabbitMQ | **no** | see the three-transaction relay in §6 |
+
+The interim design had `consumeHold` mutate **Redis** inside this transaction. Redis does not roll
+back: a failed commit left the claim spent, the timer deleted, and no order — and those seats became
+**permanently unsellable**. Making the claim a SQL `UPDATE` removes the failure mode rather than
+compensating for it (ADR-019).
+
+Under virtual threads the connection pool is the system's real concurrency limit, so a slow call
+inside a transaction does not just delay one request — it throttles checkout for everyone.
 
 ---
 
@@ -199,6 +226,7 @@ synchronously, `payment → order` only by event (ADR-005).
 | Method | Path | Auth |
 | :--- | :--- | :--- |
 | `POST` | `/api/v1/orders/checkout` | `fsid` |
+| `POST` | `/api/v1/orders/checkout/resume` | `fsid` — 3-D Secure second leg; same `holdToken` |
 | `GET` | `/api/v1/orders/{orderNumber}` | `fsid` match **or** `?receiptToken=…` |
 
 v1 left the lookup fully public against a guessable `TK-98213` reference, returning the buyer's
@@ -208,6 +236,9 @@ email — an IDOR (ADR-010).
 public interface OrderFacade {
     OrderSummaryDTO getOrderSummary(String orderNumber);
     boolean         isOrderConfirmed(String orderNumber);
+
+    /** Read-only rehydration for saleflow (ADR-025) — the facade's first real caller. */
+    Optional<OrderSummaryDTO> findPendingOrder(String userSessionId, long eventId);
 }
 ```
 
@@ -241,12 +272,27 @@ wrong PDF for any multi-tier order.
 
 ### Outbox publisher
 
+**Three short transactions, never one** (ADR-023):
+
 ```sql
-SELECT * FROM outbox_events WHERE status = 'PENDING'
- ORDER BY created_at FOR UPDATE SKIP LOCKED LIMIT 100;
+-- tx1: claim, then COMMIT immediately
+UPDATE outbox_events SET status='PROCESSING', claimed_at=now()
+ WHERE id IN (SELECT id FROM outbox_events WHERE status='PENDING'
+               ORDER BY created_at FOR UPDATE SKIP LOCKED LIMIT 100)
+ RETURNING *;
+
+-- publish to RabbitMQ — OUTSIDE any transaction
+
+-- tx2
+UPDATE outbox_events SET status='PROCESSED', processed_at=now() WHERE id = ANY(?);
 ```
 
 `FOR UPDATE SKIP LOCKED` stops three replicas from publishing every event three times (ADR-009).
+Publishing **outside** the transaction is what stops a slow broker from holding row locks and
+starving the connection pool. A crash between `tx1` and `tx2` re-publishes on the next sweep of
+stale `PROCESSING` rows — at-least-once, absorbed by the consumer's unique constraint.
+
+The poller is `@Scheduled` and runs on all three replicas; `SKIP LOCKED` makes that harmless.
 
 ---
 
@@ -263,3 +309,14 @@ SELECT * FROM outbox_events WHERE status = 'PENDING'
 8. Outbox: `SKIP LOCKED`, retry columns, purge policy, complete payload with a line-item array.
 9. Email collected at checkout — v1 required it `NOT NULL` but collected it nowhere.
 10. Sale-window enforcement with a 15-minute post-close checkout grace (ADR-016).
+
+### Added in the 2nd pass
+
+11. **`consumeHold` is now a SQL `UPDATE` inside the transaction** — closes a permanent inventory
+    leak on rollback (ADR-019).
+12. Redis cleanup and admission revocation moved to `AFTER_COMMIT` (ADR-023).
+13. Outbox relay split into three short transactions; publish happens outside any of them (ADR-023).
+14. `extendHold` failure aborts checkout **before** charging (ADR-023).
+15. `POST /api/v1/orders/checkout/resume` added for the 3-D Secure second leg.
+16. `findPendingOrder` added for `saleflow` (ADR-025).
+17. Error codes and `ProblemDetail` extensions aligned to `05-global-standards.md` §1–§2.
