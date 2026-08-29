@@ -49,7 +49,7 @@ com.flashseats.queue
 | `queue:admit:{eventId}:{sid}` | String — signed token | **600 s** | **admission session** — you are inside the sale (ADR-020) |
 | `queue:admissions:{eventId}` | ZSET — score = expiry | until sale end | live-admission count for admission control |
 | `queue:passes:{eventId}` | ZSET — score = pass expiry | until sale end | live-pass count for admission control |
-| `queue:hb:{sid}` | String | 30 s | liveness; lets abandoned entries be evicted |
+| `queue:hb:{sid}` | String | **90 s** | **advisory only** — abandonment metric. Never used for eviction (ADR-026) |
 | `queue:events:{eventId}` | Pub/Sub channel | — | promotion fan-out across replicas (ADR-007) |
 
 The two ZSETs exist so live counts can be taken with `ZCOUNT … <now> +inf` — self-cleaning, no leak,
@@ -71,7 +71,7 @@ matters after the sale.
 # score = epochMillis          when flashseats.queue.ordering = FIFO   (default)
 # score = uniform random draw  when flashseats.queue.ordering = RANDOM (ADR-024)
 ZADD queue:waiting:{eventId} NX <score> <sessionId>
-SET  queue:hb:{sessionId} 1 EX 30
+SET  queue:hb:{sessionId} 1 EX 90        # advisory only (ADR-026)
 ```
 
 **Ordering is configurable.** FIFO by arrival millisecond is intuitive and stays the default, but it
@@ -94,6 +94,7 @@ directly contradicting v1's own stated FIFO fairness guarantee (ADR-008).
 | `position-update` | `{position, aheadOfYou, estWaitSeconds}` | 2 s — **monotonic non-increasing** |
 | `queue-promoted` | `{passToken, expiresInSeconds: 120}` | on promotion — client immediately calls `/queue/admit` |
 | `sale-exhausted` | `{soldOutAt}` | terminal |
+| `tier-availability` | `{tiers:[{tierId, level}]}` | on bucket change (ADR-027) |
 | `sale-closed` | `{saleEndTime}` | terminal |
 | *(comment)* | `:hb` | 15 s |
 
@@ -125,7 +126,9 @@ if remainingStock == 0 and pendingPasses == 0 and liveAdmissions == 0:
 if admittable <= 0: skip this tick
 
 for sid in ZRANGE queue:waiting:{eventId} 0 admittable-1:
-    if not EXISTS queue:hb:{sid}: ZREM ; continue        -- abandoned
+    # NEVER skip or ZREM for a missing heartbeat. A Wi-Fi -> cellular handover
+    # routinely exceeds any heartbeat TTL; evicting on it deletes live buyers
+    # from the line through no fault of their own (ADR-026).
     passToken = HMAC-SHA256({eventId, sid, exp: now+120s, nonce}, secret)
     SET  queue:pass:{sid} <passToken> EX 120
     ZADD queue:passes:{eventId} <now+120s> <sid>
@@ -151,6 +154,27 @@ on a single instance, which is exactly why it must be tested with ≥ 2 replicas
 
 `remainingStock` comes from `CatalogFacade.getRemaining()`. If it returns `-1` (counter
 unavailable), promotion pauses rather than guessing.
+
+### Batch size is bounded by the connection pool, not just by inventory (ADR-028)
+
+```
+promotionBatchSize ≤ hikariMaxPoolSize × 1.5        # 30 → 45
+```
+
+Admission control bounds admission by *inventory*; this bounds it by *capacity to serve*. They are
+different limits and both apply. A tier with 5,000 remaining would otherwise admit 5,000 buyers into
+a checkout path backed by 30 database connections — and under virtual threads nothing errors, it
+just queues on HikariCP while p99 collapses. Alarm on `hikaricp_connections_pending`.
+
+### Abandonment and wait estimates (ADR-026)
+
+The queue **drains by promotion, never by eviction**. An abandoned entry reaches the front, is
+promoted, never claims its pass, and the pass expires in 120 s — capacity returns on its own, and the
+1.5× oversubscribe factor already prices in non-conversion.
+
+`estWaitSeconds` is therefore computed from the **measured drain rate** (`ZCARD` delta over a
+sliding 30 s window), not `position × assumedServiceTime`. Measuring the real rate accounts for
+abandonment implicitly; eviction only ever approximated it.
 
 ---
 
@@ -194,12 +218,15 @@ only.
 | :--- | :--- |
 | Refresh mid-queue | `ZADD NX` preserves position; SSE reconnects with `Last-Event-ID` |
 | Tab closed after promotion | Pass expires in 120 s, unused. No stock was touched |
+| **Wi-Fi → cellular handover mid-queue** | Position preserved: no eviction (ADR-026), `fsid` cookie survives, SSE reconnects with `Last-Event-ID`. A promotion during the gap is recovered from `/queue/status` |
+| Buyer's tier sells out while they wait | `tier-availability` frame marks it `SOLD_OUT` in the waiting room, before admission (ADR-027) |
+| 10,000 arrive at the front at once | Batch size capped by the pool (ADR-028); the rest keep their place |
 | Buyer wants a different tier | Release the hold; the **admission session survives**, so no re-queue (ADR-020) |
 | Admission expires while browsing | `410 ADMISSION_EXPIRED`; rejoin the queue |
 | Position jumps backwards after evictions | Clamped monotonic non-increasing before it is sent |
 | Promotion while SSE is down | Pass is in Redis; `/queue/status` returns it on reconnect |
 | Promoter on replica A, SSE on replica B | Pub/Sub fan-out (ADR-007) |
-| Abandoned entries inflating estimates | `queue:hb:{sid}` heartbeat; lazy `ZREM` during promotion |
+| Abandoned entries inflating estimates | Estimates come from the measured drain rate, not from position × service time (ADR-026) |
 | Sold out while users wait | `sale-exhausted`, queue drains |
 | Sale window closes | `sale-closed`, queue drains |
 | Redis down | `503 QueueUnavailable`; SSE closes; client retries with backoff |
@@ -221,7 +248,7 @@ only.
    (ADR-008).
 4. Pass TTL 300 s → **120 s**, single-use, revoked on first hold (ADR-006).
 5. `queue:passes:{eventId}` ZSET added for self-cleaning live-pass counting.
-6. `queue:hb:{sid}` heartbeat so wait estimates stay honest.
+6. `queue:hb:{sid}` heartbeat added (later demoted to advisory-only by ADR-026).
 7. Sale-window check on join (ADR-016).
 8. SSE heartbeat, `Last-Event-ID` reconnect, polling fallback, and required Nginx settings
    documented.
@@ -240,3 +267,12 @@ only.
 14. Promotion worker declared **singleton by advisory lock** — it is `@Scheduled` and would
     otherwise run on all three replicas.
 15. `getQueueState` added for `saleflow` rehydration (ADR-025).
+
+### Added in the 3rd pass
+
+16. **Eviction on missing heartbeat removed** — it deleted live buyers whose network handover
+    exceeded 30 s. The queue drains by promotion (ADR-026).
+17. Heartbeat TTL 30 s → 90 s, refreshed by any request, and demoted to metrics-only.
+18. `estWaitSeconds` now derived from measured drain rate.
+19. `tier-availability` SSE frame so buyers learn their tier sold out **while waiting** (ADR-027).
+20. Batch size explicitly bounded by `hikariMaxPoolSize × 1.5` (ADR-028).

@@ -9,14 +9,15 @@ FlashSeats — a high-concurrency ticket flash-sale engine. Modular monolith, Ja
 production code exists yet.
 
 **Read [`docs/00-architecture-decisions.md`](docs/00-architecture-decisions.md) before changing
-anything.** It contains 25 ADRs across two review passes, each recording a defect and its fix.
+anything.** It contains 30 ADRs across three review passes, each recording a defect and its fix.
 Several look like over-engineering until you read the failure they prevent.
 
 ## Document precedence
 
 ```
-00-architecture-decisions.md      ← highest authority (25 ADRs)
+00-architecture-decisions.md      ← highest authority (30 ADRs)
 05-global-standards.md            ← cross-cutting contract; module docs conform to it
+FE_SPEC.md                        ← client contract (repo root)
 03-end-to-end-flow.md             ← the authoritative user journey
 01 / 02 (architecture, HLD)
 docs/modules/*.md                 ← lowest; structural rewrite still pending
@@ -112,6 +113,11 @@ Do not reintroduce these — each cost a real defect in the first pass:
 | An `ApiResponse<T>` envelope | Fights HTTP; breaks status codes and caching |
 | `synchronized` on a blocking path | Pins the carrier thread; looks like a Redis outage |
 | A `@Scheduled` job that is neither idempotent nor lock-guarded | Runs three times, once per replica |
+| Evicting queue entries on a missing heartbeat | A Wi-Fi → cellular handover deletes live buyers from the line |
+| Rendering `503 INVENTORY_UNAVAILABLE` as "sold out" | Tells thousands the sale ended when a counter is merely missing |
+| Granting a grace extension per payment attempt | 300 + 3×120 = 660 s; three declines buy 11 minutes of squatting |
+| Retrying a deterministic render failure | Same stack trace three times, same DLQ, queue delayed |
+| Sizing promotion batches from inventory alone | Admits 5,000 buyers into a 30-connection pool |
 
 ## Implementation order
 

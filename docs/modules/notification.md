@@ -78,7 +78,23 @@ order.events.exchange  (topic, durable)
 notification.dlx.exchange (direct) ──► notification.order-confirmed.dlq
 ```
 
-Manual acknowledgement mode. Prefetch 10. Retry: 3 attempts at 5 s / 30 s / 2 min, then DLQ.
+Manual acknowledgement mode. Prefetch 10.
+
+### Failures are classified before they are retried (ADR-029)
+
+| Class | Examples | Action |
+| :--- | :--- | :--- |
+| **Transient** | SMTP timeout, broker blip, transient OOM | 3 retries — 5 s / 30 s / 2 min → DLQ |
+| **Deterministic** | Thymeleaf charset/encoding failure, malformed payload, PDFBox font or glyph error, invalid recipient | **straight to DLQ, no retries** |
+| **Poison** | `x-death` count ≥ 5, any class | straight to DLQ + alarm |
+
+A Thymeleaf encoding exception fails identically on every attempt. Retrying it three times over
+2.5 minutes delays every other message, produces three identical stack traces, and reaches the same
+DLQ. The `x-death` cap is the backstop against a render failure that corrupts consumer state and
+produces an infinite redelivery loop.
+
+Retry exists for *transient* failures — the same rule the payment module applies to card
+declines (ADR-014), stated here for the async path.
 
 ---
 
@@ -175,7 +191,9 @@ public interface NotificationFacade {
 | Worker crashes mid-render | Unacked → redelivered → unique violation → skip if already `SENT` |
 | Crash between send and status update | Possible single resend. Accepted at-least-once trade |
 | SMTP down | 3 retries → DLQ → admin replay |
-| PDF render failure | `PdfGenerationException` → retry chain → DLQ |
+| PDF render failure (font/glyph/charset) | **Deterministic** → straight to DLQ + alarm, no retries (ADR-029) |
+| PDFBox memory exhaustion | Transient → retry chain. Renderer is bounded: streamed output, one page per item, hard page cap |
+| Redelivery loop | `x-death` ≥ 5 → DLQ + alarm regardless of class |
 | Invalid recipient address | Immediate DLQ, no retries — retrying a malformed address never helps |
 | RabbitMQ down | Outbox retains `PENDING` rows; drains on recovery. No orders lost |
 | Multi-tier order | One PDF page per line item |
@@ -204,3 +222,8 @@ public interface NotificationFacade {
 9. Consumer declared to run on all replicas, made safe by the unique constraint rather than by
    coordination.
 10. Error codes aligned to the canonical registry (std §2).
+
+### Added in the 3rd pass
+
+11. **Failure classification** — deterministic render failures bypass the retry chain entirely, and
+    an `x-death` cap backstops redelivery loops (ADR-029).

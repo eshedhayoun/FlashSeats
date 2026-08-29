@@ -186,8 +186,17 @@ public record TierSummaryDTO(
 `TierSummaryDTO` carries the venue and event time so `order` can snapshot a complete outbox payload
 and `notification` never needs to call `catalog` (ADR-015).
 
-**Events:** `EventPrewarmedEvent(eventId, tierIds, totalStock, at)`,
-`StockRebuiltEvent(eventId, perTierBefore, perTierAfter, at)`.
+**Events:**
+* `EventPrewarmedEvent(eventId, tierIds, totalStock, at)`
+* `StockRebuiltEvent(eventId, perTierBefore, perTierAfter, at)`
+* `TierAvailabilityChangedEvent(eventId, tierId, level, at)` — **new (ADR-027)**. Fired when a tier
+  crosses a bucket boundary (`PLENTY` → `LIMITED` → `SOLD_OUT`). `queue` consumes it and fans it out
+  to the waiting room as a `tier-availability` SSE frame, so a buyer waiting specifically for VIP
+  learns it is gone **while waiting** rather than after admission.
+
+  Buckets, never exact counts: exact live inventory drives panic-buying and hands scalpers a feed.
+  Thresholds are `SOLD_OUT` at 0, `LIMITED` below 10 % of `total_capacity`, else `PLENTY`, with
+  hysteresis so a restored hold does not flap the banner.
 
 ---
 
@@ -229,3 +238,8 @@ and `notification` never needs to call `catalog` (ADR-015).
     exact integer. Exact counts drive panic-buying and hand scalpers a live inventory feed; industry
     practice is a coarse indicator. Exact values remain internal, for `hold` and for metrics.
 11. Error codes aligned to the canonical registry in `05-global-standards.md` §2.
+
+### Added in the 3rd pass
+
+12. `TierAvailabilityChangedEvent` published on bucket transitions, so the waiting room can show
+    per-tier sold-out state before admission (ADR-027).

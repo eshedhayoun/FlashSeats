@@ -550,3 +550,133 @@ on many — is the standard Modulith answer and is architecturally cheap.
 
 **Side benefit.** It gives `OrderFacade` its first real caller, resolving the YAGNI finding that
 `OrderFacade`'s only stated consumers were tools that do not exist.
+
+---
+
+# Third-pass decisions (ADR-026 – ADR-030)
+
+> Produced by the 360° edge-case and UX audit. ADR-026 fixes a defect that would have cost real
+> buyers their place in line; ADR-030 resolves a conflict between the requested decline-retry
+> behaviour and the grace ceiling in ADR-006.
+
+---
+
+## ADR-026 — The queue drains by promotion, never by eviction
+
+**Decision.** The promotion worker **never** removes a live entry from `queue:waiting:{eventId}`
+for a missing heartbeat. It promotes whoever is at the front, regardless.
+
+`queue:hb:{sid}` becomes **advisory only** — used for the abandonment-rate metric, never for
+eviction. Its TTL rises from 30 s to 90 s and it is refreshed by *any* request from that session,
+not only by the SSE tick.
+
+Wait estimates are computed from the **measured drain rate** (`ZCARD` delta over a sliding 30 s
+window), not from `position × assumed-service-time`.
+
+**Why.** This was a live defect. The previous rule was:
+
+```
+if not EXISTS queue:hb:{sid}: ZREM ; continue     -- abandoned
+```
+
+with a 30 s heartbeat TTL. A buyer who switches from Wi-Fi to cellular — the single most common
+mobile event during a long wait — loses their SSE connection for 10–60 s while the handover
+completes and the new connection establishes. **Any handover longer than 30 s silently deleted them
+from the queue.** They would reconnect to find themselves not in line at all, having done nothing
+wrong.
+
+Not evicting costs nothing. An abandoned entry reaches the front, is promoted, never claims its
+pass, and the pass expires in 120 s — capacity returns automatically, and the oversubscribe factor
+(ADR-020) already accounts for non-conversion. The queue drains either way.
+
+It also fixes wait estimates rather than harming them: measuring the real drain rate implicitly
+accounts for abandoned entries, whereas eviction only ever approximated it.
+
+---
+
+## ADR-027 — Per-tier availability is pushed into the waiting room
+
+**Decision.** `catalog` publishes `TierAvailabilityChangedEvent` when a tier crosses a bucket
+boundary (`PLENTY` → `LIMITED` → `SOLD_OUT`). `queue` fans it out over the existing
+`queue:events:{eventId}` channel as a `tier-availability` SSE frame:
+
+```
+event: tier-availability
+data: {"tiers":[{"tierId":501,"level":"SOLD_OUT"},{"tierId":502,"level":"LIMITED"}]}
+```
+
+**Why.** ADR-008 stopped the queue admitting people into a *fully* sold-out sale, but said nothing
+about a *partially* sold-out one. A buyer waiting twenty minutes specifically for VIP had no way to
+learn that VIP went in the first ninety seconds — they discovered it only after admission, at seat
+selection.
+
+Telling them while they wait lets them decide to switch tiers or leave, which is both kinder and
+better for throughput: they arrive at seat selection already knowing what they are buying.
+
+Buckets, not exact counts (ADR-004 note): exact live inventory drives panic-buying and hands
+scalpers a free feed.
+
+---
+
+## ADR-028 — Promotion batch size is derived from the connection pool
+
+**Decision.**
+
+```
+promotionBatchSize ≤ hikariMaxPoolSize × 1.5
+```
+
+With the default pool of 30, batch size caps at **45 per tick** — not the previously documented 50.
+Changing one without the other is a configuration error, and the two properties carry comments
+saying so.
+
+**Why.** "Ten thousand users reach the front simultaneously" is the scenario the queue exists for,
+and admission control (ADR-020) bounds it by *inventory*, not by *capacity to serve*. Those are
+different limits. A tier with 5,000 remaining would have admitted 5,000 buyers into a checkout path
+backed by 30 database connections.
+
+Under virtual threads this is especially easy to miss: nothing blocks, nothing errors, requests
+simply queue on HikariCP and p99 latency collapses. `hikaricp_connections_pending` is the alarm
+(standards §9).
+
+---
+
+## ADR-029 — Notification failures are classified before they are retried
+
+**Decision.** The consumer classifies every failure before deciding to retry:
+
+| Class | Examples | Action |
+| :--- | :--- | :--- |
+| **Transient** | SMTP timeout, broker blip, transient OOM | 3 retries: 5 s / 30 s / 2 min → DLQ |
+| **Deterministic** | Thymeleaf charset/encoding failure, malformed payload, PDFBox font or glyph error, invalid recipient | **straight to DLQ, no retries** |
+| **Poison** | `x-death` count ≥ 5 regardless of class | straight to DLQ, alarm |
+
+**Why.** A Thymeleaf rendering exception on a particular character set — the case in the brief —
+will fail identically on every attempt. Burning three retries over 2.5 minutes delays every other
+message in the queue, produces three identical stack traces, and reaches the same DLQ. Worse, a
+render failure that also corrupts consumer state can produce an infinite redelivery loop; the
+`x-death` cap is the backstop against that.
+
+Retry is for *transient* failures. This is the same rule the payment module already applies to card
+declines (ADR-014), stated once for the async path.
+
+---
+
+## ADR-030 — The grace budget is per hold, not per payment attempt
+
+**Decision.** A hold receives **one** +120 s extension across its entire lifetime, with an absolute
+ceiling of 420 s from creation. It is granted **before the first charge attempt**. Retries after a
+decline consume the remaining time; they do not earn a new extension.
+
+If a retry is submitted with less than 45 s remaining, the API returns `409` with
+`retryAfterSeconds: null` and `expiresAt`, and the UI tells the buyer plainly that there is not
+enough time left rather than starting a charge that cannot be completed.
+
+**Why.** The brief asked for "extend hold timer by 2 minutes" on decline, and up to 3 attempts are
+allowed (ADR-014). Granting an extension per attempt yields 300 + 3×120 = **660 s**, blowing the
+420 s ceiling and making seat-squatting cheap: three deliberate declines buy eleven minutes on
+inventory during a flash sale.
+
+The buyer's real need is met either way — a decline already retains the hold (ADR-011 in the payment
+spec), and the single extension is granted *before* the first attempt, so the retry window exists.
+What changes is that the budget is bounded and cannot be farmed.

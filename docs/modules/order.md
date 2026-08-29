@@ -197,7 +197,8 @@ inside a transaction does not just delay one request — it throttles checkout f
 | Case | Handling |
 | :--- | :--- |
 | Hold missing / expired / not yours | `409 HOLD_EXPIRED_OR_INVALID`. Nothing charged |
-| Card declined | `FAILED`, **hold retained**, `402` with `retryable: true`, `attemptsRemaining` |
+| Card declined | `FAILED`, **hold retained**, `402 PAYMENT_DECLINED` with `retryable: true`, `attemptsRemaining`, `expiresAt`. **No new grace extension** — the budget is per hold (ADR-030) |
+| Retry with < 45 s left | `409` + `expiresAt`; the UI says there is not enough time rather than starting a charge that cannot finish |
 | 4th attempt | `402 PAYMENT_ATTEMPTS_EXHAUSTED`; hold released |
 | Double submit | `payment:inflight` SETNX → `UNIQUE(hold_token)` → Stripe `Idempotency-Key` |
 | Gateway timeout | `503`; order stays `PENDING`; the webhook settles it |
@@ -320,3 +321,10 @@ The poller is `@Scheduled` and runs on all three replicas; `SKIP LOCKED` makes t
 15. `POST /api/v1/orders/checkout/resume` added for the 3-D Secure second leg.
 16. `findPendingOrder` added for `saleflow` (ADR-025).
 17. Error codes and `ProblemDetail` extensions aligned to `05-global-standards.md` §1–§2.
+
+### Added in the 3rd pass
+
+18. **Grace budget is per hold, not per attempt** (ADR-030). The single +120 s extension is granted
+    before the *first* charge; retries consume the remaining time. Granting one per attempt would
+    allow 300 + 3×120 = 660 s, blowing the 420 s ceiling and making seat-squatting cheap — three
+    deliberate declines would buy eleven minutes of inventory.

@@ -129,7 +129,8 @@ rebuild procedure in §4.1 instead (ADR-004).
   "windowStatus":  "UPCOMING",
   "serverTime":    "2026-08-30T09:57:12Z",
   "tiers": [
-    { "tierId": 501, "tierName": "VIP", "priceCents": 7500, "available": 120, "soldOut": false }
+    { "tierId": 501, "tierName": "VIP", "priceCents": 7500,
+      "currency": "USD", "maxPerOrder": 6, "availability": "LIMITED" }
   ]
 }
 ```
@@ -140,6 +141,10 @@ ordering becomes a lie (ADR-016).
 
 `windowStatus` drives the UI directly: `UPCOMING` → countdown, "Join" disabled; `OPEN` → "Join Flash
 Sale" enabled; `CLOSED` → sale-ended panel.
+
+`availability` is a **bucket** — `PLENTY` | `LIMITED` | `SOLD_OUT` — never an exact count. Exact live
+inventory drives panic-buying and hands scalpers a free feed (ADR-027). `maxPerOrder` is
+server-authoritative: the UI renders whatever the API returns and never hardcodes a limit.
 
 The `bot` filter issues the signed `fsid` cookie on this first request, so the visitor has a stable
 identity before the sale opens.
@@ -173,6 +178,7 @@ identity before the sale opens.
    | `position-update` | `{position, aheadOfYou, estWaitSeconds}` | every ~2 s |
    | `queue-promoted` | `{passToken, expiresInSeconds: 120}` | your turn — redirect |
    | `sale-exhausted` | `{soldOutAt}` | stock gone; queue drains |
+   | `tier-availability` | `{tiers:[{tierId, level}]}` | a tier crossed a bucket boundary (ADR-027) |
    | `sale-closed` | `{saleEndTime}` | window closed |
    | *(comment frame)* | `:hb` | 15 s heartbeat, keeps proxies open |
 
@@ -207,7 +213,14 @@ Two things are load-bearing here:
   and delivers to its own local emitters. Without this, behind three round-robin replicas roughly
   two-thirds of promotions would silently vanish (ADR-007).
 
-Abandoned entries are evicted by a `queue:hb:{sid}` heartbeat so `estWaitSeconds` stays honest.
+**Abandoned entries are never evicted** (ADR-026). They reach the front, are promoted, never claim
+their pass, and the pass expires in 120 s — capacity returns on its own, and the 1.5× oversubscribe
+factor already prices in non-conversion.
+
+Evicting on a missing heartbeat was a live defect: a Wi-Fi → cellular handover routinely exceeds any
+heartbeat TTL, so a buyer doing nothing wrong was silently deleted from the line. `estWaitSeconds` is
+now derived from the **measured drain rate** (`ZCARD` delta over 30 s), which accounts for
+abandonment implicitly.
 Position is clamped **monotonic non-increasing** client-side: evictions ahead of you can make a raw
 `ZRANK` jump backwards, and a number that goes *up* reads as a broken queue.
 
@@ -648,12 +661,15 @@ Every value below is a named property in `application.properties`.
 | Charge attempts per hold | 3 | 014 |
 | `payment:inflight` TTL | 90 s | 014 |
 | Promotion tick | 1 s | 008 |
+| Promotion batch size | **≤ `hikariMax × 1.5`** (45) | **028** |
+| Queue heartbeat | 90 s, advisory only | **026** |
 | SSE position push / heartbeat | 2 s / 15 s | 007 |
 | Sweeper interval | 30 s (Phase 2+); 10 s (Phase 1) | 019 |
 | Outbox poll / batch | 1 s / 100, `SKIP LOCKED` | 009 / 023 |
 | Session bucket | 20 burst, 10/s | 011 |
 | IP bucket | 300 burst, 150/s | 011 |
 | HikariCP pool | 30 max, 10 idle | std §7 |
+| Availability buckets | `SOLD_OUT` 0 · `LIMITED` < 10 % · else `PLENTY` | **027** |
 | reCAPTCHA threshold / cache | 0.5 / 30 min | 011 |
 
 ---

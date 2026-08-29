@@ -15,12 +15,13 @@ Read in this order:
 
 | Document | What it covers |
 | :--- | :--- |
-| [`docs/00-architecture-decisions.md`](docs/00-architecture-decisions.md) | **Start here.** 25 ADRs — every non-obvious decision and the failure it prevents |
+| [`docs/00-architecture-decisions.md`](docs/00-architecture-decisions.md) | **Start here.** 30 ADRs — every non-obvious decision and the failure it prevents |
 | [`docs/01-system-architecture.md`](docs/01-system-architecture.md) | Stack, module map, dependency graph, deployment |
 | [`docs/02-high-level-design.md`](docs/02-high-level-design.md) | Infrastructure and the concurrency model |
 | [`docs/03-end-to-end-flow.md`](docs/03-end-to-end-flow.md) | **The authoritative user journey**, step by step |
 | [`docs/04-implementation-roadmap.md`](docs/04-implementation-roadmap.md) | Four phases, each with exit criteria |
 | [`docs/05-global-standards.md`](docs/05-global-standards.md) | **Cross-cutting contract** — RFC 7807, error registry, idempotency, transaction rules, facade rules |
+| [`FE_SPEC.md`](FE_SPEC.md) | **Front-end specification** — view state machine, API map, storage, SSE, timers, copy |
 | [`docs/modules/`](docs/modules/) | Per-module specs — `catalog`, `queue`, `hold`, `bot`, `payment`, `order`, `notification`, `saleflow`, `shared` |
 
 When a module spec disagrees with an ADR, **the ADR wins** and the module spec is stale.
@@ -236,6 +237,11 @@ Design phase, two review passes complete.
 - **Pass 2 — best-practice alignment.** ADR-019…025: benchmarked against Ticketmaster / Queue-it /
   AXS. Found a permanent inventory leak (a Redis mutation inside a SQL transaction), a missing
   admission-session tier, no shared error contract, and three transaction-boundary violations.
+- **Pass 3 — edge-case and UX stress test.** ADR-026…030: found that a Wi-Fi → cellular handover
+  deleted buyers from the queue, that per-tier sell-outs were invisible to people waiting for them,
+  that promotion batch size ignored the connection pool, and that per-attempt grace extensions would
+  have blown the hold ceiling.
 
-25 ADRs record every decision and the failure it prevents. The per-module specs are aligned to them;
-a structural rewrite to the `05-global-standards.md` §10 template is the remaining work.
+30 ADRs record every decision and the failure it prevents. [`FE_SPEC.md`](FE_SPEC.md) covers the
+client. The per-module specs are aligned; a structural rewrite to the `05-global-standards.md` §10
+template is the remaining work.
