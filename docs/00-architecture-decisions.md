@@ -77,6 +77,11 @@ protection free.
 
 **Replaces.** The Redisson lock on the sweeper path, which is no longer needed.
 
+**Required Redis configuration.** `notify-keyspace-events Ex`. `E` is the key-*event* channel
+(`__keyevent@0__:expired`, message = the key name); `K` is the keyspace channel and carries the
+event name instead, so `Kx` would leave the listener permanently silent. Shipped in
+[`../docker/redis/redis.conf`](../docker/redis/redis.conf).
+
 ---
 
 ## ADR-004 — Redis stock is never rebuilt from `total_capacity` during a live sale

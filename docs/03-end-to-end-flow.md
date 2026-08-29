@@ -471,7 +471,10 @@ Redis TTL fires → `__keyevent@0__:expired` reaches **all** replicas → each a
 listener is therefore a **latency optimisation, not a correctness requirement** — keyspace pub/sub
 is at-most-once, and the sweeper is what makes the system correct without it.
 
-Requires `notify-keyspace-events Kx` (off by default).
+Requires `notify-keyspace-events Ex` (off by default). `E` is the key-**event** channel
+(`__keyevent@0__:expired`, message = the key name) — which is what the listener needs. `K` is the
+keyspace channel and carries the event name instead, so `Kx` would leave the listener silent.
+Shipped in [`docker/redis/redis.conf`](../docker/redis/redis.conf).
 
 ### 4.3 Component outages
 

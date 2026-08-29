@@ -102,10 +102,39 @@ be right from the first line of code. Retrofitting it is exactly how overbooking
 ## Commands
 
 ```bash
-./mvnw -DskipTests compile     # build
-./mvnw test                    # tests (includes ApplicationModules.verify() once written)
-./mvnw spring-boot:run         # run — needs PostgreSQL
+cp .env.example .env
+docker compose up -d                             # PostgreSQL, Redis, RabbitMQ, Mailpit
+docker compose up -d postgres                    # strictly-minimal Phase 1
+
+./mvnw -DskipTests compile                       # build
+./mvnw test                                      # incl. ApplicationModules.verify() once written
+./mvnw spring-boot:run                           # run locally against the compose services
+
+docker compose --profile cluster  up -d --build  # Nginx + 3 replicas on :8080 (Phase 4)
+docker compose --profile loadtest run --rm k6    # 10k virtual buyers
 ```
+
+UIs: RabbitMQ `:15672`, Mailpit `:8025`, API docs `/docs`.
+
+## Docker config that is correctness, not tuning
+
+`docker/redis/redis.conf` and `docker/nginx/nginx.conf` encode ADR requirements. Do not replace
+either with stock images or defaults:
+
+- `maxmemory-policy noeviction` — a `TTL = -1` key is **not** protected from an LRU policy. Evicting
+  a stock counter mid-sale is the worst failure this system has (ADR-004).
+- `notify-keyspace-events Ex` — `E` is the key-**event** channel (`__keyevent@0__:expired`, message
+  = key name), which is what the hold listener needs. `Kx` publishes the event name to the keyspace
+  channel and the listener never fires (ADR-003).
+- `appendonly yes` / `appendfsync everysec` — and remember a restart still needs a stock
+  reconciliation pass, because `everysec` can lose a second of `DECRBY`s.
+- `proxy_buffering off` + `proxy_read_timeout 3600s` on `/api/v1/queue/stream` — buffered SSE makes
+  the waiting room look frozen and delays the time-critical promotion frame (ADR-007).
+- `worker_connections 20480` — SSE connections are long-lived; the 1024 default dies at ~500 users.
+
+**Always test multi-replica.** `docker compose --profile cluster` runs three. Promotion pub/sub
+fan-out and settle-once restoration are both correct on one instance and broken on three if
+implemented naively — a single-instance test cannot see either bug.
 
 ## Working style for this repo
 

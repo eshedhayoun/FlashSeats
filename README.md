@@ -133,13 +133,54 @@ All dependencies are already declared in [`pom.xml`](pom.xml), grouped by phase.
 
 ## Getting started
 
+Prerequisites: JDK 21 and Docker.
+
 ```bash
-# Prerequisites: JDK 21, Docker
-./mvnw -DskipTests compile          # verify the build
-./mvnw spring-boot:run              # needs PostgreSQL (Phase 1)
+cp .env.example .env
+docker compose up -d                # PostgreSQL, Redis, RabbitMQ, Mailpit
+./mvnw spring-boot:run              # run the app from your machine
 ```
 
-API docs at `/docs` once running. Docker Compose lands with Phase 1.
+For a strictly-minimal Phase 1: `docker compose up -d postgres`.
+
+| Service | Where | Credentials |
+| :--- | :--- | :--- |
+| App | http://localhost:8080 · API docs at `/docs` | — |
+| PostgreSQL | `localhost:5432` | `flashseats` / `flashseats` |
+| Redis | `localhost:6379` | no auth (dev) |
+| RabbitMQ UI | http://localhost:15672 | `flashseats` / `flashseats` |
+| Mailpit UI | http://localhost:8025 | — |
+
+### Multi-replica cluster (Phase 4)
+
+```bash
+docker compose --profile cluster up -d --build     # Nginx + 3 app replicas on :8080
+docker compose --profile loadtest run --rm k6      # 10k virtual buyers
+```
+
+**Test with three replicas, not one.** Promotion pub/sub fan-out (ADR-007) and settle-once stock
+restoration (ADR-003) both behave perfectly on a single instance and break on three if implemented
+naively. A single-instance test cannot see either bug.
+
+### Docker layout
+
+```
+compose.yaml                    profiles: (default) · cluster · loadtest
+Dockerfile                      multi-stage, JRE 21, non-root
+.env.example                    copy to .env
+docker/redis/redis.conf         noeviction · notify-keyspace-events Ex · AOF
+docker/nginx/nginx.conf         least_conn · SSE unbuffered · X-Forwarded-For
+docker/k6/flash-sale.js         load harness; asserts zero overbooking
+```
+
+Two config files carry correctness requirements, not tuning preferences:
+
+- **`redis.conf`** — `maxmemory-policy noeviction` (a `TTL = -1` key is *not* safe from an LRU
+  policy), `notify-keyspace-events Ex` (the key-**event** channel; `Kx` would leave the hold expiry
+  listener silent), and AOF `everysec`. Running the stock Redis image with defaults passes tests and
+  loses inventory later.
+- **`nginx.conf`** — `proxy_buffering off` and a 3600s read timeout on `/api/v1/queue/stream`, plus
+  `worker_connections 20480` (the 1024 default is exhausted by ~500 waiting users).
 
 ---
 

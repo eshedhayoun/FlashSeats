@@ -187,7 +187,10 @@ Redis TTL fires → __keyevent@0__:expired → EVERY replica receives it
   → publish TicketHoldExpiredEvent
 ```
 
-Requires `notify-keyspace-events Kx` (off by default in Redis).
+Requires `notify-keyspace-events Ex` (off by default in Redis). `E` selects the key-**event**
+channel `__keyevent@0__:expired`, whose message is the expired key's name. `K` selects the keyspace
+channel, whose message is the event name instead — with `Kx` the listener never fires. Shipped in
+[`docker/redis/redis.conf`](../../docker/redis/redis.conf).
 
 ### Sweeper — the actual guarantee
 

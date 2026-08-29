@@ -79,7 +79,8 @@ Move inventory to RAM without weakening any Phase 1 guarantee, and add admission
 
 **`catalog`** — Redis counters, `SETNX` pre-warm **restricted to `UPCOMING`**, and the locked
 rebuild procedure (`00-architecture-decisions.md` ADR-004). Redis configured with
-`maxmemory-policy noeviction`, AOF `everysec`, and `notify-keyspace-events Kx`.
+`maxmemory-policy noeviction`, AOF `everysec`, and `notify-keyspace-events **Ex**` — all three
+already shipped in [`docker/redis/redis.conf`](../docker/redis/redis.conf).
 
 **`hold`** — `hold_reserve.lua` and `hold_restore.lua`. `holdmeta:{token}` written inside the
 reserve script with a 24 h TTL. Settle-once claim becomes `GETDEL holdmeta:{token}`. Keyspace
