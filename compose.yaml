@@ -1,0 +1,197 @@
+# FlashSeats — local development and load-test stack
+#
+#   docker compose up -d                          backing services (Phases 1-3)
+#   docker compose up -d postgres                 strictly-minimal Phase 1
+#   docker compose --profile cluster up -d        + Nginx and 3 app replicas (Phase 4)
+#   docker compose --profile loadtest run --rm k6 flash-sale harness
+#
+# Phases 1-3 run the app from your IDE against these services. The `cluster`
+# profile is what proves the multi-replica behaviour: promotion pub/sub fan-out
+# and settle-once stock restoration are both correct on one instance and broken
+# on three if implemented naively (ADR-003, ADR-007). Test with 3.
+
+name: flashseats
+
+x-app: &app
+  build:
+    context: .
+    dockerfile: Dockerfile
+  profiles: ["cluster"]
+  restart: unless-stopped
+  environment:
+    SPRING_PROFILES_ACTIVE: docker
+    SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/${POSTGRES_DB:-flashseats}
+    SPRING_DATASOURCE_USERNAME: ${POSTGRES_USER:-flashseats}
+    SPRING_DATASOURCE_PASSWORD: ${POSTGRES_PASSWORD:-flashseats}
+    SPRING_DATA_REDIS_HOST: redis
+    SPRING_DATA_REDIS_PORT: 6379
+    SPRING_RABBITMQ_HOST: rabbitmq
+    SPRING_RABBITMQ_PORT: 5672
+    SPRING_RABBITMQ_USERNAME: ${RABBITMQ_USER:-flashseats}
+    SPRING_RABBITMQ_PASSWORD: ${RABBITMQ_PASSWORD:-flashseats}
+    SPRING_MAIL_HOST: mailpit
+    SPRING_MAIL_PORT: 1025
+    # Behind Nginx the client IP arrives in X-Forwarded-For. The bot module
+    # rate-limits on it, so Spring must be told to trust the proxy.
+    SERVER_FORWARD_HEADERS_STRATEGY: framework
+    FLASHSEATS_SESSION_SECRET: ${FLASHSEATS_SESSION_SECRET:-dev-only-change-me}
+    FLASHSEATS_QUEUE_PASS_SECRET: ${FLASHSEATS_QUEUE_PASS_SECRET:-dev-only-change-me}
+    STRIPE_API_KEY: ${STRIPE_API_KEY:-}
+    STRIPE_WEBHOOK_SECRET: ${STRIPE_WEBHOOK_SECRET:-}
+    RECAPTCHA_SECRET: ${RECAPTCHA_SECRET:-}
+    JAVA_TOOL_OPTIONS: "-XX:MaxRAMPercentage=75"
+  depends_on:
+    postgres: { condition: service_healthy }
+    redis:    { condition: service_healthy }
+    rabbitmq: { condition: service_healthy }
+  healthcheck:
+    test: ["CMD", "wget", "-qO-", "http://localhost:8080/actuator/health"]
+    interval: 10s
+    timeout: 3s
+    retries: 12
+    start_period: 45s
+  networks: [flashseats]
+
+services:
+
+  # ===================================================================
+  # Phase 1 — the ACID ledger
+  # ===================================================================
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-flashseats}
+      POSTGRES_USER: ${POSTGRES_USER:-flashseats}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-flashseats}
+    ports: ["${POSTGRES_PORT:-5432}:5432"]
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    # max_connections: 3 replicas x HikariCP pool, plus the outbox poller and
+    # sweeper, plus headroom for psql and the load harness.
+    command: >
+      postgres
+        -c max_connections=200
+        -c shared_buffers=256MB
+        -c log_min_duration_statement=500
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-flashseats} -d ${POSTGRES_DB:-flashseats}"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 10s
+    networks: [flashseats]
+
+  # ===================================================================
+  # Phase 2 — inventory, queue, holds
+  # ===================================================================
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    ports: ["${REDIS_PORT:-6379}:6379"]
+    # The config file is NOT optional: it carries noeviction (ADR-004),
+    # notify-keyspace-events Ex (ADR-003) and AOF durability. Running the
+    # stock image with defaults will pass tests and lose inventory in
+    # production.
+    command: ["redis-server", "/usr/local/etc/redis/redis.conf"]
+    volumes:
+      - ./docker/redis/redis.conf:/usr/local/etc/redis/redis.conf:ro
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 5s
+    networks: [flashseats]
+
+  # ===================================================================
+  # Phase 4 — asynchronous fulfilment
+  # ===================================================================
+  rabbitmq:
+    image: rabbitmq:3.13-management-alpine
+    restart: unless-stopped
+    environment:
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_USER:-flashseats}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD:-flashseats}
+    ports:
+      - "${RABBITMQ_PORT:-5672}:5672"
+      - "${RABBITMQ_UI_PORT:-15672}:15672"   # management UI
+    volumes:
+      - rabbitmq-data:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "check_running"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+    networks: [flashseats]
+
+  # Local SMTP sink. Captures every outgoing ticket email; UI on :8025.
+  mailpit:
+    image: axllent/mailpit:latest
+    restart: unless-stopped
+    environment:
+      MP_MAX_MESSAGES: 5000          # a 10k-user run sends ~500
+      MP_SMTP_AUTH_ACCEPT_ANY: 1
+      MP_SMTP_AUTH_ALLOW_INSECURE: 1
+    ports:
+      - "${MAILPIT_SMTP_PORT:-1025}:1025"
+      - "${MAILPIT_UI_PORT:-8025}:8025"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8025/readyz"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+    networks: [flashseats]
+
+  # ===================================================================
+  # Phase 4 — the cluster (profile: cluster)
+  # ===================================================================
+  app-1: { <<: *app, container_name: flashseats-app-1 }
+  app-2: { <<: *app, container_name: flashseats-app-2 }
+  app-3: { <<: *app, container_name: flashseats-app-3 }
+
+  nginx:
+    image: nginx:1.27-alpine
+    profiles: ["cluster"]
+    restart: unless-stopped
+    ports: ["${HTTP_PORT:-8080}:80"]
+    volumes:
+      - ./docker/nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      app-1: { condition: service_healthy }
+      app-2: { condition: service_healthy }
+      app-3: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost/nginx-health"]
+      interval: 10s
+      timeout: 3s
+      retries: 6
+    networks: [flashseats]
+
+  # ===================================================================
+  # Load harness (profile: loadtest)
+  # ===================================================================
+  k6:
+    image: grafana/k6:latest
+    profiles: ["loadtest"]
+    environment:
+      BASE_URL: ${K6_BASE_URL:-http://nginx:80}
+      EVENT_ID: ${K6_EVENT_ID:-1}
+      TIER_ID: ${K6_TIER_ID:-1}
+      VUS: ${K6_VUS:-10000}
+      CAPACITY: ${K6_CAPACITY:-500}
+    volumes:
+      - ./docker/k6:/scripts:ro
+    entrypoint: ["k6", "run", "/scripts/flash-sale.js"]
+    networks: [flashseats]
+
+volumes:
+  postgres-data:
+  redis-data:
+  rabbitmq-data:
+
+networks:
+  flashseats:
+    driver: bridge

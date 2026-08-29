@@ -31,3 +31,10 @@ build/
 
 ### VS Code ###
 .vscode/
+
+# Local environment overrides (see .env.example)
+.env
+.env.local
+
+# Load-test output
+docker/k6/summary.json
