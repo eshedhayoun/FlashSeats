@@ -39,8 +39,14 @@ public interface HoldFacade {
      */
     HoldSummary consumeHold(String holdToken);
 
-    /** Hands seats back, restoring stock if this caller wins the settle-once claim. */
-    void releaseHold(String holdToken, String reason);
+    /**
+     * Hands seats back, restoring stock if this caller wins the settle-once claim.
+     *
+     * <p>The reason is recorded as the hold's {@code settle_reason} and is the only trace of why it
+     * ended. It took a {@code String} that was discarded, so every release read as
+     * {@code USER_CANCEL} whoever asked for it.
+     */
+    void releaseHold(String holdToken, HoldReleaseReason reason);
 
     /**
      * Grants the single grace extension, if this hold has not used it (ADR-030).

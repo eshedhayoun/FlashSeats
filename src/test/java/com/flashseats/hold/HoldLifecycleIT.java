@@ -9,6 +9,7 @@ import com.flashseats.flashseats.support.IntegrationTest;
 import com.flashseats.flashseats.support.SaleFixture;
 import com.flashseats.hold.exception.HoldAlreadySettledException;
 import com.flashseats.hold.facade.HoldFacade;
+import com.flashseats.hold.facade.HoldReleaseReason;
 import java.time.Duration;
 import java.util.Map;
 import java.util.concurrent.CountDownLatch;
@@ -86,7 +87,7 @@ class HoldLifecycleIT extends IntegrationTest {
             for (int i = 0; i < racers; i++) {
                 pool.submit(() -> {
                     startLine.await();
-                    holds.releaseHold(holdToken, "test");
+                    holds.releaseHold(holdToken, HoldReleaseReason.USER_CANCEL);
                     completed.incrementAndGet();
                     return null;
                 });

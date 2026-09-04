@@ -33,8 +33,16 @@ class HoldFacadeImpl implements HoldFacade {
     }
 
     @Override
-    public void releaseHold(String holdToken, String reason) {
-        holds.releaseInternal(holdToken, SettleReason.USER_CANCEL);
+    public void releaseHold(String holdToken, HoldReleaseReason reason) {
+        holds.releaseInternal(holdToken, toSettleReason(reason));
+    }
+
+    /** The public reason, mapped onto the internal one the ledger stores. */
+    private static SettleReason toSettleReason(HoldReleaseReason reason) {
+        return switch (reason) {
+            case USER_CANCEL -> SettleReason.USER_CANCEL;
+            case ORDER_ABORT -> SettleReason.ORDER_ABORT;
+        };
     }
 
     @Override
