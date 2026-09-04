@@ -11,6 +11,7 @@ import com.flashseats.order.dto.OrderReceiptResponse;
 import com.flashseats.order.exception.CheckoutWindowClosedException;
 import com.flashseats.order.exception.InsufficientTimeRemainingException;
 import com.flashseats.order.exception.OrderRefundedException;
+import com.flashseats.payment.exception.DuplicatePaymentException;
 import com.flashseats.payment.exception.PaymentDeclinedException;
 import com.flashseats.payment.facade.AuthorizeCommand;
 import com.flashseats.payment.facade.PaymentFacade;
@@ -39,6 +40,12 @@ import org.springframework.stereotype.Service;
  *   <li>after commit: best-effort cleanup that is safe to lose
  *   <li>if the commit failed after money moved: refund, and tell the buyer
  * </ol>
+ *
+ * <p><strong>Every exit past step 4 leaves the order resumable</strong> (ADR-034). The row is
+ * committed as {@code PENDING} before the charge, so an exit that recorded no outcome — a gateway
+ * outage, a hold settled underneath us, too little time left — would otherwise strand the buyer
+ * holding seats they can no longer buy, being told by a {@code 409} that a charge they never made
+ * is still running.
  *
  * <p><strong>This class is deliberately not {@code @Transactional}.</strong> It calls an external
  * provider; a transaction spanning that call would hold a pooled connection across a network round
@@ -104,35 +111,54 @@ public class CheckoutService {
             return new CheckoutOutcome(queries.receiptFor(order.orderNumber()), true);
         }
 
-        // 5. The one grace extension. Idempotent across retries; throws if the hold has been settled
-        //    by a concurrent expiry — in which case we must NOT charge (ADR-023).
-        Instant expiresAt = holds.grantGrace(request.holdToken());
-        requireTimeToComplete(expiresAt);
-
-        // 6. Money moves here, with no transaction open.
-        PaymentResult payment = payments.authorize(new AuthorizeCommand(
-                order.orderNumber(),
-                request.holdToken(),
-                sessionId,
-                amountCents,
-                tier.currency(),
-                request.paymentMethodId(),
-                request.idempotencyKey(),
-                order.attemptNumber() + 1));
-
-        if (!payment.succeeded()) {
-            // The hold stays ACTIVE. The buyer was promised they could try another card.
-            int attemptsRemaining = commit.recordFailedAttempt(order.orderNumber(), payment.failureReason());
-            throw new PaymentDeclinedException(payment.failureReason(), attemptsRemaining, expiresAt);
-        }
-
-        // 7. One transaction: consume, confirm, items, outbox. 8. Post-commit cleanup hangs off it.
+        // Everything from here can fail, and the order row is already committed as PENDING. A
+        // PENDING order that nothing ever resolves is a dead end — the buyer holds live seats they
+        // can no longer buy — so every exit below leaves the row in a state a retry can resume
+        // (ADR-034).
         try {
-            commit.confirm(order.orderNumber(), hold, tier, payment);
-        } catch (RuntimeException commitFailed) {
-            // 9. Money moved but the seats did not. Give it back and say so.
-            compensate(order.orderNumber(), payment, amountCents, commitFailed);
-            throw new OrderRefundedException(order.orderNumber());
+            // 5. The one grace extension. Idempotent across retries; throws if the hold has been
+            //    settled by a concurrent expiry — in which case we must NOT charge (ADR-023).
+            Instant expiresAt = holds.grantGrace(request.holdToken());
+            requireTimeToComplete(expiresAt);
+
+            // 6. Money moves here, with no transaction open.
+            PaymentResult payment = payments.authorize(new AuthorizeCommand(
+                    order.orderNumber(),
+                    request.holdToken(),
+                    sessionId,
+                    amountCents,
+                    tier.currency(),
+                    request.paymentMethodId(),
+                    request.idempotencyKey(),
+                    order.attemptNumber() + 1));
+
+            if (!payment.succeeded()) {
+                // The hold stays ACTIVE. The buyer was promised they could try another card.
+                int attemptsRemaining =
+                        commit.recordFailedAttempt(order.orderNumber(), payment.failureReason());
+                throw new PaymentDeclinedException(payment.failureReason(), attemptsRemaining, expiresAt);
+            }
+
+            // 7. One transaction: consume, confirm, items, outbox. 8. Post-commit cleanup hangs off it.
+            try {
+                commit.confirm(order.orderNumber(), hold, tier, payment);
+            } catch (RuntimeException commitFailed) {
+                // 9. Money moved but the seats did not. Give it back and say so.
+                compensate(order.orderNumber(), payment, amountCents, commitFailed);
+                throw new OrderRefundedException(order.orderNumber());
+            }
+        } catch (DuplicatePaymentException concurrent) {
+            // Another request owns this order right now. Leave its state entirely alone — deciding
+            // the outcome of someone else's in-flight charge is exactly the race the guard exists
+            // to prevent.
+            throw concurrent;
+        } catch (RuntimeException unresolved) {
+            // No charge outcome was reached, or the outcome was already recorded. markAbandoned only
+            // touches a row still PENDING, so a decline (already FAILED) and a compensated commit
+            // failure (already REFUNDED) both pass through it untouched — the guard is what makes
+            // this catch safe to wrap everything.
+            commit.markAbandoned(order.orderNumber(), unresolved.getMessage());
+            throw unresolved;
         }
 
         return new CheckoutOutcome(queries.receiptFor(order.orderNumber()), false);
