@@ -680,3 +680,100 @@ inventory during a flash sale.
 The buyer's real need is met either way — a decline already retains the hold (ADR-011 in the payment
 spec), and the single extension is granted *before* the first attempt, so the retry window exists.
 What changes is that the budget is bounded and cannot be farmed.
+
+---
+
+# Implementation-pass decisions (ADR-031 – ADR-033)
+
+> Produced while building the MVP. Each records a place where the design as written could not be
+> implemented as written — a missing edge, or two rules that contradicted each other in practice.
+
+---
+
+## ADR-031 — `queue → catalog` is a real facade edge
+
+**Decision.** Add `queue ──► catalog` to the facade graph. It was already required by two flows and
+present in no diagram.
+
+`queue` calls `CatalogFacade` in three places:
+
+* `getWindowStatus(eventId)` — a join before the sale opens must be `409`, not a silent success
+  (ADR-016).
+* `getRemainingForEvent(eventId)` — admission control is bounded by real capacity, and without this
+  the queue is only a slower way to deliver a `409` (ADR-008).
+* `findOpenEventIds()` — the promotion worker needs to know which sales are live.
+
+**Why it was missed.** `queue.md` §4 and §6 both describe these calls, but every graph — in
+`01-system-architecture.md`, `03-end-to-end-flow.md`, `README.md` and `CLAUDE.md` — omitted the edge.
+It is acyclic (`catalog` depends on nothing), so nothing was ever at risk; the diagrams were simply
+incomplete, and a diagram that omits a real dependency is worse than no diagram.
+
+The corrected graph:
+
+```
+                    shared          ← open module; everyone may depend on it
+
+filter   ──► bot
+queue    ──► catalog
+hold     ──► queue, catalog
+order    ──► hold, catalog, payment, queue
+saleflow ──► queue, hold, order, catalog        ← read-only leaf; nothing depends on it
+payment  ──( PaymentSettledEvent — webhook path only )──► order
+order    ──( outbox → RabbitMQ )──► notification
+```
+
+---
+
+## ADR-032 — The promotion tick is a singleton by Redis lock, not a PostgreSQL advisory lock
+
+**Decision.** `PromotionWorker` acquires `SET queue:promote:{eventId} <nodeId> NX PX 900` and skips
+the tick if it cannot. The lock is never released explicitly; its TTL is shorter than the tick
+interval, so it frees itself.
+
+**Why.** Two documented rules contradict each other here, and one had to give:
+
+* Global standards §7 says a `@Scheduled` job must be *idempotent by claim* or *singleton by
+  `pg_try_advisory_xact_lock`*. The promotion worker is not idempotent — running it twice promotes
+  twice — so it needs the lock.
+* `pg_try_advisory_xact_lock` is **transaction-scoped**: it holds only while a transaction is open.
+* Global standards §4 forbids Redis writes inside a SQL transaction — and this worker's entire body
+  is Redis writes.
+
+So a PostgreSQL advisory lock cannot guard this worker without violating the transaction rule. A
+plain Redis `SET NX PX` needs no transaction, expires on its own, cannot leak if a replica dies
+mid-tick, and adds no dependency.
+
+**Not released deliberately.** Deleting a lock you may no longer own is how one replica frees
+another's. Letting a short TTL expire is simpler and has no such failure mode. If a tick ever
+overruns the TTL, two replicas may promote in the same second — bounded by the batch size, and
+already absorbed by the 1.5× oversubscribe factor (ADR-020).
+
+**Scope.** This changes the mechanism for *this* worker only. The sweeper and the outbox relay
+remain idempotent-by-claim and need no lock at all.
+
+---
+
+## ADR-033 — One `@RestControllerAdvice`, via a shared exception base type
+
+**Decision.** A single `GlobalExceptionHandler` in `shared` handles every module's failures. Each
+module's exceptions extend `shared.error.FlashSeatsException`, which carries the module's own
+`ErrorCode` and any RFC 7807 extension members.
+
+**Why.** Global standards §1 asked for one advice per module, reasoning that a global advice *"would
+have to import every module's exception types into one class and break the boundary
+`ApplicationModules.verify()` enforces."*
+
+That reasoning is sound, and the shared base type satisfies it: the handler catches
+`FlashSeatsException` and imports nothing module-specific. The constraint is met with one class
+instead of seven, and the response shape cannot drift between modules because there is only one
+place that builds it.
+
+**What is preserved.** The handler runs at `@Order(LOWEST_PRECEDENCE)`, so any module that later
+needs bespoke handling can add its own advice and win. Error codes remain the module's own; only the
+rendering is shared.
+
+**Also recorded here:** two codes were added to the §2 registry during implementation, for behaviour
+the docs specified but left un-named — `INSUFFICIENT_TIME_REMAINING` (409, `order`) for a retry with
+too little of the hold left to finish safely (ADR-030), and `ORDER_REFUNDED` (409, `order`) for a
+charge that settled against seats that could not be delivered (ADR-012). The latter is deliberately
+distinct from `HOLD_EXPIRED`, whose promise is that *nothing was charged* — which would be false.

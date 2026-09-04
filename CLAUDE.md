@@ -5,12 +5,16 @@ Guidance for Claude Code when working in this repository.
 ## What this is
 
 FlashSeats — a high-concurrency ticket flash-sale engine. Modular monolith, Java 21, Spring Boot
-4.1.1. Currently in **design phase**: the documentation is complete and corrected; almost no
-production code exists yet.
+4.1.1. The **MVP is built and running**: all nine modules, the full journey from landing page to emailed
+PDF ticket, 25 tests green. Inventory is PostgreSQL-only for now — correct, and the Redis fast path
+replaces exactly one method body.
 
 **Read [`docs/00-architecture-decisions.md`](docs/00-architecture-decisions.md) before changing
-anything.** It contains 30 ADRs across three review passes, each recording a defect and its fix.
-Several look like over-engineering until you read the failure they prevent.
+anything.** It contains 33 ADRs across four passes, each recording a defect and its fix. Several look
+like over-engineering until you read the failure they prevent.
+
+**For what is actually built**, read [`docs/06-mvp-overview.md`](docs/06-mvp-overview.md) — scope,
+security posture, next stages, and the review-pass log. It is the doc to update after every pass.
 
 ## Document precedence
 
@@ -31,7 +35,11 @@ spec rather than the code.
 
 ## Facts that are easy to get wrong
 
-- **Spring Boot 4.1.1**, not 3.x. Spring Modulith **2.1.1**.
+- **Spring Boot 4.1.1**, not 3.x. Spring Modulith **2.1.1**. Boot 4 moved things:
+  JSON is **Jackson 3** (`tools.jackson.databind.ObjectMapper` is the autoconfigured bean — the
+  Jackson 2 class is on the classpath with no bean behind it), `@EntityScan` is now
+  `org.springframework.boot.persistence.autoconfigure.EntityScan`, and Flyway needs
+  `spring-boot-starter-flyway` — `flyway-core` alone runs no migrations.
 - Base package is **`com.flashseats`** (the app class lives in `com.flashseats.flashseats`).
   Older docs said `com.app.*`; that namespace does not exist.
 - Redis is a **single primary + Sentinel**, not Cluster. `hold_reserve.lua` spans hash slots and
@@ -49,6 +57,7 @@ spec rather than the code.
                     shared        ← open module; everyone may depend on it
 
 filter   ──► bot
+queue    ──► catalog
 hold     ──► queue, catalog
 order    ──► hold, catalog, payment, queue
 saleflow ──► queue, hold, order, catalog     ← read-only leaf; nothing depends on it
@@ -118,6 +127,8 @@ Do not reintroduce these — each cost a real defect in the first pass:
 | Granting a grace extension per payment attempt | 300 + 3×120 = 660 s; three declines buy 11 minutes of squatting |
 | Retrying a deterministic render failure | Same stack trace three times, same DLQ, queue delayed |
 | Sizing promotion batches from inventory alone | Admits 5,000 buyers into a 30-connection pool |
+| `@Modifying(clearAutomatically = true)` on the settle claim | Detaches every other entity in the transaction — the order's status change is silently discarded |
+| Validating the hold before checking for a confirmed order | A resubmitted checkout gets `410 HOLD_EXPIRED` instead of its receipt; the hold is gone because the purchase succeeded |
 
 ## Implementation order
 
