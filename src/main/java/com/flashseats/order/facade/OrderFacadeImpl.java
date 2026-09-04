@@ -21,8 +21,8 @@ class OrderFacadeImpl implements OrderFacade {
     }
 
     @Override
-    public Optional<OrderSummary> findPendingOrder(String userSessionId, long eventId) {
-        return orders.findPending(userSessionId, eventId).map(OrderFacadeImpl::toSummary);
+    public Optional<OrderSummary> findLatestOrder(String userSessionId, long eventId) {
+        return orders.findLatest(userSessionId, eventId).map(OrderFacadeImpl::toSummary);
     }
 
     /** The status crosses as a string: {@code OrderStatus} is this module's business, not a shared type. */

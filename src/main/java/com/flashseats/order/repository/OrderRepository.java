@@ -1,7 +1,6 @@
 package com.flashseats.order.repository;
 
 import com.flashseats.order.model.Order;
-import com.flashseats.order.model.OrderStatus;
 import java.util.Optional;
 import org.springframework.data.jpa.repository.JpaRepository;
 import org.springframework.data.jpa.repository.Query;
@@ -13,8 +12,15 @@ public interface OrderRepository extends JpaRepository<Order, Long> {
 
     Optional<Order> findByOrderNumber(String orderNumber);
 
-    Optional<Order> findFirstByUserSessionIdAndEventIdAndStatusOrderByCreatedAtDesc(
-            String userSessionId, long eventId, OrderStatus status);
+    /**
+     * This session's most recent order for an event, <strong>whatever its status</strong>.
+     *
+     * <p>Deliberately unfiltered (ADR-037). Filtering on {@code PENDING} meant rehydration could
+     * never surface a completed purchase, so a buyer who reloaded their receipt page was shown the
+     * landing page and invited to join the queue for seats they already owned.
+     */
+    Optional<Order> findFirstByUserSessionIdAndEventIdOrderByCreatedAtDesc(
+            String userSessionId, long eventId);
 
     /**
      * Human-facing order numbers come from a database sequence rather than a counter in application

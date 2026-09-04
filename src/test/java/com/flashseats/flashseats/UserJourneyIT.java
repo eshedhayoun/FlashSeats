@@ -105,11 +105,19 @@ class UserJourneyIT extends IntegrationTest {
         var stranger = new BuyerSession(port).get("/orders/" + orderNumber);
         assertThat(stranger.status()).isEqualTo(404);
 
-        // 8. Fulfilment was queued inside the order transaction, and the relay drains it.
+        // 8. Reloading the page must still find the purchase. Rehydration reported only payments in
+        //    flight, so a confirmed order vanished the instant it succeeded and the buyer was shown
+        //    the landing page — invited to queue for seats they already owned (ADR-037).
+        var afterReload = buyer.get("/sale/" + eventId + "/state");
+        assertThat(afterReload.json().get("order").get("orderNumber").asText()).isEqualTo(orderNumber);
+        assertThat(afterReload.json().get("order").get("status").asText()).isEqualTo("CONFIRMED");
+        assertThat(afterReload.json().get("hold").isNull()).isTrue();
+
+        // 9. Fulfilment was queued inside the order transaction, and the relay drains it.
         await().atMost(PATIENCE).untilAsserted(() ->
                 assertThat(fixture.countOutbox("PROCESSED")).isEqualTo(1));
 
-        // 9. The hold became a sale, and the books balance.
+        // 10. The hold became a sale, and the books balance.
         assertThat(fixture.holdStatus(holdToken)).isEqualTo("CONSUMED");
         assertThat(fixture.stockInvariantHolds(tierId)).isTrue();
     }
