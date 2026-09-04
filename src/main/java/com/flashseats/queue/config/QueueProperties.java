@@ -45,6 +45,16 @@ public class QueueProperties {
      */
     private int heartbeatTtlSeconds = 90;
 
+    /**
+     * How long this module's per-sale keys outlive the sale itself (ADR-036).
+     *
+     * <p>Every queue key expires; none is deleted by the application. An hour past
+     * {@code sale_end_time} covers the post-close checkout grace and any late rehydration, after
+     * which the waiting, pass and admission sets of a finished sale are simply gone. Redis runs
+     * {@code noeviction}, so a key with no TTL is a leak nothing else will clean up.
+     */
+    private long keyRetentionAfterSaleSeconds = 3_600;
+
     public String getPassSecret() {
         return passSecret;
     }
@@ -115,5 +125,13 @@ public class QueueProperties {
 
     public void setHeartbeatTtlSeconds(int heartbeatTtlSeconds) {
         this.heartbeatTtlSeconds = heartbeatTtlSeconds;
+    }
+
+    public long getKeyRetentionAfterSaleSeconds() {
+        return keyRetentionAfterSaleSeconds;
+    }
+
+    public void setKeyRetentionAfterSaleSeconds(long keyRetentionAfterSaleSeconds) {
+        this.keyRetentionAfterSaleSeconds = keyRetentionAfterSaleSeconds;
     }
 }

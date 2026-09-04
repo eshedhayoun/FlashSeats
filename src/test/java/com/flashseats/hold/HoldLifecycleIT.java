@@ -9,6 +9,7 @@ import com.flashseats.flashseats.support.IntegrationTest;
 import com.flashseats.flashseats.support.SaleFixture;
 import com.flashseats.hold.exception.HoldAlreadySettledException;
 import com.flashseats.hold.facade.HoldFacade;
+import com.flashseats.hold.facade.HoldReleaseReason;
 import java.time.Duration;
 import java.util.Map;
 import java.util.concurrent.CountDownLatch;
@@ -86,7 +87,7 @@ class HoldLifecycleIT extends IntegrationTest {
             for (int i = 0; i < racers; i++) {
                 pool.submit(() -> {
                     startLine.await();
-                    holds.releaseHold(holdToken, "test");
+                    holds.releaseHold(holdToken, HoldReleaseReason.USER_CANCEL);
                     completed.incrementAndGet();
                     return null;
                 });
@@ -158,8 +159,13 @@ class HoldLifecycleIT extends IntegrationTest {
     @Test
     @DisplayName("A missing inventory counter is a fault, never a sold-out sale")
     void missingCounterIsAFaultNotSoldOut() {
-        long unwarmedTier = fixture.tierWithoutInventory(eventId, "Balcony", 3_000, 50);
+        // Admitted BEFORE the un-warmed tier exists, because promotion now pauses for an event
+        // whose remaining count cannot be read at all (ADR-035) — one tier without a counter makes
+        // the event's total unknowable, and admitting on a number we cannot read is how a sale
+        // oversells. That pause is the subject of QueueLifecycleIT; what this test is about is what
+        // the buyer sees when they reach a tier whose counter is missing.
         BuyerSession buyer = admittedBuyer();
+        long unwarmedTier = fixture.tierWithoutInventory(eventId, "Balcony", 3_000, 50);
 
         var response = buyer.post(
                 "/holds",

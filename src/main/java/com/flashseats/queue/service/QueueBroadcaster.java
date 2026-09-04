@@ -1,7 +1,12 @@
 package com.flashseats.queue.service;
 
 import com.flashseats.catalog.facade.CatalogFacade;
+import com.flashseats.catalog.facade.EventWindowStatus;
+import com.flashseats.queue.facade.QueuePhase;
+import java.util.Map;
 import java.util.OptionalDouble;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Component;
@@ -17,6 +22,8 @@ import org.springframework.stereotype.Component;
  */
 @Component
 public class QueueBroadcaster {
+
+    private static final Logger log = LoggerFactory.getLogger(QueueBroadcaster.class);
 
     private final SseEmitterRegistry emitters;
     private final QueueService queue;
@@ -40,18 +47,51 @@ public class QueueBroadcaster {
         this.clock = clock;
     }
 
+    /**
+     * Sweeps this replica's own connections.
+     *
+     * <p><strong>Driven by the emitters, not by the open-event list</strong> (ADR-036). Sweeping
+     * open events meant a sale that closed on the clock fell out of the loop entirely: nothing sent
+     * another frame, nothing closed the stream, and everyone still waiting watched a frozen counter
+     * until they thought to reload. The connections are what need serving, so they are what the
+     * sweep iterates.
+     *
+     * <p>The window is resolved once per event and handed down, so adding it costs one read per
+     * event rather than one per waiting buyer.
+     */
     @Scheduled(
             fixedDelayString = "${flashseats.queue.sse-position-interval-ms}",
             initialDelayString = "${flashseats.queue.sse-position-interval-ms}")
     public void pushPositions() {
-        for (long eventId : catalog.findOpenEventIds()) {
-            sampleDepth(eventId);
+        for (long eventId : emitters.watchedEventIds()) {
+            try {
+                sweep(eventId);
+            } catch (RuntimeException failure) {
+                // One unreadable event must not stop the others from being served.
+                log.warn("Could not sweep queue streams for event {}", eventId, failure);
+            }
+        }
+    }
 
-            for (String sessionId : emitters.sessionsWatching(eventId)) {
-                var state = queue.getQueueState(sessionId, eventId);
-                if (state.position() != null) {
-                    emitters.sendPosition(sessionId, state.position(), state.estWaitSeconds());
-                }
+    private void sweep(long eventId) {
+        EventWindowStatus window = catalog.getWindowStatus(eventId);
+
+        if (window == EventWindowStatus.CLOSED) {
+            emitters.closeAll(
+                    eventId, "sale-closed", Map.of("closedAt", clock.instant().toString()));
+            return;
+        }
+
+        sampleDepth(eventId);
+
+        for (String sessionId : emitters.sessionsWatching(eventId)) {
+            var state = queue.getQueueState(sessionId, eventId, window);
+            if (state.phase() == QueuePhase.EXHAUSTED) {
+                // Derived from live stock, so it is not terminal for the connection: if seats come
+                // back the marker clears and this buyer's position is still theirs (ADR-035).
+                emitters.send(sessionId, "sale-exhausted", Map.of("soldOutAt", clock.instant().toString()));
+            } else if (state.position() != null) {
+                emitters.sendPosition(sessionId, state.position(), state.estWaitSeconds());
             }
         }
     }
@@ -72,7 +112,7 @@ public class QueueBroadcaster {
             fixedDelayString = "${flashseats.queue.sse-heartbeat-ms}",
             initialDelayString = "${flashseats.queue.sse-heartbeat-ms}")
     public void pushHeartbeats() {
-        catalog.findOpenEventIds().forEach(emitters::heartbeat);
+        emitters.watchedEventIds().forEach(emitters::heartbeat);
     }
 
     /** Exposed for tests that want the current estimate without waiting for a tick. */

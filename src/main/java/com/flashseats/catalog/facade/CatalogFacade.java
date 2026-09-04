@@ -46,7 +46,14 @@ public interface CatalogFacade {
      */
     int getRemaining(long tierId);
 
-    /** Total remaining across every tier of an event. Bounds how many buyers the queue admits. */
+    /**
+     * Total remaining across every tier of an event. Bounds how many buyers the queue admits.
+     *
+     * @return remaining seats, or {@link #COUNTER_UNAVAILABLE} when <em>any</em> tier of the event
+     *     has no counter. As with {@link #getRemaining}, that is a <strong>fault</strong> and must
+     *     never be read as a sold-out sale: doing so drained an entire waiting room in the first
+     *     pass, because a {@code SUM} over missing rows is indistinguishable from zero (ADR-035).
+     */
     int getRemainingForEvent(long eventId);
 
     /**

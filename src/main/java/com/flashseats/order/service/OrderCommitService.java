@@ -18,7 +18,10 @@ import com.flashseats.payment.exception.DuplicatePaymentException;
 import com.flashseats.payment.exception.PaymentDeclinedException;
 import com.flashseats.payment.facade.PaymentResult;
 import java.time.Clock;
+import java.time.Instant;
 import java.util.List;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.context.ApplicationEventPublisher;
 import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.stereotype.Component;
@@ -37,6 +40,8 @@ import org.springframework.transaction.annotation.Transactional;
  */
 @Component
 public class OrderCommitService {
+
+    private static final Logger log = LoggerFactory.getLogger(OrderCommitService.class);
 
     private static final String AGGREGATE_TYPE = "ORDER";
     static final String EVENT_ORDER_CONFIRMED = "ORDER_CONFIRMED";
@@ -85,11 +90,20 @@ public class OrderCommitService {
      *   <caption>Find-or-create behaviour</caption>
      *   <tr><th>Existing row</th><th>Behaviour</th></tr>
      *   <tr><td>none</td><td>insert {@code PENDING} and proceed</td></tr>
-     *   <tr><td>{@code PENDING}</td><td>{@code 409} — a charge is already in flight</td></tr>
+     *   <tr><td>{@code PENDING}, fresh</td><td>{@code 409} — a charge is already in flight</td></tr>
+     *   <tr><td>{@code PENDING}, stale</td><td>resume on the <em>same</em> order number (ADR-034)</td></tr>
      *   <tr><td>{@code FAILED}</td><td>reset to {@code PENDING} and retry on the <em>same</em> order number</td></tr>
      *   <tr><td>{@code CONFIRMED}</td><td>{@code 200} — replay the existing receipt</td></tr>
      *   <tr><td>{@code REFUNDED}</td><td>terminal</td></tr>
      * </table>
+     *
+     * <p><strong>{@code PENDING} is in-flight, never terminal</strong> (ADR-034). Treating it as
+     * terminal was a defect: a gateway error left the row {@code PENDING} for good, so every retry
+     * answered {@code 409 DUPLICATE_PAYMENT} while the buyer held live seats and had been told to
+     * try again. Two rules make it recoverable, and both are needed —
+     * {@link CheckoutService} marks the order {@code FAILED} on any thrown exit, which covers the
+     * ordinary case immediately, and the staleness check below covers the one it cannot: a process
+     * killed between the commit and the charge.
      *
      * <p>Reusing the order number across retries matters to the buyer: three declined attempts should
      * not produce three references to explain to support.
@@ -103,7 +117,7 @@ public class OrderCommitService {
         if (existing != null) {
             return switch (existing.getStatus()) {
                 case CONFIRMED -> new CheckoutOrder(existing.getOrderNumber(), existing.getPaymentAttempts(), true);
-                case PENDING -> throw new DuplicatePaymentException(holdToken);
+                case PENDING -> resumeIfStranded(existing, holdToken);
                 case REFUNDED -> throw new OrderRefundedException(existing.getOrderNumber());
                 case FAILED -> resumeFailed(existing);
             };
@@ -199,6 +213,27 @@ public class OrderCommitService {
     }
 
     /**
+     * Ends a checkout that never reached a charge outcome (ADR-034).
+     *
+     * <p>The order becomes {@code FAILED}, which is a state {@link #findOrCreate} already knows how
+     * to resume, so the buyer's next attempt continues on the same order number. <strong>No payment
+     * attempt is consumed</strong>: a gateway outage, a hold that expired underneath us, or a
+     * database blip is not one of the buyer's three tries at their card.
+     *
+     * <p>The hold is deliberately left alone. It is still {@code ACTIVE}, the buyer still owns those
+     * seats for the rest of its window, and it expires normally if they walk away.
+     */
+    @Transactional
+    public void markAbandoned(String orderNumber, String reason) {
+        orders.findByOrderNumber(orderNumber).ifPresent(order -> {
+            if (order.getStatus() == OrderStatus.PENDING) {
+                order.setStatus(OrderStatus.FAILED);
+                order.setFailureReason(reason);
+            }
+        });
+    }
+
+    /**
      * Records that a settled charge was refunded because the seats could not be delivered, and
      * queues a notice so the buyer hears it from us rather than from their bank statement (ADR-012).
      */
@@ -225,6 +260,27 @@ public class OrderCommitService {
     }
 
     // ----------------------------------------------------------------- helpers
+
+    /**
+     * Decides whether a {@code PENDING} row is a live charge or a stranded one (ADR-034).
+     *
+     * <p>{@code updatedAt} is the last moment anything touched this checkout. Within
+     * {@code stalePendingSeconds} — which tracks the payment module's in-flight guard — a charge
+     * genuinely may still be running, and a second request must not start another: that is the
+     * ordinary double-click, and {@code 409} is the right answer (global standards §3, rule 4).
+     * Beyond it, no charge can still be in flight, so the row is a crash artefact and the buyer gets
+     * their retry rather than a permanent refusal.
+     */
+    private CheckoutOrder resumeIfStranded(Order order, String holdToken) {
+        Instant strandedBefore =
+                clock.instant().minusSeconds(properties.getStalePendingSeconds());
+        if (order.getUpdatedAt().isAfter(strandedBefore)) {
+            throw new DuplicatePaymentException(holdToken);
+        }
+        log.warn(
+                "Resuming order {} stranded in PENDING since {}", order.getOrderNumber(), order.getUpdatedAt());
+        return resumeFailed(order);
+    }
 
     private CheckoutOrder resumeFailed(Order order) {
         if (order.getPaymentAttempts() >= properties.getMaxPaymentAttempts()) {

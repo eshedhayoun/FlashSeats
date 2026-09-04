@@ -13,14 +13,28 @@ public final class QueueKeys {
 
     private QueueKeys() {}
 
-    /** ZSET of everyone waiting. Score is arrival time, so rank is position. */
+    /**
+     * ZSET of everyone waiting. Score is arrival time, so rank is position.
+     *
+     * <p>Like {@link #passes} and {@link #admissions} this key is <strong>never deleted by the
+     * application</strong> — it expires (ADR-036). Deleting a live waiting room is a destructive act
+     * that cannot be undone if the condition that triggered it turns out to be wrong, and once was:
+     * a missing inventory counter looked like a sold-out sale and took the whole line with it.
+     */
     public static String waiting(long eventId) {
         return "queue:waiting:" + eventId;
     }
 
-    /** The single-use pass, held only until it is exchanged for an admission session. */
-    public static String pass(String sessionId) {
-        return "queue:pass:" + sessionId;
+    /**
+     * The single-use pass, held only until it is exchanged for an admission session.
+     *
+     * <p><strong>Scoped by event, like every other key here</strong> (ADR-036). It was not, and one
+     * visitor queueing for two concurrent sales had their promotion in one overwrite the other:
+     * the second sale reported them {@code PROMOTED} holding a pass its own {@code /admit} then
+     * refused, hiding their real position behind a token they could never spend.
+     */
+    public static String pass(long eventId, String sessionId) {
+        return "queue:pass:" + eventId + ":" + sessionId;
     }
 
     /**
@@ -62,5 +76,19 @@ public final class QueueKeys {
     /** Makes the promotion tick a singleton across replicas (ADR-032). */
     public static String promotionLock(long eventId) {
         return "queue:promote:" + eventId;
+    }
+
+    /**
+     * Marker that this event's stock is gone and nobody holds a claim on it.
+     *
+     * <p>Set by the promotion worker and <strong>deleted again the moment stock returns</strong>, so
+     * {@code EXHAUSTED} is a state derived from live inventory rather than an irreversible act
+     * (ADR-035). The earlier design expressed exhaustion by deleting the waiting set, which cannot
+     * be undone — and a released hold or a rebuilt counter routinely makes it wrong.
+     *
+     * <p>It also makes the terminal frame publish once instead of on every tick.
+     */
+    public static String exhausted(long eventId) {
+        return "queue:exhausted:" + eventId;
     }
 }
