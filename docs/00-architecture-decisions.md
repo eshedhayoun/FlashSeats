@@ -777,3 +777,217 @@ the docs specified but left un-named — `INSUFFICIENT_TIME_REMAINING` (409, `or
 too little of the hold left to finish safely (ADR-030), and `ORDER_REFUNDED` (409, `order`) for a
 charge that settled against seats that could not be delivered (ADR-012). The latter is deliberately
 distinct from `HOLD_EXPIRED`, whose promise is that *nothing was charged* — which would be false.
+
+---
+
+# Pass 1 — decisions the first review forced
+
+ADR-034 to ADR-039 all come from the same review pass over the built MVP. Each records a defect
+that shipped, and the rule that now prevents it. They are stated as rules on purpose: a rule can be
+checked against new code, where a fix cannot.
+
+---
+
+## ADR-034 — A `PENDING` order is in-flight, never terminal
+
+**Decision.** Every exit from checkout leaves the order in a state a retry can resume. Two rules,
+because one is not enough:
+
+1. Any throw past the find-or-create step marks the order `FAILED` — a state `findOrCreate` already
+   knows how to resume, on the same order number. **No payment attempt is consumed:** a gateway
+   outage is not one of the buyer's three tries at their card.
+2. A `PENDING` row untouched for longer than `flashseats.order.stale-pending-seconds` is resumable
+   regardless. That value tracks `flashseats.payment.inflight-ttl-seconds`, past which no charge can
+   still be running.
+
+**The defect.** `findOrCreate` commits the order as `PENDING` *before* charging, and answered every
+subsequent request with `409 DUPLICATE_PAYMENT`. That is correct for a double-click and wrong for
+everything else. A gateway error therefore produced:
+
+```
+POST /orders/checkout  →  503  "Your seats are still held — please retry."   retryable: true
+POST /orders/checkout  →  409  "A payment for this reservation is already
+                                being processed."                            retryable: false
+```
+
+The buyer held live seats, was told to retry, and could not — for the remaining five minutes of
+their hold, on any card. The same dead end was reachable through `InsufficientTimeRemainingException`,
+a grace extension lost to a concurrent expiry, and any transient database blip in that window.
+
+**Why two rules.** Rule 1 handles everything that throws, immediately. It cannot handle a process
+killed between the commit and the charge, because no handler runs — and that row is indistinguishable
+from a live charge except by its age, which is what rule 2 reads. Rule 2 alone would work but would
+make an instant gateway error cost the buyer a 90-second wait.
+
+**Why not read the payment module's in-flight key.** It is the more precise signal, and `order` may
+not touch a `payment:` Redis key. The property mirrors it instead; the comment on each says so.
+
+**What is preserved.** A genuine double-click inside the staleness window still gets `409`. Global
+standards §3 rule 4 — in-flight is `409`, never a wait — is unchanged; what changed is that
+"in-flight" now has an end.
+
+---
+
+## ADR-035 — "No counter" is never "zero", and `EXHAUSTED` is derived, not destructive
+
+**Decision.** Two rules over inventory reads in the waiting room:
+
+1. `CatalogFacade.getRemainingForEvent` returns `COUNTER_UNAVAILABLE` if **any** tier of the event
+   lacks a counter row. A `SUM` cannot express the difference between "nothing left" and "nothing
+   known", so the aggregate answers with the fault.
+2. Nothing deletes the waiting set. Exhaustion is a marker key that the promotion worker sets when
+   stock is gone and **clears the moment stock returns**, so `EXHAUSTED` is a state derived from
+   live inventory rather than an act performed on the queue.
+
+**The defect.** ADR-004's failure mode, reproduced one module over. `PromotionWorker` guarded on
+`remaining == COUNTER_UNAVAILABLE` — but the guard was unreachable, because `COALESCE(SUM(remaining), 0)`
+over zero rows returns `0`. An event that opened without pre-warm therefore looked sold out, and the
+worker's response to a sold-out sale was to publish `sale-exhausted` to every watcher **and delete
+the waiting ZSET**. A missing row told an entire waiting room the sale had ended and then destroyed
+their place in it. The dev seeder ships exactly such an event, one `sale_start_time` away.
+
+**Why non-destructive matters independently.** Even when the read is correct, "sold out" is not
+final: a released hold returns seats within seconds, and the sweeper reclaims abandoned ones every
+ten. Deletion cannot be undone; a marker can. The narrow race where a hold outlives its admission —
+possible because the admission TTL is 600 s and a hold may live 420 s from creation — used to drain
+a queue that was about to have seats again.
+
+**Consequence, accepted.** One tier without a counter pauses promotion for the whole event. That is
+the conservative direction: admission is bounded by total remaining, and admitting on a number that
+cannot be read is how a sale oversells. It fails loudly — `log.error` on every tick — rather than
+silently, and it is fixed by pre-warming the tier.
+
+---
+
+## ADR-036 — The window is checked before the queue, and every queue key expires
+
+**Decision.** Three rules in `queue`:
+
+1. `getQueueState` resolves `CLOSED` **first**, before any Redis lookup. The precedence is then
+   `CLOSED → ADMITTED → PROMOTED → EXHAUSTED → WAITING → NOT_JOINED`.
+2. `QueueBroadcaster` sweeps the events **its own emitters are watching**, not the open-event list,
+   and delivers a terminal frame to a connection whose sale has closed.
+3. Every key this module owns is scoped by event and carries a TTL tied to the sale window. Sets
+   scored by expiry are trimmed on read.
+
+**The defects.** Three, all in the same place.
+
+*The waiting room never ended.* `getQueueState` checked ZSET rank before the window, so a session
+still in the line reported `WAITING` after the sale closed — and because both the promotion worker
+and the broadcaster iterated only *open* events, nothing was left to tell them otherwise. Nothing
+ever published `sale-closed`; the client listened for a frame that had no producer, and
+`QueuePhase.EXHAUSTED` was never returned by anything either. Two dead branches and a frozen screen.
+
+*The pass key was not event-scoped.* `queue:pass:{sessionId}` while admission was
+`queue:admit:{eventId}:{sessionId}`. One visitor queueing for two concurrent sales had one promotion
+overwrite the other: the second sale reported them `PROMOTED` holding a token its own `/admit`
+refused on the signature check, with their real position hidden behind it.
+
+*The sets grew without bound.* `queue:passes` and `queue:admissions` are scored by expiry so the
+counts self-correct, but members were only removed on `admit` and `revokeAdmission`. An unclaimed
+pass stayed a member for the life of the key, and the keys had no life. Redis runs `noeviction`
+precisely so it never discards anything quietly, which makes an untrimmed key the one leak nothing
+else cleans up.
+
+**Why the broadcaster iterates emitters.** The connections are what need serving. Deriving the sweep
+from the open-event list meant the moment a sale stopped being open, the buyers waiting for it
+stopped being swept — the exact moment they most needed a frame.
+
+**Why `CLOSED` outranks a pass.** A pass or admission is a claim on a sale that is still running.
+When the window has closed there is nothing left to claim, and reporting anything else invites a
+client to try.
+
+---
+
+## ADR-037 — Rehydration reports the latest order, whatever its status
+
+**Decision.** `OrderFacade.findLatestOrder` returns this session's most recent order for an event
+regardless of status. The client's router decides what each status means for the screen it draws.
+
+**The defect.** The facade returned only `PENDING` orders, so a **confirmed** purchase was invisible
+to `GET /sale/{eventId}/state`. After a successful checkout the hold is consumed and the admission
+revoked, so all three sections came back null:
+
+```json
+{"queue":{"state":"NOT_JOINED"}, "hold":null, "order":null, "partial":[]}
+```
+
+A buyer who reloaded their receipt page was shown the landing page and invited to join the queue for
+seats they already owned. The client's `sale.order.status === "CONFIRMED"` branch was unreachable.
+
+**Why the facade and not the client.** `saleflow` makes no decisions (ADR-025), and "which statuses
+count" is a decision. Reporting the fact and letting the consumer route on it keeps the leaf leaf-like.
+
+**The client rule that goes with it.** The confirmed order sits **below** the queue states in
+`route()`'s precedence, so a buyer who purchases and then rejoins for a second tier sees the queue
+rather than being pinned on their old receipt. Full precedence in `FE_SPEC.md`.
+
+---
+
+## ADR-038 — A claim is released when the work did not happen
+
+**Decision.** `NotificationLogService.claim` succeeds for a row that is dead-lettered, via a
+conditional `UPDATE … WHERE status = 'DLQ'`. Both halves of the claim are now single statements whose
+rowcount is the answer: `INSERT … ON CONFLICT DO NOTHING`, then the re-claim.
+
+**The defect.** Insert-then-send is right — the unique violation is atomic where a preceding `SELECT`
+is a race — but the claim was also *permanent*. A transient SMTP outage dead-lettered the message
+**and kept its claim**, so replaying it from the DLQ found the row already present and acknowledged
+without sending. The ticket was unrecoverable without an operator deleting a row by hand. ADR-029's
+"do not retry a deterministic failure" is correct and unchanged; a transport failure is not one.
+
+**A second defect, found while fixing the first.** The original `claim` caught
+`DataIntegrityViolationException` and returned `false`. It could not: a flush that violates a
+constraint marks the transaction rollback-only, so the `REQUIRES_NEW` boundary threw
+`UnexpectedRollbackException` at commit and the consumer read that as a delivery failure. The
+duplicate-suppression path — quietly acknowledge a redelivered message — never worked, and every
+redelivery went to the DLQ. `ON CONFLICT DO NOTHING` returns a rowcount instead of throwing, which
+also brings this claim into the same shape as every other one in the system.
+
+**What is preserved.** `AND status = 'DLQ'` is what keeps it safe. A `PENDING` row — a send genuinely
+in progress — or a `SENT` one is untouched, so this can never authorise a second delivery of a
+message that worked. No buyer receives two tickets.
+
+---
+
+## ADR-039 — Tokens are domain-separated and secret-separated; defaults refuse to boot
+
+**Decision.** Four rules covering the signed-capability surface:
+
+1. `X-Forwarded-For` is honoured **only** from a peer in `flashseats.bot.trusted-proxies`, which is
+   **empty by default**.
+2. Every signed token declares a `kind`, which is length-prefixed into the signed bytes and not
+   carried in the token.
+3. The receipt secret is its own value (`FLASHSEATS_RECEIPT_SECRET`), and a receipt token carries an
+   expiry and a nonce.
+4. On any profile but `dev` and `test`, a default secret or admin password **stops startup**.
+
+**The defect behind rule 1.** `RateLimitFilter` read the header directly, with no trust check, on
+every deployment shape including one with no proxy at all. Any caller could rotate a fake address to
+mint unlimited fresh IP buckets, or poison a real one. Since discarding the cookie also mints a
+fresh session bucket, this left **no effective rate limiting whatsoever** for a cookie-less client —
+while ADR-011 was explicitly relying on the IP bucket as the backstop that makes a deliberately
+loose session bucket acceptable. Note that `server.forward-headers-strategy` does not help here: the
+filter reads the header itself, so it does its own trust check.
+
+**The defect behind rules 2 and 3.** `flashseats.order.receipt-secret` defaulted to
+`${FLASHSEATS_SESSION_SECRET}`, so every deployment that set the session secret signed receipts with
+the same key — and `SignedToken` had no domain separation, so what stopped a token of one type
+verifying as another was payload formats happening not to collide. Receipt tokens were also
+`sign(orderNumber)`: deterministic, unexpiring, and against sequential order numbers, derivable by
+counting rather than by observation.
+
+**Why length-prefixed rather than delimited.** A delimiter only works while no kind can contain it,
+an invariant that lives in a comment. With a space, `("pass", "admit x")` and `("pass admit", "x")`
+sign identical bytes — precisely the confusion domain separation exists to prevent. A length prefix
+is unambiguous for any kind and any payload.
+
+**Why startup fails rather than warns.** This failure is silent by nature: everything works
+perfectly with a default secret, so nothing about a running system reveals the problem until someone
+exploits it. A warning is a line in a log that a deploy scrolls past. `dev` and `test` are exempt
+because the defaults are the point there — the stack must run from a clean checkout, and tests need
+deterministic secrets so a token minted in one place verifies in another.
+
+**Consequence, accepted.** `docker compose --profile cluster` runs the `docker` profile and therefore
+refuses to start until real secrets are supplied. A three-replica run is closer to a deployment than
+to a laptop demo, and `.env.example` says so with the command to generate them.

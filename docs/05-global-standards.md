@@ -108,7 +108,7 @@ breaking change.
 | `ADMISSION_EXPIRED` | 410 | queue | Rejoin the queue |
 | `ADMISSION_REQUIRED` | 401 | queue | Not admitted to the sale |
 | `QUEUE_UNAVAILABLE` | 503 | queue | Retry with backoff |
-| `SALE_EXHAUSTED` | 409 | queue | Terminal — sold out |
+| `SALE_EXHAUSTED` | 409 | queue | Sold out. **Not terminal** — exhaustion is derived from live stock and clears when seats return (ADR-035) |
 | `INSUFFICIENT_STOCK` | 409 | hold | Choose another tier |
 | `HOLD_NOT_FOUND` | 404 | hold | — |
 | `HOLD_EXPIRED` | 410 | hold | Reservation gone; nothing charged |
@@ -118,12 +118,14 @@ breaking change.
 | `PAYMENT_DECLINED` | 402 | payment | Retry — see `attemptsRemaining` |
 | `PAYMENT_ATTEMPTS_EXHAUSTED` | 402 | payment | Terminal |
 | `PAYMENT_ACTION_REQUIRED` | 402 | payment | 3-D Secure — follow `resumeUrl` |
-| `PAYMENT_GATEWAY_UNAVAILABLE` | 503 | payment | Circuit open; hold retained |
-| `DUPLICATE_PAYMENT` | 409 | payment | A charge is already in flight |
+| `PAYMENT_GATEWAY_UNAVAILABLE` | 503 | payment | Circuit open; hold retained, **no payment attempt consumed**, and the retry genuinely works (ADR-034) |
+| `DUPLICATE_PAYMENT` | 409 | payment | A charge is already in flight. Do **not** re-enable the pay button; poll `/sale/{id}/state`. Bounded by `stale-pending-seconds` — it can no longer mean "forever" (ADR-034) |
 | `WEBHOOK_SIGNATURE_INVALID` | 400 | payment | Gateway only |
 | `ORDER_NOT_FOUND` | 404 | order | — |
 | `ORDER_ALREADY_CONFIRMED` | 409 | order | Return the existing receipt |
 | `CHECKOUT_WINDOW_CLOSED` | 409 | order | Past the 15-minute grace |
+| `INSUFFICIENT_TIME_REMAINING` | 409 | order | Too little of the hold left to start a charge that could finish (ADR-030). Nothing charged; the order is left resumable |
+| `ORDER_REFUNDED` | 409 | order | A settled charge was refunded because the seats could not be delivered (ADR-012). Distinct from `HOLD_EXPIRED`, whose promise that nothing was charged would be false |
 | `NOTIFICATION_LOG_NOT_FOUND` | 404 | notification | Admin only |
 
 ---
@@ -153,6 +155,21 @@ Rules:
 4. **In-flight is `409`, not a wait.** Never block a request waiting for a concurrent duplicate.
 5. **Short in-flight TTLs.** 90 s, roughly the gateway timeout — never hours. A crash must not lock
    a key for a day.
+6. **A claim is released when the work did not happen.** A claim guards an operation in progress, so
+   an operation that did not occur must give it back. The notification claim was permanent: a
+   transient SMTP outage dead-lettered the message *and* kept the claim, so replaying it from the
+   DLQ acknowledged without sending (ADR-038). Release it with the same conditional `UPDATE` shape —
+   `WHERE status = 'DLQ'` — so a send genuinely in progress, or one that succeeded, is untouched.
+7. **"In-flight" must have an end.** Every in-flight state needs a rule for when it is no longer in
+   flight, or it becomes terminal by accident. A `PENDING` order answered every retry with `409`
+   forever, stranding buyers holding live seats behind a charge they never made (ADR-034). Bound it
+   by the same TTL that bounds the in-flight guard, and resume past it.
+8. **A claim's outcome is a rowcount, not an exception.** `INSERT … ON CONFLICT DO NOTHING`, not
+   insert-and-catch. This is not style: a flush that violates a constraint marks the transaction
+   rollback-only, so the `catch` block's "already handled, carry on" cannot actually return — it
+   throws `UnexpectedRollbackException` at commit and the caller reads it as a failure. The
+   notification consumer dead-lettered every redelivered message for exactly this reason (ADR-038).
+   The constraint is still the guarantee; only how the answer arrives has changed.
 
 ---
 

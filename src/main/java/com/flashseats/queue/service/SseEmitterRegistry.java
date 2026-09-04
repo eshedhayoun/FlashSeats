@@ -63,6 +63,33 @@ public class SseEmitterRegistry {
                 .collect(Collectors.toSet());
     }
 
+    /**
+     * The events this replica is actually holding connections for.
+     *
+     * <p>Drives {@link QueueBroadcaster}, which used to sweep <em>open</em> events instead — so the
+     * moment a sale closed it stopped sweeping the very connections that most needed telling
+     * (ADR-036).
+     */
+    public Set<Long> watchedEventIds() {
+        return connections.values().stream().map(Connection::eventId).collect(Collectors.toSet());
+    }
+
+    /**
+     * Delivers a final frame to every local watcher and closes the stream.
+     *
+     * <p>Completing is what makes a terminal frame terminal: the connection leaves the registry, so
+     * the next sweep does not find it and send the same news again every two seconds.
+     */
+    public void closeAll(long eventId, String eventName, Object data) {
+        for (String sessionId : sessionsWatching(eventId)) {
+            send(sessionId, eventName, data);
+            Connection connection = connections.remove(sessionId);
+            if (connection != null) {
+                connection.emitter().complete();
+            }
+        }
+    }
+
     public boolean isLocal(String sessionId) {
         return connections.containsKey(sessionId);
     }

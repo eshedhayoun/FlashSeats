@@ -6,6 +6,7 @@ import io.github.bucket4j.BucketConfiguration;
 import io.github.bucket4j.distributed.proxy.ProxyManager;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
+import java.util.Set;
 import java.util.function.Supplier;
 import org.springframework.stereotype.Service;
 
@@ -27,11 +28,24 @@ public class RateLimitService {
     private final ProxyManager<byte[]> buckets;
     private final Supplier<BucketConfiguration> sessionConfig;
     private final Supplier<BucketConfiguration> ipConfig;
+    private final Set<String> trustedProxies;
 
     public RateLimitService(ProxyManager<byte[]> buckets, BotProperties properties) {
         this.buckets = buckets;
         this.sessionConfig = configFor(properties.getSessionBucket());
         this.ipConfig = configFor(properties.getIpBucket());
+        this.trustedProxies = Set.copyOf(properties.getTrustedProxies());
+    }
+
+    /**
+     * Whether a peer address may speak for someone else via {@code X-Forwarded-For} (ADR-039).
+     *
+     * <p>Exact addresses, not ranges: the set is the handful of load balancers in front of this
+     * app, and a CIDR parser is a place for a subtle bug to hide in the one check that decides
+     * whether the rate limiter can be bypassed. Empty by default — trust nobody until told.
+     */
+    public boolean isTrustedProxy(String peerAddress) {
+        return peerAddress != null && trustedProxies.contains(peerAddress);
     }
 
     public boolean allowSession(String sessionId) {

@@ -339,25 +339,40 @@ takes card details.
 `order` orchestrates. There is exactly one checkout endpoint (ADR-001):
 
 ```
- 1. HoldFacade.getActiveHold(holdToken, sid)      → 409 if missing/expired/not yours
+ 0. already CONFIRMED for this hold?              → return the receipt, 200
+ 1. HoldFacade.getActiveHold(holdToken, sid)      → 404/410 if missing/expired/not yours
  2. CatalogFacade.getTierSummary(eventId,tierId)  → price snapshot, SERVER-SIDE (ADR-013)
- 3. find-or-create orders row, hold_token UNIQUE, status = PENDING (ADR-002)
- 4. HoldFacade.extendHold(holdToken, 120s)        → once, ceiling 420s (ADR-006)
-       └─ FAILS ⇒ ABORT with 410 HOLD_EXPIRED. Do NOT charge.       ← see below
- 5. PaymentFacade.authorize(orderNumber, amountCents, currency, pmId, idempotencyKey)
-                                                  ← OUTSIDE any transaction (ADR-023)
- 6. @Transactional {          ← SQL ONLY. No Redis, no HTTP, no broker.
-        UPDATE ticket_holds SET status='CONSUMED'
-          WHERE hold_token=? AND status='ACTIVE'   → rowcount 0 ⇒ roll back + refund
-        orders.status = CONFIRMED
-        INSERT order_items
-        INSERT outbox_events (ORDER_CONFIRMED, PENDING)
-    }
- 7. AFTER_COMMIT (best-effort, safe to lose):
-        DEL hold:{holdToken}                       ← Redis cleanup only
+ 3. window gate                                   → OPEN, or CLOSED within 15 min (ADR-016)
+ 4. find-or-create orders row, hold_token UNIQUE, status = PENDING (ADR-002)
+ ┌─ from here every exit leaves the order RESUMABLE (ADR-034) ─────────────────┐
+ │ 5. HoldFacade.grantGrace(holdToken)             → once, ceiling 420s (ADR-030)
+ │       └─ FAILS ⇒ ABORT with 410 HOLD_EXPIRED. Do NOT charge.       ← see below
+ │ 6. PaymentFacade.authorize(...)                 ← OUTSIDE any transaction (ADR-023)
+ │       └─ declined  ⇒ order FAILED, hold KEPT, 402 + attemptsRemaining
+ │       └─ gateway   ⇒ order FAILED, hold KEPT, 503, no attempt consumed
+ │ 7. @Transactional {          ← SQL ONLY. No Redis, no HTTP, no broker.
+ │        UPDATE ticket_holds SET status='CONSUMED'
+ │          WHERE hold_token=? AND status='ACTIVE'   → rowcount 0 ⇒ roll back + refund
+ │        orders.status = CONFIRMED
+ │        INSERT order_items
+ │        INSERT outbox_events (ORDER_CONFIRMED, PENDING)
+ │    }
+ └─ any throw above ⇒ markAbandoned() ⇒ FAILED, which findOrCreate resumes ────┘
+ 8. AFTER_COMMIT (best-effort, safe to lose):
+        HoldFacade.discardTimer(holdToken)         ← Redis cleanup only
         QueueFacade.revokeAdmission(sid, eventId)
- 8. 201 Created + OrderReceiptDTO
+ 9. 201 Created + OrderReceiptDTO   (200 on an idempotent replay)
 ```
+
+**Step 0 has to be first.** A successful purchase consumes its hold, so validating the hold first
+would answer a resubmission with "your reservation expired" when the buyer already owns the seats.
+
+**Steps 5-7 are wrapped, and that wrapper is load-bearing.** The order row is committed as `PENDING`
+at step 4, before any money moves. Without the wrapper, an exit that recorded no charge outcome left
+it `PENDING` forever — and `PENDING` answered every retry with `409 DUPLICATE_PAYMENT`, so the buyer
+held live seats they could no longer buy (ADR-034). `markAbandoned` only touches a row still
+`PENDING`, so a decline (already `FAILED`) and a compensated commit failure (already `REFUNDED`) pass
+through it untouched.
 
 **Charge first, consume second.** Consuming before charging would require a
 `CONSUMED → RELEASED` transition the state machine forbids, and would briefly release inventory the
@@ -381,7 +396,10 @@ hold. This abort was missing from the first pass and is the phantom-hold race cl
 | Scenario | Handling |
 | :--- | :--- |
 | **Card declined** | Order → `FAILED`. **The hold stays `ACTIVE`.** `402 PAYMENT_DECLINED` with `retryable: true` and `attemptsRemaining`. Retry on the same hold and the same `order_number`. Max 3. |
-| **Double-click / double submit** | Layer 1: `SETNX payment:inflight:{holdToken}` (90 s). Layer 2: `UNIQUE(hold_token)` — the second request sees `PENDING` and gets `409`. Layer 3: the client `idempotencyKey` reaches Stripe as its `Idempotency-Key` (ADR-014). |
+| **Gateway unreachable** | Order → `FAILED`, **hold stays `ACTIVE`, and no attempt is consumed** — the outage is ours, not the buyer's. `503 PAYMENT_GATEWAY_UNAVAILABLE`, `retryable: true`. The retry succeeds on the same `order_number` (ADR-034). |
+| **Crash between commit and charge** | The order is stranded `PENDING` with no handler having run. Within `stale-pending-seconds` a retry gets `409` — a charge really may be in flight. Past it, the row is resumed on the same `order_number` (ADR-034). |
+| **Too little time left to finish** | `409 INSUFFICIENT_TIME_REMAINING`, **nothing charged**, order → `FAILED`. The grace extension is already spent, so this hold cannot be stretched further; the buyer releases and re-reserves. |
+| **Double-click / double submit** | Layer 1: `SETNX payment:inflight:{holdToken}` (90 s). Layer 2: `UNIQUE(hold_token)` — the second request sees a *fresh* `PENDING` and gets `409`. Layer 3: the client `idempotencyKey` reaches Stripe as its `Idempotency-Key` (ADR-014). |
 | **3-D Secure required** | `402 PAYMENT_ACTION_REQUIRED` + `resumeUrl`. Client runs `stripe.handleNextAction()`, then calls `POST /api/v1/orders/checkout/resume` with the same `holdToken`. The order stays `PENDING` throughout; the grace extension from step 4 covers the challenge. |
 | **Extension fails at step 4** | `410 HOLD_EXPIRED`, **nothing charged**. |
 | **Timer expires before submit** | `410 HOLD_EXPIRED`. UI offers re-entry — and the admission session may still be live, so the buyer often does not have to re-queue at all. |
@@ -390,7 +408,8 @@ hold. This abort was missing from the first pass and is the phantom-hold race cl
 | **Charge succeeds, commit fails** | Compensating refund, order → `REFUNDED`, `REFUND_NOTICE` queued. |
 | **User cancels** | `DELETE /api/v1/holds/{holdToken}` → claim → stock restored. **Admission session survives**, so they can pick another tier (ADR-020). |
 | **User abandons silently** | TTL expires → §4.2. No action needed from anyone. |
-| **Tab reloaded anywhere** | `GET /api/v1/sale/{eventId}/state` rehydrates queue position, admission, hold and pending order in one call (ADR-025). |
+| **Tab reloaded anywhere** | `GET /api/v1/sale/{eventId}/state` rehydrates queue position, admission, hold and the buyer's **latest** order — whatever its status — in one call (ADR-025, ADR-037). Returning only *pending* orders made a completed purchase vanish on reload and sent the buyer back to the landing page. |
+| **Reloaded after buying** | The confirmed order is in `/sale/state`, and the client renders the receipt. It sits *below* the queue states in the router's precedence, so a buyer who re-queues for a second tier sees the queue rather than their old receipt (ADR-037). |
 
 Note what is *absent*: `payment` never calls `HoldFacade`. Grace extension is requested by `order`;
 a decline deliberately retains the hold; abandonment is handled by the TTL. Removing that edge is
@@ -529,10 +548,22 @@ leak inventory permanently when a commit failed.
 ```
   (none) ──► PENDING ──► CONFIRMED   ← terminal, success
                │  ▲
-               │  └── retry after decline (same order_number)
+               │  └── retry after decline, outage or abandonment (same order_number)
                ├──► FAILED           ← retryable, hold retained
                └──► REFUNDED         ← terminal; charge settled but seats unobtainable
 ```
+
+**`PENDING` is in-flight, never terminal** (ADR-034). It is committed before the charge, so any exit
+that reached no charge outcome has to leave the row resumable. Two rules do that, and both are
+needed:
+
+| Exit | Rule |
+| :--- | :--- |
+| Anything that **throws** — gateway outage, grace lost to a concurrent expiry, too little time, a database blip | `markAbandoned` → `FAILED`, which `findOrCreate` resumes on the same order number. No payment attempt consumed. |
+| A **process killed** between the commit and the charge | No handler ran, so only age can tell. A `PENDING` row older than `stale-pending-seconds` is resumed; a fresher one is a live charge and still gets `409`. |
+
+Treating `PENDING` as terminal is what stranded buyers holding live seats behind a `409` that told
+them a charge they never made was still running.
 
 ### Payment
 
@@ -592,12 +623,46 @@ Shipped in [`docker/redis/redis.conf`](../docker/redis/redis.conf).
 
 | Down | Effect | Behaviour |
 | :--- | :--- | :--- |
-| PostgreSQL | browse and queue survive on Redis | checkout `503`; no data loss (holds are in Redis) |
-| Redis | fatal for sale operations | `503` + rebuild per §4.1; browse degrades to PostgreSQL |
+| PostgreSQL | fatal for everything but the landing page | checkout, holds and promotion all `503`. In the MVP the holds ledger *is* PostgreSQL (ADR-019), so nothing survives its loss |
+| Redis | fatal for sale operations, **including checkout** | `503` + rebuild per §4.1. Checkout opens with `SETNX payment:inflight:{holdToken}` and `POST /holds` verifies admission against Redis, so neither degrades — they fail closed, which for a payment is the right direction |
 | Stripe | Resilience4j circuit opens | `503` + retry guidance; **holds retained**, not destroyed |
 | RabbitMQ | fulfilment stalls | orders still commit; outbox drains on recovery |
-| SMTP | delivery stalls | 3 retries → DLQ → admin replay |
+| SMTP | delivery stalls | Straight to the DLQ, no retry chain (ADR-029). The claim is **released** on the way, so a replay actually sends — it used to find the claim taken and acknowledge silently (ADR-038) |
 | reCAPTCHA | verification unavailable | **fail open**, rely on rate limits — a deliberate availability-over-security trade (ADR-011) |
+
+---
+
+### 4.4 Queue lifecycle at sale close and exhaustion
+
+Two terminal conditions, and they behave differently on purpose.
+
+**A closed window is terminal and irreversible.** `getQueueState` resolves `CLOSED` *before* any
+Redis lookup, so a session still ranked in the waiting ZSET reports `CLOSED` rather than a position
+(ADR-036). `QueueBroadcaster` sweeps the events its own emitters are watching — not the open-event
+list — sends `sale-closed`, and completes the stream. Checking rank first, and sweeping open events,
+was what left a closed sale's waiting room reporting `WAITING` forever with nothing left running to
+say otherwise.
+
+**Exhaustion is derived and reversible.** The promotion worker sets `queue:exhausted:{eventId}` when
+stock is zero with no live pass or admission, publishes `sale-exhausted` once, and **deletes the
+marker on the next tick with stock**. Nothing deletes the waiting set.
+
+| Condition | Reported phase | Waiting set | Reverses? |
+| :--- | :--- | :--- | :--- |
+| Window closed | `CLOSED` | expires with the sale | no |
+| Stock zero, no claims held | `EXHAUSTED` | untouched, positions intact | **yes** — a released hold or a rebuilt counter clears it |
+| Counter unreadable | promotion **pauses**; phase unchanged | untouched | yes, on pre-warm or rebuild |
+
+The third row is the one that mattered most. `SUM(remaining)` over an event with no counter rows
+returns `0`, indistinguishable from sold out — so an un-warmed sale announced itself exhausted and
+deleted its own queue (ADR-035). A missing counter is a fault in the queue exactly as it is in
+`hold`: pause and alarm, never "sold out".
+
+**Every key expires.** `queue:waiting`, `queue:passes`, `queue:admissions` and the exhausted marker
+all carry a TTL of `sale_end_time + flashseats.queue.key-retention-after-sale-seconds`, and the two
+expiry-scored sets are trimmed with `ZREMRANGEBYSCORE` on each tick. Redis runs `noeviction`
+precisely so it never discards anything quietly, which makes an untrimmed key the one leak nothing
+else cleans up.
 
 ---
 

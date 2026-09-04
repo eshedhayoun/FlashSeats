@@ -35,6 +35,9 @@ import org.springframework.web.filter.OncePerRequestFilter;
 @Order(Ordered.HIGHEST_PRECEDENCE + 20)
 public class SessionIdentityFilter extends OncePerRequestFilter {
 
+    /** Domain-separates the cookie's signature from every other signed token (ADR-039). */
+    private static final String KIND = "fsid";
+
     private final BotProperties properties;
 
     public SessionIdentityFilter(BotProperties properties) {
@@ -59,7 +62,8 @@ public class SessionIdentityFilter extends OncePerRequestFilter {
         return Arrays.stream(cookies)
                 .filter(c -> properties.getCookie().getName().equals(c.getName()))
                 .map(Cookie::getValue)
-                .flatMap(value -> SignedToken.verify(value, properties.getSessionSecret()).stream())
+                .flatMap(value ->
+                        SignedToken.verify(KIND, value, properties.getSessionSecret()).stream())
                 .findFirst();
     }
 
@@ -68,7 +72,9 @@ public class SessionIdentityFilter extends OncePerRequestFilter {
         BotProperties.Cookie config = properties.getCookie();
 
         ResponseCookie cookie = ResponseCookie
-                .from(config.getName(), SignedToken.sign(sessionId, properties.getSessionSecret()))
+                .from(
+                        config.getName(),
+                        SignedToken.sign(KIND, sessionId, properties.getSessionSecret()))
                 .httpOnly(true)
                 .secure(config.isSecure())
                 .sameSite(config.getSameSite())

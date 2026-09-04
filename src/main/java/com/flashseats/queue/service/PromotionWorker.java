@@ -80,17 +80,37 @@ public class PromotionWorker {
         Instant now = clock.instant();
         double nowMillis = now.toEpochMilli();
 
-        long pendingPasses = count(QueueKeys.passes(eventId), nowMillis);
-        long liveAdmissions = count(QueueKeys.admissions(eventId), nowMillis);
         int remaining = catalog.getRemainingForEvent(eventId);
-
         if (remaining == CatalogFacade.COUNTER_UNAVAILABLE) {
-            // Pause rather than guess. Admitting on a number we cannot read is how a sale oversells.
+            // Pause rather than guess. Admitting on a number we cannot read is how a sale oversells
+            // — and, before ADR-035, declaring one exhausted on a number we could not read is how a
+            // whole waiting room was told a sale had ended because a counter row was missing.
             log.warn("Inventory unreadable for event {}; promotion paused", eventId);
             return;
         }
 
-        if (remaining <= 0 && pendingPasses == 0 && liveAdmissions == 0) {
+        // Both sets are scored by expiry, so this drops exactly the members that have lapsed. They
+        // are already excluded from the counts below; trimming keeps the keys from growing for the
+        // length of the sale under a noeviction policy (ADR-036).
+        trimExpired(QueueKeys.passes(eventId), nowMillis);
+        trimExpired(QueueKeys.admissions(eventId), nowMillis);
+
+        // ...and trimming alone is not enough: an emptied set still exists, and a key with no TTL
+        // outlives the sale forever. Refreshed here, once per tick, which also covers a key created
+        // by /queue/admit between ticks.
+        Instant saleEndTime = catalog.getEventSummary(eventId).saleEndTime();
+        expireWithSale(QueueKeys.passes(eventId), now, saleEndTime);
+        expireWithSale(QueueKeys.admissions(eventId), now, saleEndTime);
+        expireWithSale(QueueKeys.waiting(eventId), now, saleEndTime);
+
+        long pendingPasses = count(QueueKeys.passes(eventId), nowMillis);
+        long liveAdmissions = count(QueueKeys.admissions(eventId), nowMillis);
+
+        if (remaining > 0) {
+            // Exhaustion is derived, so it un-derives: a released hold or a rebuilt counter puts
+            // seats back and the waiting room resumes exactly where it was (ADR-035).
+            redis.delete(QueueKeys.exhausted(eventId));
+        } else if (pendingPasses == 0 && liveAdmissions == 0) {
             exhaust(eventId, now);
             return;
         }
@@ -128,7 +148,7 @@ public class PromotionWorker {
 
         redis.opsForValue()
                 .set(
-                        QueueKeys.pass(sessionId),
+                        QueueKeys.pass(eventId, sessionId),
                         passToken,
                         Duration.ofSeconds(properties.getPassTtlSeconds()));
         redis.opsForZSet()
@@ -145,17 +165,43 @@ public class PromotionWorker {
                                 "expiresInSeconds", properties.getPassTtlSeconds())));
     }
 
-    /** Stock is gone and nobody holds a claim on it. Tell everyone and drain the line. */
+    /**
+     * Stock is gone and nobody holds a claim on it. Say so — once — and change nothing else.
+     *
+     * <p><strong>The waiting set is deliberately left intact</strong> (ADR-035). Deleting it was the
+     * original behaviour and it is unrecoverable: the condition that triggers this is a live
+     * inventory read, a released hold puts seats straight back, and a missing counter used to look
+     * exactly like a sold-out sale. Everyone in the line was deleted on the strength of a number
+     * that could be wrong a second later.
+     *
+     * <p>Setting the marker instead makes the state <em>derived</em>: {@code getQueueState} reports
+     * {@code EXHAUSTED} while it exists, the next tick with stock removes it, and every buyer's
+     * position is exactly where they left it. {@code SETNX} is also what makes the frame publish
+     * once rather than every second for the rest of the sale.
+     */
     private void exhaust(long eventId, Instant now) {
-        Long waiting = redis.opsForZSet().zCard(QueueKeys.waiting(eventId));
-        if (waiting == null || waiting == 0) {
+        Boolean firstToSee = redis.opsForValue()
+                .setIfAbsent(
+                        QueueKeys.exhausted(eventId),
+                        now.toString(),
+                        Duration.ofSeconds(properties.getKeyRetentionAfterSaleSeconds()));
+        if (!Boolean.TRUE.equals(firstToSee)) {
             return;
         }
-        log.info("Event {} is exhausted; draining {} waiting session(s)", eventId, waiting);
+        log.info("Event {} is exhausted; notifying the waiting room", eventId);
         publish(
                 eventId,
                 QueueChannelMessage.toAll("sale-exhausted", Map.of("soldOutAt", now.toString())));
-        redis.delete(QueueKeys.waiting(eventId));
+    }
+
+    /** Drops members whose score — their expiry — is already in the past. */
+    private void trimExpired(String zsetKey, double nowMillis) {
+        redis.opsForZSet().removeRangeByScore(zsetKey, Double.NEGATIVE_INFINITY, nowMillis);
+    }
+
+    private void expireWithSale(String key, Instant now, Instant saleEndTime) {
+        QueueKeyLifetimes.expireWithSale(
+                redis, key, now, saleEndTime, properties.getKeyRetentionAfterSaleSeconds());
     }
 
     /**

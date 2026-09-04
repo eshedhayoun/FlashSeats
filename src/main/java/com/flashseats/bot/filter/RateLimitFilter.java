@@ -70,16 +70,31 @@ public class RateLimitFilter extends OncePerRequestFilter {
     }
 
     /**
-     * Behind a proxy the real address arrives in {@code X-Forwarded-For}; the first entry is the
-     * client. Without this every request would appear to come from the load balancer, and the IP
-     * bucket would throttle the entire sale at once.
+     * The client's address, from the socket unless a <em>trusted</em> proxy says otherwise.
+     *
+     * <p>Behind a load balancer the real address arrives in {@code X-Forwarded-For} and the first
+     * entry is the client; without honouring it every request would appear to come from the balancer
+     * and the IP bucket would throttle the entire sale at once.
+     *
+     * <p><strong>But the header is client-supplied</strong> (ADR-039). Trusting it unconditionally —
+     * which this filter did — let anyone rotate a fake address and mint an unlimited number of fresh
+     * IP buckets, or poison someone else's. Since a caller who simply discards their cookie also
+     * gets a fresh session bucket, that left no effective rate limit at all, while ADR-011 was
+     * relying on the IP bucket as its backstop.
+     *
+     * <p>The list is <strong>empty by default</strong>, so an app with nothing in front of it uses
+     * the socket address and the header is ignored. Populate it wherever a proxy terminates.
      */
     private String clientIpOf(HttpServletRequest request) {
+        String peer = request.getRemoteAddr();
+        if (!rateLimits.isTrustedProxy(peer)) {
+            return peer;
+        }
         String forwarded = request.getHeader("X-Forwarded-For");
         if (forwarded != null && !forwarded.isBlank()) {
             return forwarded.split(",")[0].trim();
         }
-        return request.getRemoteAddr();
+        return peer;
     }
 
     /** Written directly: a filter runs before the exception handlers can see it. */

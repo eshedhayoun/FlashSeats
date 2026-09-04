@@ -6,7 +6,8 @@
 > A **Review passes** log at the bottom records every pass over this MVP. Append to it; do not
 > rewrite history.
 
-**Status:** built and running. 25 tests green, including the concurrency and journey suites.
+**Status:** built and running, one review pass deep. 39 tests green, including the concurrency,
+journey, checkout-recovery and queue-lifecycle suites.
 
 ---
 
@@ -195,7 +196,7 @@ Findings that cost real time and would cost it again.
 ## 8. Verification
 
 ```bash
-./mvnw test        # 25 tests: unit, modularity, concurrency, journey
+./mvnw test        # 39 tests: unit, modularity, concurrency, journey, recovery, queue lifecycle
 ```
 
 | Test | What it proves |
@@ -203,8 +204,11 @@ Findings that cost real time and would cost it again.
 | `StockReserveConcurrencyIT` | 50 threads for the last seat → exactly one wins. 100 threads for 30 seats → exactly 30. Four-seat requests against ten remaining → two win, and no partial reservation. |
 | `HoldLifecycleIT` | Double consume → `409`. Ten concurrent releases restore **once**. The sweeper reclaims an abandoned hold and does not keep restoring it. One hold per session. A missing counter is `503`, never "sold out". |
 | `UserJourneyIT` | The full journey over real HTTP with a real cookie; a spent pass is rejected; a decline retains the hold and the retry succeeds on the same order number; a double submit yields one order and one charge; `/sale/state` tracks the stage. |
+| `CheckoutRecoveryIT` | A gateway outage keeps the seats **and** the ability to pay for them; it costs none of the three card attempts; a charge genuinely in flight is still refused; an order stranded by a crash resumes once no charge can still be running. |
+| `QueueLifecycleIT` | An un-warmed event pauses promotion rather than selling out; a closed sale ends the wait instead of freezing it; a pass for one sale is never offered to another; exhaustion reverses when seats return. |
+| `NotificationClaimIT` | The claim blocks a duplicate, is terminal once sent, and releases a dead letter for replay. |
 | `ModularityTests` | The boundary graph is acyclic and unbroken. |
-| `SignedTokenTest`, `AvailabilityBucketsTest` | The signing primitive and the availability rule. |
+| `SignedTokenTest`, `AvailabilityBucketsTest` | The signing primitive — including domain separation — and the availability rule. |
 
 **Verified by hand against the live stack:** the nine-step journey end to end, a declined card
 leaving the hold `ACTIVE`, a replay returning `200` with the same order number, a 1,058-byte PDF
@@ -228,6 +232,21 @@ Honest list. None of these is hidden behind a passing test.
 - **`ORDER_REFUNDED` is written but never consumed** — the refund-notice template is deferred.
 - **`stock.drift` is asserted in tests, not exported as a metric.** With a PostgreSQL counter it
   cannot diverge from itself; it becomes a live metric when Redis holds the count.
+- **The outbox relay publishes without confirms.** `rabbit.send()` is fire-and-forget and
+  `spring.rabbitmq.publisher-confirm-type` is unset, so the relay marks a row `PROCESSED` on a
+  successful TCP write. A broker that accepts the frame and dies before persisting loses the message
+  with the outbox row already burned — the one failure the outbox exists to prevent. Deliberately
+  deferred to Stage 3 with the rest of the broker work; the fix is `publisher-confirm-type=correlated`
+  and marking processed only on the ack.
+- **`QueueBroadcaster` does 3–4 sequential Redis round trips per connection per 2 s tick.** At ten
+  thousand connections one sweep cannot finish inside its own interval. Pass 1 removed one read per
+  session (the window is now resolved once per event) but the shape is unchanged. Needs the k6
+  harness to validate a fix, so it moves with Stage 3.
+- **`notification.order-refunded.queue` has no consumer**, so it grows without bound on a durable
+  broker. The refund-notice template is Stage 4.
+- **Checkout does not survive a Redis outage.** It opens with `SETNX payment:inflight:{holdToken}`,
+  and `POST /holds` verifies admission against Redis. Both fail closed, which for a payment is the
+  right direction — but §12's "does checkout keep working?" now has a written answer: no.
 
 ---
 
@@ -236,22 +255,29 @@ Honest list. None of these is hidden behind a passing test.
 **This MVP is not production-ready, and the gaps are deliberate rather than overlooked.** Everything
 below is a real exposure someone should close before real money moves through it.
 
+### Closed in Pass 1
+
+| # | Was | Now |
+| :-- | :--- | :--- |
+| S1 | **Default secrets** — one leaked string forged an `fsid`, a queue pass, an admission **and** a receipt token, and `receipt-secret` defaulted to the *session* secret's env var so the two were the same value | Three separate secrets (`FLASHSEATS_SESSION_SECRET`, `FLASHSEATS_QUEUE_PASS_SECRET`, `FLASHSEATS_RECEIPT_SECRET`), every token domain-separated by a length-prefixed `kind`, and `SecretsGuard` **refuses to start** on any profile but `dev`/`test` while a default is in place (ADR-039) |
+| S2 | **Default admin credentials** `admin`/`admin` | Same guard covers the admin password. Still an in-memory user — a real identity provider remains the right answer, and is still deferred |
+| S3 | **`Secure` cookie defaults to false** | Now `${FLASHSEATS_COOKIE_SECURE:false}`, so it is set per environment rather than edited in a properties file. The default stays `false` because a `Secure` cookie is silently dropped over `http://localhost` and would break every local session |
+| S4 | **Receipt tokens never expire** and were `sign(orderNumber)` — deterministic, so derivable by counting against sequential order numbers | Payload is `orderNumber:expiry:nonce`, mirroring `QueueTokens`. Default lifetime 90 days (`flashseats.order.receipt-token-ttl-days`) |
+| S11 | **`X-Forwarded-For` trusted from any client** — anyone could rotate a fake address for unlimited fresh IP buckets, or poison a real one. With the session bucket already free to mint, this left *no* effective rate limit for a cookie-less caller | Honoured only from a peer in `flashseats.bot.trusted-proxies`, **empty by default** (ADR-039) |
+
 ### Must fix before any deployment
 
 | # | Exposure | Detail and fix |
 | :-- | :--- | :--- |
-| S1 | **Default secrets** | `flashseats.bot.session-secret`, `queue.pass-secret` and `order.receipt-secret` all fall back to `dev-only-change-me`. Anyone who knows that string can forge an `fsid`, a queue pass, an admission session **and** a receipt token — that is total impersonation of any buyer. Generate per-environment secrets and fail startup if the default is still in place. |
-| S2 | **Default admin credentials** | `admin` / `admin`, in `application.properties`, guarding pre-warm. Move to a secret, and prefer a real identity provider over an in-memory user. |
-| S3 | **`Secure` cookie flag defaults to false** | Correct for `http://localhost` and wrong everywhere else: over plain HTTP the session cookie travels in clear and is trivially stolen. Set `flashseats.bot.cookie.secure=true` wherever TLS terminates, and serve only over TLS. |
-| S4 | **Receipt tokens never expire** | A signed capability with unlimited lifetime, sent by email and appearing in a URL — so it leaks through forwarded mail, browser history, and `Referer`. Add an expiry claim and re-issue on demand. |
+| S12 | **Admin auth is an in-memory user** | HTTP Basic against one hardcoded account guards pre-warm and the metrics endpoints. The password is no longer a published default, but this is not an identity system. Replace the `UserDetailsService` bean before anyone else needs access. |
 
 ### Structural weaknesses to weigh
 
 | # | Weakness | Assessment |
 | :-- | :--- | :--- |
-| S5 | **Session identity is free to mint** | The rate limiter's primary bucket is per-`fsid`, and anyone can discard a cookie to get a fresh one. The IP bucket is therefore the only real backstop — and it is deliberately loose (300 burst) so NAT populations are not blocked. This is the ADR-011 trade working as designed, but it means **the session bucket does not constrain a determined attacker at all.** reCAPTCHA on join is the missing compensating control, and it is deferred. |
+| S5 | **Session identity is free to mint** | The rate limiter's primary bucket is per-`fsid`, and anyone can discard a cookie to get a fresh one. The IP bucket is therefore the only real backstop — and it is deliberately loose (300 burst) so NAT populations are not blocked. This is the ADR-011 trade working as designed, but it means **the session bucket does not constrain a determined attacker at all.** Pass 1 made the IP bucket real (S11); it is now genuinely the backstop ADR-011 assumed it was. reCAPTCHA on join is still the missing compensating control, and it is still deferred. |
 | S6 | **CSRF is disabled while a cookie authorises actions** | Justified for a stateless JSON API, and the checkout path is safe because it needs a `holdToken` an attacker cannot guess. But a cross-site `POST /queue/join` or `POST /holds` *would* succeed against a logged-in visitor and could be used to consume their one-hold-per-event allowance. Low impact, non-zero. Require a custom header, or re-enable CSRF for the mutating endpoints. |
-| S7 | **Order numbers are sequential** | `TK-00001`, `TK-00002`. Access is properly controlled, so this is not an IDOR — but it publishes exact sales volume to anyone who buys one ticket. Prefer a non-sequential public reference. |
+| S7 | **Order numbers are sequential** | `TK-00001`, `TK-00002`. Access is properly controlled, so this is not an IDOR — but it publishes exact sales volume to anyone who buys one ticket. It was worse in combination with S4: a deterministic receipt token over a countable order number meant one leaked secret enumerated every buyer's email. The nonce closes that; the volume leak remains. Prefer a non-sequential public reference. |
 | S8 | **SSE connections are uncapped per session** | The stream is exempt from per-request rate accounting (correctly — it is one connection, not a request stream), and nothing limits how many a single session opens. A few thousand connections would exhaust the container. Cap concurrent streams per session and per IP. |
 | S9 | **PII is stored and logged in clear** | `orders.user_email` and `notification_logs.recipient_email` are plaintext, with no retention policy and no deletion path. Whatever regime applies, decide it explicitly. |
 | S10 | **The stub gateway accepts anything** | Obvious, but worth stating: it must never reach an environment where a `201` implies money moved. |
@@ -327,6 +353,10 @@ every hold exactly once.
 - Notification failure classification (ADR-029): deterministic render failures skip the retry chain.
 - `tier-availability` frames in the waiting room (ADR-027); `RANDOM` queue ordering (ADR-024).
 - The React SPA against `FE_SPEC.md`, if the demo client is outgrown.
+- **The Playwright suite specified in `FE_SPEC.md` §8.** Every one of the four client rules is a
+  browser behaviour — a skewed clock, a real reload, a live `EventSource` — so none of them is
+  reachable from the API suite, and the twelve reload points are checked by hand today. Two of the
+  defects this pass fixed were reload-path defects. The spec is written; the implementation is not.
 
 ---
 
@@ -356,7 +386,8 @@ Ordered by expected value. The first three are where this build is most likely t
 8. **Backpressure.** Where does the system queue when it is overloaded — Hikari, the SSE registry, the
    broker? Under virtual threads nothing errors, so this has to be measured rather than observed.
 9. **The demo client against `FE_SPEC.md`.** It implements the four rules and the recovery matrix
-   informally. Walk the twelve reload points by hand.
+   informally. Walk the twelve reload points by hand — or build the Playwright suite specified in
+   `FE_SPEC.md` §8, which exists to stop that being a manual job.
 
 ---
 
@@ -376,3 +407,63 @@ Append one section per pass. Record what was examined, what was found, and what 
   locking the whole sale behind a generated password; missing `claimed_at` on `outbox_events`;
   `/actuator/metrics` and `/actuator/prometheus` exposed without authentication.
 - **Result:** 25 tests green; the journey verified by hand end to end.
+
+### Pass 1 — first review of the built MVP
+
+- **Scope:** an end-to-end review of all nine modules, the demo client, the infrastructure config and
+  the test suite, from the user's perspective and the attacker's. Three findings were reproduced by
+  running them before anything was changed.
+- **Method:** five independent passes over one shared reading of the codebase — checkout state
+  machine, queue and SSE lifecycle, async fulfilment, security, and a walk of the nine-step journey.
+
+**Verified defects, each now closed by a stated rule.**
+
+| Found | Rule |
+| :--- | :--- |
+| A gateway error left the order `PENDING` forever, and `PENDING` answered every retry with `409 DUPLICATE_PAYMENT` — so a buyer holding live seats was told to retry and could not, on any card | **ADR-034** — a `PENDING` order is in-flight, never terminal |
+| `COALESCE(SUM(remaining), 0)` made an un-warmed event look sold out; the promotion worker's `COUNTER_UNAVAILABLE` guard was therefore unreachable, and its response to "sold out" was to broadcast `sale-exhausted` **and delete the waiting ZSET** | **ADR-035** — "no counter" is never "zero", and `EXHAUSTED` is derived, not destructive |
+| Rehydration returned only `PENDING` orders, so reloading after a purchase showed the landing page and invited the buyer to queue for seats they already owned | **ADR-037** — `/sale/state` reports the latest order whatever its status |
+
+**Also found and fixed.**
+
+| Found | Rule |
+| :--- | :--- |
+| A sale closing on the clock froze its waiting room: rank was checked before the window, and both the promoter and the broadcaster iterated only *open* events. `sale-closed` had no producer and `QueuePhase.EXHAUSTED` was never returned | **ADR-036** |
+| `queue:pass:{sessionId}` was not event-scoped, so one visitor in two concurrent sales had one promotion overwrite the other | **ADR-036** |
+| `queue:passes` and `queue:admissions` were never trimmed and had no TTL, under `noeviction` | **ADR-036** |
+| A dead-lettered email permanently consumed its own claim, so a DLQ replay acknowledged without sending | **ADR-038** |
+| `X-Forwarded-For` was trusted from any client, leaving no effective rate limit for a cookie-less caller | **ADR-039** |
+| The receipt secret defaulted to the *session* secret's env var; no token was domain-separated; receipt tokens were deterministic and unexpiring | **ADR-039** |
+| `ticket_holds.quantity CHECK (… <= 6)` hardcoded one input of a configurable limit, and `HoldService` reported *every* constraint violation on the table as `HOLD_LIMIT_EXCEEDED` | `V6__pass1_corrections.sql`; the catch now matches the index name |
+| `flashseats.queue.ordering=FIFO` had no backing field and was silently ignored | Removed, with a note that it returns with ADR-024 |
+| `HoldFacade.releaseHold` accepted a reason and discarded it, recording every release as `USER_CANCEL` | `HoldReleaseReason` enum, `SettleReason.ORDER_ABORT` |
+
+**Found while fixing, not in the original review.**
+
+- **`NotificationLogService.claim` could not return `false`.** A flush that violates a constraint
+  marks the transaction rollback-only, so the catch block's "already handled" threw
+  `UnexpectedRollbackException` at commit and the consumer read it as a delivery failure — meaning
+  **every redelivered message went to the DLQ** instead of being quietly acknowledged. Now
+  `INSERT … ON CONFLICT DO NOTHING`, a rowcount like every other claim in the system (ADR-038,
+  global standards §3 rule 8).
+- **The first cut of domain separation was ambiguous.** A space delimiter makes
+  `("pass", "admit x")` and `("pass admit", "x")` sign identical bytes. Caught by the test written
+  for it; the kind is now length-prefixed.
+- **`ModularityTests` rejected the first `SecretsGuard`**, which read three modules' `config`
+  classes. It reads the `Environment` instead — which is also closer to what it means.
+
+**Verified correct, so the next pass need not re-derive it.**
+
+- Zero `Instant.now()`, `System.currentTimeMillis()` or `LocalDate.now()` in `src/main/java` (§12.6).
+- No `synchronized` anywhere in main; the virtual-thread pinning rule holds (§12.4).
+- Every `@Transactional` contains SQL only, and the three bean splits are real proxies (§12.4).
+- `AFTER_COMMIT` is safe to lose: skipping `OrderPostCommitTasks` entirely leaves the system
+  correct (§12.5).
+- Eleven registry codes are unreachable, all of them forward contract for deferred stages (§12.7).
+
+**Deferred, with reasons, to Stage 3:** RabbitMQ publisher confirms and the `QueueBroadcaster`
+fan-out cost. Both are load-path concerns and neither can be validated until the k6 harness runs.
+Recorded in §9 rather than left implied.
+
+- **Result:** 39 tests green, up from 25. The three verified defects each have a test that fails
+  against the old behaviour.

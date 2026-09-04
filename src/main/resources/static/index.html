@@ -214,6 +214,9 @@ const state = {
   paymentInFlight: false,
   displayedPosition: Infinity,
   startDepth: null,
+  /* Breaks the route() -> admit() -> route() loop when a pass exists but is not
+     acceptable — a rotated secret, or one minted for a different event. */
+  admitFailed: false,
 };
 
 const store = {
@@ -283,22 +286,38 @@ async function bootstrap() {
   await route();
 }
 
-/* The §1 view table: the server says where we are, and we render that. */
+/* The §1 view table: the server says where we are, and we render that.
+
+   PRECEDENCE, most-live-first. The order is the rule, and each step earns its
+   place:
+
+     1. hold          — outranks even a closed window. The checkout grace
+                        (ADR-016) exists precisely so a buyer at the payment
+                        form when the sale ends can still finish.
+     2. admitted      — inside the sale, browsing tiers.
+     3. promoted      — holding an unspent pass; exchange it immediately.
+     4. waiting       — in line.
+     5. confirmed     — nothing live, but they already bought. Deliberately
+                        BELOW the queue states: a buyer who purchased and then
+                        rejoined for a second tier must see the queue, not be
+                        pinned on their old receipt.
+     6. exhausted     — stock is gone.
+     7. closed        — the window ended.
+     8. landing.                                                              */
 async function route() {
   const sale = await api(`/sale/${state.eventId}/state`);
   state.clockOffsetMs = Date.parse(sale.serverTime) - Date.now();
 
-  if (sale.hold) store.hold = sale.hold.holdToken; else store.hold = null;
-
-  if (sale.order && sale.order.status === "CONFIRMED") return showReceipt(sale.order.orderNumber);
-  if (sale.windowStatus === "CLOSED") return terminal("Sales have ended", "This sale is over.");
-  if (sale.hold) return showCheckout(sale.hold);
-
+  store.hold = sale.hold ? sale.hold.holdToken : null;
   const phase = sale.queue?.state ?? "NOT_JOINED";
-  if (phase === "EXHAUSTED") return terminal("Sold out", "Every ticket for this event has been sold.");
-  if (phase === "PROMOTED" && sale.queue.passToken) return admit(sale.queue.passToken);
+
+  if (sale.hold) return showCheckout(sale.hold);
   if (phase === "ADMITTED") return showSelect(sale.queue.admissionExpiresAt);
+  if (phase === "PROMOTED" && sale.queue.passToken) return admit(sale.queue.passToken);
   if (phase === "WAITING") return showQueue(sale.queue);
+  if (sale.order && sale.order.status === "CONFIRMED") return showReceipt(sale.order.orderNumber);
+  if (phase === "EXHAUSTED") return terminal("Sold out", "Every ticket for this event has been sold.");
+  if (sale.windowStatus === "CLOSED") return terminal("Sales have ended", "This sale is over.");
   return showLanding();
 }
 
@@ -415,12 +434,19 @@ async function admit(passToken) {
       method: "POST",
       headers: { "X-Queue-Pass-Token": passToken },
     });
+    state.admitFailed = false;
     store.admission = res.admissionToken;
     closeStream();
     notify("You're in. Take your time choosing.", true);
     showSelect(res.expiresAt);
   } catch (e) {
     notify(e.problem.detail || "That entry pass was not accepted.");
+    // Do NOT re-route on a second consecutive failure. `route()` sends PROMOTED
+    // straight back here, so a pass that is present but unacceptable — a rotated
+    // secret, or one minted for another event — would loop between the two
+    // forever. Fall back to the landing page and let them rejoin.
+    if (state.admitFailed) { state.admitFailed = false; return showLanding(); }
+    state.admitFailed = true;
     route();
   }
 }
@@ -472,9 +498,18 @@ async function reserve() {
   } catch (e) {
     const code = e.problem.code;
     notify(e.problem.detail || "Could not reserve those seats.");
-    // 503 means the counter is unreadable, NOT that the tier sold out.
+
+    // Their place in the sale is gone; the server decides what comes next.
     if (code === "ADMISSION_EXPIRED" || code === "ADMISSION_REQUIRED") return route();
+    // They already hold seats for this event — rehydrate onto that hold.
     if (code === "HOLD_LIMIT_EXCEEDED") return route();
+    // 503 means the counter is UNREADABLE, not that the tier sold out (ADR-004).
+    // Rendering this as "sold out" tells thousands of buyers a live sale has ended.
+    if (code === "INVENTORY_UNAVAILABLE") {
+      notify("We're having trouble reading availability. Nothing was reserved — try again in a moment.");
+      $("btn-reserve").disabled = false;
+      return;
+    }
     state.event = await api(`/events/${state.eventId}`);
     showSelect(state.admissionExpiresAt);
   }
@@ -515,22 +550,58 @@ async function pay() {
     store.admission = null;
     renderReceipt(receipt);
   } catch (e) {
-    const p = e.problem;
-    notify(p.detail || "That payment could not be completed.");
-    if (p.code === "PAYMENT_DECLINED") {
-      // The seats are still held. Say so plainly — this is the moment trust is won or lost.
-      notify(`${p.detail} Your seats are still held${p.attemptsRemaining != null ? ` — ${p.attemptsRemaining} attempt(s) left` : ""}.`);
-      $("btn-pay").disabled = false;
-      $("btn-pay").textContent = "Try again";
-    } else if (p.code === "HOLD_EXPIRED" || p.code === "ORDER_REFUNDED" || p.code === "INSUFFICIENT_TIME_REMAINING") {
-      store.hold = null;
-      setTimeout(route, 1200);
-    } else {
-      $("btn-pay").disabled = false;
-      $("btn-pay").textContent = "Pay now";
-    }
+    handleCheckoutFailure(e.problem || {});
   } finally {
     state.paymentInFlight = false;
+  }
+}
+
+/* One rule per error code. Every branch answers the same two questions: may they
+   press Pay again, and do they still have their seats? Getting either wrong is
+   how a buyer ends up mashing a button that can never succeed. */
+function handleCheckoutFailure(p) {
+  const retry = (label) => { $("btn-pay").disabled = false; $("btn-pay").textContent = label; };
+  const stop  = ()      => { $("btn-pay").disabled = true;  $("btn-pay").textContent = "Pay now"; };
+
+  notify(p.detail || "That payment could not be completed.");
+
+  switch (p.code) {
+    case "PAYMENT_DECLINED":
+      // The seats are still held. Say so plainly — this is the moment trust is won or lost.
+      notify(`${p.detail} Your seats are still held${p.attemptsRemaining != null ? ` — ${p.attemptsRemaining} attempt(s) left` : ""}.`);
+      return retry("Try again");
+
+    case "PAYMENT_GATEWAY_UNAVAILABLE":
+      // Ours, not theirs: the hold is intact and no attempt was spent (ADR-034).
+      notify(`${p.detail} No attempt was used.`);
+      return retry("Try again");
+
+    case "PAYMENT_ATTEMPTS_EXHAUSTED":
+      // No further card attempt will be accepted for this reservation. Offering
+      // "Pay now" again would be a button that cannot work.
+      notify(`${p.detail} Release your seats to start over.`);
+      return stop();
+
+    case "DUPLICATE_PAYMENT":
+      // A charge really is in flight. Re-enabling Pay invites a second submit of
+      // something already running; ask the server instead.
+      notify("Finishing a payment that is already in progress…");
+      stop();
+      return setTimeout(route, 2000);
+
+    case "INVENTORY_UNAVAILABLE":
+      // A FAULT, never "sold out" (ADR-004). The wording matters more than the retry.
+      notify("We're having trouble reading availability. Nothing was charged — please try again.");
+      return retry("Try again");
+
+    case "HOLD_EXPIRED":
+    case "ORDER_REFUNDED":
+    case "INSUFFICIENT_TIME_REMAINING":
+      store.hold = null;
+      return setTimeout(route, 1200);
+
+    default:
+      return retry("Pay now");
   }
 }
 
