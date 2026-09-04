@@ -5,12 +5,17 @@
 > and observable. Concurrency guarantees are never retrofitted — that is precisely how overbooking
 > bugs are born.
 
+> **Where this stands.** The MVP cut a thin slice through *all four* phases rather than completing
+> them in order: everything the journey needs is built, everything additive is deferred. See
+> [`06-mvp-overview.md`](06-mvp-overview.md) §4 for exactly what ships and §11 for what comes next.
+> The phase table below remains the plan for finishing each one properly.
+
 | Phase | Objective | Core work | Exit criterion |
 | :--- | :--- | :--- | :--- |
-| **1** | Correct single-user transaction | catalog, hold, mock payment, order, outbox rows | Two parallel requests for the last ticket → exactly one succeeds |
-| **2** | Move the hot path to RAM | Redis stock + Lua, ZSET queue, SSE, pass tokens | Same guarantee at 1,000 concurrent requests |
-| **3** | Defence and real money | bot, Stripe, webhooks, Resilience4j | Payments survive tab closure; floods are throttled |
-| **4** | Async fulfilment and scale | RabbitMQ, PDFBox, email, Nginx, k6 | 10,000 users / 500 tickets / zero overbooking / 500 emails |
+| **1** | Correct single-user transaction | catalog, hold, mock payment, order, outbox rows | Two parallel requests for the last ticket → exactly one succeeds — **done, and tested** |
+| **2** | Move the hot path to RAM | Redis stock + Lua, ZSET queue, SSE, pass tokens | Same guarantee at 1,000 concurrent requests — **queue, SSE and passes done; Lua and the rebuild are not** |
+| **3** | Defence and real money | bot, Stripe, webhooks, Resilience4j | Payments survive tab closure; floods are throttled — **cookie identity and rate limits done; Stripe and reCAPTCHA are not** |
+| **4** | Async fulfilment and scale | RabbitMQ, PDFBox, email, Nginx, k6 | 10,000 users / 500 tickets / zero overbooking / 500 emails — **fulfilment done on one replica; the cluster and load runs are not** |
 
 ---
 
