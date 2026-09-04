@@ -49,6 +49,9 @@ public class HoldService {
 
     private static final Logger log = LoggerFactory.getLogger(HoldService.class);
 
+    /** The partial unique index from {@code V2__hold.sql} that caps a session at one live hold. */
+    private static final String ONE_ACTIVE_HOLD_INDEX = "idx_holds_one_active_per_session";
+
     private final TicketHoldRepository holds;
     private final CatalogFacade catalog;
     private final QueueFacade queue;
@@ -120,7 +123,13 @@ public class HoldService {
         try {
             // Flushed here, not at commit, so the constraint speaks while we can still translate it.
             holds.saveAndFlush(hold);
-        } catch (DataIntegrityViolationException alreadyHolding) {
+        } catch (DataIntegrityViolationException violation) {
+            if (!isOneActiveHoldPerSession(violation)) {
+                // Some other constraint on this table. Reporting it as "you already hold seats"
+                // would answer a question the buyer never asked and hide a real schema problem —
+                // which is exactly what the quantity CHECK did before V6 relaxed it.
+                throw violation;
+            }
             throw new HoldLimitExceededException(eventId);
         }
 
@@ -275,6 +284,19 @@ public class HoldService {
      * keeps their place in the sale and can pick a different tier without re-queueing, which is the
      * entire reason the middle tier exists.
      */
+    /**
+     * Whether this violation is the one-live-hold-per-session index, and not some other constraint.
+     *
+     * <p>Matched on the index name because that is the only thing that identifies <em>which</em>
+     * rule was broken. The message is searched as well as the structured constraint name: Hibernate
+     * populates the latter for most dialects but not reliably for every wrapped cause, and guessing
+     * wrong here means reporting the wrong error to a buyer.
+     */
+    private boolean isOneActiveHoldPerSession(DataIntegrityViolationException violation) {
+        String constraint = violation.getMostSpecificCause().getMessage();
+        return constraint != null && constraint.contains(ONE_ACTIVE_HOLD_INDEX);
+    }
+
     private void requireAdmission(String sessionId, long eventId, String admissionToken) {
         if (admissionToken == null || admissionToken.isBlank()) {
             throw new AdmissionRequiredException();
