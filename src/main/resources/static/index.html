@@ -1,0 +1,617 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>FlashSeats</title>
+<style>
+  /* ---------------------------------------------------------------------
+     One file, no build step. This page exists to make the backend walkable:
+     every countdown derives from the server's clock, every limit comes from
+     the API, and a timer reaching zero asks the server rather than deciding.
+     --------------------------------------------------------------------- */
+  :root {
+    --paper:#f6f5f1; --surface:#fffefb; --surface-2:#edece6;
+    --ink:#1b1e1c; --ink-2:#4c534e; --ink-3:#79817b;
+    --rule:#dbd8d0; --accent:#2f6f5e; --accent-ink:#235345; --accent-soft:#e3ece8;
+    --warn:#93590f; --warn-soft:#f4ecdc; --crit:#93342a; --crit-soft:#f4e4e1;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --paper:#131613; --surface:#191d1a; --surface-2:#212622;
+      --ink:#e8e9e4; --ink-2:#a9b1ab; --ink-3:#7e8781;
+      --rule:#2c322e; --accent:#74bda3; --accent-ink:#8ecfb5; --accent-soft:#1c2a25;
+      --warn:#d09950; --warn-soft:#2a2318; --crit:#d8877b; --crit-soft:#2c1d1a;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin:0; background:var(--paper); color:var(--ink);
+    font:15px/1.6 system-ui,-apple-system,"Segoe UI",sans-serif;
+    -webkit-font-smoothing:antialiased;
+  }
+  .wrap { max-width:640px; margin:0 auto; padding:40px 20px 80px; }
+  header { border-bottom:2px solid var(--ink); padding-bottom:14px; margin-bottom:28px; }
+  .brand { font-size:12px; letter-spacing:.16em; text-transform:uppercase; color:var(--accent-ink); font-weight:600; }
+  h1 { font-size:28px; margin:8px 0 4px; letter-spacing:-.02em; }
+  .sub { color:var(--ink-2); margin:0; }
+  h2 { font-size:19px; margin:0 0 12px; letter-spacing:-.01em; }
+  .card { background:var(--surface); border:1px solid var(--rule); border-radius:8px; padding:18px 20px; margin-bottom:14px; }
+  .row { display:flex; justify-content:space-between; align-items:center; gap:12px; }
+  .muted { color:var(--ink-3); font-size:13.5px; }
+  .mono { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-variant-numeric:tabular-nums; }
+
+  button {
+    font:inherit; font-weight:600; border:none; border-radius:6px; padding:11px 18px;
+    background:var(--accent); color:#fff; cursor:pointer;
+  }
+  button:disabled { opacity:.45; cursor:not-allowed; }
+  button.ghost { background:transparent; color:var(--ink-2); border:1px solid var(--rule); font-weight:500; }
+  .full { width:100%; }
+
+  input, select {
+    font:inherit; width:100%; padding:10px 12px; border-radius:6px;
+    border:1px solid var(--rule); background:var(--surface); color:var(--ink);
+  }
+  label { display:block; font-size:13px; font-weight:600; margin:14px 0 5px; color:var(--ink-2); }
+
+  .badge { font-size:11px; font-weight:700; letter-spacing:.06em; text-transform:uppercase;
+           padding:3px 8px; border-radius:4px; white-space:nowrap; }
+  .badge.PLENTY  { background:var(--accent-soft); color:var(--accent-ink); }
+  .badge.LIMITED { background:var(--warn-soft);   color:var(--warn); }
+  .badge.SOLD_OUT{ background:var(--surface-2);   color:var(--ink-3); }
+
+  .tier { display:flex; justify-content:space-between; align-items:center; gap:14px;
+          padding:14px 16px; border:1px solid var(--rule); border-radius:7px;
+          margin-bottom:10px; background:var(--surface); cursor:pointer; }
+  .tier[aria-selected="true"] { border-color:var(--accent); box-shadow:0 0 0 1px var(--accent); }
+  .tier[aria-disabled="true"] { opacity:.5; cursor:not-allowed; }
+  .tier .name { font-weight:600; }
+
+  .bigposition { font-size:52px; font-weight:700; letter-spacing:-.03em; text-align:center;
+                 margin:10px 0 2px; font-variant-numeric:tabular-nums; }
+  .bar { height:7px; border-radius:4px; background:var(--surface-2); overflow:hidden; margin:16px 0 8px; }
+  .bar > span { display:block; height:100%; background:var(--accent); width:0; transition:width .4s ease; }
+
+  .timer { font-size:15px; font-weight:700; padding:4px 10px; border-radius:5px;
+           background:var(--surface-2); color:var(--ink-2); }
+  .timer.warn { background:var(--warn-soft); color:var(--warn); }
+  .timer.crit { background:var(--crit-soft); color:var(--crit); }
+
+  .alert { border-left:3px solid var(--crit); background:var(--crit-soft); color:var(--ink);
+           padding:12px 15px; border-radius:0 5px 5px 0; margin-bottom:14px; font-size:14px; }
+  .alert.ok { border-left-color:var(--accent); background:var(--accent-soft); }
+  .dot { display:inline-block; width:8px; height:8px; border-radius:50%; background:var(--accent); margin-right:6px; }
+  .dot.off { background:var(--warn); }
+  [hidden] { display:none !important; }
+  a { color:var(--accent-ink); }
+  @media (prefers-reduced-motion: reduce) { * { transition:none !important; } }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <div class="brand">FlashSeats</div>
+    <h1 id="ev-title">Loading…</h1>
+    <p class="sub" id="ev-sub"></p>
+  </header>
+
+  <div id="alert" class="alert" hidden></div>
+
+  <!-- V1 — landing -->
+  <section id="v-landing" hidden>
+    <div class="card">
+      <div class="row">
+        <div><strong id="window-label">Sale</strong><div class="muted" id="window-detail"></div></div>
+        <div class="timer mono" id="sale-countdown"></div>
+      </div>
+    </div>
+    <h2>Tiers</h2>
+    <div id="landing-tiers"></div>
+    <button id="btn-join" class="full" disabled>Join Flash Sale</button>
+  </section>
+
+  <!-- V2 — waiting room -->
+  <section id="v-queue" hidden>
+    <div class="card">
+      <div class="muted" style="text-align:center">You're in the queue</div>
+      <div class="bigposition mono" id="q-position">—</div>
+      <div class="muted" style="text-align:center" id="q-wait">Working out how long…</div>
+      <div class="bar"><span id="q-bar"></span></div>
+      <div class="row">
+        <span class="muted"><span class="dot" id="q-dot"></span><span id="q-conn">Connected</span></span>
+        <button class="ghost" id="btn-leave">Leave queue</button>
+      </div>
+    </div>
+    <p class="muted">Your place is saved against your browser session. Reloading or losing signal will not lose it.</p>
+  </section>
+
+  <!-- V3 — seat selection -->
+  <section id="v-select" hidden>
+    <div class="card">
+      <div class="row">
+        <div><strong>You're in</strong><div class="muted">Take your time — pick a tier.</div></div>
+        <div class="timer mono" id="admit-timer">—</div>
+      </div>
+    </div>
+    <h2>Choose your seats</h2>
+    <div id="select-tiers"></div>
+    <label for="qty">Quantity</label>
+    <input id="qty" type="number" min="1" value="2">
+    <div style="height:16px"></div>
+    <button id="btn-reserve" class="full" disabled>Reserve seats</button>
+  </section>
+
+  <!-- V4 — checkout -->
+  <section id="v-checkout" hidden>
+    <div class="card">
+      <div class="row">
+        <div><strong id="co-summary">Your seats</strong><div class="muted" id="co-total"></div></div>
+        <div class="timer mono" id="hold-timer">—</div>
+      </div>
+    </div>
+    <label for="email">Email for your tickets</label>
+    <input id="email" type="email" placeholder="you@example.com" autocomplete="email">
+    <label for="card">Card</label>
+    <select id="card">
+      <option value="pm_card_visa">Visa ending 4242 — succeeds</option>
+      <option value="pm_card_declined">Test card — declines</option>
+      <option value="pm_card_error">Test card — provider error</option>
+    </select>
+    <div style="height:18px"></div>
+    <button id="btn-pay" class="full">Pay now</button>
+    <div style="height:8px"></div>
+    <button id="btn-release" class="ghost full">Release seats</button>
+  </section>
+
+  <!-- V5 — receipt -->
+  <section id="v-receipt" hidden>
+    <div class="alert ok">Your order is confirmed. Nothing further is needed.</div>
+    <div class="card">
+      <div class="muted">Order reference</div>
+      <div class="mono" style="font-size:30px; font-weight:700; letter-spacing:.02em" id="r-number"></div>
+      <div class="muted" style="margin-top:10px" id="r-items"></div>
+      <div style="margin-top:14px; font-weight:600" id="r-total"></div>
+    </div>
+    <p class="muted">
+      We're sending your tickets to <strong id="r-email"></strong>. They usually arrive within a minute —
+      check <a href="http://localhost:8025" target="_blank" rel="noopener">Mailpit</a> to see them land.
+    </p>
+    <button class="ghost full" id="btn-restart">Start again</button>
+  </section>
+
+  <!-- V6 — terminal -->
+  <section id="v-over" hidden>
+    <div class="card">
+      <h2 id="over-title">That's all</h2>
+      <p class="muted" id="over-detail"></p>
+    </div>
+    <button class="ghost full" id="btn-restart-2">Back to the event</button>
+  </section>
+</div>
+
+<script>
+"use strict";
+
+/* ===================================================================
+   Four rules this client obeys, because the server owns the truth:
+     1. Every countdown derives from serverTime, never Date.now() alone.
+     2. Every limit (maxPerOrder, TTLs, attempts) comes from the API.
+     3. Rehydrate on mount and on visibility change; never assume.
+     4. A timer hitting zero is a prompt to ASK, not a conclusion.
+   =================================================================== */
+
+const $ = (id) => document.getElementById(id);
+const VIEWS = ["v-landing","v-queue","v-select","v-checkout","v-receipt","v-over"];
+
+const state = {
+  eventId: Number(new URLSearchParams(location.search).get("eventId")) || null,
+  event: null,
+  clockOffsetMs: 0,
+  stream: null,
+  attempt: 0,
+  tierId: null,
+  paymentInFlight: false,
+  displayedPosition: Infinity,
+  startDepth: null,
+};
+
+const store = {
+  get admission() { return sessionStorage.getItem("fs.admissionToken"); },
+  set admission(v) { v ? sessionStorage.setItem("fs.admissionToken", v) : sessionStorage.removeItem("fs.admissionToken"); },
+  get hold() { return sessionStorage.getItem("fs.holdToken"); },
+  set hold(v) { v ? sessionStorage.setItem("fs.holdToken", v) : sessionStorage.removeItem("fs.holdToken"); },
+  /* Generated ONCE per hold and reused on every retry — regenerating it per
+     attempt would defeat the gateway-level duplicate guard. */
+  idemFor(holdToken) {
+    const key = "fs.idem." + holdToken;
+    let v = sessionStorage.getItem(key);
+    if (!v) { v = crypto.randomUUID(); sessionStorage.setItem(key, v); }
+    return v;
+  },
+};
+
+const now = () => Date.now() + state.clockOffsetMs;
+const secondsUntil = (iso) => iso ? Math.max(0, Math.round((Date.parse(iso) - now()) / 1000)) : 0;
+const mmss = (s) => `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`;
+const money = (cents, ccy) => `${ccy} ${(cents / 100).toFixed(2)}`;
+
+/* --- API ---------------------------------------------------------- */
+
+async function api(path, init = {}) {
+  const res = await fetch("/api/v1" + path, {
+    ...init,
+    credentials: "include",
+    headers: { "Content-Type": "application/json", ...(init.headers || {}) },
+  });
+  if (res.status === 204) return null;
+  const body = await res.json().catch(() => null);
+  if (!res.ok) throw Object.assign(new Error(body?.detail || res.statusText), { problem: body || {} });
+  return body;
+}
+
+/* --- view switching ----------------------------------------------- */
+
+function show(view) {
+  VIEWS.forEach((v) => ($(v).hidden = v !== view));
+  if (view !== "v-queue") closeStream();
+}
+
+function notify(message, ok = false) {
+  const el = $("alert");
+  el.textContent = message;
+  el.className = "alert" + (ok ? " ok" : "");
+  el.hidden = !message;
+}
+
+/* --- bootstrap + rehydration -------------------------------------- */
+
+async function bootstrap() {
+  if (!state.eventId) {
+    const events = await api("/events");
+    const open = events.find((e) => e.windowStatus === "OPEN") || events[0];
+    if (!open) { notify("No events are published yet."); return; }
+    state.eventId = open.eventId;
+  }
+
+  state.event = await api(`/events/${state.eventId}`);
+  state.clockOffsetMs = Date.parse(state.event.serverTime) - Date.now();
+
+  $("ev-title").textContent = state.event.title;
+  $("ev-sub").textContent = `${state.event.venueName} · ${new Date(state.event.eventStartTime).toDateString()}`;
+
+  await route();
+}
+
+/* The §1 view table: the server says where we are, and we render that. */
+async function route() {
+  const sale = await api(`/sale/${state.eventId}/state`);
+  state.clockOffsetMs = Date.parse(sale.serverTime) - Date.now();
+
+  if (sale.hold) store.hold = sale.hold.holdToken; else store.hold = null;
+
+  if (sale.order && sale.order.status === "CONFIRMED") return showReceipt(sale.order.orderNumber);
+  if (sale.windowStatus === "CLOSED") return terminal("Sales have ended", "This sale is over.");
+  if (sale.hold) return showCheckout(sale.hold);
+
+  const phase = sale.queue?.state ?? "NOT_JOINED";
+  if (phase === "EXHAUSTED") return terminal("Sold out", "Every ticket for this event has been sold.");
+  if (phase === "PROMOTED" && sale.queue.passToken) return admit(sale.queue.passToken);
+  if (phase === "ADMITTED") return showSelect(sale.queue.admissionExpiresAt);
+  if (phase === "WAITING") return showQueue(sale.queue);
+  return showLanding();
+}
+
+/* --- V1 landing ---------------------------------------------------- */
+
+function showLanding() {
+  const ev = state.event;
+  const open = ev.windowStatus === "OPEN";
+
+  $("window-label").textContent = open ? "Sale is open" : ev.windowStatus === "UPCOMING" ? "Sale opens soon" : "Sale closed";
+  $("window-detail").textContent = open ? "Join the queue to buy." : "";
+  $("btn-join").disabled = !open;
+
+  $("landing-tiers").innerHTML = ev.tiers.map((t) => `
+    <div class="tier">
+      <div>
+        <div class="name">${escapeHtml(t.tierName)}</div>
+        <div class="muted">${money(t.priceCents, t.currency)} · up to ${t.maxPerOrder} per order</div>
+      </div>
+      <span class="badge ${t.availability}">${t.availability.replace("_", " ")}</span>
+    </div>`).join("");
+
+  show("v-landing");
+  tickSaleCountdown();
+}
+
+function tickSaleCountdown() {
+  const ev = state.event;
+  if (!ev || ev.windowStatus !== "UPCOMING") { $("sale-countdown").textContent = ""; return; }
+  const left = secondsUntil(ev.saleStartTime);
+  $("sale-countdown").textContent = left > 3600
+    ? `${Math.floor(left / 3600)}h ${Math.floor((left % 3600) / 60)}m`
+    : mmss(left);
+  if (left === 0) bootstrap();   // ask the server; do not assume it opened
+}
+
+/* --- V2 waiting room ----------------------------------------------- */
+
+async function join() {
+  $("btn-join").disabled = true;
+  try {
+    const status = await api("/queue/join", {
+      method: "POST",
+      body: JSON.stringify({ eventId: state.eventId, recaptchaToken: null }),
+    });
+    notify("");
+    showQueue(status);
+  } catch (e) {
+    notify(e.problem.detail || "Could not join the queue.");
+    $("btn-join").disabled = false;
+  }
+}
+
+function showQueue(status) {
+  state.displayedPosition = Infinity;
+  state.startDepth = null;
+  renderPosition(status.position, status.estWaitSeconds);
+  show("v-queue");
+  openStream();
+}
+
+function renderPosition(position, estWaitSeconds) {
+  if (position == null) return;
+  // Monotonic: a number that goes UP reads as a broken queue even when nothing is wrong.
+  state.displayedPosition = Math.min(state.displayedPosition, position);
+  const p = state.displayedPosition;
+
+  $("q-position").textContent = p > 1000 ? "1,000+" : p < 1 ? "You're next" : `#${p}`;
+  if (state.startDepth === null) state.startDepth = p;
+  $("q-bar").style.width = `${Math.max(0, Math.min(100, (1 - p / Math.max(state.startDepth, 1)) * 100))}%`;
+
+  $("q-wait").textContent =
+    estWaitSeconds == null || estWaitSeconds < 0 ? "Working out how long…"
+    : estWaitSeconds < 60 ? "Less than a minute"
+    : `About ${Math.round(estWaitSeconds / 60)} minute${estWaitSeconds >= 120 ? "s" : ""}`;
+}
+
+function openStream() {
+  closeStream();
+  const es = new EventSource(`/api/v1/queue/stream?eventId=${state.eventId}`, { withCredentials: true });
+  state.stream = es;
+
+  es.addEventListener("position-update", (e) => {
+    const d = JSON.parse(e.data);
+    renderPosition(d.position, d.estWaitSeconds < 0 ? null : d.estWaitSeconds);
+  });
+  es.addEventListener("queue-promoted", (e) => admit(JSON.parse(e.data).passToken));
+  es.addEventListener("sale-exhausted", () => terminal("Sold out", "The last ticket went while you were waiting."));
+  es.addEventListener("sale-closed", () => terminal("Sales have ended", "This sale is over."));
+
+  es.onopen = () => { state.attempt = 0; connection(true); };
+  es.onerror = () => { es.close(); connection(false); scheduleReconnect(); };
+}
+
+function closeStream() { if (state.stream) { state.stream.close(); state.stream = null; } }
+
+function connection(live) {
+  $("q-dot").className = "dot" + (live ? "" : " off");
+  $("q-conn").textContent = live ? "Connected" : "Reconnecting — your place is saved";
+}
+
+/* Full jitter, capped. Ten thousand clients reconnecting in lockstep after a
+   blip is a self-inflicted denial of service. */
+function scheduleReconnect() {
+  const delay = Math.random() * Math.min(30000, 1000 * 2 ** state.attempt++);
+  setTimeout(() => { if (!$("v-queue").hidden) { openStream(); route(); } }, delay);
+}
+
+/* --- V3 seat selection ---------------------------------------------- */
+
+async function admit(passToken) {
+  try {
+    const res = await api(`/queue/admit?eventId=${state.eventId}`, {
+      method: "POST",
+      headers: { "X-Queue-Pass-Token": passToken },
+    });
+    store.admission = res.admissionToken;
+    closeStream();
+    notify("You're in. Take your time choosing.", true);
+    showSelect(res.expiresAt);
+  } catch (e) {
+    notify(e.problem.detail || "That entry pass was not accepted.");
+    route();
+  }
+}
+
+function showSelect(admissionExpiresAt) {
+  state.admissionExpiresAt = admissionExpiresAt;
+  const tiers = state.event.tiers;
+
+  $("select-tiers").innerHTML = tiers.map((t) => `
+    <div class="tier" data-tier="${t.tierId}" data-max="${t.maxPerOrder}"
+         aria-selected="false" aria-disabled="${t.availability === "SOLD_OUT"}">
+      <div>
+        <div class="name">${escapeHtml(t.tierName)}</div>
+        <div class="muted">${money(t.priceCents, t.currency)} each</div>
+      </div>
+      <span class="badge ${t.availability}">${t.availability.replace("_", " ")}</span>
+    </div>`).join("");
+
+  $("select-tiers").querySelectorAll(".tier").forEach((el) => {
+    el.onclick = () => {
+      if (el.getAttribute("aria-disabled") === "true") return;
+      $("select-tiers").querySelectorAll(".tier").forEach((o) => o.setAttribute("aria-selected", "false"));
+      el.setAttribute("aria-selected", "true");
+      state.tierId = Number(el.dataset.tier);
+      // The server owns the limit. Never hardcode one here.
+      $("qty").max = el.dataset.max;
+      $("btn-reserve").disabled = false;
+    };
+  });
+
+  show("v-select");
+}
+
+async function reserve() {
+  $("btn-reserve").disabled = true;
+  try {
+    const hold = await api("/holds", {
+      method: "POST",
+      headers: { "X-Admission-Token": store.admission || "" },
+      body: JSON.stringify({
+        eventId: state.eventId,
+        tierId: state.tierId,
+        quantity: Number($("qty").value),
+      }),
+    });
+    store.hold = hold.holdToken;
+    notify("");
+    showCheckout(hold);
+  } catch (e) {
+    const code = e.problem.code;
+    notify(e.problem.detail || "Could not reserve those seats.");
+    // 503 means the counter is unreadable, NOT that the tier sold out.
+    if (code === "ADMISSION_EXPIRED" || code === "ADMISSION_REQUIRED") return route();
+    if (code === "HOLD_LIMIT_EXCEEDED") return route();
+    state.event = await api(`/events/${state.eventId}`);
+    showSelect(state.admissionExpiresAt);
+  }
+}
+
+/* --- V4 checkout ----------------------------------------------------- */
+
+function showCheckout(hold) {
+  state.hold = hold;
+  const tier = state.event.tiers.find((t) => t.tierId === hold.tierId);
+  $("co-summary").textContent = `${hold.quantity} × ${tier ? tier.tierName : "seat"}`;
+  $("co-total").textContent = tier ? money(tier.priceCents * hold.quantity, tier.currency) : "";
+  $("btn-pay").disabled = false;
+  $("btn-pay").textContent = "Pay now";
+  show("v-checkout");
+}
+
+async function pay() {
+  const holdToken = store.hold;
+  if (!holdToken) return route();
+
+  state.paymentInFlight = true;
+  $("btn-pay").disabled = true;
+  $("btn-pay").textContent = "Completing your purchase…";
+  notify("");
+
+  try {
+    const receipt = await api("/orders/checkout", {
+      method: "POST",
+      body: JSON.stringify({
+        holdToken,
+        userEmail: $("email").value.trim(),
+        paymentMethodId: $("card").value,
+        idempotencyKey: store.idemFor(holdToken),
+      }),
+    });
+    store.hold = null;
+    store.admission = null;
+    renderReceipt(receipt);
+  } catch (e) {
+    const p = e.problem;
+    notify(p.detail || "That payment could not be completed.");
+    if (p.code === "PAYMENT_DECLINED") {
+      // The seats are still held. Say so plainly — this is the moment trust is won or lost.
+      notify(`${p.detail} Your seats are still held${p.attemptsRemaining != null ? ` — ${p.attemptsRemaining} attempt(s) left` : ""}.`);
+      $("btn-pay").disabled = false;
+      $("btn-pay").textContent = "Try again";
+    } else if (p.code === "HOLD_EXPIRED" || p.code === "ORDER_REFUNDED" || p.code === "INSUFFICIENT_TIME_REMAINING") {
+      store.hold = null;
+      setTimeout(route, 1200);
+    } else {
+      $("btn-pay").disabled = false;
+      $("btn-pay").textContent = "Pay now";
+    }
+  } finally {
+    state.paymentInFlight = false;
+  }
+}
+
+async function release() {
+  try { await api(`/holds/${store.hold}`, { method: "DELETE" }); } catch { /* already gone */ }
+  store.hold = null;
+  notify("Seats released. Your place in the sale is unaffected.", true);
+  route();
+}
+
+/* --- V5 receipt ------------------------------------------------------- */
+
+function renderReceipt(receipt) {
+  $("r-number").textContent = receipt.orderNumber;
+  $("r-email").textContent = receipt.userEmail;
+  $("r-total").textContent = money(receipt.totalAmountCents, receipt.currency);
+  $("r-items").textContent = receipt.items.map((i) => `${i.quantity} × ${i.tierName}`).join(", ");
+  show("v-receipt");
+}
+
+async function showReceipt(orderNumber) {
+  try { renderReceipt(await api(`/orders/${orderNumber}`)); }
+  catch { terminal("Order complete", `Order ${orderNumber} is confirmed.`); }
+}
+
+/* --- V6 terminal ------------------------------------------------------ */
+
+function terminal(title, detail) {
+  $("over-title").textContent = title;
+  $("over-detail").textContent = detail;
+  show("v-over");
+}
+
+/* --- timers ----------------------------------------------------------- */
+
+/* One app-wide tick. Recomputes from expiry timestamps rather than
+   decrementing, because a decrementing counter drifts and is throttled in
+   background tabs. */
+setInterval(() => {
+  tickSaleCountdown();
+
+  if (!$("v-select").hidden && state.admissionExpiresAt) {
+    const left = secondsUntil(state.admissionExpiresAt);
+    const el = $("admit-timer");
+    el.textContent = mmss(left);
+    el.className = "timer mono" + (left < 60 ? " warn" : "");
+    if (left === 0) route();
+  }
+
+  if (!$("v-checkout").hidden && state.hold) {
+    const left = secondsUntil(state.hold.expiresAt);
+    const el = $("hold-timer");
+    el.textContent = mmss(left);
+    el.className = "timer mono" + (left < 60 ? " crit" : left < 120 ? " warn" : "");
+    if (left === 0 && !state.paymentInFlight) {
+      // Ask the server. Never navigate away on a local timer — a charge already
+      // submitted WILL complete, and "expired" would be a lie.
+      route();
+    }
+  }
+}, 1000);
+
+/* --- wiring ------------------------------------------------------------ */
+
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, (c) =>
+    ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+}
+
+$("btn-join").onclick = join;
+$("btn-leave").onclick = () => { closeStream(); showLanding(); };
+$("btn-reserve").onclick = reserve;
+$("btn-pay").onclick = pay;
+$("btn-release").onclick = release;
+$("btn-restart").onclick = () => { sessionStorage.clear(); location.href = location.pathname; };
+$("btn-restart-2").onclick = () => { sessionStorage.clear(); location.href = location.pathname; };
+
+document.addEventListener("visibilitychange", () => { if (document.visibilityState === "visible") route(); });
+window.addEventListener("online", () => { state.attempt = 0; route(); });
+
+bootstrap().catch((e) => notify(e.problem?.detail || "Could not reach the server."));
+</script>
+</body>
+</html>
