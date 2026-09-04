@@ -54,6 +54,7 @@
                  (everyone may depend on it)
 
 filter   ──► bot
+queue    ──► catalog
 hold     ──► queue, catalog
 order    ──► hold, catalog, payment, queue
 saleflow ──► queue, hold, order, catalog        ← read-only leaf; nothing depends on it

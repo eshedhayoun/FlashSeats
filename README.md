@@ -21,6 +21,7 @@ Read in this order:
 | [`docs/03-end-to-end-flow.md`](docs/03-end-to-end-flow.md) | **The authoritative user journey**, step by step |
 | [`docs/04-implementation-roadmap.md`](docs/04-implementation-roadmap.md) | Four phases, each with exit criteria |
 | [`docs/05-global-standards.md`](docs/05-global-standards.md) | **Cross-cutting contract** — RFC 7807, error registry, idempotency, transaction rules, facade rules |
+| [`docs/06-mvp-overview.md`](docs/06-mvp-overview.md) | **What is actually built** — scope, security posture, next stages, review-pass log |
 | [`FE_SPEC.md`](FE_SPEC.md) | **Front-end specification** — view state machine, API map, storage, SSE, timers, copy |
 | [`docs/modules/`](docs/modules/) | Per-module specs — `catalog`, `queue`, `hold`, `bot`, `payment`, `order`, `notification`, `saleflow`, `shared` |
 
@@ -67,6 +68,7 @@ Dependencies are acyclic and verified at build time by `ApplicationModules.verif
                     shared        ← open module; everyone may depend on it
 
 filter   ──► bot
+queue    ──► catalog
 hold     ──► queue, catalog
 order    ──► hold, catalog, payment, queue
 saleflow ──► queue, hold, order, catalog     ← read-only leaf
@@ -156,10 +158,18 @@ Prerequisites: JDK 21 and Docker.
 ```bash
 cp .env.example .env
 docker compose up -d                # PostgreSQL, Redis, RabbitMQ, Mailpit
-./mvnw spring-boot:run              # run the app from your machine
+./mvnw spring-boot:run              # seeds a sale that is already open
+open http://localhost:8080          # walk the whole journey in a browser
 ```
 
-For a strictly-minimal Phase 1: `docker compose up -d postgres`.
+The demo client at `/` takes you from the event page through the waiting room to a PDF ticket. Use
+the card selector on the checkout screen to drive the interesting branches: `pm_card_declined`
+declines and **keeps your seats**, `pm_card_error` fails the provider. The email lands in Mailpit at
+[localhost:8025](http://localhost:8025).
+
+```bash
+./mvnw test                         # 25 tests, including the concurrency and journey suites
+```
 
 | Service | Where | Credentials |
 | :--- | :--- | :--- |
@@ -230,18 +240,23 @@ non-zero.
 
 ## Project status
 
-Design phase, two review passes complete.
+**MVP built and running.** All nine modules, the full journey from landing page to emailed PDF, and
+a test suite that proves the guarantees rather than asserting them —
+[`docs/06-mvp-overview.md`](docs/06-mvp-overview.md) is the reference for what exists, what is
+deliberately deferred, where the security gaps are, and what comes next.
+
+The design behind it took four passes:
 
 - **Pass 1 — correctness.** ADR-001…018: overbooking holes, contradictory checkout flows,
   cross-replica bugs, missing constraints.
-- **Pass 2 — best-practice alignment.** ADR-019…025: benchmarked against Ticketmaster / Queue-it /
-  AXS. Found a permanent inventory leak (a Redis mutation inside a SQL transaction), a missing
-  admission-session tier, no shared error contract, and three transaction-boundary violations.
-- **Pass 3 — edge-case and UX stress test.** ADR-026…030: found that a Wi-Fi → cellular handover
-  deleted buyers from the queue, that per-tier sell-outs were invisible to people waiting for them,
-  that promotion batch size ignored the connection pool, and that per-attempt grace extensions would
-  have blown the hold ceiling.
+- **Pass 2 — best-practice alignment.** ADR-019…025: found a permanent inventory leak (a Redis
+  mutation inside a SQL transaction), a missing admission-session tier, no shared error contract, and
+  three transaction-boundary violations.
+- **Pass 3 — edge-case and UX stress test.** ADR-026…030: a Wi-Fi → cellular handover deleted buyers
+  from the queue, per-tier sell-outs were invisible to people waiting for them, promotion batch size
+  ignored the connection pool, and per-attempt grace extensions blew the hold ceiling.
+- **Pass 4 — implementation.** ADR-031…033: a facade edge that every diagram omitted, an advisory
+  lock that could not guard a Redis-only worker, and one exception advice in place of seven. Plus
+  the defects the build itself surfaced, recorded in the MVP overview.
 
-30 ADRs record every decision and the failure it prevents. [`FE_SPEC.md`](FE_SPEC.md) covers the
-client. The per-module specs are aligned; a structural rewrite to the `05-global-standards.md` §10
-template is the remaining work.
+33 ADRs record every decision and the failure it prevents.
