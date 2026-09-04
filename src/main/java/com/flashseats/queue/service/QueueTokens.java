@@ -62,11 +62,11 @@ public class QueueTokens {
                 sessionId,
                 Long.toString(clock.instant().plusSeconds(ttlSeconds).getEpochSecond()),
                 UUID.randomUUID().toString());
-        return SignedToken.sign(payload, properties.getPassSecret());
+        return SignedToken.sign(kind, payload, properties.getPassSecret());
     }
 
     private boolean isValid(String token, String kind, long eventId, String sessionId) {
-        return SignedToken.verify(token, properties.getPassSecret())
+        return SignedToken.verify(kind, token, properties.getPassSecret())
                 .map(payload -> payload.split(SEPARATOR))
                 .filter(parts -> parts.length == 5)
                 .filter(parts -> kind.equals(parts[0]))
