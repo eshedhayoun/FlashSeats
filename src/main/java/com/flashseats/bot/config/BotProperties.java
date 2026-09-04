@@ -1,5 +1,6 @@
 package com.flashseats.bot.config;
 
+import java.util.List;
 import org.springframework.boot.context.properties.ConfigurationProperties;
 
 /**
@@ -16,12 +17,31 @@ public class BotProperties {
     private final Bucket sessionBucket = new Bucket(20, 10);
     private final Bucket ipBucket = new Bucket(300, 150);
 
+    /**
+     * Peer addresses whose {@code X-Forwarded-For} header is believed (ADR-039).
+     *
+     * <p><strong>Empty means trust nobody</strong>, which is the correct default for an app with
+     * nothing in front of it. Set it to the load balancer's address wherever one terminates —
+     * {@code compose.yaml} does this for the {@code cluster} profile. Leaving it empty behind a
+     * proxy is safe but coarse: every request then looks like it came from the balancer and shares
+     * one IP bucket.
+     */
+    private List<String> trustedProxies = List.of();
+
     public String getSessionSecret() {
         return sessionSecret;
     }
 
     public void setSessionSecret(String sessionSecret) {
         this.sessionSecret = sessionSecret;
+    }
+
+    public List<String> getTrustedProxies() {
+        return trustedProxies;
+    }
+
+    public void setTrustedProxies(List<String> trustedProxies) {
+        this.trustedProxies = trustedProxies;
     }
 
     public Cookie getCookie() {

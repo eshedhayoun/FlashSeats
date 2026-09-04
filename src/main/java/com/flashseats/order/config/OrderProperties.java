@@ -37,6 +37,9 @@ public class OrderProperties {
     /** Signs receipt tokens. Rotating it invalidates every outstanding receipt link. */
     private String receiptSecret = "dev-only-change-me";
 
+    /** How long a receipt link stays usable (ADR-039). Long enough to survive a forwarded email. */
+    private int receiptTokenTtlDays = 90;
+
     public int getCheckoutGraceMinutes() {
         return checkoutGraceMinutes;
     }
@@ -75,5 +78,13 @@ public class OrderProperties {
 
     public void setReceiptSecret(String receiptSecret) {
         this.receiptSecret = receiptSecret;
+    }
+
+    public int getReceiptTokenTtlDays() {
+        return receiptTokenTtlDays;
+    }
+
+    public void setReceiptTokenTtlDays(int receiptTokenTtlDays) {
+        this.receiptTokenTtlDays = receiptTokenTtlDays;
     }
 }

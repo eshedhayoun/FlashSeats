@@ -34,8 +34,18 @@ x-app: &app
     # Behind Nginx the client IP arrives in X-Forwarded-For. The bot module
     # rate-limits on it, so Spring must be told to trust the proxy.
     SERVER_FORWARD_HEADERS_STRATEGY: framework
+    # ...and so must the rate limiter, which reads the header itself and
+    # therefore does its own trust check (ADR-039). Without an entry here the
+    # header is ignored and every request shares nginx's single IP bucket.
+    # The compose network is a /16; nginx is the only thing that proxies to the
+    # app, so name the service's resolvable address.
+    FLASHSEATS_TRUSTED_PROXIES: ${FLASHSEATS_TRUSTED_PROXIES:-}
     FLASHSEATS_SESSION_SECRET: ${FLASHSEATS_SESSION_SECRET:-dev-only-change-me}
     FLASHSEATS_QUEUE_PASS_SECRET: ${FLASHSEATS_QUEUE_PASS_SECRET:-dev-only-change-me}
+    FLASHSEATS_RECEIPT_SECRET: ${FLASHSEATS_RECEIPT_SECRET:-dev-only-change-me}
+    FLASHSEATS_ADMIN_USERNAME: ${FLASHSEATS_ADMIN_USERNAME:-admin}
+    FLASHSEATS_ADMIN_PASSWORD: ${FLASHSEATS_ADMIN_PASSWORD:-admin}
+    FLASHSEATS_COOKIE_SECURE: ${FLASHSEATS_COOKIE_SECURE:-false}
     STRIPE_API_KEY: ${STRIPE_API_KEY:-}
     STRIPE_WEBHOOK_SECRET: ${STRIPE_WEBHOOK_SECRET:-}
     RECAPTCHA_SECRET: ${RECAPTCHA_SECRET:-}
