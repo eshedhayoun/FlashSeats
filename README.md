@@ -22,7 +22,7 @@ Read in this order:
 | [`docs/04-implementation-roadmap.md`](docs/04-implementation-roadmap.md) | Four phases, each with exit criteria |
 | [`docs/05-global-standards.md`](docs/05-global-standards.md) | **Cross-cutting contract** — RFC 7807, error registry, idempotency, transaction rules, facade rules |
 | [`docs/06-mvp-overview.md`](docs/06-mvp-overview.md) | **What is actually built** — scope, security posture, next stages, review-pass log |
-| [`FE_SPEC.md`](FE_SPEC.md) | **Front-end specification** — view state machine, API map, storage, SSE, timers, copy |
+| [`FE_SPEC.md`](FE_SPEC.md) | **Front-end specification** — view state machine, API map, storage, SSE, timers, copy, and the planned Playwright suite |
 | [`docs/modules/`](docs/modules/) | Per-module specs — `catalog`, `queue`, `hold`, `bot`, `payment`, `order`, `notification`, `saleflow`, `shared` |
 
 When a module spec disagrees with an ADR, **the ADR wins** and the module spec is stale.

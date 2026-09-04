@@ -10,7 +10,8 @@ PDF ticket, 25 tests green. Inventory is PostgreSQL-only for now — correct, an
 replaces exactly one method body.
 
 **Read [`docs/00-architecture-decisions.md`](docs/00-architecture-decisions.md) before changing
-anything.** It contains 33 ADRs across four passes, each recording a defect and its fix. Several look
+anything.** It contains 39 ADRs, each recording a defect and its fix — 034-039 come from the first review
+pass over the built code. Several look
 like over-engineering until you read the failure they prevent.
 
 **For what is actually built**, read [`docs/06-mvp-overview.md`](docs/06-mvp-overview.md) — scope,
@@ -19,7 +20,7 @@ security posture, next stages, and the review-pass log. It is the doc to update 
 ## Document precedence
 
 ```
-00-architecture-decisions.md      ← highest authority (30 ADRs)
+00-architecture-decisions.md      ← highest authority (39 ADRs)
 05-global-standards.md            ← cross-cutting contract; module docs conform to it
 FE_SPEC.md                        ← client contract (repo root)
 03-end-to-end-flow.md             ← the authoritative user journey
@@ -50,6 +51,11 @@ spec rather than the code.
 - `spring.threads.virtual.enabled=true` is load-bearing, not decoration.
 - **Redisson is gone** (ADR-022). Distributed locks are `pg_try_advisory_xact_lock`.
 - There are **nine** modules: seven domain + `shared` (open) + `saleflow` (read-only leaf).
+- **`SecretsGuard` refuses to start** outside `dev`/`test` while any secret is still
+  `dev-only-change-me` — including `docker compose --profile cluster`, which runs the `docker`
+  profile. Generate them per `.env.example` (ADR-039).
+- Every signed token declares a **`kind`**, length-prefixed into the signed bytes. `SignedToken.sign`
+  and `.verify` both take it; a token of one kind never verifies as another.
 
 ## Module boundaries — enforced, not advisory
 
@@ -129,6 +135,15 @@ Do not reintroduce these — each cost a real defect in the first pass:
 | Sizing promotion batches from inventory alone | Admits 5,000 buyers into a 30-connection pool |
 | `@Modifying(clearAutomatically = true)` on the settle claim | Detaches every other entity in the transaction — the order's status change is silently discarded |
 | Validating the hold before checking for a confirmed order | A resubmitted checkout gets `410 HOLD_EXPIRED` instead of its receipt; the hold is gone because the purchase succeeded |
+| Treating `PENDING` as a terminal order state | It is committed before the charge, so any exit that recorded no outcome strands the buyer holding live seats behind a `409` about a charge they never made (ADR-034) |
+| Reading `COALESCE(SUM(remaining), 0)` as "sold out" | A `SUM` cannot distinguish "nothing left" from "nothing known". An un-warmed event told its whole waiting room the sale had ended (ADR-035) |
+| Deleting the waiting ZSET to express "sold out" | Unrecoverable, and the trigger is a live inventory read that a released hold makes wrong seconds later (ADR-035) |
+| Checking ZSET rank before the sale window | A closed sale's queue reports `WAITING` forever, and both the promoter and the broadcaster have already stopped iterating it (ADR-036) |
+| A Redis key that is not scoped by event | One visitor in two concurrent sales has one promotion overwrite the other (ADR-036) |
+| A claim that survives the failure of the work it guarded | The DLQ replay finds the claim taken and acknowledges without sending (ADR-038) |
+| `saveAndFlush` + catch `DataIntegrityViolationException` + **return** | The transaction is rollback-only; the return throws `UnexpectedRollbackException` at commit. Use `ON CONFLICT DO NOTHING` and a rowcount (ADR-038) |
+| Trusting `X-Forwarded-For` without a trusted-proxy check | Unlimited fresh IP buckets from one caller, and with a free-to-mint session bucket that is no rate limiting at all (ADR-039) |
+| Filtering rehydration to "in flight" states | A completed purchase vanishes on reload and the buyer is invited to re-buy what they own (ADR-037) |
 
 ## Implementation order
 
