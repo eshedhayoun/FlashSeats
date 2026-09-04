@@ -40,20 +40,27 @@ speeds the first paint; the server is the truth.
                         │  every mount: GET /sale/{eventId}/state  │
                         └────────────────────┬─────────────────────┘
                                              ▼
-   windowStatus=UPCOMING ──────────► V1  Pre-Sale Landing
-   windowStatus=CLOSED   ──────────► V6  Sale Closed
-   queue.state=NOT_JOINED ─────────► V1  (Join enabled)
-   queue.state=WAITING ────────────► V2  Virtual Waiting Room
-   queue.state=PROMOTED ───────────► V2 → auto POST /queue/admit → V3
-   queue.state=ADMITTED, hold=null ► V3  Seat Selection
-   queue.state=EXHAUSTED ──────────► V6  Sold Out
-   hold≠null, order=null|FAILED ───► V4  Billing & Checkout
-   order.status=PENDING ───────────► V4  (payment in flight — poll)
-   order.status=CONFIRMED ─────────► V5  Order Confirmation
+   1. hold ≠ null ─────────────────► V4  Billing & Checkout
+   2. queue.state=ADMITTED ────────► V3  Seat Selection
+   3. queue.state=PROMOTED ────────► auto POST /queue/admit → V3
+   4. queue.state=WAITING ─────────► V2  Virtual Waiting Room
+   5. order.status=CONFIRMED ──────► V5  Order Confirmation
+   6. queue.state=EXHAUSTED ───────► V6  Sold Out
+   7. windowStatus=CLOSED ─────────► V6  Sale Closed
+   8. otherwise ───────────────────► V1  Pre-Sale Landing / Join
 ```
 
-This table **is** the router. Do not derive the view from navigation history — a buyer who reloads,
-hits Back, or opens a second tab must land on the view the server says they are in.
+This list **is** the router, and it is **ordered**. Evaluate top to bottom and take the first match.
+Do not derive the view from navigation history — a buyer who reloads, hits Back, or opens a second
+tab must land on the view the server says they are in.
+
+Three positions in that order are load-bearing:
+
+| Rule | Why it sits where it does |
+| :--- | :--- |
+| **hold above `CLOSED`** | The checkout grace (ADR-016) lets a buyer who reached the payment form finish for 15 minutes after the sale ends. Checking the window first would throw them off a purchase the server would have accepted. |
+| **`CONFIRMED` below the queue states** | So a buyer who purchases and then rejoins for a second tier sees the queue rather than being pinned on their old receipt. `/sale/state` reports the *latest* order whatever its status (ADR-037), and precedence — not filtering — decides what that means. |
+| **`EXHAUSTED` above `CLOSED`, both last** | Both are terminal screens, but "sold out" and "the sale ended" are different facts and the buyer deserves the accurate one. Note that `EXHAUSTED` is **reversible**: it is derived from live stock, so a released hold can put a buyer back in the queue (ADR-035). V6's action must re-route, never dead-end.
 
 ---
 
@@ -400,7 +407,34 @@ SPA and a fragile one.
 | V4, mid-3-DS | `order: PENDING` | Resume panel; poll every 2 s |
 | V4, charge settled during reload | `order: CONFIRMED` | Straight to V5 — **the reload cost nothing** |
 | V4, hold expired while away | `hold: null` | Expired panel, "nothing was charged" |
+| **V5, reloaded after buying** | `hold: null`, `order: CONFIRMED` | **Receipt, not the landing page.** Rehydration returned only *pending* orders, so a completed purchase was invisible and the buyer was invited to queue for seats they already owned (ADR-037) |
+| **V2, sale closed while waiting** | `queue.state: CLOSED` | V6. The window is resolved before ZSET rank, and the broadcaster sends `sale-closed` and completes the stream (ADR-036) |
+| **V2, counter unreadable** | `queue.state` unchanged, promotion paused | **Stay in V2.** A missing counter is a fault, never a sold-out sale (ADR-004, ADR-035) |
 | Second tab opened | same session | Both tabs converge on the same state |
+
+### Checkout error handling — one rule per code
+
+The two questions every branch answers: *may they press Pay again*, and *do they still have their
+seats*. Getting either wrong leaves a buyer mashing a button that cannot succeed.
+
+| `code` | Pay button | Seats | Copy must say |
+| :--- | :--- | :--- | :--- |
+| `PAYMENT_DECLINED` | **enabled**, "Try again" | held | "Your seats are still held — N attempt(s) left" |
+| `PAYMENT_GATEWAY_UNAVAILABLE` | **enabled**, "Try again" | held | Our problem, not theirs, and **no attempt was used** (ADR-034) |
+| `PAYMENT_ATTEMPTS_EXHAUSTED` | **disabled** | held | Offer *Release seats* — a further attempt cannot be accepted |
+| `DUPLICATE_PAYMENT` | **disabled** | held | "Finishing a payment already in progress", then poll `/sale/state` |
+| `INVENTORY_UNAVAILABLE` | **enabled**, "Try again" | untouched | "Having trouble reading availability." **Never "sold out"** (ADR-004) |
+| `HOLD_EXPIRED` | — | gone | "Nothing was charged", then re-route |
+| `INSUFFICIENT_TIME_REMAINING` | — | gone | Nothing charged; re-reserve |
+| `ORDER_REFUNDED` | — | gone | A charge settled and **was refunded** — do not claim nothing was charged |
+
+Two of these were missing and fell to a default that re-enabled Pay: `DUPLICATE_PAYMENT`, which
+looped forever, and `PAYMENT_ATTEMPTS_EXHAUSTED`, which offered an attempt the server would refuse.
+
+**`admit()` must not recurse.** A failed `/queue/admit` calls `route()`, and `route()` sends
+`PROMOTED` straight back to `admit()`. A pass that is present but unacceptable — a rotated secret, or
+one minted for another event — loops between the two. Fall back to V1 on a second consecutive
+failure.
 
 ---
 
@@ -563,7 +597,101 @@ tell thousands of buyers the sale ended when it had not.
 
 ---
 
-## 8. Definition of done
+## 8. End-to-end tests — Playwright
+
+> **Status: specified, not built.** Nothing in this section exists yet. It is written down now
+> because the decisions below are cheap to make while the contract is fresh and expensive to
+> retrofit onto a suite someone has already started.
+
+### Why a real browser is required here
+
+The backend suite (`./mvnw test`, 39 tests) already proves the things that live in SQL and Redis: no
+overbooking, restore-exactly-once, one order per hold, the queue's terminal states. It drives the API
+over real HTTP with a real cookie jar. What it cannot touch is **every one of the four rules in §0**,
+because all four are browser behaviours:
+
+| §0 rule | Why only a browser can check it |
+| :--- | :--- |
+| Countdowns derive from `serverTime` | Needs a page whose clock can be skewed away from the server's |
+| Limits come from the API | Needs the rendered DOM, not the response body |
+| Rehydrate on mount, `visibilitychange`, `online` | Needs real page lifecycle events and a real reload |
+| A timer at zero **asks**, never concludes | Needs the timer to actually run for its duration |
+
+Add `EventSource` — which jsdom does not implement, and whose reconnect behaviour is the whole point
+of §4 — and a fake DOM stops being a shortcut and starts being a different system under test.
+
+### Shape
+
+```
+e2e/
+├── playwright.config.ts     webServer: docker compose + spring-boot:run, reuse locally
+├── fixtures/
+│   ├── sale.ts              seed an event via SQL, return its ids  (mirrors SaleFixture)
+│   └── buyer.ts             a browser context = one buyer = one fsid cookie
+└── specs/
+    ├── journey.spec.ts      landing → queue → admit → hold → pay → receipt
+    ├── recovery.spec.ts     the twelve reload points of §3
+    ├── router.spec.ts       the ordered precedence of §1
+    ├── checkout-errors.spec.ts  one case per row of the §3 error matrix
+    └── sse.spec.ts          promotion frame, heartbeat, reconnect, polling fallback
+```
+
+**One browser context per buyer, never one page.** The `fsid` cookie *is* the identity (ADR-010), so
+two contexts are two buyers and two pages in one context are two tabs of the same buyer. Both cases
+need testing and conflating them tests neither.
+
+### What it must cover, and what it must not
+
+**Must** — everything the API suite structurally cannot reach:
+
+- The **recovery matrix** (§3). Twelve rows, twelve `page.reload()` calls. This is the single
+  highest-value spec: two shipped defects were reload-path defects, and both were invisible to a
+  test that never reloaded.
+- The **router precedence** (§1), especially the two ordering rules that are load-bearing: a live
+  hold outranking a closed window, and a confirmed order sitting *below* the queue states.
+- The **checkout error matrix** (§3) — one case per row, asserting the pay button's state as well as
+  the copy. Two rows were missing entirely and fell to a default that re-enabled a button the server
+  would refuse.
+- **SSE**: the promotion frame arriving on a live stream, heartbeats keeping an idle stream open,
+  reconnect with full-jitter backoff, and the polling fallback taking over.
+- **Two tabs converge**, and a purchase in one is visible in the other after a rehydrate.
+
+**Must not** — anything already proven cheaper elsewhere. No overbooking races, no restore-once, no
+settle-claim concurrency. A browser is the slowest, flakiest place to assert a database invariant,
+and `StockReserveConcurrencyIT` already does it in 100 ms.
+
+### The four hard parts, decided in advance
+
+**1. Never sleep; wait on a condition.** Promotion is a real 1 s worker, so a buyer's pass appears
+when it appears. Wait for the UI state or poll `/queue/status`, with a generous timeout — never
+`waitForTimeout`. Shrink `flashseats.queue.promotion-interval-ms` for the test profile instead of
+waiting longer.
+
+**2. Skew the clock deliberately.** Rule §0.1 is only testable if the browser's clock disagrees with
+the server's. Use `page.clock` to install a fixed offset, then assert the countdown still tracks
+`serverTime`. A suite whose browser clock happens to match the server's proves nothing about the
+rule it thinks it is testing.
+
+**3. Drive the payment branches by card token, not by mocking.** `pm_card_visa`, `pm_card_declined`
+and `pm_card_error` already select success, decline and outage in `StubPaymentGateway`, and the
+select on V4 exposes all three. Route-intercepting `/orders/checkout` to fake a response would test
+the client against a fiction — and the two worst checkout defects were in what the *server* actually
+returned, which an intercept would have hidden.
+
+**4. Seed per spec, and reset Redis with PostgreSQL.** Truncating tables while `queue:waiting:1`
+survives is how one spec's queue becomes the next spec's starting state. `SaleFixture.reset()` learned
+this the hard way; the fixture here must flush both. Prefer a fresh event id per spec over sharing
+one.
+
+### Not in scope for the first cut
+
+Visual regression, axe/accessibility assertions, mobile viewport matrices, and multi-replica runs
+behind the `cluster` profile. All of them are worth doing; none of them is worth blocking the
+recovery-matrix coverage on.
+
+---
+
+## 9. Definition of done
 
 - [ ] Every countdown derives from `serverTime` + `expiresAt`; no local decrementing counters
 - [ ] `maxPerOrder` and all TTLs come from the API; no hardcoded limits
@@ -583,3 +711,7 @@ tell thousands of buyers the sale ended when it had not.
 - [ ] `prefers-reduced-motion` respected
 - [ ] Pay button disabled on click, not debounced
 - [ ] Two tabs on the same session converge on the same view
+
+**Not yet covered by any automated test.** Every box above is verified by hand today. §8 specifies
+the Playwright suite that should own them; until it exists, this list is a checklist a person walks,
+and the twelve reload points are the ones most likely to rot between passes.
