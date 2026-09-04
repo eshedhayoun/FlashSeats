@@ -81,9 +81,15 @@
 			<artifactId>micrometer-registry-prometheus</artifactId>
 			<scope>runtime</scope>
 		</dependency>
+		<!--
+			Boot 4 split Flyway's auto-configuration out of spring-boot-autoconfigure into its own
+			module. With flyway-core alone the migrations are on the classpath but nothing runs
+			them, and the first symptom is Hibernate's `ddl-auto=validate` reporting a missing
+			table — which reads like a mapping bug rather than a missing starter.
+		-->
 		<dependency>
-			<groupId>org.flywaydb</groupId>
-			<artifactId>flyway-core</artifactId>
+			<groupId>org.springframework.boot</groupId>
+			<artifactId>spring-boot-starter-flyway</artifactId>
 		</dependency>
 		<dependency>
 			<groupId>org.flywaydb</groupId>
@@ -251,6 +257,37 @@
 			<plugin>
 				<groupId>org.springframework.boot</groupId>
 				<artifactId>spring-boot-maven-plugin</artifactId>
+			</plugin>
+			<!--
+				Run the *IT classes with the unit tests. They are Testcontainers-backed
+				integration tests, and they carry the guarantees this system exists to make —
+				no overbooking, restore-exactly-once, one order per hold. Relegating them to a
+				separate profile would mean `./mvnw test` reported success without ever having
+				checked the only things that matter.
+			-->
+			<plugin>
+				<groupId>org.apache.maven.plugins</groupId>
+				<artifactId>maven-surefire-plugin</artifactId>
+				<configuration>
+					<includes>
+						<include>**/*Test.java</include>
+						<include>**/*Tests.java</include>
+						<include>**/*IT.java</include>
+					</includes>
+					<systemPropertyVariables>
+						<!--
+							Docker Engine 29 rejects the API version docker-java negotiates by
+							default, and the symptom is badly misleading: /info answers HTTP 400
+							with an empty body, so Testcontainers reports "Could not find a valid
+							Docker environment" on a machine where `docker ps` works fine.
+
+							1.44 sits well inside the supported range (Engine 29 accepts 1.40 and
+							up) and is understood by every Docker since 25, so pinning it costs
+							nothing and saves the next person an hour.
+						-->
+						<api.version>1.44</api.version>
+					</systemPropertyVariables>
+				</configuration>
 			</plugin>
 			<plugin>
 				<groupId>org.apache.maven.plugins</groupId>
