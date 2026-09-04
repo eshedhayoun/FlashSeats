@@ -57,10 +57,16 @@ public class OrderQueryService {
         return toReceipt(order);
     }
 
+    /**
+     * This session's most recent order for an event, whatever its status.
+     *
+     * <p>Feeds rehydration, which needs to answer "where is this buyer?" — and "they already bought"
+     * is one of the answers (ADR-037). Restricting it to {@code PENDING} made a confirmed purchase
+     * invisible the moment the page reloaded.
+     */
     @Transactional(readOnly = true)
-    public Optional<Order> findPending(String sessionId, long eventId) {
-        return orders.findFirstByUserSessionIdAndEventIdAndStatusOrderByCreatedAtDesc(
-                sessionId, eventId, OrderStatus.PENDING);
+    public Optional<Order> findLatest(String sessionId, long eventId) {
+        return orders.findFirstByUserSessionIdAndEventIdOrderByCreatedAtDesc(sessionId, eventId);
     }
 
     @Transactional(readOnly = true)

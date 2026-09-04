@@ -72,7 +72,7 @@ public class SaleStateAssembler {
         SaleStateResponse.OrderSection orderSection = read(
                 "order",
                 partial,
-                () -> orders.findPendingOrder(sessionId, eventId)
+                () -> orders.findLatestOrder(sessionId, eventId)
                         .map(order -> new SaleStateResponse.OrderSection(
                                 order.orderNumber(), order.status()))
                         .orElse(null));
