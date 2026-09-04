@@ -147,9 +147,24 @@ public class CatalogService {
         return inventory.findRemaining(tierId).orElse(COUNTER_UNAVAILABLE);
     }
 
-    /** Total remaining across an event's tiers — the promoter's admission bound. */
+    /**
+     * Total remaining across an event's tiers — the promoter's admission bound.
+     *
+     * <p><strong>"No counter" is never "zero"</strong> (ADR-035). A tier with no
+     * {@code tier_inventory} row contributes nothing to a {@code SUM}, so an un-warmed event would
+     * report {@code 0} remaining and be indistinguishable from a sold-out one. The caller would then
+     * tell an entire waiting room the sale had ended because a row was missing — ADR-004's failure,
+     * one module over. If any tier is missing its counter the whole answer is a fault.
+     *
+     * @return remaining seats across the event, or {@link #COUNTER_UNAVAILABLE} if any tier has no
+     *     counter
+     */
     @Transactional(readOnly = true)
     public int getRemainingForEvent(long eventId) {
+        if (inventory.countTiersMissingInventory(eventId) > 0) {
+            log.error("Event {} has tiers with no inventory counter; remaining is unreadable", eventId);
+            return COUNTER_UNAVAILABLE;
+        }
         return inventory.sumRemainingForEvent(eventId);
     }
 

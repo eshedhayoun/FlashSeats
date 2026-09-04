@@ -159,8 +159,13 @@ class HoldLifecycleIT extends IntegrationTest {
     @Test
     @DisplayName("A missing inventory counter is a fault, never a sold-out sale")
     void missingCounterIsAFaultNotSoldOut() {
-        long unwarmedTier = fixture.tierWithoutInventory(eventId, "Balcony", 3_000, 50);
+        // Admitted BEFORE the un-warmed tier exists, because promotion now pauses for an event
+        // whose remaining count cannot be read at all (ADR-035) — one tier without a counter makes
+        // the event's total unknowable, and admitting on a number we cannot read is how a sale
+        // oversells. That pause is the subject of QueueLifecycleIT; what this test is about is what
+        // the buyer sees when they reach a tier whose counter is missing.
         BuyerSession buyer = admittedBuyer();
+        long unwarmedTier = fixture.tierWithoutInventory(eventId, "Balcony", 3_000, 50);
 
         var response = buyer.post(
                 "/holds",

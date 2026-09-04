@@ -75,4 +75,22 @@ public interface TierInventoryRepository extends JpaRepository<TierInventory, Lo
 
     @Query("SELECT COALESCE(SUM(i.remaining), 0) FROM TierInventory i WHERE i.eventId = :eventId")
     int sumRemainingForEvent(@Param("eventId") long eventId);
+
+    /**
+     * How many of an event's tiers have no counter row at all.
+     *
+     * <p>This exists because {@code SUM} cannot express the difference between "nothing left" and
+     * "nothing known" — {@code COALESCE(SUM(...), 0)} answers {@code 0} for both. Reading that
+     * {@code 0} as "sold out" is ADR-004's failure mode, and it reached the waiting room: an event
+     * that was never pre-warmed made the promotion worker declare the sale exhausted and drain
+     * everybody out of the line (ADR-035).
+     *
+     * @return 0 when every tier has a counter and the sum is therefore meaningful
+     */
+    @Query("""
+            SELECT COUNT(t) FROM TicketTier t
+             WHERE t.eventId = :eventId
+               AND NOT EXISTS (SELECT 1 FROM TierInventory i WHERE i.tierId = t.id)
+            """)
+    int countTiersMissingInventory(@Param("eventId") long eventId);
 }
