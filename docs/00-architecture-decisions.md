@@ -991,3 +991,236 @@ deterministic secrets so a token minted in one place verifies in another.
 **Consequence, accepted.** `docker compose --profile cluster` runs the `docker` profile and therefore
 refuses to start until real secrets are supplied. A three-replica run is closer to a deployment than
 to a laptop demo, and `.env.example` says so with the command to generate them.
+
+---
+
+# Pass 2 — decisions the second review forced
+
+ADR-040 to ADR-042 come from the second review pass over the built MVP. ADR-040 is the one that
+mattered: it is ADR-004's failure mode surviving in the one place ADR-035 did not look.
+
+---
+
+## ADR-040 — An unreadable counter is `UNKNOWN`, never a bucket
+
+**Decision.** `AvailabilityLevel` gains a fourth value, `UNKNOWN`, and it is not a bucket — it is
+the absence of one. `AvailabilityBuckets.of` receives the raw counter value, fault code included,
+and answers `UNKNOWN` for `COUNTER_UNAVAILABLE`. No caller may clamp the fault into a number.
+
+The client renders `UNKNOWN` as "Checking…", in neutral colour, and **never disables the tier**.
+`POST /holds` is what actually knows, and it already distinguishes `409 INSUFFICIENT_STOCK` from
+`503 INVENTORY_UNAVAILABLE` correctly.
+
+**The defect.** `CatalogService.toTierResponse` read the counter and passed
+`Math.max(remaining, 0)` into the bucket rule. `COUNTER_UNAVAILABLE` is `-1`, so a tier with no
+`tier_inventory` row was published to every visitor as `SOLD_OUT` — on the landing page, the first
+surface anyone touches.
+
+This is exactly ADR-004's prohibition ("a missing counter is a fault, never sold out") and exactly
+the trap `CLAUDE.md` names. ADR-035 closed it in `getRemainingForEvent` for the promoter and in
+`HoldService` for the reserve path; **the browse read was the third caller and it was missed.** The
+dev seeder demonstrates it out of the box: *Midnight Sessions* ships un-warmed, so its only tier
+reads `SOLD_OUT` on a sale that has not opened.
+
+**Why the second-order effect is worse than the first.** The demo client sets
+`aria-disabled="true"` on a `SOLD_OUT` tier. An admitted buyer facing a tier whose counter went
+missing mid-sale could not click it — no error, no `503`, no retry copy, nothing to act on. A
+Phase-2 Redis eviction lands here before it lands anywhere else.
+
+**Why a fourth enum value rather than a flag.** "Sold out" and "unknown" are different facts about
+inventory, and a three-value enum can only express the first. Anything that maps the second onto
+the first is a lossy conversion at a call site — which is precisely what happened. Making the type
+able to say it removes the whole class of mistake.
+
+**Consequence, accepted.** `availability` is a wider contract: `FE_SPEC.md` §V1 gains a badge row.
+An old client that switches on three values falls through to its default, which must not be
+"sold out" — the spec now says so explicitly.
+
+---
+
+## ADR-041 — A `@RestControllerAdvice` that catches `Exception` must list what Spring throws first
+
+**Decision.** `GlobalExceptionHandler` handles `MissingServletRequestParameterException`,
+`MethodArgumentTypeMismatchException`, `MissingPathVariableException`,
+`HttpRequestMethodNotSupportedException` and `HttpMediaTypeNotSupportedException` explicitly, ahead
+of its `Exception` backstop.
+
+**The defect.** `ExceptionHandlerExceptionResolver` runs **before**
+`DefaultHandlerExceptionResolver`, and `spring.mvc.problemdetails.enabled` is not set. So the
+`@ExceptionHandler(Exception.class)` backstop — added for genuinely unhandled faults — matched
+every one of Spring's own binding exceptions first. A missing query parameter returned
+**`500 INTERNAL_ERROR`**, logged a stack trace at `ERROR`, and carried no registry `code`.
+
+Verified before the fix: `GET /api/v1/queue/status` with no `eventId` and
+`GET /api/v1/events/not-a-number` both answered `500`.
+
+Three things break at once. Global standards §1 says `500` is never a client error and every
+problem carries a `code`. The SPA switches on `code`, so it fell through to a default that
+re-enables the Pay button. And an `ERROR` log line per malformed request buries real faults.
+
+**The general rule.** A catch-all advice is a backstop, not a router. Anything the framework raises
+on the way to a handler must be named before it, or the backstop silently owns it.
+
+---
+
+## ADR-042 — `DLQ` means the work did not happen
+
+**Decision.** `OrderConfirmedConsumer` tracks whether the message was actually delivered. A failure
+*after* a successful send records `SENT`, never `DLQ`.
+
+**Why.** ADR-038 made a dead-lettered notification re-claimable so a DLQ replay actually sends —
+and that is right. But its safety argument rests entirely on `DLQ` meaning the send did not happen.
+The consumer's single `catch` spanned `dispatcher.send`, `markSent` and `basicAck`, so a closed
+channel after the mail server had already accepted the message marked the row `DLQ` — and the
+replay would then send the buyer a **second ticket**, the one outcome ADR-038 states cannot occur.
+
+The redelivery still arrives. It finds the row `SENT`, wins no claim, and is quietly acknowledged,
+which is the path a duplicate is supposed to take.
+
+**The rule this generalises.** A claim's terminal states must mean what the next reader assumes they
+mean. `DLQ` is not "something went wrong"; it is "the work did not happen and may be retried".
+
+---
+
+# Post-MVP decisions (ADR-043 – ADR-045)
+
+> Taken before the work starts rather than during it, because all three shape schemas and the module
+> graph — and the cheapest moment to decide where an identity lives is before anything stores one.
+
+---
+
+## ADR-043 — The operator surface is a correctness dependency, not polish
+
+**Decision.** Build the admin surface in Stage 4, and treat it as **required**, not additive. Admin
+endpoints live in the module that owns the state, under `/api/v1/admin/**`, guarded by `ROLE_ADMIN`.
+**There is no `admin` module.**
+
+Minimum set, each in its owning module:
+
+| Endpoint | Module | Why it is not optional |
+| :--- | :--- | :--- |
+| `POST /admin/events/{id}/pause` | `catalog` | There is currently no way to stop a sale that is going wrong |
+| `POST /admin/events/{id}/rebuild-stock` | `catalog` | **ADR-004 names this as the only legal recovery** from a missing counter, and nothing exposes it |
+| `GET /admin/notifications/dlq` | `notification` | A dead letter nobody can see is a lost ticket |
+| `POST /admin/notifications/resend/{orderNumber}` | `notification` | **ADR-029's premise.** See below |
+| `GET /admin/orders/{orderNumber}` | `order` | Support cannot answer "where is my ticket?" without it |
+
+**Why this is a correctness dependency.** Two ADRs already assume an operator who can act, and
+neither says so out loud:
+
+* **ADR-029** routes deterministic failures *straight to the DLQ with no retries*. That is the right
+  call — three identical stack traces help nobody — but it is only correct **if someone can replay
+  the message.** Pass 2 found a PDF font failure that dead-lettered a **paid** buyer's ticket, and
+  because no replay endpoint exists the DLQ was a black hole. ADR-038 went to real trouble to make a
+  dead-lettered claim re-claimable *specifically so a replay would send*; nothing can currently
+  trigger that replay.
+* **ADR-004** forbids reseeding a live counter and points at a locked rebuild instead. The rebuild is
+  specified in three documents and implemented nowhere, so the documented recovery from the system's
+  worst failure is currently "edit the database by hand".
+
+A design that deliberately routes failures somewhere is only finished when something can retrieve
+them from there.
+
+**Why there is no `admin` module.** An admin module would have to read `catalog`'s inventory,
+`notification`'s logs and `order`'s ledger — every module's internals, which is exactly the boundary
+violation `ApplicationModules.verify()` exists to reject. Ownership does not change because the
+caller is an operator. `catalog` already does this correctly with `AdminCatalogController`.
+
+**Auth.** The in-memory `UserDetailsService` (§10 S12) must be replaced before this surface grows.
+One hardcoded account is tolerable for one pre-warm endpoint and is not tolerable for a surface that
+can pause sales and resend tickets.
+
+**An admin UI is not required.** Every endpoint above is usable with `curl` and belongs to whoever
+is on call. A console is presentation; the endpoints are the capability, and only the capability is
+load-bearing.
+
+---
+
+## ADR-044 — Buyer accounts are an overlay on session identity, never a replacement
+
+**Decision.** Add an optional account in Stage 5. **`fsid` remains the only session identity, and
+ADR-010 is unchanged.** An account is a second, *durable* identity that attaches to purchases —
+never to queue position, hold ownership, or rate limiting.
+
+```
+fsid       — anonymous, signed, 24 h, per browser.   Queue · holds · rate limits · order access
+accountId  — durable, authenticated, optional.       Purchase history · a stronger abuse bucket
+```
+
+New leaf module `com.flashseats.account`, depended on by `order` (to stamp a purchase) and
+`saleflow` (to report who is signed in). It depends on nothing, so the graph stays acyclic:
+
+```
+order    ──► hold, catalog, payment, queue, account
+saleflow ──► queue, hold, order, catalog, account
+```
+
+Binding happens at **checkout only**: if the session is authenticated, `orders.account_id` (nullable
+FK) is stamped inside the existing transaction. Not at join, not at hold — those must keep working
+for a visitor who has never signed in.
+
+**Why an overlay rather than a replacement.** Three things break if an account becomes *the*
+identity:
+
+1. **The queue must serve anonymous visitors.** Ten thousand people arrive at `t=0`; putting an
+   authentication round trip in front of `POST /queue/join` adds a dependency to the hottest path in
+   the system for no correctness gain.
+2. **ADR-010's guarantee is that identity has exactly one source.** What makes spoofing impossible
+   is that nothing anywhere reads a session id from a body, header or parameter. A second identity
+   source is a second thing to get wrong, and the two would have to be reconciled at every ownership
+   check.
+3. **Pre-sale browsing is anonymous by nature.** The `fsid` is minted on the landing page so a
+   visitor has a stable identity *before* the sale opens. An account cannot be required that early.
+
+**What it actually buys, concretely.**
+
+* **Purchase history that outlives the cookie.** `flashseats.bot.cookie.max-age-seconds` is
+  **86 400**, so `GET /orders/{n}` authorised by a matching `fsid` works for exactly one day. After
+  that a buyer's only route to their own order is the signed `receiptToken` link in their email
+  (ADR-010) — lose the email, lose the ticket. `FE_SPEC.md` §3 papers over this with
+  `localStorage: fs.recentOrders`, which is a per-browser hint, not a record. An account is the
+  first durable answer.
+* **A rate-limit bucket that costs something to mint.** §10 S5 is explicit that the session bucket
+  "does not constrain a determined attacker at all", because anyone can discard a cookie for a fresh
+  one, leaving the deliberately loose IP bucket as the only backstop. A verified account is the
+  compensating control that section has been waiting for — and it is what Verified-Fan-style drops
+  actually gate on.
+* **A support identity.** "Which of these orders is mine" is currently unanswerable without an order
+  number.
+
+**Anonymous purchases stay first class.** A buyer who never signs in must still complete the whole
+journey and still receive their ticket. An account created later can **claim** an existing order by
+presenting its `receiptToken` — the capability already exists and already proves possession, so
+claiming needs no new mechanism.
+
+**Whether to require login to enter the queue is a product decision, not a technical one.** The
+architecture above supports either. Requiring it raises the cost of automation and lowers
+conversion; the default is not to require it, and to revisit that with real abuse data rather than
+in advance.
+
+**Consequence, accepted.** §10 S9 stops being deferrable. Storing `orders.user_email` in clear with
+no retention policy is one thing for an anonymous transaction and another once it hangs off a named
+account: a deletion path and a stated retention period become mandatory, not advisable, and they are
+part of this stage rather than after it.
+
+---
+
+## ADR-045 — `/actuator/health` is already the right shape; the gap is what it reports
+
+**Decision.** No change to the actuator surface. `/actuator/health` stays public because it is the
+container healthcheck target in `Dockerfile`, `compose.yaml` and `nginx.conf`; `metrics` and
+`prometheus` stay behind `ROLE_ADMIN`. Recorded so a later pass does not "fix" either one.
+
+**Why the split is deliberate.** A healthcheck an orchestrator cannot read is useless, so
+`health` must be open. `metrics` and `prometheus` are the opposite: they describe inventory levels,
+queue depth, order rates and connection-pool pressure — a live read on how the sale is going, and a
+useful one to anyone attacking it. Exposing them without authentication was a defect fixed in Pass 0.
+
+**The real gap is upstream of the endpoint.** The endpoint works; the metrics behind it are thin.
+`flashseats.stock.drift` — the system's canary, the one alarm that should page — is asserted in
+tests and **not exported**, because with a PostgreSQL counter it cannot diverge from itself. It
+becomes a live metric the moment Redis holds the count, which is Stage 1. The rest of the alarm set
+in global standards §9 lands with Stage 3.
+
+So: health is done and needs nothing. **Observability is not done**, and it is already scheduled —
+the thing to avoid is mistaking the first for the second because the endpoint returns `UP`.

@@ -10,8 +10,8 @@ PDF ticket, 25 tests green. Inventory is PostgreSQL-only for now — correct, an
 replaces exactly one method body.
 
 **Read [`docs/00-architecture-decisions.md`](docs/00-architecture-decisions.md) before changing
-anything.** It contains 39 ADRs, each recording a defect and its fix — 034-039 come from the first review
-pass over the built code. Several look
+anything.** It contains 42 ADRs, each recording a defect and its fix — 034-039 come from the first
+review pass over the built code, 040-042 from the second. Several look
 like over-engineering until you read the failure they prevent.
 
 **For what is actually built**, read [`docs/06-mvp-overview.md`](docs/06-mvp-overview.md) — scope,
@@ -20,7 +20,7 @@ security posture, next stages, and the review-pass log. It is the doc to update 
 ## Document precedence
 
 ```
-00-architecture-decisions.md      ← highest authority (39 ADRs)
+00-architecture-decisions.md      ← highest authority (42 ADRs)
 05-global-standards.md            ← cross-cutting contract; module docs conform to it
 FE_SPEC.md                        ← client contract (repo root)
 03-end-to-end-flow.md             ← the authoritative user journey
@@ -144,6 +144,11 @@ Do not reintroduce these — each cost a real defect in the first pass:
 | `saveAndFlush` + catch `DataIntegrityViolationException` + **return** | The transaction is rollback-only; the return throws `UnexpectedRollbackException` at commit. Use `ON CONFLICT DO NOTHING` and a rowcount (ADR-038) |
 | Trusting `X-Forwarded-For` without a trusted-proxy check | Unlimited fresh IP buckets from one caller, and with a free-to-mint session bucket that is no rate limiting at all (ADR-039) |
 | Filtering rehydration to "in flight" states | A completed purchase vanishes on reload and the buyer is invited to re-buy what they own (ADR-037) |
+| `Math.max(remaining, 0)` on a counter that can return `-1` | Clamps the *fault code* into a *number*. A missing counter is published as `SOLD_OUT` on the landing page, and the client renders that tier unclickable (ADR-040) |
+| A `@RestControllerAdvice` catching `Exception` without naming Spring's binding exceptions first | `ExceptionHandlerExceptionResolver` runs before `DefaultHandlerExceptionResolver`, so the backstop owns them: a missing query param answers `500 INTERNAL_ERROR` with no `code` (ADR-041) |
+| Marking a notification `DLQ` after the mail server already accepted it | `DLQ` is re-claimable by design, so the replay sends a second ticket (ADR-042) |
+| Drawing operator-supplied text with a standard-14 PDF font | `showText` throws on anything outside WinAnsi. Deterministic, so no retry — a Hebrew event title costs a paid buyer their ticket |
+| A default `spring.profiles.active` in `application.properties` | Makes a fail-closed profile guard opt-in: the packaged jar boots on dev secrets, silently |
 
 ## Implementation order
 
@@ -164,7 +169,9 @@ docker compose up -d postgres                    # strictly-minimal Phase 1
 
 ./mvnw -DskipTests compile                       # build
 ./mvnw test                                      # incl. ApplicationModules.verify() once written
-./mvnw spring-boot:run                           # run locally against the compose services
+./mvnw spring-boot:run                           # runs the `dev` profile (set in the pom, not in
+                                                 # application.properties — a default profile there
+                                                 # would make SecretsGuard opt-in, ADR-039)
 
 docker compose --profile cluster  up -d --build  # Nginx + 3 replicas on :8080 (Phase 4)
 docker compose --profile loadtest run --rm k6    # 10k virtual buyers

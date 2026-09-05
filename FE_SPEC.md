@@ -84,8 +84,18 @@ Three positions in that order are load-bearing:
 | `PLENTY` | "Available" | success |
 | `LIMITED` | "Limited" | warning |
 | `SOLD_OUT` | "Sold Out" | disabled |
+| `UNKNOWN` | "Checking…" | neutral — **never** the sold-out treatment (ADR-040) |
 
 > Exact counts are deliberately not exposed: they drive panic-buying and give scalpers a live feed.
+
+**`UNKNOWN` is a fault, not a bucket.** It means the server could not read that tier's counter — the
+same fact as `503 INVENTORY_UNAVAILABLE`, arriving on a `200`. Render it neutrally, keep the tier
+**selectable**, and let `POST /holds` answer: it already distinguishes `409 INSUFFICIENT_STOCK` from
+`503 INVENTORY_UNAVAILABLE`. Rendering it as sold out would tell every visitor a live sale had ended
+because a row was missing, which is precisely what shipped (ADR-004, ADR-040).
+
+**Any value your switch does not recognise must fall through to `UNKNOWN`, never to `SOLD_OUT`.**
+The enum has grown once and may grow again; the safe default is "we do not know", never "it is gone".
 
 **At `T-0`:** flip the CTA live client-side from the countdown. Do **not** auto-submit — a self-firing
 join at exactly `t=0` from every open tab is indistinguishable from a bot, and reCAPTCHA will score
@@ -313,10 +323,10 @@ Base `/api/v1`. `fsid` is an `HttpOnly` cookie — **JavaScript never reads or s
 | V1→V2 | `POST` | `/queue/join` | — | `{eventId, recaptchaToken}` | `202` | `SALE_NOT_OPEN`, `RATE_LIMITED`, `BOT_VERIFICATION_FAILED` |
 | V2 | `GET` | `/queue/stream?eventId=` | `Accept: text/event-stream` | — | SSE | — |
 | V2 | `GET` | `/queue/status?eventId=` | — | — | `200` | `NOT_IN_QUEUE` |
-| V2→V3 | `POST` | `/queue/admit` | `X-Queue-Pass-Token` | `{eventId}` | `200` | `QUEUE_PASS_INVALID`, `QUEUE_PASS_EXPIRED` |
+| V2→V3 | `POST` | `/queue/admit` | `X-Queue-Pass-Token` | `{eventId}` | `200` | `QUEUE_PASS_INVALID`, `QUEUE_PASS_EXPIRED`, `VALIDATION_FAILED` |
 | V3 | `POST` | `/holds` | `X-Admission-Token` | `{eventId, tierId, quantity}` | `201` | `INSUFFICIENT_STOCK`, `QUANTITY_EXCEEDS_LIMIT`, `HOLD_LIMIT_EXCEEDED`, `ADMISSION_EXPIRED`, `INVENTORY_UNAVAILABLE` |
 | V4 | `GET` | `/holds/{holdToken}` | — | — | `200` | `HOLD_NOT_FOUND`, `HOLD_EXPIRED` |
-| V4 | `DELETE` | `/holds/{holdToken}` | — | — | `200` | `HOLD_NOT_FOUND` |
+| V4 | `DELETE` | `/holds/{holdToken}` | — | — | `204` | `HOLD_NOT_FOUND` |
 | V4 | `POST` | `/orders/checkout` | — | `{holdToken, userEmail, paymentMethodId, idempotencyKey}` | `201`/`200` | `PAYMENT_DECLINED`, `PAYMENT_ACTION_REQUIRED`, `PAYMENT_ATTEMPTS_EXHAUSTED`, `HOLD_EXPIRED`, `DUPLICATE_PAYMENT`, `PAYMENT_GATEWAY_UNAVAILABLE`, `CHECKOUT_WINDOW_CLOSED` |
 | V4 | `POST` | `/orders/checkout/resume` | — | `{holdToken}` | `201`/`200` | as above |
 | V5 | `GET` | `/orders/{orderNumber}?receiptToken=` | — | — | `200` | `ORDER_NOT_FOUND` |
@@ -425,11 +435,19 @@ seats*. Getting either wrong leaves a buyer mashing a button that cannot succeed
 | `DUPLICATE_PAYMENT` | **disabled** | held | "Finishing a payment already in progress", then poll `/sale/state` |
 | `INVENTORY_UNAVAILABLE` | **enabled**, "Try again" | untouched | "Having trouble reading availability." **Never "sold out"** (ADR-004) |
 | `HOLD_EXPIRED` | — | gone | "Nothing was charged", then re-route |
-| `INSUFFICIENT_TIME_REMAINING` | — | gone | Nothing charged; re-reserve |
+| `INSUFFICIENT_TIME_REMAINING` | **disabled** | **held** | Nothing charged, but the grace budget is spent. Offer *Release seats* — do **not** re-route |
 | `ORDER_REFUNDED` | — | gone | A charge settled and **was refunded** — do not claim nothing was charged |
 
 Two of these were missing and fell to a default that re-enabled Pay: `DUPLICATE_PAYMENT`, which
 looped forever, and `PAYMENT_ATTEMPTS_EXHAUSTED`, which offered an attempt the server would refuse.
+
+A third was **wrong rather than missing**. `INSUFFICIENT_TIME_REMAINING` was listed as "seats gone",
+and the client cleared the hold and re-routed. The server does the opposite: it refuses to *start* a
+charge it cannot finish inside the window and deliberately **keeps the reservation** (ADR-030,
+`order.md` §5). Re-routing therefore rehydrated onto the same live hold and dropped the buyer back
+on the checkout screen, where the same timer guaranteed the same `409` — a loop with no exit, on the
+one screen where money is involved. The grace budget is already spent, so the only way out is to
+release and re-reserve, and the UI has to say so.
 
 **`admit()` must not recurse.** A failed `/queue/admit` calls `route()`, and `route()` sends
 `PROMOTED` straight back to `admit()`. A pass that is present but unacceptable — a rotated secret, or

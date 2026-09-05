@@ -27,7 +27,6 @@ import org.springframework.web.filter.OncePerRequestFilter;
 @Order(Ordered.HIGHEST_PRECEDENCE + 30)
 public class RateLimitFilter extends OncePerRequestFilter {
 
-    private static final String STREAM_PATH = "/api/v1/queue/stream";
     private static final int RETRY_AFTER_SECONDS = 2;
 
     private final RateLimitService rateLimits;
@@ -41,14 +40,18 @@ public class RateLimitFilter extends OncePerRequestFilter {
     /**
      * Only the API is metered.
      *
-     * <p>The SSE stream is exempt from per-request accounting and counted once at connect: it is one
-     * long-lived connection, not a stream of requests, and charging it per frame would throttle
-     * exactly the buyers who are waiting patiently.
+     * <p>The SSE stream <strong>is</strong> filtered — it is a single request that opens a
+     * connection, and it is charged exactly once, here, at connect. What it is exempt from is
+     * per-<em>frame</em> accounting, which it gets for free: the frames are pushed by the server and
+     * never come back through this filter. Charging per frame would throttle precisely the buyers
+     * who are waiting patiently.
+     *
+     * <p>It used to be skipped entirely, which is not the same thing (ADR-011, {@code bot.md} §4):
+     * a session could open unlimited streams and spend nothing at all.
      */
     @Override
     protected boolean shouldNotFilter(HttpServletRequest request) {
-        String path = request.getRequestURI();
-        return !path.startsWith("/api/") || path.equals(STREAM_PATH);
+        return !request.getRequestURI().startsWith("/api/");
     }
 
     @Override

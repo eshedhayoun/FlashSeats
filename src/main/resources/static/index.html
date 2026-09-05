@@ -60,6 +60,9 @@
   .badge.PLENTY  { background:var(--accent-soft); color:var(--accent-ink); }
   .badge.LIMITED { background:var(--warn-soft);   color:var(--warn); }
   .badge.SOLD_OUT{ background:var(--surface-2);   color:var(--ink-3); }
+  /* UNKNOWN means the counter could not be read — a fault, never a sold-out tier (ADR-040).
+     Neutral on purpose: it must not look like either "available" or "gone". */
+  .badge.UNKNOWN { background:var(--surface-2);   color:var(--ink-2); }
 
   .tier { display:flex; justify-content:space-between; align-items:center; gap:14px;
           padding:14px 16px; border:1px solid var(--rule); border-radius:7px;
@@ -239,6 +242,13 @@ const secondsUntil = (iso) => iso ? Math.max(0, Math.round((Date.parse(iso) - no
 const mmss = (s) => `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`;
 const money = (cents, ccy) => `${ccy} ${(cents / 100).toFixed(2)}`;
 
+/* UNKNOWN is a FAULT, not a bucket (ADR-040): the counter could not be read. Rendering it as
+   "sold out" would tell every visitor a live sale had ended because a row was missing — the same
+   mistake as rendering a 503 INVENTORY_UNAVAILABLE that way. The tier stays selectable; POST
+   /holds is what actually knows, and it already answers 409 and 503 differently. */
+const availabilityLabel = (level) =>
+  level === "UNKNOWN" ? "Checking…" : level.replace("_", " ");
+
 /* --- API ---------------------------------------------------------- */
 
 async function api(path, init = {}) {
@@ -337,7 +347,7 @@ function showLanding() {
         <div class="name">${escapeHtml(t.tierName)}</div>
         <div class="muted">${money(t.priceCents, t.currency)} · up to ${t.maxPerOrder} per order</div>
       </div>
-      <span class="badge ${t.availability}">${t.availability.replace("_", " ")}</span>
+      <span class="badge ${t.availability}">${availabilityLabel(t.availability)}</span>
     </div>`).join("");
 
   show("v-landing");
@@ -402,7 +412,7 @@ function openStream() {
 
   es.addEventListener("position-update", (e) => {
     const d = JSON.parse(e.data);
-    renderPosition(d.position, d.estWaitSeconds < 0 ? null : d.estWaitSeconds);
+    renderPosition(d.position, d.estWaitSeconds);
   });
   es.addEventListener("queue-promoted", (e) => admit(JSON.parse(e.data).passToken));
   es.addEventListener("sale-exhausted", () => terminal("Sold out", "The last ticket went while you were waiting."));
@@ -430,9 +440,10 @@ function scheduleReconnect() {
 
 async function admit(passToken) {
   try {
-    const res = await api(`/queue/admit?eventId=${state.eventId}`, {
+    const res = await api("/queue/admit", {
       method: "POST",
       headers: { "X-Queue-Pass-Token": passToken },
+      body: JSON.stringify({ eventId: state.eventId }),
     });
     state.admitFailed = false;
     store.admission = res.admissionToken;
@@ -457,12 +468,13 @@ function showSelect(admissionExpiresAt) {
 
   $("select-tiers").innerHTML = tiers.map((t) => `
     <div class="tier" data-tier="${t.tierId}" data-max="${t.maxPerOrder}"
-         aria-selected="false" aria-disabled="${t.availability === "SOLD_OUT"}">
+         aria-selected="false" aria-disabled="${t.availability === "SOLD_OUT"}"
+         data-comment="UNKNOWN is deliberately selectable — see availabilityLabel()">
       <div>
         <div class="name">${escapeHtml(t.tierName)}</div>
         <div class="muted">${money(t.priceCents, t.currency)} each</div>
       </div>
-      <span class="badge ${t.availability}">${t.availability.replace("_", " ")}</span>
+      <span class="badge ${t.availability}">${availabilityLabel(t.availability)}</span>
     </div>`).join("");
 
   $("select-tiers").querySelectorAll(".tier").forEach((el) => {
@@ -594,9 +606,16 @@ function handleCheckoutFailure(p) {
       notify("We're having trouble reading availability. Nothing was charged — please try again.");
       return retry("Try again");
 
+    case "INSUFFICIENT_TIME_REMAINING":
+      // The seats are STILL HELD — the server refused to start a charge it could not finish
+      // inside the window, and deliberately kept the reservation (ADR-030). Clearing the hold
+      // and re-routing bounced the buyer straight back onto this screen, where the same timer
+      // guaranteed the same refusal. The grace budget is spent, so the way out is to release.
+      notify(`${p.detail} Release your seats and reserve again.`);
+      return stop();
+
     case "HOLD_EXPIRED":
     case "ORDER_REFUNDED":
-    case "INSUFFICIENT_TIME_REMAINING":
       store.hold = null;
       return setTimeout(route, 1200);
 

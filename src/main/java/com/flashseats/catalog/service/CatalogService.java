@@ -18,7 +18,9 @@ import com.flashseats.catalog.repository.TicketTierRepository;
 import com.flashseats.catalog.repository.TierInventoryRepository;
 import java.time.Clock;
 import java.time.Instant;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Service;
@@ -78,8 +80,12 @@ public class CatalogService {
         Event event = requireEvent(eventId);
         Instant now = clock.instant();
 
+        // One read for every counter, not one per tier: this is the landing page, and every visitor
+        // loads it before the sale and reloads it while they wait.
+        Map<Long, Integer> remainingByTier = remainingByTier(eventId);
+
         List<TierResponse> tierResponses = tiers.findByEventIdOrderByPriceCentsDesc(eventId).stream()
-                .map(this::toTierResponse)
+                .map(tier -> toTierResponse(tier, remainingByTier))
                 .toList();
 
         return new EventDetailResponse(
@@ -227,8 +233,33 @@ public class CatalogService {
         return events.findById(eventId).orElseThrow(() -> new EventNotFoundException(eventId));
     }
 
-    private TierResponse toTierResponse(TicketTier tier) {
-        int remaining = getRemaining(tier.getId());
+    /** Tier id to remaining seats. A tier with no counter is absent, never zero (ADR-040). */
+    private Map<Long, Integer> remainingByTier(long eventId) {
+        Map<Long, Integer> remaining = new HashMap<>();
+        for (Object[] row : inventory.findRemainingByEvent(eventId)) {
+            remaining.put((Long) row[0], (Integer) row[1]);
+        }
+        return remaining;
+    }
+
+    /**
+     * One tier as the public API exposes it.
+     *
+     * <p>A missing counter becomes {@link com.flashseats.catalog.model.AvailabilityLevel#UNKNOWN},
+     * <strong>not</strong> {@code SOLD_OUT} (ADR-040). The previous code clamped
+     * {@link #COUNTER_UNAVAILABLE} to zero with {@code Math.max}, which published "we cannot read
+     * our own inventory" to every visitor as "this tier is gone" — ADR-004's failure mode reaching
+     * the landing page. An un-warmed event announced itself sold out before its sale had even
+     * started, and the client rendered that tier unselectable with no way to retry.
+     */
+    private TierResponse toTierResponse(TicketTier tier, Map<Long, Integer> remainingByTier) {
+        int remaining = remainingByTier.getOrDefault(tier.getId(), COUNTER_UNAVAILABLE);
+        if (remaining == COUNTER_UNAVAILABLE) {
+            log.warn(
+                    "Tier {} of event {} has no inventory counter; reporting availability as UNKNOWN",
+                    tier.getId(),
+                    tier.getEventId());
+        }
         return new TierResponse(
                 tier.getId(),
                 tier.getTierName(),
@@ -236,8 +267,6 @@ public class CatalogService {
                 tier.getCurrency(),
                 tier.getMaxPerOrder(),
                 AvailabilityBuckets.of(
-                        Math.max(remaining, 0),
-                        tier.getTotalCapacity(),
-                        properties.getLimitedThresholdPercent()));
+                        remaining, tier.getTotalCapacity(), properties.getLimitedThresholdPercent()));
     }
 }

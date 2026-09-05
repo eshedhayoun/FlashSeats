@@ -32,9 +32,9 @@
 		<!-- Third-party libraries not managed by the Spring Boot BOM. See docs/01-system-architecture.md -->
 		<bucket4j.version>8.14.0</bucket4j.version>
 		<testcontainers.version>1.21.3</testcontainers.version>
-		<stripe.version>29.2.0</stripe.version>
-		<resilience4j.version>2.3.0</resilience4j.version>
 		<pdfbox.version>3.0.7</pdfbox.version>
+		<!-- Pinned versions for Stage 2, kept so re-adding the dependency is a one-line change:
+		     stripe-java 29.2.0 · resilience4j 2.3.0 -->
 	</properties>
 	<dependencies>
 		<dependency>
@@ -112,27 +112,22 @@
 			<artifactId>bucket4j_jdk17-lettuce</artifactId>
 			<version>${bucket4j.version}</version>
 		</dependency>
-		<dependency>
-			<groupId>com.stripe</groupId>
-			<artifactId>stripe-java</artifactId>
-			<version>${stripe.version}</version>
-		</dependency>
-		<dependency>
-			<groupId>io.github.resilience4j</groupId>
-			<artifactId>resilience4j-circuitbreaker</artifactId>
-			<version>${resilience4j.version}</version>
-		</dependency>
-		<dependency>
-			<groupId>io.github.resilience4j</groupId>
-			<artifactId>resilience4j-retry</artifactId>
-			<version>${resilience4j.version}</version>
-		</dependency>
+		<!--
+			Stripe, Resilience4j and Thymeleaf were declared here ahead of the stages that
+			use them, and none of them is on the classpath for a reason yet:
+
+			  - stripe-java      -> Stage 2, with StripeGateway and the webhook receiver
+			  - resilience4j-*   -> Stage 2, as plain beans (the Boot 3 starter does not apply)
+			  - thymeleaf        -> deferred indefinitely; EmailComposer builds the one small
+			                        HTML body in Java on purpose, and there is no templates/
+			                        directory. Its starter also autoconfigures a view resolver
+			                        into an API that returns nothing but JSON.
+
+			An unused dependency is not free: it ships in the image and it carries CVEs that
+			someone has to triage. They come back with the code that needs them.
+		-->
 
 		<!-- ===== Phase 4: async fulfilment ===== -->
-		<dependency>
-			<groupId>org.springframework.boot</groupId>
-			<artifactId>spring-boot-starter-thymeleaf</artifactId>
-		</dependency>
 		<dependency>
 			<groupId>org.apache.pdfbox</groupId>
 			<artifactId>pdfbox</artifactId>
@@ -257,6 +252,20 @@
 			<plugin>
 				<groupId>org.springframework.boot</groupId>
 				<artifactId>spring-boot-maven-plugin</artifactId>
+				<configuration>
+					<!--
+						`dev` belongs to the local run, not to the artefact. SecretsGuard is
+						@Profile("!dev & !test"), so a default profile baked into
+						application.properties made the fail-closed secrets check opt-in: a
+						packaged jar started with no SPRING_PROFILES_ACTIVE ran on development
+						secrets and seeded a demo catalog, silently (ADR-039). Setting it here
+						keeps `./mvnw spring-boot:run` working exactly as documented while the
+						jar defaults to refusing.
+					-->
+					<profiles>
+						<profile>dev</profile>
+					</profiles>
+				</configuration>
 			</plugin>
 			<!--
 				Run the *IT classes with the unit tests. They are Testcontainers-backed
