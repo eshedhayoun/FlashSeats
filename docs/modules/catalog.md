@@ -198,6 +198,24 @@ and `notification` never needs to call `catalog` (ADR-015).
   Thresholds are `SOLD_OUT` at 0, `LIMITED` below 10 % of `total_capacity`, else `PLENTY`, with
   hysteresis so a restored hold does not flap the banner.
 
+### `AvailabilityLevel` has four values, and the fourth is not a bucket (ADR-040)
+
+| Value | Meaning |
+| :--- | :--- |
+| `PLENTY` | above the threshold |
+| `LIMITED` | at or below `limited-threshold-percent` of capacity |
+| `SOLD_OUT` | the counter says zero |
+| **`UNKNOWN`** | **there is no counter** — a fault to repair, never a sold-out tier |
+
+`AvailabilityBuckets.of` takes the **raw** value, fault code included. The call site used to clamp
+with `Math.max(remaining, 0)`, which turned `COUNTER_UNAVAILABLE` (`-1`) into `0` and published a
+missing counter to every visitor as `SOLD_OUT` — ADR-004's prohibition, on the browse path, on the
+first surface anyone loads. ADR-035 fixed the same substitution for the promoter and the reserve
+path; this was the third caller.
+
+Clients render `UNKNOWN` neutrally and keep the tier **selectable**. `POST /holds` is what actually
+knows, and it already separates `409 INSUFFICIENT_STOCK` from `503 INVENTORY_UNAVAILABLE`.
+
 ---
 
 ## 6. Edge cases
