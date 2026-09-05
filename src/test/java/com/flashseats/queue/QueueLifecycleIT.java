@@ -54,7 +54,7 @@ class QueueLifecycleIT extends IntegrationTest {
         // Give the promotion worker several ticks to get it wrong.
         await().pollDelay(Duration.ofSeconds(2)).atMost(Duration.ofSeconds(5)).untilAsserted(() -> {
             var state = buyer.get("/sale/" + eventId + "/state");
-            assertThat(state.json().get("queue").get("state").asText())
+            assertThat(state.json().get("queue").get("state").asString())
                     .describedAs("a missing counter is a fault, never a sold-out sale")
                     .isEqualTo("WAITING");
         });
@@ -79,8 +79,8 @@ class QueueLifecycleIT extends IntegrationTest {
         // The promotion worker and the broadcaster both skip closed events, so nothing was left to
         // tell a session still ranked in the ZSET. It reported WAITING indefinitely (ADR-036).
         var state = buyer.get("/sale/" + eventId + "/state");
-        assertThat(state.json().get("queue").get("state").asText()).isEqualTo("CLOSED");
-        assertThat(state.json().get("windowStatus").asText()).isEqualTo("CLOSED");
+        assertThat(state.json().get("queue").get("state").asString()).isEqualTo("CLOSED");
+        assertThat(state.json().get("windowStatus").asString()).isEqualTo("CLOSED");
     }
 
     @Test
@@ -150,7 +150,7 @@ class QueueLifecycleIT extends IntegrationTest {
         // (ADR-035).
         await().atMost(PATIENCE).untilAsserted(() -> {
             var state = second.get("/sale/" + eventId + "/state");
-            assertThat(state.json().get("queue").get("state").asText()).isIn("WAITING", "PROMOTED", "ADMITTED");
+            assertThat(state.json().get("queue").get("state").asString()).isIn("WAITING", "PROMOTED", "ADMITTED");
         });
     }
 }
