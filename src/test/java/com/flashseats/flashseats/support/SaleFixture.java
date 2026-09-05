@@ -99,6 +99,15 @@ public class SaleFixture {
                 eventId, name, priceCents, capacity);
     }
 
+    /**
+     * Takes a tier's counter to zero — genuinely sold out, as distinct from having no counter.
+     *
+     * <p>The two are one row apart and must never read the same to a buyer (ADR-040).
+     */
+    public void drainTier(long tierId) {
+        jdbc.update("UPDATE tier_inventory SET remaining = 0 WHERE tier_id = ?", tierId);
+    }
+
     /** Ends a sale's window now, as the clock would. */
     public void closeSale(long eventId) {
         jdbc.update(
