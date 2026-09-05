@@ -53,7 +53,7 @@ class UserJourneyIT extends IntegrationTest {
         assertThat(landing.text("windowStatus")).isEqualTo("OPEN");
         assertThat(landing.text("serverTime")).isNotNull();
         // Availability is a bucket, never a count — an exact number invites panic-buying.
-        assertThat(landing.json().get("tiers").get(0).get("availability").asText())
+        assertThat(landing.json().get("tiers").get(0).get("availability").asString())
                 .isIn("PLENTY", "LIMITED", "SOLD_OUT");
 
         // 2. Join the queue.
@@ -109,8 +109,8 @@ class UserJourneyIT extends IntegrationTest {
         //    flight, so a confirmed order vanished the instant it succeeded and the buyer was shown
         //    the landing page — invited to queue for seats they already owned (ADR-037).
         var afterReload = buyer.get("/sale/" + eventId + "/state");
-        assertThat(afterReload.json().get("order").get("orderNumber").asText()).isEqualTo(orderNumber);
-        assertThat(afterReload.json().get("order").get("status").asText()).isEqualTo("CONFIRMED");
+        assertThat(afterReload.json().get("order").get("orderNumber").asString()).isEqualTo(orderNumber);
+        assertThat(afterReload.json().get("order").get("status").asString()).isEqualTo("CONFIRMED");
         assertThat(afterReload.json().get("hold").isNull()).isTrue();
 
         // 9. Fulfilment was queued inside the order transaction, and the relay drains it.
@@ -191,7 +191,7 @@ class UserJourneyIT extends IntegrationTest {
 
         // Still admitted: picking a different tier must not cost them their place (ADR-020).
         var state = buyer.get("/sale/" + eventId + "/state");
-        assertThat(state.json().get("queue").get("state").asText()).isEqualTo("ADMITTED");
+        assertThat(state.json().get("queue").get("state").asString()).isEqualTo("ADMITTED");
         assertThat(state.json().get("hold").isNull()).isTrue();
     }
 
@@ -201,19 +201,19 @@ class UserJourneyIT extends IntegrationTest {
         BuyerSession buyer = new BuyerSession(port);
         buyer.get("/events/" + eventId);
 
-        assertThat(buyer.get("/sale/" + eventId + "/state").json().get("queue").get("state").asText())
+        assertThat(buyer.get("/sale/" + eventId + "/state").json().get("queue").get("state").asString())
                 .isEqualTo("NOT_JOINED");
 
         buyer.post("/queue/join", Map.of("eventId", eventId));
         await().atMost(PATIENCE).untilAsserted(() -> assertThat(
-                        buyer.get("/sale/" + eventId + "/state").json().get("queue").get("state").asText())
+                        buyer.get("/sale/" + eventId + "/state").json().get("queue").get("state").asString())
                 .isIn("WAITING", "PROMOTED"));
 
         String admissionToken = admit(buyer);
         reserveWith(buyer, admissionToken, 1);
 
         var state = buyer.get("/sale/" + eventId + "/state");
-        assertThat(state.json().get("queue").get("state").asText()).isEqualTo("ADMITTED");
+        assertThat(state.json().get("queue").get("state").asString()).isEqualTo("ADMITTED");
         assertThat(state.json().get("hold").get("quantity").asInt()).isEqualTo(1);
         assertThat(state.text("serverTime")).isNotNull();
         assertThat(state.json().get("partial")).isEmpty();

@@ -94,7 +94,7 @@ public class BuyerSession {
 
         public String text(String field) {
             JsonNode value = json().get(field);
-            return value == null || value.isNull() ? null : value.asText();
+            return value == null || value.isNull() ? null : value.asString();
         }
 
         public int number(String field) {
