@@ -2,8 +2,8 @@ package com.flashseats.queue.service;
 
 import com.flashseats.queue.config.QueueProperties;
 import com.flashseats.shared.security.SignedToken;
+import com.flashseats.shared.time.Expiry;
 import java.time.Clock;
-import java.time.Instant;
 import java.util.UUID;
 import org.springframework.stereotype.Component;
 
@@ -72,15 +72,7 @@ public class QueueTokens {
                 .filter(parts -> kind.equals(parts[0]))
                 .filter(parts -> Long.toString(eventId).equals(parts[1]))
                 .filter(parts -> sessionId.equals(parts[2]))
-                .filter(parts -> notExpired(parts[3]))
+                .filter(parts -> Expiry.notPassed(clock, parts[3]))
                 .isPresent();
-    }
-
-    private boolean notExpired(String expiryEpochSecond) {
-        try {
-            return clock.instant().isBefore(Instant.ofEpochSecond(Long.parseLong(expiryEpochSecond)));
-        } catch (NumberFormatException tampered) {
-            return false;
-        }
     }
 }
