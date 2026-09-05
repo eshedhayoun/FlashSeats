@@ -1,12 +1,11 @@
 package com.flashseats.queue.service;
 
-import tools.jackson.databind.ObjectMapper;
 import java.nio.charset.StandardCharsets;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
+import lombok.extern.slf4j.Slf4j;
 import org.springframework.data.redis.connection.Message;
 import org.springframework.data.redis.connection.MessageListener;
 import org.springframework.stereotype.Component;
+import tools.jackson.databind.ObjectMapper;
 
 /**
  * Delivers queue frames published by <em>any</em> replica to the connections held by <em>this</em>
@@ -18,10 +17,9 @@ import org.springframework.stereotype.Component;
  * silently drops roughly two-thirds of promotions on three — and no single-instance test can see it
  * (ADR-007).
  */
+@Slf4j
 @Component
 public class QueuePubSubListener implements MessageListener {
-
-    private static final Logger log = LoggerFactory.getLogger(QueuePubSubListener.class);
 
     private final SseEmitterRegistry emitters;
     private final ObjectMapper json;

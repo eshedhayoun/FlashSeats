@@ -1,6 +1,5 @@
 package com.flashseats.queue.service;
 
-import tools.jackson.databind.ObjectMapper;
 import java.io.IOException;
 import java.util.LinkedHashMap;
 import java.util.Map;
@@ -9,10 +8,10 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.stream.Collectors;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
+import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Component;
 import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
+import tools.jackson.databind.ObjectMapper;
 
 /**
  * The live SSE connections held by <strong>this replica</strong>.
@@ -27,10 +26,9 @@ import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
  * jump backwards when entries ahead are removed, and a queue position that goes <em>up</em> reads as
  * a broken system even when nothing is wrong.
  */
+@Slf4j
 @Component
 public class SseEmitterRegistry {
-
-    private static final Logger log = LoggerFactory.getLogger(SseEmitterRegistry.class);
 
     private final Map<String, Connection> connections = new ConcurrentHashMap<>();
     private final ObjectMapper json;
@@ -95,10 +93,6 @@ public class SseEmitterRegistry {
                 entry.getValue().emitter().complete();
             }
         }
-    }
-
-    public boolean isLocal(String sessionId) {
-        return connections.containsKey(sessionId);
     }
 
     /**

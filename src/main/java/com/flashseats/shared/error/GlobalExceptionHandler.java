@@ -2,8 +2,7 @@ package com.flashseats.shared.error;
 
 import java.util.List;
 import java.util.Map;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
+import lombok.extern.slf4j.Slf4j;
 import org.springframework.core.Ordered;
 import org.springframework.core.annotation.Order;
 import org.springframework.http.HttpStatusCode;
@@ -33,11 +32,10 @@ import org.springframework.web.method.annotation.MethodArgumentTypeMismatchExcep
  * <p>Runs at {@link Ordered#LOWEST_PRECEDENCE} so a module may still add its own advice later
  * without being shadowed.
  */
+@Slf4j
 @RestControllerAdvice
 @Order(Ordered.LOWEST_PRECEDENCE)
 public class GlobalExceptionHandler {
-
-    private static final Logger log = LoggerFactory.getLogger(GlobalExceptionHandler.class);
 
     /** Every deliberate business failure in every module arrives here. */
     @ExceptionHandler(FlashSeatsException.class)

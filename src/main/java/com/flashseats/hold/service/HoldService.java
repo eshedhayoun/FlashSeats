@@ -24,8 +24,7 @@ import com.flashseats.queue.facade.QueueFacade;
 import java.time.Clock;
 import java.time.Instant;
 import java.util.Optional;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
+import lombok.extern.slf4j.Slf4j;
 import org.springframework.context.ApplicationEventPublisher;
 import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.data.domain.Limit;
@@ -44,10 +43,9 @@ import org.springframework.transaction.annotation.Transactional;
  *       claim touches stock.
  * </ol>
  */
+@Slf4j
 @Service
 public class HoldService {
-
-    private static final Logger log = LoggerFactory.getLogger(HoldService.class);
 
     /** The partial unique index from {@code V2__hold.sql} that caps a session at one live hold. */
     private static final String ONE_ACTIVE_HOLD_INDEX = "idx_holds_one_active_per_session";
@@ -277,14 +275,6 @@ public class HoldService {
     // ----------------------------------------------------------------- helpers
 
     /**
-     * Requires a live admission session — <strong>not</strong> a queue pass, which was already spent
-     * at {@code POST /queue/admit} (ADR-020).
-     *
-     * <p>The admission session deliberately survives this call. A buyer who releases these seats
-     * keeps their place in the sale and can pick a different tier without re-queueing, which is the
-     * entire reason the middle tier exists.
-     */
-    /**
      * Whether this violation is the one-live-hold-per-session index, and not some other constraint.
      *
      * <p>Matched on the index name because that is the only thing that identifies <em>which</em>
@@ -297,6 +287,14 @@ public class HoldService {
         return constraint != null && constraint.contains(ONE_ACTIVE_HOLD_INDEX);
     }
 
+    /**
+     * Requires a live admission session — <strong>not</strong> a queue pass, which was already spent
+     * at {@code POST /queue/admit} (ADR-020).
+     *
+     * <p>The admission session deliberately survives this call. A buyer who releases these seats
+     * keeps their place in the sale and can pick a different tier without re-queueing, which is the
+     * entire reason the middle tier exists.
+     */
     private void requireAdmission(String sessionId, long eventId, String admissionToken) {
         if (admissionToken == null || admissionToken.isBlank()) {
             throw new AdmissionRequiredException();

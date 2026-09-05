@@ -1,8 +1,7 @@
 package com.flashseats.order.service;
 
 import com.flashseats.order.model.OutboxEvent;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
+import lombok.extern.slf4j.Slf4j;
 
 /**
  * Drains the outbox to the log.
@@ -11,9 +10,8 @@ import org.slf4j.LoggerFactory;
  * first line of code, before a broker exists. When {@code notification} arrives it registers its own
  * {@link OutboxPublisher} bean and this one steps aside untouched.
  */
+@Slf4j
 public class LoggingOutboxPublisher implements OutboxPublisher {
-
-    private static final Logger log = LoggerFactory.getLogger(LoggingOutboxPublisher.class);
 
     @Override
     public void publish(OutboxEvent event) {

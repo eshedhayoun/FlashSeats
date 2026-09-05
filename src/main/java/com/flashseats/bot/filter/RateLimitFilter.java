@@ -3,7 +3,6 @@ package com.flashseats.bot.filter;
 import com.flashseats.bot.service.RateLimitService;
 import com.flashseats.shared.error.ErrorCode;
 import com.flashseats.shared.error.ProblemDetails;
-import tools.jackson.databind.ObjectMapper;
 import com.flashseats.shared.identity.SessionId;
 import jakarta.servlet.FilterChain;
 import jakarta.servlet.ServletException;
@@ -16,6 +15,7 @@ import org.springframework.core.annotation.Order;
 import org.springframework.http.MediaType;
 import org.springframework.stereotype.Component;
 import org.springframework.web.filter.OncePerRequestFilter;
+import tools.jackson.databind.ObjectMapper;
 
 /**
  * Applies the session and IP token buckets.
@@ -60,10 +60,11 @@ public class RateLimitFilter extends OncePerRequestFilter {
             throws ServletException, IOException {
 
         Object sessionId = request.getAttribute(SessionId.REQUEST_ATTRIBUTE);
-        boolean allowed = sessionId == null || rateLimits.allowSession(sessionId.toString());
-        if (allowed) {
-            allowed = rateLimits.allowIp(clientIpOf(request));
-        }
+
+        // Short-circuited on purpose: a request already refused by its session bucket must not also
+        // spend a token from the shared IP bucket, which thousands of buyers behind one NAT share.
+        boolean allowed = (sessionId == null || rateLimits.allowSession(sessionId.toString()))
+                && rateLimits.allowIp(clientIpOf(request));
 
         if (!allowed) {
             writeRateLimited(response);

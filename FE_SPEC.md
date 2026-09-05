@@ -623,7 +623,7 @@ tell thousands of buyers the sale ended when it had not.
 
 ### Why a real browser is required here
 
-The backend suite (`./mvnw test`, 39 tests) already proves the things that live in SQL and Redis: no
+The backend suite (`./mvnw test`, 53 tests) already proves the things that live in SQL and Redis: no
 overbooking, restore-exactly-once, one order per hold, the queue's terminal states. It drives the API
 over real HTTP with a real cookie jar. What it cannot touch is **every one of the four rules in §0**,
 because all four are browser behaviours:
