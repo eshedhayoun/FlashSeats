@@ -201,7 +201,7 @@ Findings that cost real time and would cost it again.
 ## 8. Verification
 
 ```bash
-./mvnw test        # 39 tests: unit, modularity, concurrency, journey, recovery, queue lifecycle
+./mvnw test        # 53 tests: unit, modularity, concurrency, journey, recovery, queue lifecycle
 ```
 
 | Test | What it proves |
