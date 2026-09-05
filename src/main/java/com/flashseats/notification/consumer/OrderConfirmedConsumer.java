@@ -68,6 +68,7 @@ public class OrderConfirmedConsumer {
     public void onOrderConfirmed(Message message, Channel channel) throws IOException {
         long deliveryTag = message.getMessageProperties().getDeliveryTag();
         String orderNumber = null;
+        boolean delivered = false;
 
         try {
             OrderConfirmedPayload payload =
@@ -87,6 +88,7 @@ public class OrderConfirmedConsumer {
                     composer.bodyFor(payload),
                     ticket,
                     payload.orderNumber() + ".pdf");
+            delivered = true;
 
             logs.markSent(orderNumber, KIND);
             channel.basicAck(deliveryTag, false);
@@ -95,10 +97,36 @@ public class OrderConfirmedConsumer {
         } catch (Exception failure) {
             log.error("Could not deliver tickets for {}", orderNumber, failure);
             if (orderNumber != null) {
-                logs.markDeadLettered(orderNumber, KIND, failure.toString());
+                recordFailure(orderNumber, delivered, failure);
             }
             // requeue=false: straight to the dead-letter queue, where an operator can see it.
             channel.basicNack(deliveryTag, false, false);
         }
+    }
+
+    /**
+     * Records the outcome, distinguishing "never sent" from "sent, then something else broke".
+     *
+     * <p><strong>The distinction is load-bearing.</strong> A dead-lettered row is deliberately
+     * re-claimable so a DLQ replay actually sends (ADR-038) — but the mail server has already
+     * accepted the message by the time {@code markSent} or {@code basicAck} can fail, and marking
+     * <em>that</em> row {@code DLQ} would authorise the replay to send a buyer a second ticket.
+     * ADR-038's safety argument rests on {@code DLQ} meaning the work did not happen, so nothing may
+     * write {@code DLQ} once it has.
+     *
+     * <p>The redelivery still arrives; it finds the row {@code SENT}, wins no claim, and is quietly
+     * acknowledged — which is exactly the path a duplicate is supposed to take.
+     */
+    private void recordFailure(String orderNumber, boolean delivered, Exception failure) {
+        if (delivered) {
+            log.warn(
+                    "Tickets for {} were delivered but the outcome could not be recorded cleanly; "
+                            + "marking SENT so a replay cannot send them twice",
+                    orderNumber,
+                    failure);
+            logs.markSent(orderNumber, KIND);
+            return;
+        }
+        logs.markDeadLettered(orderNumber, KIND, failure.toString());
     }
 }
