@@ -16,6 +16,7 @@
 | **2** | Move the hot path to RAM | Redis stock + Lua, ZSET queue, SSE, pass tokens | Same guarantee at 1,000 concurrent requests — **queue, SSE and passes done; Lua and the rebuild are not** |
 | **3** | Defence and real money | bot, Stripe, webhooks, Resilience4j | Payments survive tab closure; floods are throttled — **cookie identity and rate limits done; Stripe and reCAPTCHA are not** |
 | **4** | Async fulfilment and scale | RabbitMQ, PDFBox, email, Nginx, k6 | 10,000 users / 500 tickets / zero overbooking / 500 emails — **fulfilment done on one replica; the cluster and load runs are not** |
+| **5** | Operate it, and let buyers return | The operator surface (ADR-043); buyer accounts as an overlay (ADR-044) | A dead-lettered ticket can be replayed by a human; a lost counter can be rebuilt without SQL; a buyer finds their order more than 24 h later |
 
 ---
 
@@ -196,3 +197,52 @@ These must hold at the end of **every** phase:
 6. `ApplicationModules.verify()` passes.
 
 Invariant 1 is the `stock.drift` metric. Wire it in Phase 1 and never let it go non-zero.
+
+---
+
+## Phase 5 — Operate it, and let buyers return
+
+### Objective
+Make every failure the earlier phases deliberately routed somewhere retrievable by a human, and give
+a buyer a durable way back to what they bought.
+
+### Build
+
+**The operator surface (ADR-043)** — endpoints in the module that owns the state, under
+`/api/v1/admin/**`, `ROLE_ADMIN`. There is no `admin` module: one would have to read every other
+module's internals, which is the boundary violation `ApplicationModules.verify()` exists to reject.
+
+* `catalog` — `pause`, `rebuild-stock`. The rebuild is **ADR-004's only legal recovery** from a
+  missing counter and is specified in three documents and implemented nowhere.
+* `notification` — DLQ inspection and `resend`. **ADR-029's premise.** Sending deterministic
+  failures straight to the DLQ with no retries is right *only if someone can replay them*; without
+  a replay path the DLQ is where paid buyers' tickets go to be forgotten.
+* `order` — order lookup for support.
+* Replace the in-memory `UserDetailsService` first (`06-mvp-overview.md` §10 S12).
+
+**Buyer accounts as an overlay (ADR-044)** — a new leaf module `account`. `fsid` remains the only
+session identity and ADR-010 is unchanged; an account attaches to *purchases* and to nothing else.
+`orders.account_id` is nullable and stamped at checkout only, inside the existing transaction. An
+anonymous order is claimable later with its `receiptToken`.
+
+**PII (S9)** — a deletion path and a stated retention period ship with the accounts work, not after
+it. Plaintext email hanging off a named account is a different obligation from the anonymous case.
+
+### Traps this phase exists to avoid
+
+1. **An `admin` module.** Ownership does not change because the caller is an operator.
+2. **Replacing `fsid` with an account id.** Queue join, holds and rate limits must serve visitors who
+   have never signed in, and ADR-010's guarantee is that identity has exactly *one* source.
+3. **Requiring login to enter the queue** as a technical decision. It is a product one; the design
+   supports either, and the default is not to require it.
+4. **Building a console before the endpoints.** The endpoints are the capability and are usable with
+   `curl`; a UI is presentation.
+
+### Exit criteria
+- [ ] A dead-lettered ticket is visible, replayable, and actually arrives on replay.
+- [ ] A `FLUSHDB` mid-sale is recovered through `rebuild-stock` with no manual SQL.
+- [ ] A paused sale stops promoting and stops accepting new holds, and honours existing ones.
+- [ ] A buyer signs in 48 h later — past the cookie's `max-age` — and finds their order.
+- [ ] An anonymous purchase is claimed into an account with its `receiptToken`.
+- [ ] Anonymous checkout still completes end to end, untouched.
+- [ ] A deletion request removes the buyer's PII and leaves the ledger's integrity intact.

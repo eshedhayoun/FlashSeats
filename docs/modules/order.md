@@ -198,8 +198,8 @@ inside a transaction does not just delay one request — it throttles checkout f
 | :--- | :--- |
 | Hold missing / expired / not yours | `409 HOLD_EXPIRED_OR_INVALID`. Nothing charged |
 | Card declined | `FAILED`, **hold retained**, `402 PAYMENT_DECLINED` with `retryable: true`, `attemptsRemaining`, `expiresAt`. **No new grace extension** — the budget is per hold (ADR-030) |
-| Retry with < 45 s left | `409` + `expiresAt`; the UI says there is not enough time rather than starting a charge that cannot finish |
-| 4th attempt | `402 PAYMENT_ATTEMPTS_EXHAUSTED`; hold released |
+| Retry with < 45 s left | `409 INSUFFICIENT_TIME_REMAINING` + `expiresAt`. **Nothing charged and the hold is retained** — the grace budget is spent, so the buyer releases and re-reserves. The UI must offer *Release seats*, not re-route: re-routing rehydrates onto the same live hold and returns to a screen whose timer guarantees the same `409` |
+| 4th attempt | `402 PAYMENT_ATTEMPTS_EXHAUSTED`; **the hold is retained**. A further charge cannot be accepted, but taking the seats away as well would be a second punishment for a card problem — the UI offers *Release seats* (`FE_SPEC.md` §3). This row previously said "hold released" and contradicted both the code and the client spec |
 | Double submit | `payment:inflight` SETNX → `UNIQUE(hold_token)` → Stripe `Idempotency-Key` |
 | Gateway timeout | `503`; order stays `PENDING`; the webhook settles it |
 | **Charge OK, commit fails** | `PaymentFacade.refund()`, `REFUNDED`, `ORDER_REFUNDED` outbox event |
