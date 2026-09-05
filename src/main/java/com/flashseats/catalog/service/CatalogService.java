@@ -21,13 +21,13 @@ import java.time.Instant;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
+import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Propagation;
 import org.springframework.transaction.annotation.Transactional;
 
 /** Event metadata, sale windows, and every movement of the inventory counter. */
+@Slf4j
 @Service
 public class CatalogService {
 
@@ -37,8 +37,6 @@ public class CatalogService {
      * the value other modules see.
      */
     public static final int COUNTER_UNAVAILABLE = -1;
-
-    private static final Logger log = LoggerFactory.getLogger(CatalogService.class);
 
     private final EventRepository events;
     private final TicketTierRepository tiers;

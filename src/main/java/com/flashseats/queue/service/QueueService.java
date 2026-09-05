@@ -14,16 +14,14 @@ import java.time.Clock;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.OptionalDouble;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
+import lombok.extern.slf4j.Slf4j;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.stereotype.Service;
 
 /** Joining, position, and the pass-for-admission exchange. */
+@Slf4j
 @Service
 public class QueueService {
-
-    private static final Logger log = LoggerFactory.getLogger(QueueService.class);
 
     private final StringRedisTemplate redis;
     private final CatalogFacade catalog;

@@ -7,14 +7,13 @@ import java.nio.charset.Charset;
 import java.text.Normalizer;
 import java.time.ZoneOffset;
 import java.time.format.DateTimeFormatter;
+import lombok.extern.slf4j.Slf4j;
 import org.apache.pdfbox.pdmodel.PDDocument;
 import org.apache.pdfbox.pdmodel.PDPage;
 import org.apache.pdfbox.pdmodel.PDPageContentStream;
 import org.apache.pdfbox.pdmodel.common.PDRectangle;
 import org.apache.pdfbox.pdmodel.font.PDType1Font;
 import org.apache.pdfbox.pdmodel.font.Standard14Fonts;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Component;
 
 /**
@@ -36,10 +35,9 @@ import org.springframework.stereotype.Component;
  * the ticket they had been charged for. Degrading the glyph is strictly better than losing the
  * ticket; carrying a Unicode TTF is the real fix and belongs with the rest of the Stage 4 work.
  */
+@Slf4j
 @Component
 public class TicketPdfRenderer {
-
-    private static final Logger log = LoggerFactory.getLogger(TicketPdfRenderer.class);
 
     private static final DateTimeFormatter DATE =
             DateTimeFormatter.ofPattern("EEEE d MMMM yyyy 'at' HH:mm").withZone(ZoneOffset.UTC);

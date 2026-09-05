@@ -13,8 +13,7 @@ import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
+import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
 
 /**
@@ -28,10 +27,9 @@ import org.springframework.stereotype.Service;
  * without a window status and a server clock there is nothing meaningful to draw, so that failure
  * surfaces.
  */
+@Slf4j
 @Service
 public class SaleStateAssembler {
-
-    private static final Logger log = LoggerFactory.getLogger(SaleStateAssembler.class);
 
     private final CatalogFacade catalog;
     private final QueueFacade queue;

@@ -1,5 +1,6 @@
 package com.flashseats.queue.service;
 
+import lombok.extern.slf4j.Slf4j;
 import tools.jackson.databind.ObjectMapper;
 import java.io.IOException;
 import java.util.LinkedHashMap;
@@ -9,8 +10,6 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.stream.Collectors;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Component;
 import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
 
@@ -27,10 +26,9 @@ import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
  * jump backwards when entries ahead are removed, and a queue position that goes <em>up</em> reads as
  * a broken system even when nothing is wrong.
  */
+@Slf4j
 @Component
 public class SseEmitterRegistry {
-
-    private static final Logger log = LoggerFactory.getLogger(SseEmitterRegistry.class);
 
     private final Map<String, Connection> connections = new ConcurrentHashMap<>();
     private final ObjectMapper json;

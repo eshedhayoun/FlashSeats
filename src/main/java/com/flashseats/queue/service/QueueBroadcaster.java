@@ -5,8 +5,7 @@ import com.flashseats.catalog.facade.EventWindowStatus;
 import com.flashseats.queue.facade.QueuePhase;
 import java.util.Map;
 import java.util.OptionalDouble;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
+import lombok.extern.slf4j.Slf4j;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Component;
@@ -20,10 +19,9 @@ import org.springframework.stereotype.Component;
  *
  * <p>Safe to run on every replica because each only ever writes to sockets it owns.
  */
+@Slf4j
 @Component
 public class QueueBroadcaster {
-
-    private static final Logger log = LoggerFactory.getLogger(QueueBroadcaster.class);
 
     private final SseEmitterRegistry emitters;
     private final QueueService queue;

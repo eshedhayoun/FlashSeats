@@ -3,8 +3,7 @@ package com.flashseats.order.service;
 import com.flashseats.hold.facade.HoldFacade;
 import com.flashseats.order.event.OrderConfirmedEvent;
 import com.flashseats.queue.facade.QueueFacade;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
+import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Component;
 import org.springframework.transaction.event.TransactionPhase;
 import org.springframework.transaction.event.TransactionalEventListener;
@@ -20,10 +19,9 @@ import org.springframework.transaction.event.TransactionalEventListener;
  * <p>Failures are logged and swallowed deliberately. Throwing here would achieve nothing — the
  * transaction has already committed and the buyer already has their tickets.
  */
+@Slf4j
 @Component
 public class OrderPostCommitTasks {
-
-    private static final Logger log = LoggerFactory.getLogger(OrderPostCommitTasks.class);
 
     private final HoldFacade holds;
     private final QueueFacade queue;

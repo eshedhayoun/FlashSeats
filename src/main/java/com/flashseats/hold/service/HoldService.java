@@ -24,8 +24,7 @@ import com.flashseats.queue.facade.QueueFacade;
 import java.time.Clock;
 import java.time.Instant;
 import java.util.Optional;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
+import lombok.extern.slf4j.Slf4j;
 import org.springframework.context.ApplicationEventPublisher;
 import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.data.domain.Limit;
@@ -44,10 +43,9 @@ import org.springframework.transaction.annotation.Transactional;
  *       claim touches stock.
  * </ol>
  */
+@Slf4j
 @Service
 public class HoldService {
-
-    private static final Logger log = LoggerFactory.getLogger(HoldService.class);
 
     /** The partial unique index from {@code V2__hold.sql} that caps a session at one live hold. */
     private static final String ONE_ACTIVE_HOLD_INDEX = "idx_holds_one_active_per_session";
