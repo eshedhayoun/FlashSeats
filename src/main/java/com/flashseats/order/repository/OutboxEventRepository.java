@@ -37,12 +37,23 @@ public interface OutboxEventRepository extends JpaRepository<OutboxEvent, UUID> 
             """)
     List<OutboxEvent> claimPending(Limit limit);
 
+    /**
+     * Marks a published batch done.
+     *
+     * <p>{@code AND status = PROCESSING} is not decoration. A relay that stalls past
+     * {@code stale-claim-seconds} has its rows returned to {@code PENDING} and re-published by
+     * someone else; if it then wakes up and finishes, an unguarded {@code WHERE id IN (…)} would
+     * mark rows processed that a <em>different</em> claim now owns — including one still waiting to
+     * be sent. Every other claim in this system carries its precondition in the {@code WHERE}
+     * clause; so does this one.
+     */
     @Modifying(flushAutomatically = true)
     @Query("""
             UPDATE OutboxEvent e
                SET e.status = com.flashseats.order.model.OutboxStatus.PROCESSED,
                    e.processedAt = :now
              WHERE e.id IN :ids
+               AND e.status = com.flashseats.order.model.OutboxStatus.PROCESSING
             """)
     int markProcessed(@Param("ids") Collection<UUID> ids, @Param("now") Instant now);
 
