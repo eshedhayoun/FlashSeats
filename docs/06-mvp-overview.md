@@ -6,8 +6,9 @@
 > A **Review passes** log at the bottom records every pass over this MVP. Append to it; do not
 > rewrite history.
 
-**Status:** built and running, two review passes deep. 49 tests green, including the concurrency,
-journey, checkout-recovery, queue-lifecycle, availability and problem-response suites.
+**Status:** built and running, two review passes and one cleanup pass deep. 53 tests green,
+including the concurrency, journey, checkout-recovery, queue-lifecycle, availability and
+problem-response suites.
 
 ---
 
@@ -590,3 +591,67 @@ Recorded in §9 rather than left implied.
 
 - **Result:** 49 tests green, up from 39. Each of the three verified defects has a test that fails
   against the old behaviour; the `500`-instead-of-`400` one was reproduced by reverting the handler.
+
+### Pass 3 — cleanup and simplification, no behaviour change
+
+- **Scope:** all nine modules, `src/main` only. An explicitly **zero-logic-change** pass: no
+  workflow, state transition, validation rule, schema, facade signature, REST mapping, DTO shape or
+  event payload was altered. `src/test` was not touched, and the same 53 tests pass before and after.
+- **Method:** mechanical scans first — unused imports, unreferenced private and package-private
+  methods, unreferenced public methods that no framework invokes, `System.out`/`printStackTrace`,
+  commented-out code, `TODO`/`FIXME` — then a module-by-module read.
+
+**What the scans found: almost nothing.** Zero unused imports, zero dead private methods, zero
+print statements, zero commented-out blocks, zero `TODO`s. Two passes of review had already removed
+the usual material. What follows is the remainder.
+
+**Removed.**
+
+| Removed | Why |
+| :--- | :--- |
+| `SseEmitterRegistry.isLocal` | No caller anywhere, in `main` or `test` |
+| `QueueBroadcaster.drainRatePerSecond` | Documented as "exposed for tests"; no test ever used it. `QueueDrainRateTracker.perSecond` is public and reachable directly |
+| `SaleStateAssembler.ThrowingSupplier` | A private functional interface declaring `T get()` and throwing nothing — `java.util.function.Supplier` exactly, under a name that promised otherwise |
+
+**Deduplicated.**
+
+- `QueueTokens.notExpired` and `ReceiptTokens.notExpired` were character-identical: parse an epoch
+  second, compare against the clock, and treat a `NumberFormatException` as *not valid* rather than
+  letting it escape. That last part is the reason it is now one method — a second copy that let the
+  exception through would turn a tampered token into a `500`. Extracted to
+  `shared/time/Expiry.notPassed(Clock, String)`, alongside `ClockConfig`, on the same footing as
+  `SignedToken`: a primitive with no state and no business rule, used by more than one module.
+
+**Boilerplate and readability.**
+
+| Change | Effect |
+| :--- | :--- |
+| `@Slf4j` in place of `private static final Logger log = LoggerFactory.getLogger(X.class);` | 20 classes, three lines each. Lombok was already a dependency with annotation processing configured for both compile phases; it had been confined to JPA entities |
+| Fully-qualified types replaced with imports | `java.time.Clock` in `QueueBroadcaster`, `amqp.core.Message` and `StandardCharsets` in `RabbitOutboxPublisher`, `EventStatus` in `EventRepository` |
+| Import blocks sorted | Ten files where `tools.jackson.*` or `ConditionalOnProperty` sat out of order at the top |
+| `FlashseatsApplication` re-indented | The only tab-indented file in `src/main` |
+| `RateLimitFilter.doFilterInternal` | A reassigned `allowed` flag collapsed into one short-circuit expression. Same evaluation order, so a request already refused by its session bucket still does not spend an IP token — now stated in a comment rather than implied by control flow |
+| `HoldService` | The Javadoc for `requireAdmission` sat stacked above the Javadoc for `isOneActiveHoldPerSession`, so the tool-rendered docs attributed it to the wrong method. Moved to the method it describes |
+| `HoldFacadeImpl` | `toSummary` narrowed to `private`; the two mappers moved below the `@Override`s so the interface implementations read in declaration order |
+
+**One efficiency fix.**
+
+- `TicketPdfRenderer.drawable` called `WIN_ANSI.newEncoder()` **inside** its per-character loop —
+  one `CharsetEncoder` allocated per character of every event title, venue and tier name on every
+  ticket page. Hoisted to one per call. It cannot become a static constant: `CharsetEncoder` is
+  stateful and not thread-safe, and this method is `static` on a shared bean.
+
+**Deliberately left alone.**
+
+- `TicketHoldRepository.sumActiveQuantityForTier` and `OrderRepository.sumConfirmedQuantityForTier`
+  have no callers, but both are the documented scaffolding for the `flashseats.stock.drift` metric
+  (invariant 1, ADR-045). Unreferenced is not the same as unwanted.
+- The `*Properties` getters that only Spring's binder and the `configprops` endpoint read.
+- JPA entities keep `@Getter`/`@Setter`/`@NoArgsConstructor`. Hibernate requires a mutable class
+  with a no-arg constructor; they are not candidates for records.
+- `PDType1Font` is still constructed per line rather than hoisted. PDFBox 3 made the standard-14
+  fonts non-static precisely because sharing one across documents is unsafe.
+- No ADR was added or amended. Nothing here is a decision.
+
+- **Result:** 53 tests green, unchanged from before the pass. 96 insertions, 156 deletions across
+  30 files, plus one new 33-line class.
