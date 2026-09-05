@@ -2,6 +2,7 @@ package com.flashseats.queue.service;
 
 import tools.jackson.databind.ObjectMapper;
 import java.io.IOException;
+import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
@@ -79,13 +80,19 @@ public class SseEmitterRegistry {
      *
      * <p>Completing is what makes a terminal frame terminal: the connection leaves the registry, so
      * the next sweep does not find it and send the same news again every two seconds.
+     *
+     * <p>Removal is keyed on <em>this</em> connection, not just the session id. A buyer reconnecting
+     * in the same instant would otherwise have their fresh emitter evicted by the sweep that was
+     * closing their old one, leaving them holding a socket nothing will ever write to.
      */
     public void closeAll(long eventId, String eventName, Object data) {
-        for (String sessionId : sessionsWatching(eventId)) {
-            send(sessionId, eventName, data);
-            Connection connection = connections.remove(sessionId);
-            if (connection != null) {
-                connection.emitter().complete();
+        for (Map.Entry<String, Connection> entry : Map.copyOf(connections).entrySet()) {
+            if (entry.getValue().eventId() != eventId) {
+                continue;
+            }
+            send(entry.getKey(), eventName, data);
+            if (connections.remove(entry.getKey(), entry.getValue())) {
+                entry.getValue().emitter().complete();
             }
         }
     }
@@ -105,13 +112,15 @@ public class SseEmitterRegistry {
             return false;
         }
         int displayed = connection.clampPosition(position);
-        return send(
-                sessionId,
-                "position-update",
-                Map.of(
-                        "position", displayed,
-                        "aheadOfYou", Math.max(0, displayed - 1),
-                        "estWaitSeconds", estWaitSeconds == null ? -1 : estWaitSeconds));
+
+        // An unknown estimate is null, not a -1 sentinel. QueueStatusResponse and FE_SPEC §4 both
+        // use null, and a client that forgot to translate the sentinel would render "-1 seconds".
+        Map<String, Object> frame = new LinkedHashMap<>();
+        frame.put("position", displayed);
+        frame.put("aheadOfYou", Math.max(0, displayed - 1));
+        frame.put("estWaitSeconds", estWaitSeconds);
+
+        return send(sessionId, "position-update", frame);
     }
 
     public boolean send(String sessionId, String eventName, Object data) {
