@@ -2,6 +2,7 @@ package com.flashseats.order.service;
 
 import com.flashseats.order.config.OrderProperties;
 import com.flashseats.shared.security.SignedToken;
+import com.flashseats.shared.time.Expiry;
 import java.time.Clock;
 import java.time.Duration;
 import java.time.Instant;
@@ -66,15 +67,7 @@ public class ReceiptTokens {
                 .map(payload -> payload.split(SEPARATOR))
                 .filter(parts -> parts.length == 3)
                 .filter(parts -> orderNumber.equals(parts[0]))
-                .filter(parts -> notExpired(parts[1]))
+                .filter(parts -> Expiry.notPassed(clock, parts[1]))
                 .isPresent();
-    }
-
-    private boolean notExpired(String expiryEpochSecond) {
-        try {
-            return clock.instant().isBefore(Instant.ofEpochSecond(Long.parseLong(expiryEpochSecond)));
-        } catch (NumberFormatException tampered) {
-            return false;
-        }
     }
 }
