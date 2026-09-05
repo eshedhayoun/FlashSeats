@@ -3,7 +3,6 @@ package com.flashseats.bot.filter;
 import com.flashseats.bot.service.RateLimitService;
 import com.flashseats.shared.error.ErrorCode;
 import com.flashseats.shared.error.ProblemDetails;
-import tools.jackson.databind.ObjectMapper;
 import com.flashseats.shared.identity.SessionId;
 import jakarta.servlet.FilterChain;
 import jakarta.servlet.ServletException;
@@ -16,6 +15,7 @@ import org.springframework.core.annotation.Order;
 import org.springframework.http.MediaType;
 import org.springframework.stereotype.Component;
 import org.springframework.web.filter.OncePerRequestFilter;
+import tools.jackson.databind.ObjectMapper;
 
 /**
  * Applies the session and IP token buckets.

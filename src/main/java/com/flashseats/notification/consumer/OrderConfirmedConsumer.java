@@ -1,8 +1,5 @@
 package com.flashseats.notification.consumer;
 
-import lombok.extern.slf4j.Slf4j;
-import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
-import tools.jackson.databind.ObjectMapper;
 import com.flashseats.notification.config.RabbitTopologyConfig;
 import com.flashseats.notification.dto.OrderConfirmedPayload;
 import com.flashseats.notification.model.NotificationKind;
@@ -12,9 +9,12 @@ import com.flashseats.notification.service.NotificationLogService;
 import com.flashseats.notification.service.TicketPdfRenderer;
 import com.rabbitmq.client.Channel;
 import java.io.IOException;
+import lombok.extern.slf4j.Slf4j;
 import org.springframework.amqp.core.Message;
 import org.springframework.amqp.rabbit.annotation.RabbitListener;
+import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.stereotype.Component;
+import tools.jackson.databind.ObjectMapper;
 
 /**
  * Turns a confirmed order into a PDF ticket in a buyer's inbox.
