@@ -1,5 +1,6 @@
 package com.flashseats.queue.controller;
 
+import com.flashseats.queue.dto.AdmitRequest;
 import com.flashseats.queue.dto.AdmitResponse;
 import com.flashseats.queue.dto.JoinQueueRequest;
 import com.flashseats.queue.dto.QueueStatusResponse;
@@ -58,13 +59,19 @@ public class QueueController {
         return queue.status(session.value(), eventId);
     }
 
-    /** Exchanges the single-use pass for a browse session. */
+    /**
+     * Exchanges the single-use pass for a browse session.
+     *
+     * <p>{@code eventId} arrives in the body, like every other {@code POST} here and as
+     * {@code FE_SPEC.md} §2 specifies. It was a query parameter, which worked only because the demo
+     * client was written against the code rather than against the contract.
+     */
     @PostMapping("/admit")
     public AdmitResponse admit(
-            @RequestParam long eventId,
+            @Valid @RequestBody AdmitRequest request,
             @RequestHeader("X-Queue-Pass-Token") String passToken,
             SessionId session) {
-        return queue.admit(session.value(), eventId, passToken);
+        return queue.admit(session.value(), request.eventId(), passToken);
     }
 
     /**

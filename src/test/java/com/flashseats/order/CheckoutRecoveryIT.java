@@ -131,7 +131,7 @@ class CheckoutRecoveryIT extends IntegrationTest {
                 .until(() -> buyer.get("/queue/status?eventId=" + eventId).text("passToken"),
                         token -> token != null);
         admissionToken = buyer
-                .post("/queue/admit?eventId=" + eventId, null, Map.of("X-Queue-Pass-Token", passToken))
+                .post("/queue/admit", java.util.Map.of("eventId", eventId), Map.of("X-Queue-Pass-Token", passToken))
                 .text("admissionToken");
         return buyer;
     }
