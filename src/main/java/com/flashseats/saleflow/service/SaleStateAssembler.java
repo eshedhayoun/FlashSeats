@@ -13,6 +13,7 @@ import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.function.Supplier;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
 
@@ -104,7 +105,7 @@ public class SaleStateAssembler {
     }
 
     /** Runs one sub-read, recording rather than propagating a failure. */
-    private <T> T read(String section, List<String> partial, ThrowingSupplier<T> read) {
+    private <T> T read(String section, List<String> partial, Supplier<T> read) {
         try {
             return read.get();
         } catch (RuntimeException failure) {
@@ -112,10 +113,5 @@ public class SaleStateAssembler {
             partial.add(section);
             return null;
         }
-    }
-
-    @FunctionalInterface
-    private interface ThrowingSupplier<T> {
-        T get();
     }
 }

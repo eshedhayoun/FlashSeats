@@ -4,7 +4,6 @@ import com.flashseats.catalog.facade.CatalogFacade;
 import com.flashseats.catalog.facade.EventWindowStatus;
 import com.flashseats.queue.facade.QueuePhase;
 import java.util.Map;
-import java.util.OptionalDouble;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.scheduling.annotation.Scheduled;
@@ -111,10 +110,5 @@ public class QueueBroadcaster {
             initialDelayString = "${flashseats.queue.sse-heartbeat-ms}")
     public void pushHeartbeats() {
         emitters.watchedEventIds().forEach(emitters::heartbeat);
-    }
-
-    /** Exposed for tests that want the current estimate without waiting for a tick. */
-    OptionalDouble drainRatePerSecond(long eventId) {
-        return drainRate.perSecond(eventId);
     }
 }

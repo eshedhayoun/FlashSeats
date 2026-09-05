@@ -95,10 +95,6 @@ public class SseEmitterRegistry {
         }
     }
 
-    public boolean isLocal(String sessionId) {
-        return connections.containsKey(sessionId);
-    }
-
     /**
      * Sends a position update, clamped so the number never rises.
      *
