@@ -3,6 +3,8 @@ package com.flashseats.notification.service;
 import com.flashseats.notification.dto.OrderConfirmedPayload;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
+import java.nio.charset.Charset;
+import java.text.Normalizer;
 import java.time.ZoneOffset;
 import java.time.format.DateTimeFormatter;
 import org.apache.pdfbox.pdmodel.PDDocument;
@@ -11,6 +13,8 @@ import org.apache.pdfbox.pdmodel.PDPageContentStream;
 import org.apache.pdfbox.pdmodel.common.PDRectangle;
 import org.apache.pdfbox.pdmodel.font.PDType1Font;
 import org.apache.pdfbox.pdmodel.font.Standard14Fonts;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Component;
 
 /**
@@ -24,12 +28,27 @@ import org.springframework.stereotype.Component;
  * differently on a different machine. A render failure here is deterministic and must not be
  * retried: it would fail identically three times and reach the same dead-letter queue 2.5 minutes
  * later (ADR-029).
+ *
+ * <p><strong>Which is exactly why every string is sanitised before it is drawn.</strong> The
+ * standard-14 fonts encode WinAnsi, and {@code showText} throws on any character outside it — so a
+ * Hebrew, Cyrillic, CJK or emoji event title turned a <em>paid</em> order into a dead letter with no
+ * retry and, in this MVP, no admin replay endpoint to recover it. The buyer simply never received
+ * the ticket they had been charged for. Degrading the glyph is strictly better than losing the
+ * ticket; carrying a Unicode TTF is the real fix and belongs with the rest of the Stage 4 work.
  */
 @Component
 public class TicketPdfRenderer {
 
+    private static final Logger log = LoggerFactory.getLogger(TicketPdfRenderer.class);
+
     private static final DateTimeFormatter DATE =
             DateTimeFormatter.ofPattern("EEEE d MMMM yyyy 'at' HH:mm").withZone(ZoneOffset.UTC);
+
+    /** What the standard-14 fonts can actually draw. */
+    private static final Charset WIN_ANSI = Charset.forName("windows-1252");
+
+    /** Stands in for a character the font cannot render, so the line still reads. */
+    private static final char REPLACEMENT = '?';
 
     private static final float MARGIN = 56f;
     private static final float TITLE_SIZE = 22f;
@@ -84,8 +103,48 @@ public class TicketPdfRenderer {
                         bold ? Standard14Fonts.FontName.HELVETICA_BOLD : Standard14Fonts.FontName.HELVETICA),
                 size);
         content.newLineAtOffset(x, y);
-        content.showText(text == null ? "" : text);
+        content.showText(drawable(text));
         content.endText();
         return y - (size + 6);
+    }
+
+    /**
+     * Reduces operator-supplied text to something the standard-14 fonts can actually draw.
+     *
+     * <p>Two steps, in order. Normalising to NFD and dropping the combining marks turns {@code "é"}
+     * into {@code "e"} and {@code "Ø"} into {@code "O"} — an accent lost, but the word still
+     * readable, which is what matters on a ticket someone holds at a door. Whatever still cannot be
+     * encoded becomes {@code '?'}.
+     *
+     * <p><strong>It never throws.</strong> That is the whole point: {@code showText} does, and
+     * because a font failure is deterministic, ADR-029 correctly sends it straight to the DLQ with
+     * no retry — so one unrenderable character in an event title used to cost a paying buyer their
+     * ticket outright, with no automated path back. A degraded glyph is a cosmetic loss; an
+     * undelivered ticket is not.
+     */
+    static String drawable(String text) {
+        if (text == null || text.isEmpty()) {
+            return "";
+        }
+        String decomposed = Normalizer.normalize(text, Normalizer.Form.NFD)
+                .replaceAll("\\p{InCombiningDiacriticalMarks}+", "");
+
+        StringBuilder safe = new StringBuilder(decomposed.length());
+        boolean degraded = false;
+        for (int i = 0; i < decomposed.length(); i++) {
+            char c = decomposed.charAt(i);
+            if (WIN_ANSI.newEncoder().canEncode(c)) {
+                safe.append(c);
+            } else {
+                safe.append(REPLACEMENT);
+                degraded = true;
+            }
+        }
+        if (degraded) {
+            log.warn(
+                    "Ticket text contained characters the standard-14 fonts cannot render; "
+                            + "they were replaced. Embed a Unicode font to carry them properly.");
+        }
+        return safe.toString();
     }
 }

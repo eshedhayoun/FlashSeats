@@ -39,4 +39,21 @@ class AvailabilityBucketsTest {
         assertThat(AvailabilityBuckets.of(5, 5, TEN_PERCENT)).isEqualTo(AvailabilityLevel.PLENTY);
         assertThat(AvailabilityBuckets.of(1, 5, TEN_PERCENT)).isEqualTo(AvailabilityLevel.PLENTY);
     }
+
+    @Test
+    @DisplayName("a missing counter is UNKNOWN, never SOLD_OUT")
+    void missingCounterIsUnknown() {
+        // ADR-040. The call site used to clamp with Math.max(remaining, 0), which turned the fault
+        // code into zero and published "we cannot read our inventory" as "this tier is gone" — on
+        // the landing page, to every visitor, for a sale that had not started.
+        assertThat(AvailabilityBuckets.of(CatalogService.COUNTER_UNAVAILABLE, 500, TEN_PERCENT))
+                .isEqualTo(AvailabilityLevel.UNKNOWN);
+    }
+
+    @Test
+    @DisplayName("UNKNOWN is distinct from SOLD_OUT — the whole point of the level")
+    void unknownIsNotSoldOut() {
+        assertThat(AvailabilityBuckets.of(CatalogService.COUNTER_UNAVAILABLE, 500, TEN_PERCENT))
+                .isNotEqualTo(AvailabilityBuckets.of(0, 500, TEN_PERCENT));
+    }
 }

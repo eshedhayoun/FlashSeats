@@ -109,8 +109,7 @@ class QueueLifecycleIT extends IntegrationTest {
 
         // And A's pass still works for A.
         assertThat(buyer.post(
-                                "/queue/admit?eventId=" + saleA,
-                                null,
+                                "/queue/admit", java.util.Map.of("eventId", saleA),
                                 Map.of("X-Queue-Pass-Token", passForA))
                         .ok())
                 .isTrue();
@@ -129,7 +128,7 @@ class QueueLifecycleIT extends IntegrationTest {
                 .until(() -> first.get("/queue/status?eventId=" + eventId).text("passToken"),
                         token -> token != null);
         String admission = first
-                .post("/queue/admit?eventId=" + eventId, null, Map.of("X-Queue-Pass-Token", pass))
+                .post("/queue/admit", java.util.Map.of("eventId", eventId), Map.of("X-Queue-Pass-Token", pass))
                 .text("admissionToken");
         String holdToken = first.post(
                         "/holds",

@@ -2,6 +2,7 @@ package com.flashseats.catalog.repository;
 
 import com.flashseats.catalog.model.TierInventory;
 import java.time.Instant;
+import java.util.List;
 import java.util.Optional;
 import org.springframework.data.jpa.repository.JpaRepository;
 import org.springframework.data.jpa.repository.Modifying;
@@ -72,6 +73,20 @@ public interface TierInventoryRepository extends JpaRepository<TierInventory, Lo
 
     @Query("SELECT i.remaining FROM TierInventory i WHERE i.tierId = :tierId")
     Optional<Integer> findRemaining(@Param("tierId") long tierId);
+
+    /**
+     * Every counter this event has, in one round trip.
+     *
+     * <p>The browse read renders one badge per tier, and doing that with a lookup per tier put an
+     * N+1 on the single hottest endpoint in the system — the landing page, which every visitor loads
+     * before the sale opens and reloads while they wait.
+     *
+     * <p>A tier with no counter is simply <em>absent</em> from the result, which is the point: the
+     * caller sees the gap rather than a zero, and answers {@link
+     * com.flashseats.catalog.model.AvailabilityLevel#UNKNOWN} (ADR-040).
+     */
+    @Query("SELECT i.tierId, i.remaining FROM TierInventory i WHERE i.eventId = :eventId")
+    List<Object[]> findRemainingByEvent(@Param("eventId") long eventId);
 
     @Query("SELECT COALESCE(SUM(i.remaining), 0) FROM TierInventory i WHERE i.eventId = :eventId")
     int sumRemainingForEvent(@Param("eventId") long eventId);

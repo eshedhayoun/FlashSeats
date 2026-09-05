@@ -189,7 +189,8 @@ public interface NotificationFacade {
 | Duplicate message | Unique violation on insert → ack and skip |
 | Two workers, same message | One insert wins; the other acks and skips |
 | Worker crashes mid-render | Unacked → redelivered → unique violation → skip if already `SENT` |
-| Crash between send and status update | Possible single resend. Accepted at-least-once trade |
+| Crash between send and status update | The row is marked **`SENT`**, not `DLQ` (ADR-042). The redelivery finds it `SENT`, wins no claim, and is quietly acknowledged. Marking it `DLQ` would make it re-claimable under ADR-038 and send the buyer a **second** ticket — the one thing that claim design promises cannot happen |
+| PDF text outside WinAnsi (Hebrew, CJK, emoji) | Sanitised before drawing (ADR-040 sibling fix): accents transliterate, anything else becomes `?`, and a warning is logged. The standard-14 fonts throw on these, and a font failure is *deterministic* — so it went straight to a DLQ that has no replay endpoint, costing a **paid** buyer their ticket outright. Embedding a Unicode TTF is the Stage 4 answer |
 | SMTP down | 3 retries → DLQ → admin replay |
 | PDF render failure (font/glyph/charset) | **Deterministic** → straight to DLQ + alarm, no retries (ADR-029) |
 | PDFBox memory exhaustion | Transient → retry chain. Renderer is bounded: streamed output, one page per item, hard page cap |

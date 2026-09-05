@@ -68,14 +68,14 @@ class UserJourneyIT extends IntegrationTest {
 
         // 4. Exchange the pass for a browse session.
         var admit = buyer.post(
-                "/queue/admit?eventId=" + eventId, null, Map.of("X-Queue-Pass-Token", passToken));
+                "/queue/admit", java.util.Map.of("eventId", eventId), Map.of("X-Queue-Pass-Token", passToken));
         assertThat(admit.ok()).isTrue();
         String admissionToken = admit.text("admissionToken");
         assertThat(admissionToken).isNotNull();
 
         // The pass is single-use: spending it again must fail.
         var replay = buyer.post(
-                "/queue/admit?eventId=" + eventId, null, Map.of("X-Queue-Pass-Token", passToken));
+                "/queue/admit", java.util.Map.of("eventId", eventId), Map.of("X-Queue-Pass-Token", passToken));
         assertThat(replay.errorCode()).isEqualTo("QUEUE_PASS_INVALID");
 
         // 5. Reserve seats.
@@ -236,7 +236,7 @@ class UserJourneyIT extends IntegrationTest {
                 .until(() -> buyer.get("/queue/status?eventId=" + eventId).text("passToken"),
                         token -> token != null);
         return buyer
-                .post("/queue/admit?eventId=" + eventId, null, Map.of("X-Queue-Pass-Token", passToken))
+                .post("/queue/admit", java.util.Map.of("eventId", eventId), Map.of("X-Queue-Pass-Token", passToken))
                 .text("admissionToken");
     }
 

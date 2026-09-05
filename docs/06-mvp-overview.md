@@ -6,8 +6,8 @@
 > A **Review passes** log at the bottom records every pass over this MVP. Append to it; do not
 > rewrite history.
 
-**Status:** built and running, one review pass deep. 39 tests green, including the concurrency,
-journey, checkout-recovery and queue-lifecycle suites.
+**Status:** built and running, two review passes deep. 49 tests green, including the concurrency,
+journey, checkout-recovery, queue-lifecycle, availability and problem-response suites.
 
 ---
 
@@ -29,6 +29,11 @@ docker compose up -d          # postgres, redis, rabbitmq, mailpit
 ./mvnw spring-boot:run        # the dev profile seeds a sale that is already open
 open http://localhost:8080
 ```
+
+`dev` is set by the `spring-boot-maven-plugin`, **not** by `application.properties`. A default
+profile in the properties file made `SecretsGuard` opt-in: a packaged jar started with no
+`SPRING_PROFILES_ACTIVE` ran on development secrets and seeded a demo catalog, silently (ADR-039).
+Running the jar directly therefore requires a profile, which is the intended fail-closed behaviour.
 
 | Where | What |
 | :--- | :--- |
@@ -207,8 +212,10 @@ Findings that cost real time and would cost it again.
 | `CheckoutRecoveryIT` | A gateway outage keeps the seats **and** the ability to pay for them; it costs none of the three card attempts; a charge genuinely in flight is still refused; an order stranded by a crash resumes once no charge can still be running. |
 | `QueueLifecycleIT` | An un-warmed event pauses promotion rather than selling out; a closed sale ends the wait instead of freezing it; a pass for one sale is never offered to another; exhaustion reverses when seats return. |
 | `NotificationClaimIT` | The claim blocks a duplicate, is terminal once sent, and releases a dead letter for replay. |
+| `CatalogAvailabilityIT` | A tier with no counter reads `UNKNOWN`, a drained tier still reads `SOLD_OUT`, and the two are never the same answer (ADR-040). |
+| `ProblemResponseIT` | Spring's own binding failures are `400` with a registry `code`, not `500` (ADR-041). |
 | `ModularityTests` | The boundary graph is acyclic and unbroken. |
-| `SignedTokenTest`, `AvailabilityBucketsTest` | The signing primitive — including domain separation — and the availability rule. |
+| `SignedTokenTest`, `AvailabilityBucketsTest`, `TicketPdfRendererTest` | The signing primitive — including domain separation — the availability rule including its fault value, and a ticket that renders whatever alphabet the title is in. |
 
 **Verified by hand against the live stack:** the nine-step journey end to end, a declined card
 leaving the hold `ACTIVE`, a replay returning `200` with the same order number, a 1,058-byte PDF
@@ -346,17 +353,79 @@ every hold exactly once.
   `outbox.lag.seconds`, `dlq.depth`, `queue.promotion.rate`, `payment.decline.ratio`,
   `jvm.threads.pinned`.
 
-### Stage 4 — Operability and polish
+### Stage 4 — The operator surface, and it is not optional (ADR-043)
 
-- Admin surface: pause a sale, rebuild stock, inspect and replay the DLQ.
-- The refund-notice template, so `ORDER_REFUNDED` reaches the buyer.
-- Notification failure classification (ADR-029): deterministic render failures skip the retry chain.
+**The docs currently promise eleven `/api/v1/admin/**` endpoints and exactly one exists.** That is
+not a documentation debt, it is a functional gap, because two ADRs already assume an operator who
+can act:
+
+- **ADR-029** sends deterministic failures straight to the DLQ *with no retries* — correct only if
+  someone can replay them. Pass 2 found a PDF font failure that dead-lettered a **paid** buyer's
+  ticket, and with no replay endpoint the DLQ was a black hole. ADR-038 went to real trouble making
+  a dead-lettered claim re-claimable *so that a replay would send*; nothing can trigger that replay.
+- **ADR-004** names a locked rebuild as the only legal recovery from a missing counter. It is
+  specified in three documents and implemented nowhere, so the documented recovery from the system's
+  worst failure is "edit the database by hand".
+
+Endpoints live in the module that owns the state — there is **no `admin` module**, because one would
+have to read every other module's internals (ADR-043).
+
+- `POST /admin/events/{id}/pause` · `POST /admin/events/{id}/rebuild-stock` — `catalog`
+- `GET /admin/notifications/dlq` · `POST /admin/notifications/resend/{orderNumber}` — `notification`
+- `GET /admin/orders/{orderNumber}` — `order`, so support can answer "where is my ticket?"
+- **Replace the in-memory `UserDetailsService` (§10 S12) first.** One hardcoded account is tolerable
+  for one pre-warm endpoint; it is not tolerable for a surface that can pause a sale.
+
+A console is presentation and can wait. The endpoints are the capability.
+
+### Stage 4b — Fulfilment and client polish
+
+- The refund-notice template, so `ORDER_REFUNDED` reaches the buyer — and a consumer for
+  `notification.order-refunded.queue`, which currently has none and grows without bound.
+- Notification failure classification (ADR-029): transient failures earn the retry chain; the
+  deterministic ones already skip it.
 - `tier-availability` frames in the waiting room (ADR-027); `RANDOM` queue ordering (ADR-024).
 - The React SPA against `FE_SPEC.md`, if the demo client is outgrown.
 - **The Playwright suite specified in `FE_SPEC.md` §8.** Every one of the four client rules is a
   browser behaviour — a skewed clock, a real reload, a live `EventSource` — so none of them is
   reachable from the API suite, and the twelve reload points are checked by hand today. Two of the
-  defects this pass fixed were reload-path defects. The spec is written; the implementation is not.
+  defects Pass 1 fixed were reload-path defects. The spec is written; the implementation is not.
+
+### Stage 5 — Buyer accounts, as an overlay (ADR-044)
+
+**`fsid` stays the only session identity; ADR-010 does not change.** An account is a second,
+*durable* identity that attaches to purchases and to nothing else — never to queue position, hold
+ownership or rate limiting, all of which must keep working for a visitor who has never signed in.
+
+- New leaf module `com.flashseats.account`; `order` and `saleflow` depend on it, it depends on
+  nothing, the graph stays acyclic.
+- `orders.account_id`, nullable, stamped **at checkout only** inside the existing transaction.
+- An anonymous purchase can be **claimed** later by presenting its `receiptToken` — that capability
+  already exists and already proves possession, so claiming needs no new mechanism.
+
+The concrete gap it closes: the `fsid` cookie's `max-age` is **86 400 seconds**, so order access by
+cookie works for exactly one day. After that a buyer's only route to their own order is the receipt
+link in their email — lose the email, lose the ticket. `fs.recentOrders` in `localStorage` is a
+per-browser hint, not a record.
+
+It is also §10 S5's missing compensating control: a verified account is a rate-limit bucket that
+costs something to mint, where a discarded cookie costs nothing.
+
+**Whether login gates the queue is a product decision, not a technical one** — the design supports
+either, and the default is not to gate it.
+
+**S9 stops being deferrable here.** Plaintext `user_email` with no retention policy is one thing for
+an anonymous transaction and another hanging off a named account: a deletion path and a stated
+retention period ship *with* this stage.
+
+### Observability: already the right shape, still thin (ADR-045)
+
+`/actuator/health` is public because it is the container healthcheck target; `metrics` and
+`prometheus` are behind `ROLE_ADMIN` because they are a live read on how the sale is going. **Both
+are correct and neither needs changing.** What is thin is what they report:
+`flashseats.stock.drift` — the one alarm that should page — is asserted in tests and not exported,
+because a PostgreSQL counter cannot diverge from itself. It becomes real in Stage 1; the rest of the
+§9 alarm set lands in Stage 3. Do not mistake a green `/actuator/health` for observability.
 
 ---
 
@@ -467,3 +536,57 @@ Recorded in §9 rather than left implied.
 
 - **Result:** 39 tests green, up from 25. The three verified defects each have a test that fails
   against the old behaviour.
+
+### Pass 2 — second review of the built MVP
+
+- **Scope:** a full PR-style review of all nine modules, the demo client, the infrastructure config
+  and the test suite, read against the whole documentation pool first — 39 ADRs, the global
+  standards, `FE_SPEC.md`, the end-to-end flow and the nine module specs — and then against the code.
+- **Method:** documentation as the context pool, then a module-by-module audit, then two sweeps the
+  first pass had not done explicitly: every call site of a method that can return a *fault code*, and
+  every error path that never reaches a registry `code`.
+
+**Verified defects, each now closed by a stated rule.**
+
+| Found | Rule |
+| :--- | :--- |
+| `CatalogService.toTierResponse` clamped the counter with `Math.max(remaining, 0)`, so a tier with no `tier_inventory` row was published to every visitor as `SOLD_OUT` — and the client renders a `SOLD_OUT` tier **unclickable**. ADR-004's failure mode on the browse path; ADR-035 had closed the promoter and the reserve path and missed the third caller. The dev seeder demonstrates it out of the box | **ADR-040** — an unreadable counter is `UNKNOWN`, never a bucket |
+| `@ExceptionHandler(Exception.class)` matched Spring's own binding exceptions before `DefaultHandlerExceptionResolver` could, so a missing query parameter answered **`500 INTERNAL_ERROR`** with no `code` and an `ERROR` stack trace. Reproduced before the fix on `/queue/status` and `/events/{bad-id}` | **ADR-041** — a catch-all advice must name what the framework throws first |
+| The notification consumer's single `catch` spanned send, `markSent` and `basicAck`, so a failure *after* the mail server accepted the message marked the row `DLQ` — which ADR-038 makes re-claimable, sending a second ticket | **ADR-042** — `DLQ` means the work did not happen |
+
+**Also found and fixed.**
+
+| Found | Fix |
+| :--- | :--- |
+| `TicketPdfRenderer` drew operator-supplied text with a standard-14 font, which throws on anything outside WinAnsi. Deterministic, so ADR-029 correctly skips the retry chain — and with no admin replay endpoint, one Hebrew or CJK character in an event title cost a **paid** buyer their ticket permanently | Text is sanitised before drawing: accents transliterate, the rest degrades to `?`, and a warning is logged. A Unicode TTF is the Stage 4 answer |
+| `FE_SPEC.md` §3 listed `INSUFFICIENT_TIME_REMAINING` as "seats gone" and the client cleared the hold and re-routed. The server keeps the hold (ADR-030), so rehydration returned to the same checkout screen and the same `409` — a loop on the payment screen | Spec row corrected; the client now offers *Release seats* and disables Pay |
+| `POST /queue/admit` took `eventId` as a query parameter where `FE_SPEC.md` §2 specifies a body; `DELETE /holds/{token}` returns `204` where the spec said `200` | `admit` moved to a body (`AdmitRequest`); the spec corrected to `204` |
+| `spring.profiles.active=dev` was compiled into `application.properties`, so a jar started with no `SPRING_PROFILES_ACTIVE` ran on development secrets with `SecretsGuard` silent and the dev seeder active | Removed. `dev` is set by the `spring-boot-maven-plugin` for `./mvnw spring-boot:run`; the artefact defaults to refusing (ADR-039) |
+| `/api/v1/queue/stream` was skipped by `RateLimitFilter` entirely, where ADR-011 says "counted once at connect" | The stream is filtered and charged once at connect; per-frame accounting was never possible anyway, since frames are server-pushed |
+| `OutboxEventRepository.markProcessed` had no status guard, so a relay finishing after its claim had been swept back to `PENDING` could mark a row processed that another claim now owned | `AND status = PROCESSING`, like every other claim in the system |
+| `SseEmitterRegistry.sendPosition` emitted `-1` for an unknown estimate where `QueueStatusResponse` and `FE_SPEC.md` both use `null`; `closeAll` removed by key alone, so a reconnect racing a terminal sweep lost its fresh emitter | `null` on the wire; two-arg `remove(key, value)` |
+| `GET /events/{id}` issued one counter lookup per tier — an N+1 on the single hottest endpoint | One `findRemainingByEvent` per request |
+
+**Removed rather than fixed.**
+
+- `shared/money/Money.java` and `bot/exception/RateLimitExceededException.java` — zero usages each.
+  The rate-limit filter writes its problem document directly, because a filter runs before any
+  advice can see it.
+- `stripe-java`, `resilience4j-circuitbreaker`, `resilience4j-retry`, `spring-boot-starter-thymeleaf`
+  — declared ahead of the stages that use them and on the classpath for no reason yet. Thymeleaf also
+  autoconfigures a view resolver into an API that returns only JSON. Versions are recorded in the pom
+  comment so re-adding each is one line.
+
+**Verified correct, so the next pass need not re-derive it.**
+
+- The checkout sequence matches ADR-001/023/030/034 exactly, including that `markAbandoned` only
+  touches a still-`PENDING` row, which is what makes the blanket `catch` safe.
+- The settle-once claim is the sole path to stock restoration, in all four endings.
+- `consumeHold` and `tryReserve` are both `Propagation.MANDATORY` — they cannot silently run
+  without the caller's transaction.
+- Still zero `synchronized` and zero `Instant.now()` in `src/main/java`.
+- Every `@Transactional` still contains SQL only; the three bean splits are still real proxies.
+- Token domain separation is length-prefixed and covers all four kinds.
+
+- **Result:** 49 tests green, up from 39. Each of the three verified defects has a test that fails
+  against the old behaviour; the `500`-instead-of-`400` one was reproduced by reverting the handler.
