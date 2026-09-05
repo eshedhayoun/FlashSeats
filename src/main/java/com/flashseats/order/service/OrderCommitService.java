@@ -1,7 +1,5 @@
 package com.flashseats.order.service;
 
-import lombok.extern.slf4j.Slf4j;
-import tools.jackson.databind.ObjectMapper;
 import com.flashseats.catalog.facade.TierSummary;
 import com.flashseats.hold.facade.HoldFacade;
 import com.flashseats.hold.facade.HoldSummary;
@@ -21,10 +19,12 @@ import com.flashseats.payment.facade.PaymentResult;
 import java.time.Clock;
 import java.time.Instant;
 import java.util.List;
+import lombok.extern.slf4j.Slf4j;
 import org.springframework.context.ApplicationEventPublisher;
 import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.stereotype.Component;
 import org.springframework.transaction.annotation.Transactional;
+import tools.jackson.databind.ObjectMapper;
 
 /**
  * The transactional half of checkout.

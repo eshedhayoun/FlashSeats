@@ -1,8 +1,8 @@
 package com.flashseats.catalog.service;
 
+import com.flashseats.catalog.facade.EventWindowStatus;
 import com.flashseats.catalog.model.Event;
 import com.flashseats.catalog.model.EventStatus;
-import com.flashseats.catalog.facade.EventWindowStatus;
 import java.time.Instant;
 
 /**

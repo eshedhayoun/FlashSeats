@@ -3,6 +3,7 @@ package com.flashseats.queue.service;
 import com.flashseats.catalog.facade.CatalogFacade;
 import com.flashseats.catalog.facade.EventWindowStatus;
 import com.flashseats.queue.facade.QueuePhase;
+import java.time.Clock;
 import java.util.Map;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.data.redis.core.StringRedisTemplate;
@@ -27,7 +28,7 @@ public class QueueBroadcaster {
     private final QueueDrainRateTracker drainRate;
     private final CatalogFacade catalog;
     private final StringRedisTemplate redis;
-    private final java.time.Clock clock;
+    private final Clock clock;
 
     public QueueBroadcaster(
             SseEmitterRegistry emitters,
@@ -35,7 +36,7 @@ public class QueueBroadcaster {
             QueueDrainRateTracker drainRate,
             CatalogFacade catalog,
             StringRedisTemplate redis,
-            java.time.Clock clock) {
+            Clock clock) {
         this.emitters = emitters;
         this.queue = queue;
         this.drainRate = drainRate;
