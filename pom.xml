@@ -257,6 +257,20 @@
 			<plugin>
 				<groupId>org.springframework.boot</groupId>
 				<artifactId>spring-boot-maven-plugin</artifactId>
+				<configuration>
+					<!--
+						`dev` belongs to the local run, not to the artefact. SecretsGuard is
+						@Profile("!dev & !test"), so a default profile baked into
+						application.properties made the fail-closed secrets check opt-in: a
+						packaged jar started with no SPRING_PROFILES_ACTIVE ran on development
+						secrets and seeded a demo catalog, silently (ADR-039). Setting it here
+						keeps `./mvnw spring-boot:run` working exactly as documented while the
+						jar defaults to refusing.
+					-->
+					<profiles>
+						<profile>dev</profile>
+					</profiles>
+				</configuration>
 			</plugin>
 			<!--
 				Run the *IT classes with the unit tests. They are Testcontainers-backed
