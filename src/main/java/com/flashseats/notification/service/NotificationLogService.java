@@ -4,8 +4,7 @@ import com.flashseats.notification.model.NotificationKind;
 import com.flashseats.notification.model.NotificationStatus;
 import com.flashseats.notification.repository.NotificationLogRepository;
 import java.time.Clock;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
+import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Propagation;
 import org.springframework.transaction.annotation.Transactional;
@@ -18,10 +17,9 @@ import org.springframework.transaction.annotation.Transactional;
  * real concurrency ceiling (ADR-023). So: claim, commit, do the slow work with nothing open, record
  * the outcome.
  */
+@Slf4j
 @Service
 public class NotificationLogService {
-
-    private static final Logger log = LoggerFactory.getLogger(NotificationLogService.class);
 
     private final NotificationLogRepository logs;
     private final Clock clock;

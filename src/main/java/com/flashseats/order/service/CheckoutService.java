@@ -20,8 +20,7 @@ import java.time.Clock;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.Optional;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
+import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
 
 /**
@@ -53,10 +52,9 @@ import org.springframework.stereotype.Service;
  * limit, so one slow gateway would throttle checkout for everyone (ADR-023). The transactional work
  * lives in {@link OrderCommitService}.
  */
+@Slf4j
 @Service
 public class CheckoutService {
-
-    private static final Logger log = LoggerFactory.getLogger(CheckoutService.class);
 
     private final HoldFacade holds;
     private final CatalogFacade catalog;

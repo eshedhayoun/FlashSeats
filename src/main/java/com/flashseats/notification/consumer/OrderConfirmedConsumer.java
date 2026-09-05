@@ -1,5 +1,6 @@
 package com.flashseats.notification.consumer;
 
+import lombok.extern.slf4j.Slf4j;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import tools.jackson.databind.ObjectMapper;
 import com.flashseats.notification.config.RabbitTopologyConfig;
@@ -11,8 +12,6 @@ import com.flashseats.notification.service.NotificationLogService;
 import com.flashseats.notification.service.TicketPdfRenderer;
 import com.rabbitmq.client.Channel;
 import java.io.IOException;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
 import org.springframework.amqp.core.Message;
 import org.springframework.amqp.rabbit.annotation.RabbitListener;
 import org.springframework.stereotype.Component;
@@ -37,12 +36,12 @@ import org.springframework.stereotype.Component;
  * three identical stack traces and reaches the same dead-letter queue anyway (ADR-029). Transport
  * failures are the broker's concern, not this method's.
  */
+@Slf4j
 @Component
 @ConditionalOnProperty(
         name = "flashseats.notification.enabled", havingValue = "true", matchIfMissing = true)
 public class OrderConfirmedConsumer {
 
-    private static final Logger log = LoggerFactory.getLogger(OrderConfirmedConsumer.class);
     private static final NotificationKind KIND = NotificationKind.TICKET_DELIVERY;
 
     private final NotificationLogService logs;

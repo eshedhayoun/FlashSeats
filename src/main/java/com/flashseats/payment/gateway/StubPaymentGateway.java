@@ -1,8 +1,7 @@
 package com.flashseats.payment.gateway;
 
 import java.util.UUID;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
+import lombok.extern.slf4j.Slf4j;
 
 /**
  * An in-process gateway that behaves like a real one, steered by the payment method id.
@@ -21,12 +20,11 @@ import org.slf4j.LoggerFactory;
  * <p>Registered by {@link PaymentGatewayConfig} only when no other {@link PaymentGateway} bean
  * exists, so adding a real one replaces this without touching any call site.
  */
+@Slf4j
 public class StubPaymentGateway implements PaymentGateway {
 
     public static final String DECLINE_TOKEN = "pm_card_declined";
     public static final String ERROR_TOKEN = "pm_card_error";
-
-    private static final Logger log = LoggerFactory.getLogger(StubPaymentGateway.class);
 
     @Override
     public GatewayResult charge(GatewayCharge charge) {
