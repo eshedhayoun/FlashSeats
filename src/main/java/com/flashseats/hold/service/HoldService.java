@@ -275,14 +275,6 @@ public class HoldService {
     // ----------------------------------------------------------------- helpers
 
     /**
-     * Requires a live admission session — <strong>not</strong> a queue pass, which was already spent
-     * at {@code POST /queue/admit} (ADR-020).
-     *
-     * <p>The admission session deliberately survives this call. A buyer who releases these seats
-     * keeps their place in the sale and can pick a different tier without re-queueing, which is the
-     * entire reason the middle tier exists.
-     */
-    /**
      * Whether this violation is the one-live-hold-per-session index, and not some other constraint.
      *
      * <p>Matched on the index name because that is the only thing that identifies <em>which</em>
@@ -295,6 +287,14 @@ public class HoldService {
         return constraint != null && constraint.contains(ONE_ACTIVE_HOLD_INDEX);
     }
 
+    /**
+     * Requires a live admission session — <strong>not</strong> a queue pass, which was already spent
+     * at {@code POST /queue/admit} (ADR-020).
+     *
+     * <p>The admission session deliberately survives this call. A buyer who releases these seats
+     * keeps their place in the sale and can pick a different tier without re-queueing, which is the
+     * entire reason the middle tier exists.
+     */
     private void requireAdmission(String sessionId, long eventId, String admissionToken) {
         if (admissionToken == null || admissionToken.isBlank()) {
             throw new AdmissionRequiredException();
