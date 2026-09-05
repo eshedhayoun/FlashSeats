@@ -37,14 +37,6 @@ class HoldFacadeImpl implements HoldFacade {
         holds.releaseInternal(holdToken, toSettleReason(reason));
     }
 
-    /** The public reason, mapped onto the internal one the ledger stores. */
-    private static SettleReason toSettleReason(HoldReleaseReason reason) {
-        return switch (reason) {
-            case USER_CANCEL -> SettleReason.USER_CANCEL;
-            case ORDER_ABORT -> SettleReason.ORDER_ABORT;
-        };
-    }
-
     @Override
     public Instant grantGrace(String holdToken) {
         return holds.grantGrace(holdToken);
@@ -56,7 +48,15 @@ class HoldFacadeImpl implements HoldFacade {
         // AFTER_COMMIT call site in `order` is written once and never has to move.
     }
 
-    static HoldSummary toSummary(TicketHold hold) {
+    /** The public reason, mapped onto the internal one the ledger stores. */
+    private static SettleReason toSettleReason(HoldReleaseReason reason) {
+        return switch (reason) {
+            case USER_CANCEL -> SettleReason.USER_CANCEL;
+            case ORDER_ABORT -> SettleReason.ORDER_ABORT;
+        };
+    }
+
+    private static HoldSummary toSummary(TicketHold hold) {
         return new HoldSummary(
                 hold.getHoldToken(),
                 hold.getUserSessionId(),

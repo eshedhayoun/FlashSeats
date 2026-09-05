@@ -60,10 +60,11 @@ public class RateLimitFilter extends OncePerRequestFilter {
             throws ServletException, IOException {
 
         Object sessionId = request.getAttribute(SessionId.REQUEST_ATTRIBUTE);
-        boolean allowed = sessionId == null || rateLimits.allowSession(sessionId.toString());
-        if (allowed) {
-            allowed = rateLimits.allowIp(clientIpOf(request));
-        }
+
+        // Short-circuited on purpose: a request already refused by its session bucket must not also
+        // spend a token from the shared IP bucket, which thousands of buyers behind one NAT share.
+        boolean allowed = (sessionId == null || rateLimits.allowSession(sessionId.toString()))
+                && rateLimits.allowIp(clientIpOf(request));
 
         if (!allowed) {
             writeRateLimited(response);
