@@ -6,13 +6,15 @@ Guidance for Claude Code when working in this repository.
 
 FlashSeats — a high-concurrency ticket flash-sale engine. Modular monolith, Java 21, Spring Boot
 4.1.1. The **MVP is built and running**: all nine modules, the full journey from landing page to emailed
-PDF ticket, 25 tests green. Inventory is PostgreSQL-only for now — correct, and the Redis fast path
+PDF ticket, 53 tests green. Inventory is PostgreSQL-only for now — correct, and the Redis fast path
 replaces exactly one method body.
 
 **Read [`docs/00-architecture-decisions.md`](docs/00-architecture-decisions.md) before changing
-anything.** It contains 42 ADRs, each recording a defect and its fix — 034-039 come from the first
-review pass over the built code, 040-042 from the second. Several look
-like over-engineering until you read the failure they prevent.
+anything.** It contains 45 ADRs. Most record a defect and its fix — 034-039 come from the first
+review pass over the built code, 040-042 from the second — and several look like over-engineering
+until you read the failure they prevent. 043-045 are the exception: forward-looking decisions about
+the operator surface, buyer accounts and what health should report, with nothing built against them
+yet.
 
 **For what is actually built**, read [`docs/06-mvp-overview.md`](docs/06-mvp-overview.md) — scope,
 security posture, next stages, and the review-pass log. It is the doc to update after every pass.
@@ -20,7 +22,7 @@ security posture, next stages, and the review-pass log. It is the doc to update 
 ## Document precedence
 
 ```
-00-architecture-decisions.md      ← highest authority (42 ADRs)
+00-architecture-decisions.md      ← highest authority (45 ADRs)
 05-global-standards.md            ← cross-cutting contract; module docs conform to it
 FE_SPEC.md                        ← client contract (repo root)
 03-end-to-end-flow.md             ← the authoritative user journey

@@ -4,17 +4,17 @@ import com.flashseats.notification.dto.OrderConfirmedPayload;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.nio.charset.Charset;
+import java.nio.charset.CharsetEncoder;
 import java.text.Normalizer;
 import java.time.ZoneOffset;
 import java.time.format.DateTimeFormatter;
+import lombok.extern.slf4j.Slf4j;
 import org.apache.pdfbox.pdmodel.PDDocument;
 import org.apache.pdfbox.pdmodel.PDPage;
 import org.apache.pdfbox.pdmodel.PDPageContentStream;
 import org.apache.pdfbox.pdmodel.common.PDRectangle;
 import org.apache.pdfbox.pdmodel.font.PDType1Font;
 import org.apache.pdfbox.pdmodel.font.Standard14Fonts;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Component;
 
 /**
@@ -36,10 +36,9 @@ import org.springframework.stereotype.Component;
  * the ticket they had been charged for. Degrading the glyph is strictly better than losing the
  * ticket; carrying a Unicode TTF is the real fix and belongs with the rest of the Stage 4 work.
  */
+@Slf4j
 @Component
 public class TicketPdfRenderer {
-
-    private static final Logger log = LoggerFactory.getLogger(TicketPdfRenderer.class);
 
     private static final DateTimeFormatter DATE =
             DateTimeFormatter.ofPattern("EEEE d MMMM yyyy 'at' HH:mm").withZone(ZoneOffset.UTC);
@@ -129,11 +128,14 @@ public class TicketPdfRenderer {
         String decomposed = Normalizer.normalize(text, Normalizer.Form.NFD)
                 .replaceAll("\\p{InCombiningDiacriticalMarks}+", "");
 
+        // One encoder per call, not per character: CharsetEncoder is stateful and not thread-safe,
+        // so it cannot be a shared constant, but allocating one per char was pure waste.
+        CharsetEncoder encoder = WIN_ANSI.newEncoder();
         StringBuilder safe = new StringBuilder(decomposed.length());
         boolean degraded = false;
         for (int i = 0; i < decomposed.length(); i++) {
             char c = decomposed.charAt(i);
-            if (WIN_ANSI.newEncoder().canEncode(c)) {
+            if (encoder.canEncode(c)) {
                 safe.append(c);
             } else {
                 safe.append(REPLACEMENT);

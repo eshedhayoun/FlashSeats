@@ -10,8 +10,7 @@ import com.flashseats.catalog.repository.TierInventoryRepository;
 import java.time.Clock;
 import java.time.Duration;
 import java.time.Instant;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
+import lombok.extern.slf4j.Slf4j;
 import org.springframework.boot.ApplicationArguments;
 import org.springframework.boot.ApplicationRunner;
 import org.springframework.context.annotation.Profile;
@@ -34,11 +33,10 @@ import org.springframework.transaction.annotation.Transactional;
  * <p>Runs only when the database is empty, so a restart never duplicates or resets a sale in
  * progress.
  */
+@Slf4j
 @Component
 @Profile("dev")
 public class CatalogDevSeeder implements ApplicationRunner {
-
-    private static final Logger log = LoggerFactory.getLogger(CatalogDevSeeder.class);
 
     private final EventRepository events;
     private final TicketTierRepository tiers;

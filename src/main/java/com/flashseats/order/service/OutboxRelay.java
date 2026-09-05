@@ -4,8 +4,7 @@ import com.flashseats.order.model.OutboxEvent;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.UUID;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
+import lombok.extern.slf4j.Slf4j;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Component;
 
@@ -20,10 +19,9 @@ import org.springframework.stereotype.Component;
  * is the right trade: the consumer's unique constraint absorbs a duplicate, whereas a lost ticket
  * email has no recovery path at all.
  */
+@Slf4j
 @Component
 public class OutboxRelay {
-
-    private static final Logger log = LoggerFactory.getLogger(OutboxRelay.class);
 
     private final OutboxStore store;
     private final OutboxPublisher publisher;

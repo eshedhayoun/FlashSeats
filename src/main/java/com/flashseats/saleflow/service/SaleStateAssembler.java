@@ -13,8 +13,8 @@ import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
+import java.util.function.Supplier;
+import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
 
 /**
@@ -28,10 +28,9 @@ import org.springframework.stereotype.Service;
  * without a window status and a server clock there is nothing meaningful to draw, so that failure
  * surfaces.
  */
+@Slf4j
 @Service
 public class SaleStateAssembler {
-
-    private static final Logger log = LoggerFactory.getLogger(SaleStateAssembler.class);
 
     private final CatalogFacade catalog;
     private final QueueFacade queue;
@@ -106,7 +105,7 @@ public class SaleStateAssembler {
     }
 
     /** Runs one sub-read, recording rather than propagating a failure. */
-    private <T> T read(String section, List<String> partial, ThrowingSupplier<T> read) {
+    private <T> T read(String section, List<String> partial, Supplier<T> read) {
         try {
             return read.get();
         } catch (RuntimeException failure) {
@@ -114,10 +113,5 @@ public class SaleStateAssembler {
             partial.add(section);
             return null;
         }
-    }
-
-    @FunctionalInterface
-    private interface ThrowingSupplier<T> {
-        T get();
     }
 }

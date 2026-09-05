@@ -1,6 +1,5 @@
 package com.flashseats.order.service;
 
-import tools.jackson.databind.ObjectMapper;
 import com.flashseats.catalog.facade.TierSummary;
 import com.flashseats.hold.facade.HoldFacade;
 import com.flashseats.hold.facade.HoldSummary;
@@ -20,12 +19,12 @@ import com.flashseats.payment.facade.PaymentResult;
 import java.time.Clock;
 import java.time.Instant;
 import java.util.List;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
+import lombok.extern.slf4j.Slf4j;
 import org.springframework.context.ApplicationEventPublisher;
 import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.stereotype.Component;
 import org.springframework.transaction.annotation.Transactional;
+import tools.jackson.databind.ObjectMapper;
 
 /**
  * The transactional half of checkout.
@@ -38,10 +37,9 @@ import org.springframework.transaction.annotation.Transactional;
  * <p>Every method here contains SQL and nothing else. No HTTP, no Redis, no broker, no rendering
  * (ADR-023).
  */
+@Slf4j
 @Component
 public class OrderCommitService {
-
-    private static final Logger log = LoggerFactory.getLogger(OrderCommitService.class);
 
     private static final String AGGREGATE_TYPE = "ORDER";
     static final String EVENT_ORDER_CONFIRMED = "ORDER_CONFIRMED";

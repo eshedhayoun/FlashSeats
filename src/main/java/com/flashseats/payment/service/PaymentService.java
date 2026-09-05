@@ -11,8 +11,7 @@ import com.flashseats.payment.gateway.GatewayResult;
 import com.flashseats.payment.gateway.PaymentGateway;
 import com.flashseats.payment.model.PaymentTransaction;
 import java.time.Duration;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
+import lombok.extern.slf4j.Slf4j;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.stereotype.Service;
 
@@ -23,13 +22,12 @@ import org.springframework.stereotype.Service;
  * call with two short transactions owned by {@link PaymentTransactionStore}, so no pooled connection
  * is ever held across the provider round trip (ADR-023).
  */
+@Slf4j
 @Service
 public class PaymentService {
 
     /** Owned by this module. Nothing else reads or writes this prefix. */
     private static final String INFLIGHT_KEY = "payment:inflight:";
-
-    private static final Logger log = LoggerFactory.getLogger(PaymentService.class);
 
     private final PaymentGateway gateway;
     private final PaymentTransactionStore store;

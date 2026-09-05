@@ -1,6 +1,8 @@
 package com.flashseats.order.service;
 
 import com.flashseats.order.model.OutboxEvent;
+import java.nio.charset.StandardCharsets;
+import org.springframework.amqp.core.Message;
 import org.springframework.amqp.core.MessageDeliveryMode;
 import org.springframework.amqp.core.MessageProperties;
 import org.springframework.amqp.rabbit.core.RabbitTemplate;
@@ -36,14 +38,13 @@ public class RabbitOutboxPublisher implements OutboxPublisher {
         rabbit.send(EXCHANGE, routingKeyFor(event.getEventType()), toMessage(event));
     }
 
-    private org.springframework.amqp.core.Message toMessage(OutboxEvent event) {
+    private Message toMessage(OutboxEvent event) {
         MessageProperties properties = new MessageProperties();
         properties.setContentType(MessageProperties.CONTENT_TYPE_JSON);
         properties.setContentEncoding("UTF-8");
         properties.setDeliveryMode(MessageDeliveryMode.PERSISTENT);
         properties.setMessageId(event.getId().toString());
-        return new org.springframework.amqp.core.Message(
-                event.getPayload().getBytes(java.nio.charset.StandardCharsets.UTF_8), properties);
+        return new Message(event.getPayload().getBytes(StandardCharsets.UTF_8), properties);
     }
 
     private String routingKeyFor(String eventType) {
