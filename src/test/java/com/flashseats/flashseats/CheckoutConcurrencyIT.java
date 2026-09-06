@@ -36,7 +36,6 @@ class CheckoutConcurrencyIT extends IntegrationTest {
     @BeforeEach
     void seedSale() {
         fixture.reset();
-
         eventId = fixture.openEvent("Checkout Concurrency Test");
         tierId = fixture.tier(eventId, "VIP", 7_500, 10);
     }
@@ -153,5 +152,6 @@ class CheckoutConcurrencyIT extends IntegrationTest {
             throw new RuntimeException(e);
         }
     }
+    
 }
 
