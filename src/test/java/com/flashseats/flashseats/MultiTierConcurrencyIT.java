@@ -1,27 +1,28 @@
 package com.flashseats.flashseats;
 import static org.assertj.core.api.Assertions.assertThat;
 
-import com.flashseats.catalog.facade.CatalogFacade;
-import com.flashseats.flashseats.support.BuyerSession;
-import com.flashseats.flashseats.support.IntegrationTest;
-import com.flashseats.flashseats.support.SaleFixture;
-import java.util.ArrayList;
+import java.time.Duration;
 import java.util.List;
 import java.util.Map;
-import java.util.concurrent.Callable;
 import java.util.concurrent.CountDownLatch;
-import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
+
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.web.server.LocalServerPort;
 import org.springframework.transaction.support.TransactionTemplate;
-import java.time.Duration;
+
+import com.flashseats.catalog.facade.CatalogFacade;
+import com.flashseats.flashseats.support.BuyerSession;
+import com.flashseats.flashseats.support.IntegrationTest;
+import com.flashseats.flashseats.support.SaleFixture;
+import com.flashseats.hold.service.HoldService;
+import static org.awaitility.Awaitility.await;
 class MultiTierConcurrencyIT extends IntegrationTest  {
     @Autowired
     private CatalogFacade catalog;
@@ -32,6 +33,8 @@ class MultiTierConcurrencyIT extends IntegrationTest  {
     @Autowired
     private TransactionTemplate transactions;
 
+    @Autowired 
+    private HoldService holdService;
     private long eventId;
     private long vipTierId;
     private long generalTierId;
@@ -49,7 +52,6 @@ class MultiTierConcurrencyIT extends IntegrationTest  {
             Future<Integer> general = submitHold(pool,startLine,buyer,generalTierId,3);
             Future<Integer> balcony = submitHold(pool,startLine,buyer,balconyTierId,4);
             startLine.countDown();
-
             int vipStatus = vip.get(30, TimeUnit.SECONDS);
             int generalStatus = general.get(30, TimeUnit.SECONDS);
             int balconyStatus = balcony.get(30, TimeUnit.SECONDS);
@@ -70,17 +72,72 @@ class MultiTierConcurrencyIT extends IntegrationTest  {
         assertThat(fixture.stockInvariantHolds(generalTierId)).isTrue(); 
         assertThat(fixture.stockInvariantHolds(balconyTierId)).isTrue();
     }
-    
+    @Test
+    @DisplayName("Checkout and hold expiry racing each other never creates an inconsistent order")
+    void checkoutAndHoldExpiryRacingEachOtherNeverCreatesInconsistentOrder() throws Exception {
+        BuyerSession buyer = admittedBuyer();
+        String holdToken = reserve(buyer, vipTierId, 1);
+        assertThat(fixture.remaining(vipTierId)).isEqualTo(9);
+        CountDownLatch startLine = new CountDownLatch(1);
+        try (ExecutorService pool = Executors.newFixedThreadPool(2)){
+            Future<Integer> checkout = submitCheckout( pool, startLine, buyer, holdToken );
+            Future<Integer> expiry = pool.submit(() -> { 
+                startLine.await(); 
+                return holdService.sweepExpired(); 
+            });
+            startLine.countDown();
+            int checkoutStatus = checkout.get(30, TimeUnit.SECONDS); 
+            int reclaimed = expiry.get(30, TimeUnit.SECONDS);
+            assertThat(checkoutStatus).isIn(201, 404, 409, 410);
+            assertThat(reclaimed).isIn(0, 1);
+        }
+        String status = fixture.holdStatus(holdToken);
+        switch (status) {
+            case "CONSUMED":
+                assertThat(fixture.countOrders()).isEqualTo(1);
+                assertThat(fixture.countPaymentTransactions()).isEqualTo(1);
+                assertThat(fixture.remaining(vipTierId)).isEqualTo(9);
+                break;
+            case "EXPIRED":
+                assertThat(fixture.countOrders()).isEqualTo(0);
+                assertThat(fixture.countPaymentTransactions()).isEqualTo(0);
+                assertThat(fixture.remaining(vipTierId)).isEqualTo(10);
+            default:
+                throw new AssertionError( "Unexpected hold status: " + status );
+                
+        }
+        assertThat(fixture.stockInvariantHolds(vipTierId)).isTrue();
+    }
+    @Test 
+    @DisplayName("An expired hold cannot be checked out") 
+    void expiredHoldCannotBeCheckedOut(){
+        BuyerSession buyer = admittedBuyer();
+        String holdToken = reserve(buyer, vipTierId, 2);
+        assertThat(fixture.remaining(vipTierId)).isEqualTo(8);
+        fixture.expireHold(holdToken);
+        await().atMost(PATIENCE) .untilAsserted(() -> { 
+            assertThat(fixture.holdStatus(holdToken)).isEqualTo("EXPIRED");
+            assertThat(fixture.remaining(vipTierId)).isEqualTo(10);
+         });
+        int checkoutStatus = buyer.post(
+                "/orders/checkout",
+                checkout(holdToken, "pm_card_visa")
+        ).status();
+        assertThat(checkoutStatus).isIn(404, 409, 410);
+        assertThat(fixture.countOrders()).isEqualTo(0);
+        assertThat(fixture.countPaymentTransactions()).isEqualTo(0);
+        assertThat(fixture.remaining(vipTierId)).isEqualTo(10);
+        assertThat(fixture.holdStatus(holdToken)) .isEqualTo("EXPIRED");
+        assertThat(fixture.stockInvariantHolds(vipTierId)).isTrue();
+    }
+    //helpper methods that I might use in future tests
+
     @BeforeEach
     void setUp() {
         fixture.reset();
-
         eventId = fixture.openEvent("Multi Tier Concurrency Test");
-
         vipTierId = fixture.tier(eventId,"VIP",10_000,10);
-
         generalTierId = fixture.tier(eventId,"General",5_000,20);
-
         balconyTierId = fixture.tier(eventId,"Balcony",2_500,30);
     }
     private long count_success(List<Integer> results) {
@@ -93,18 +150,16 @@ class MultiTierConcurrencyIT extends IntegrationTest  {
                 .filter(status -> status == 409)
                 .count();
     }
-    /* 
-    //helpper methods that I might use in future tests
-    private List<Callable<Boolean>> requests(long tierId,int quantity,int count) {
-        List<Callable<Boolean>> tasks = new ArrayList<>();
-        for (int i = 0; i < count; i++) {
-            tasks.add(() -> reserve(tierId, quantity));
-        }
-        return tasks;
+    
+    private String reserve(BuyerSession buyer, long tierId, int quantity) {
+        return buyer.post(
+                "/holds",
+                Map.of(
+                        "eventId", eventId,
+                        "tierId", tierId,
+                        "quantity", quantity),
+                        Map.of("X-Admission-Token", admissionToken)).text("holdToken");
     }
-    private boolean reserve(long tierId, int quantity) {
-        return transactions.execute(tx -> catalog.tryReserve(tierId, quantity));
-    }*/
     
     private String admissionToken;
     private BuyerSession admittedBuyer(){
@@ -147,5 +202,31 @@ class MultiTierConcurrencyIT extends IntegrationTest  {
                         Map.of("eventId", eventId, "tierId", tierId,"quantity", quantity),
                         Map.of("X-Admission-Token",admissionToken)).status();
                 });
+    }
+    private Map<String, Object> checkout(String holdToken,String paymentMethodId) {
+        return Map.of(
+                "holdToken", holdToken,
+                "userEmail", "buyer@example.com",
+                "paymentMethodId", paymentMethodId,
+                "idempotencyKey", "test-" + holdToken
+        );
+    }
+    private Future<Integer> submitCheckout(
+        ExecutorService pool,
+        CountDownLatch startLine,
+        BuyerSession buyer,
+        String holdToken) {
+
+        return pool.submit(() -> {
+            startLine.await();
+
+            return buyer.post(
+                    "/orders/checkout",
+                    checkout(holdToken, "pm_card_visa")
+            ).status();
+        });
+    }
+    private boolean isSuccess(int status) { 
+        return status == 200 || status == 201; 
     }
 }
