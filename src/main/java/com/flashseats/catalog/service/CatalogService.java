@@ -13,6 +13,7 @@ import com.flashseats.catalog.facade.TierSummary;
 import com.flashseats.catalog.model.Event;
 import com.flashseats.catalog.model.EventStatus;
 import com.flashseats.catalog.model.TicketTier;
+import com.flashseats.catalog.redis.CatalogRedisRepository;
 import com.flashseats.catalog.repository.EventRepository;
 import com.flashseats.catalog.repository.TicketTierRepository;
 import com.flashseats.catalog.repository.TierInventoryRepository;
@@ -22,6 +23,8 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import lombok.extern.slf4j.Slf4j;
+
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Propagation;
 import org.springframework.transaction.annotation.Transactional;
@@ -43,18 +46,36 @@ public class CatalogService {
     private final TierInventoryRepository inventory;
     private final CatalogProperties properties;
     private final Clock clock;
-
+    private final CatalogRedisRepository redisStock;//added this feild to use redis for stock management might change later
+    @Autowired//this constructor is used when redis is not used for stock management 
+    //i made this the default constructor to avoid breaking existing code that uses this service without redis
     public CatalogService(
             EventRepository events,
             TicketTierRepository tiers,
             TierInventoryRepository inventory,
             CatalogProperties properties,
-            Clock clock) {
+            Clock clock
+            ) {
         this.events = events;
         this.tiers = tiers;
         this.inventory = inventory;
         this.properties = properties;
         this.clock = clock;
+        this.redisStock = null;
+    }
+    public CatalogService(
+            EventRepository events,
+            TicketTierRepository tiers,
+            TierInventoryRepository inventory,
+            CatalogProperties properties,
+            Clock clock,
+            CatalogRedisRepository redisStock) {
+        this.events = events;
+        this.tiers = tiers;
+        this.inventory = inventory;
+        this.properties = properties;
+        this.clock = clock;
+        this.redisStock = redisStock;
     }
 
     // ---------------------------------------------------------------- browse
@@ -221,9 +242,27 @@ public class CatalogService {
             throw new PrewarmWindowClosedException(eventId);
         }
         int seeded = inventory.seedFromCapacity(eventId);
-        log.info("Pre-warmed event {}: {} tier counters seeded", eventId, seeded);
+
+        int redisSeeded = 0;
+
+        for (TicketTier tier : tiers.findByEventIdOrderByPriceCentsDesc(eventId)) {
+            if (redisStock.initializeIfAbsent(
+                    eventId,
+                    tier.getId(),
+                    tier.getTotalCapacity())) {
+                redisSeeded++;
+            }
+        }
+
+        log.info(
+                "Pre-warmed event {}: {} DB counters, {} Redis counters",
+                eventId,
+                seeded,
+                redisSeeded);
+
         return seeded;
-    }
+    } 
+    
 
     // ----------------------------------------------------------------- helpers
 

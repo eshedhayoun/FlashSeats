@@ -9,6 +9,7 @@ import org.springframework.data.jpa.repository.Modifying;
 import org.springframework.data.jpa.repository.Query;
 import org.springframework.data.repository.query.Param;
 
+
 /** Access to the live remaining counts. */
 public interface TierInventoryRepository extends JpaRepository<TierInventory, Long> {
 
@@ -108,4 +109,36 @@ public interface TierInventoryRepository extends JpaRepository<TierInventory, Lo
                AND NOT EXISTS (SELECT 1 FROM TierInventory i WHERE i.tierId = t.id)
             """)
     int countTiersMissingInventory(@Param("eventId") long eventId);
+    @Query(
+        value = """
+                SELECT
+                    t.id AS tier_id,
+                    t.total_capacity
+                        - COALESCE(confirmed.quantity, 0)
+                        - COALESCE(active_holds.quantity, 0) AS remaining
+                FROM ticket_tiers t
+                LEFT JOIN (
+                    SELECT
+                        oi.tier_id,
+                        SUM(oi.quantity) AS quantity
+                    FROM order_items oi
+                    JOIN orders o ON o.id = oi.order_id
+                    WHERE o.status = 'CONFIRMED'
+                    GROUP BY oi.tier_id
+                ) confirmed
+                    ON confirmed.tier_id = t.id
+                LEFT JOIN (
+                    SELECT
+                        h.tier_id,
+                        SUM(h.quantity) AS quantity
+                    FROM ticket_holds h
+                    WHERE h.status = 'ACTIVE'
+                      AND h.expires_at > now()
+                    GROUP BY h.tier_id
+                ) active_holds
+                    ON active_holds.tier_id = t.id
+                WHERE t.event_id = :eventId
+                ORDER BY t.id
+                """,nativeQuery = true)
+        List<Object[]> findAuthoritativeRemainingByEvent(@Param("eventId") long eventId);
 }
