@@ -36,6 +36,11 @@ public enum ErrorCode {
      */
     INVENTORY_UNAVAILABLE(HttpStatus.SERVICE_UNAVAILABLE),
     PREWARM_WINDOW_CLOSED(HttpStatus.CONFLICT),
+    /**
+     * Another rebuild already holds the lock for this event. Retry, do not force — two rebuilds
+     * computing from a ledger that is moving under them is how a recovery makes things worse.
+     */
+    STOCK_REBUILD_IN_PROGRESS(HttpStatus.SERVICE_UNAVAILABLE),
 
     // --- queue --------------------------------------------------------------
     NOT_IN_QUEUE(HttpStatus.NOT_FOUND),
