@@ -1,7 +1,7 @@
 package com.flashseats.order.service;
 
+import com.flashseats.order.config.OutboxProperties;
 import com.flashseats.order.model.OutboxEvent;
-import java.util.ArrayList;
 import java.util.List;
 import java.util.UUID;
 import lombok.extern.slf4j.Slf4j;
@@ -25,10 +25,12 @@ public class OutboxRelay {
 
     private final OutboxStore store;
     private final OutboxPublisher publisher;
+    private final int staleClaimSeconds;
 
-    public OutboxRelay(OutboxStore store, OutboxPublisher publisher) {
+    public OutboxRelay(OutboxStore store, OutboxPublisher publisher, OutboxProperties properties) {
         this.store = store;
         this.publisher = publisher;
+        this.staleClaimSeconds = properties.getStaleClaimSeconds();
     }
 
     @Scheduled(
@@ -40,20 +42,23 @@ public class OutboxRelay {
             return;
         }
 
-        List<UUID> published = new ArrayList<>(batch.size());
-        for (OutboxEvent event : batch) {
-            try {
-                publisher.publish(event); // no transaction open
-                published.add(event.getId());
-            } catch (RuntimeException failed) {
-                // Left PROCESSING on purpose: the stale-claim sweep returns it to PENDING and it is
-                // retried, rather than being silently dropped here.
-                log.error("Failed to publish outbox event {}", event.getId(), failed);
-            }
-        }
+        // No transaction open. The publisher reports what the transport durably accepted, which may
+        // be fewer rows than were handed to it — a broker that nacks, routes nowhere, or does not
+        // answer in time. Anything absent stays PROCESSING and recoverStaleClaims returns it to
+        // PENDING, so the outcome of a bad batch is a retry rather than a lost ticket.
+        List<UUID> published = publisher.publish(batch);
 
         if (!published.isEmpty()) {
             store.markProcessed(published); // tx2
+        }
+
+        if (published.size() < batch.size()) {
+            log.warn(
+                    "{} of {} outbox event(s) were not confirmed; they stay PROCESSING and will be"
+                            + " retried after {}s",
+                    batch.size() - published.size(),
+                    batch.size(),
+                    staleClaimSeconds);
         }
     }
 
