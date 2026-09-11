@@ -48,6 +48,11 @@ class HoldFacadeImpl implements HoldFacade {
         // AFTER_COMMIT call site in `order` is written once and never has to move.
     }
 
+    @Override
+    public int sumActiveQuantityForTier(long tierId) {
+        return holds.sumActiveQuantityForTier(tierId);
+    }
+
     /** The public reason, mapped onto the internal one the ledger stores. */
     private static SettleReason toSettleReason(HoldReleaseReason reason) {
         return switch (reason) {

@@ -2,6 +2,7 @@ package com.flashseats.catalog.facade;
 
 import com.flashseats.catalog.service.CatalogService;
 import java.util.List;
+import java.util.Map;
 import org.springframework.stereotype.Component;
 
 /**
@@ -40,22 +41,32 @@ class CatalogFacadeImpl implements CatalogFacade {
     }
 
     @Override
-    public int getRemaining(long tierId) {
-        return catalog.getRemaining(tierId);
-    }
-
-    @Override
     public int getRemainingForEvent(long eventId) {
         return catalog.getRemainingForEvent(eventId);
     }
 
     @Override
-    public boolean tryReserve(long tierId, int quantity) {
-        return catalog.tryReserve(tierId, quantity);
+    public ReserveResult tryReserve(long eventId, long tierId, int quantity) {
+        return catalog.tryReserve(eventId, tierId, quantity);
     }
 
     @Override
-    public void restore(long tierId, int quantity) {
-        catalog.restore(tierId, quantity);
+    public void restore(long eventId, long tierId, int quantity) {
+        catalog.restore(eventId, tierId, quantity);
+    }
+
+    @Override
+    public Map<Long, Integer> getTierCapacities(long eventId) {
+        return catalog.getTierCapacities(eventId);
+    }
+
+    @Override
+    public Map<Long, Integer> getLiveCounters(long eventId) {
+        return catalog.getLiveCounters(eventId);
+    }
+
+    @Override
+    public void applyRebuild(long eventId, Map<Long, Integer> remainingByTier) {
+        catalog.applyRebuild(eventId, remainingByTier);
     }
 }

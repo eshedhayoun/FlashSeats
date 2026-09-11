@@ -6,9 +6,12 @@
 > A **Review passes** log at the bottom records every pass over this MVP. Append to it; do not
 > rewrite history.
 
-**Status:** built and running, two review passes and one cleanup pass deep. 53 tests green,
-including the concurrency, journey, checkout-recovery, queue-lifecycle, availability and
-problem-response suites.
+**Status:** built and running, two review passes, one cleanup pass and **Stage 1** deep. 68 tests
+green, including the concurrency, journey, checkout-recovery, queue-lifecycle, availability,
+problem-response, pre-warm, rebuild and Redis-restart suites.
+
+**Inventory lives in Redis** (ADR-046). `catalog:stock:{eventId}:{tierId}` is the live count;
+PostgreSQL keeps no copy of it and `tier_inventory` is dropped.
 
 ---
 
@@ -109,27 +112,26 @@ it, so if anything fails the hold returns to `ACTIVE` and expires normally.
 | :--- | :--- | :--- |
 | `shared` | `ErrorCode` (37 codes), `ProblemDetails`, one global advice, `SessionId`, `Money`, `Clock`, `SignedToken`, `TraceIdFilter` | — |
 | `bot` | Signed `fsid` cookie; Redis-backed Bucket4j session + IP buckets; SSE exempt from per-request accounting | reCAPTCHA, `ip_rules`, audit logs. **Writes no tables.** |
-| `catalog` | Events, tiers, `tier_inventory`, window derivation, `serverTime`, bucketed availability, pre-warm, `tryReserve`/`restore` | Redis counters + Lua, the `-2` fault path, locked rebuild, pause, `TierAvailabilityChangedEvent` |
+| `catalog` | Events, tiers, window derivation, `serverTime`, bucketed availability, **Redis counters + Lua, the `-2` fault path, pre-warm, the Redis-restart guard** | pause, `TierAvailabilityChangedEvent` |
 | `queue` | `ZADD NX` join, SSE with heartbeats, HMAC passes, admission sessions, promotion worker, **pub/sub fan-out**, measured drain-rate estimates | `RANDOM` ordering, `tier-availability` frame, `Last-Event-ID` replay |
-| `hold` | `ticket_holds` authority, the settle-once claim, atomic reserve, bounded grace, sweeper, all three endpoints | Lua scripts, the `hold:{token}` Redis timer, the keyspace listener |
+| `hold` | `ticket_holds` authority, the settle-once claim, atomic reserve **with compensation**, **after-commit restore**, bounded grace, sweeper, all three endpoints | the `hold:{token}` Redis timer and the keyspace listener (Stage 3) |
 | `payment` | Real `PaymentFacade`, `payment_transactions`, three idempotency layers, stub gateway behind the final interface | Stripe, webhooks, 3-D Secure, Resilience4j |
-| `order` | Full orchestration, find-or-create, server-side pricing, receipt tokens, outbox relay with `SKIP LOCKED`, compensating refund | `PaymentSettledEvent` listener, `/checkout/resume` |
+| `order` | Full orchestration, find-or-create, server-side pricing, receipt tokens, outbox relay with `SKIP LOCKED`, compensating refund, **the stock rebuild and the drift gauge** | `PaymentSettledEvent` listener, `/checkout/resume` |
 | `notification` | Rabbit topology + DLX, insert-then-send consumer, PDFBox tickets, HTML email, Mailpit | Failure classification, DLQ inspection, admin resend, refund-notice template |
 | `saleflow` | `GET /sale/{id}/state`, failing soft per section | — |
 
-### What gets replaced later — and it is almost nothing
-
-Four method bodies and one bean. Every interface is already final:
+### What gets replaced later
 
 | Today | Later | Blast radius |
 | :--- | :--- | :--- |
-| `CatalogFacade.tryReserve` — one SQL statement | `hold_reserve.lua` | the method body |
 | `HoldFacade.discardTimer` — a no-op | `DEL hold:{token}` | the method body |
 | `StubPaymentGateway` | `StripeGateway` | one `@Bean` |
 | `LoggingOutboxPublisher` | already switchable by property | none |
 
-That is the point of the sequencing: the transaction boundaries, the claim, and every constraint are
-the final versions. Speed arrives later; correctness did not wait for it.
+`CatalogFacade.tryReserve` has already made its move, and it cost more than the method body the
+first draft of this table predicted — the signature, the transaction boundary either side of it, and
+a table. What the prediction got right is what mattered: the claim, the constraints and the checkout
+sequence are unchanged, so speed arrived without correctness being reopened (ADR-046).
 
 ---
 
@@ -139,7 +141,9 @@ Guarantees are enforced by constraints and single statements, not by careful cal
 
 | Invariant | Enforced by |
 | :--- | :--- |
-| Never oversold | `TierInventoryRepository.tryReserve` — one `UPDATE … WHERE remaining >= :q`, backed by `CHECK (remaining >= 0)` |
+| Never oversold | `stock_reserve.lua` — `GET`, compare, `DECRBY` in one atomic step, refusing to go below the requested quantity |
+| The counter is watched, not merely trusted | `flashseats.stock.drift` against `capacity − confirmed − held`; `rebuild-stock` repairs it |
+| A rolled-back Redis cannot quietly oversell | `catalog:vouch:{eventId}` vs the live `run_id` — holds are refused until a rebuild (ADR-046) |
 | Seats restored **exactly once** | `TicketHoldRepository.settle` — `UPDATE … WHERE status = 'ACTIVE'`; only `rowcount = 1` restores |
 | One hold never becomes two orders | `UNIQUE(hold_token)` on `orders` |
 | One live hold per session per event | Partial unique index `idx_holds_one_active_per_session` |
@@ -202,12 +206,16 @@ Findings that cost real time and would cost it again.
 ## 8. Verification
 
 ```bash
-./mvnw test        # 53 tests: unit, modularity, concurrency, journey, recovery, queue lifecycle
+./mvnw test        # 68 tests: unit, modularity, concurrency, journey, recovery, queue lifecycle,
+                   #            pre-warm, stock rebuild, drift, Redis-restart guard
 ```
 
 | Test | What it proves |
 | :--- | :--- |
-| `StockReserveConcurrencyIT` | 50 threads for the last seat → exactly one wins. 100 threads for 30 seats → exactly 30. Four-seat requests against ten remaining → two win, and no partial reservation. |
+| `StockReserveConcurrencyIT` | 50 threads for the last seat → exactly one wins. **1,000 concurrent buyers against 100 seats → exactly 100.** Four-seat requests against ten remaining → two win, and no partial reservation. A tier whose counter is gone reports a fault, not a sell-out. |
+| `CatalogPrewarmIT` | Pre-warm creates the counter, is a no-op the second time, and leaves Redis untouched when it refuses an open sale. |
+| `StockRebuildIT` | A counter that never existed, one left too high by a restart, and one left too low by a lost restore are all rebuilt to the ledger's number. Drift reads zero when they agree and reports the gap when they do not; a missing counter is counted separately. |
+| `StockEpochIT` | A Redis restart refuses to sell rather than overselling; a rebuild releases that sale and only that sale; noticing the restart does not consume it; a sale created afterwards is never in doubt. |
 | `HoldLifecycleIT` | Double consume → `409`. Ten concurrent releases restore **once**. The sweeper reclaims an abandoned hold and does not keep restoring it. One hold per session. A missing counter is `503`, never "sold out". |
 | `UserJourneyIT` | The full journey over real HTTP with a real cookie; a spent pass is rejected; a decline retains the hold and the retry succeeds on the same order number; a double submit yields one order and one charge; `/sale/state` tracks the stage. |
 | `CheckoutRecoveryIT` | A gateway outage keeps the seats **and** the ability to pay for them; it costs none of the three card attempts; a charge genuinely in flight is still refused; an order stranded by a crash resumes once no charge can still be running. |
@@ -233,13 +241,20 @@ Honest list. None of these is hidden behind a passing test.
   from one instance.
 - **No load test run.** The k6 harness exists but still uses the pre-ADR-020 pass flow; it needs the
   `/queue/admit` exchange before it will run.
-- **Inventory is PostgreSQL-only.** Correct, and roughly two orders of magnitude slower than the Lua
-  path. Fine to thousands of requests per second, not to hundreds of thousands.
+- **`stock.drift` will read non-zero transiently under live traffic.** Redis and PostgreSQL are not
+  read in one snapshot, so a hold created between the two reads shows as a momentary gap. The two
+  SQL sums *are* one snapshot, which removes the only drift the measurement can manufacture by
+  itself. Alarm on sustained non-zero, not on a single sample.
+- **A rebuild during live traffic can still under-count** by any hold created inside its settling
+  window. That is the deliberate direction (ADR-046), and a second rebuild recovers it — but the
+  sanctioned use is recovery from a counter that is missing or known wrong, not routine maintenance.
+- **The Redis-restart guard halts selling for every affected event** until each is rebuilt. That is
+  what `catalog.md` has always demanded after a restart; it is now enforced rather than remembered,
+  and an unattended restart therefore stops a sale.
 - **Payment is a stub.** Every idempotency layer is real; the gateway is not.
 - **No admin surface** beyond pre-warm. No pause, no stock rebuild, no DLQ replay.
 - **`ORDER_REFUNDED` is written but never consumed** — the refund-notice template is deferred.
-- **`stock.drift` is asserted in tests, not exported as a metric.** With a PostgreSQL counter it
-  cannot diverge from itself; it becomes a live metric when Redis holds the count.
+
 - **The outbox relay publishes without confirms.** `rabbit.send()` is fire-and-forget and
   `spring.rabbitmq.publisher-confirm-type` is unset, so the relay marks a row `PROCESSED` on a
   successful TCP write. A broker that accepts the frame and dies before persisting loses the message
@@ -312,22 +327,16 @@ below is a real exposure someone should close before real money moves through it
 In dependency order. Each stage leaves a system that is still correct, and none of them requires
 reopening a decision made above.
 
-### Stage 1 — Redis fast path (the documented Phase 2)
+### Stage 1 — Redis fast path — **DONE** (ADR-046)
 
-The only stage that touches inventory correctness, so it goes first and alone.
+`catalog:stock:{eventId}:{tierId}` is the live count. `stock_reserve.lua` / `stock_restore.lua`,
+the `-2` fault path end to end, `SETNX` pre-warm restricted to `UPCOMING`, the rebuild from the
+ledger, `flashseats.stock.drift` as a live gauge, and `catalog:vouch:{eventId}` refusing to sell
+from counters a Redis restart may have rolled back. `tier_inventory` is dropped.
 
-- `hold_reserve.lua` / `hold_restore.lua`, replacing the body of `CatalogFacade.tryReserve`.
-- The `-2` fault path: a missing counter is `503 INVENTORY_UNAVAILABLE`, **never** "sold out". The
-  distinction already exists in `HoldService`; it moves into the script.
-- `SETNX` pre-warm restricted to `UPCOMING`, and the locked rebuild from the ledger under
-  `pg_try_advisory_xact_lock`.
-- `hold:{token}` as a TTL timer plus the keyspace listener — a *latency optimisation*. The sweeper
-  stays the correctness guarantee, and disabling the listener must change no outcome.
-- `flashseats.stock.drift` becomes a live metric, because now the counter can diverge.
-
-**Exit:** 1,000 concurrent requests for 100 tickets sell exactly 100; `FLUSHDB` mid-sale returns
-`503` and a rebuild restores the exact count; with the listener disabled the sweeper still restores
-every hold exactly once.
+**Deferred to Stage 3, deliberately:** the `hold:{token}` TTL key and the keyspace-expiry listener.
+Latency only — the sweeper is unchanged and still the guarantee — and the claim needing proof about
+them is a multi-replica one.
 
 ### Stage 2 — Real money and real defence (Phase 3)
 
@@ -347,6 +356,11 @@ every hold exactly once.
 
 - Run `docker compose --profile cluster` and verify promotion fan-out across replicas. **This is the
   highest-value unverified claim in the system** and the first thing to check.
+- Verify the Redis-restart guard across replicas: every replica must distrust an event, and a
+  rebuild on one must release it on all. Built for this (ADR-046) and observable only here.
+- The `hold:{token}` timer and the `__keyevent@0__:expired` listener, deferred out of Stage 1
+  because the thing to prove — three replicas receiving one broadcast expiry restore a hold exactly
+  once — needs three replicas.
 - Fix `docker/k6/flash-sale.js` for the ADR-020 admission flow, then the 10,000-VU run: 500 tickets,
   exactly 500 sold, zero overbooking, checkout p99 under 200 ms.
 - Nginx in front, Redis Sentinel behind.
@@ -364,14 +378,15 @@ can act:
   someone can replay them. Pass 2 found a PDF font failure that dead-lettered a **paid** buyer's
   ticket, and with no replay endpoint the DLQ was a black hole. ADR-038 went to real trouble making
   a dead-lettered claim re-claimable *so that a replay would send*; nothing can trigger that replay.
-- **ADR-004** names a locked rebuild as the only legal recovery from a missing counter. It is
-  specified in three documents and implemented nowhere, so the documented recovery from the system's
-  worst failure is "edit the database by hand".
+- ~~**ADR-004** names a locked rebuild as the only legal recovery from a missing counter.~~ **Built
+  in Stage 1**, as `POST /admin/events/{id}/rebuild-stock` served by `order` — the only module that
+  may read the whole ledger (ADR-046).
 
 Endpoints live in the module that owns the state — there is **no `admin` module**, because one would
 have to read every other module's internals (ADR-043).
 
-- `POST /admin/events/{id}/pause` · `POST /admin/events/{id}/rebuild-stock` — `catalog`
+- `POST /admin/events/{id}/pause` — `catalog`. (`rebuild-stock` shipped in Stage 1, served by
+  `order`; the ledger it reads is not catalog's alone.)
 - `GET /admin/notifications/dlq` · `POST /admin/notifications/resend/{orderNumber}` — `notification`
 - `GET /admin/orders/{orderNumber}` — `order`, so support can answer "where is my ticket?"
 - **Replace the in-memory `UserDetailsService` (§10 S12) first.** One hardcoded account is tolerable
@@ -655,3 +670,47 @@ the usual material. What follows is the remainder.
 
 - **Result:** 53 tests green, unchanged from before the pass. 96 insertions, 156 deletions across
   30 files, plus one new 33-line class.
+
+### Pass 4 — Stage 1, the Redis fast path
+
+- **Scope:** moving the live inventory count from PostgreSQL to Redis without weakening a guarantee,
+  then a review of the result against the question "is this a Redis-first design anyone could read".
+- **Method:** built in ordered steps, each left green — the counter primitives, then the flip and
+  its test fixture, then the rebuild and the drift gauge. A design review before the first line of
+  code found five failure modes worth the rework, and a review after it found three more.
+
+**What the design review found before implementation.**
+
+| Found | Consequence |
+| :--- | :--- |
+| The sweeper settles up to 500 holds in one transaction | An inline `INCRBY` would return every earlier hold's seats and leave those holds `ACTIVE` on any failure. Restoration moved to `AFTER_COMMIT` |
+| Compensating a reserve on *any* exception | A commit failure is ambiguous; returning seats that may still be held is an oversell. Compensate only on the constraint rejection |
+| `catalog.md`'s rebuild filters `expires_at > now()` | An expired-but-unswept hold is subtracted by nobody and restored by the sweeper — the same seats twice |
+| A rebuild reading the ledger once | Misses a hold whose `DECRBY` has landed and whose row has not, and writes a count that is too high. Two snapshots, smaller wins |
+| Nothing detected a Redis restart | AOF `everysec` brings counters back **high**. `StockEpoch` and `catalog:vouch:{eventId}` |
+
+**What the review after implementation found.**
+
+| Found | Fix |
+| :--- | :--- |
+| `tier_inventory` had become write-only — pre-warm and rebuild wrote it, nothing read it, and the rebuild derives from the ledger without it | Dropped (`V7`). A stale column named `remaining` reads exactly like the truth. Losing V1's `CHECK (remaining >= 0)` is a real trade, recorded in ADR-046 |
+| The restart guard consumed its own signal: one in-memory flag plus one shared stamped key, so whichever replica noticed first protected only itself | Per-event vouched `run_id` in Redis, verdict recomputed each tick. Also less code — no global key, no flag, no `SCAN` |
+| `StockCounterRepository` published the Lua return codes, so `-1` meant "sold out" there and "no counter" one layer up | `reserve()` returns `ReserveResult`, `restore()` returns a boolean; the numbers are private |
+
+**Cut after building it.** The `hold:{token}` timer and keyspace listener were built, tested and
+removed. Proving the listener fires needs the sweeper slowed and proving the sweeper suffices needs
+the listener off — two `@TestPropertySource` classes, so two extra Spring contexts, so three sets of
+schedulers over shared containers. `HoldLifecycleIT` then failed in the suite while passing alone:
+exactly the failure `SaleFixture`'s own comments warn about. It is a latency optimisation whose one
+real claim is a multi-replica one, so it moved to Stage 3 intact.
+
+**Verified by hand against the live stack.** The existing dev database was the true cutover case —
+counters in SQL, none in Redis — and reported every tier `UNKNOWN` rather than `SOLD_OUT`, which is
+ADR-040 holding through the change. `rebuild-stock` then reconstructed event 2 as `200 − 5 sold =
+195` from three genuine confirmed orders, before and after the table was dropped.
+
+**Cutover note.** A database predating Stage 1 has no counters, so holds answer `503` until
+`rebuild-stock` runs once per open event. That is the designed behaviour: the alternative is seeding
+from capacity, which is precisely ADR-004's prohibition.
+
+- **Result:** 68 tests green, up from 53.
