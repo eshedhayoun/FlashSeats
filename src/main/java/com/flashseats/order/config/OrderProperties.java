@@ -34,6 +34,23 @@ public class OrderProperties {
      */
     private int stalePendingSeconds = 90;
 
+    /**
+     * How long a rebuild waits between its two ledger snapshots.
+     *
+     * <p>A reserve decrements Redis a moment before its {@code ticket_holds} row commits, so a single
+     * snapshot can miss a hold that is seconds from existing and compute a count that is too high —
+     * an oversell written by the very procedure meant to repair one. Two snapshots a settling window
+     * apart, and the smaller of the two, make that impossible: an in-flight hold has landed by the
+     * second read, while seats genuinely abandoned read the same both times and are correctly
+     * returned.
+     *
+     * <p>Must comfortably exceed the reserve-to-insert window, which is one local INSERT.
+     */
+    private int rebuildSettleMillis = 1_000;
+
+    /** How often the stock-drift gauge is recomputed (ADR-045, invariant 1). */
+    private int driftIntervalMs = 60_000;
+
     /** Signs receipt tokens. Rotating it invalidates every outstanding receipt link. */
     private String receiptSecret = "dev-only-change-me";
 
@@ -70,6 +87,22 @@ public class OrderProperties {
 
     public void setStalePendingSeconds(int stalePendingSeconds) {
         this.stalePendingSeconds = stalePendingSeconds;
+    }
+
+    public int getRebuildSettleMillis() {
+        return rebuildSettleMillis;
+    }
+
+    public void setRebuildSettleMillis(int rebuildSettleMillis) {
+        this.rebuildSettleMillis = rebuildSettleMillis;
+    }
+
+    public int getDriftIntervalMs() {
+        return driftIntervalMs;
+    }
+
+    public void setDriftIntervalMs(int driftIntervalMs) {
+        this.driftIntervalMs = driftIntervalMs;
     }
 
     public String getReceiptSecret() {

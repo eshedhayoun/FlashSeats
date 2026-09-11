@@ -13,7 +13,7 @@
 | Phase | Objective | Core work | Exit criterion |
 | :--- | :--- | :--- | :--- |
 | **1** | Correct single-user transaction | catalog, hold, mock payment, order, outbox rows | Two parallel requests for the last ticket → exactly one succeeds — **done, and tested** |
-| **2** | Move the hot path to RAM | Redis stock + Lua, ZSET queue, SSE, pass tokens | Same guarantee at 1,000 concurrent requests — **queue, SSE and passes done; Lua and the rebuild are not** |
+| **2** | Move the hot path to RAM | Redis stock + Lua, ZSET queue, SSE, pass tokens | Same guarantee at 1,000 concurrent requests — **done** (ADR-046), bar the `hold:{token}` timer, deferred to Phase 4 |
 | **3** | Defence and real money | bot, Stripe, webhooks, Resilience4j | Payments survive tab closure; floods are throttled — **cookie identity and rate limits done; Stripe and reCAPTCHA are not** |
 | **4** | Async fulfilment and scale | RabbitMQ, PDFBox, email, Nginx, k6 | 10,000 users / 500 tickets / zero overbooking / 500 emails — **fulfilment done on one replica; the cluster and load runs are not** |
 | **5** | Operate it, and let buyers return | The operator surface (ADR-043); buyer accounts as an overlay (ADR-044) | A dead-lettered ticket can be replayed by a human; a lost counter can be rebuilt without SQL; a buyer finds their order more than 24 h later |
@@ -85,8 +85,9 @@ Move inventory to RAM without weakening any Phase 1 guarantee, and add admission
 
 ### Build
 
-**`catalog`** — Redis counters, `SETNX` pre-warm **restricted to `UPCOMING`**, and the locked
-rebuild procedure (`00-architecture-decisions.md` ADR-004). Redis configured with
+**`catalog`** — Redis counters, `SETNX` pre-warm **restricted to `UPCOMING`**, and the rebuild
+procedure (`00-architecture-decisions.md` ADR-004 — served by `order`, which is the only module that
+may read the whole ledger; ADR-046). Redis configured with
 `maxmemory-policy noeviction`, AOF `everysec`, and `notify-keyspace-events **Ex**` — all three
 already shipped in [`docker/redis/redis.conf`](../docker/redis/redis.conf).
 
@@ -115,12 +116,18 @@ position clamping.
    two-thirds of passes on three. Test with ≥ 2 replicas or the bug stays hidden until Phase 4.
 
 ### Exit criteria
-- [ ] 1,000 concurrent requests for 100 tickets → exactly 100 sold.
-- [ ] `FLUSHDB` mid-sale → holds return `503`, rebuild restores the exact correct count.
-- [ ] With 2 replicas, every promoted user receives a pass (pub/sub verified).
-- [ ] Keyspace listener disabled → sweeper still restores every expired hold, exactly once.
-- [ ] A refresh mid-queue preserves position (`ZADD NX`).
-- [ ] `stock.drift` reads zero throughout.
+- [x] 1,000 concurrent requests for 100 tickets → exactly 100 sold. (`StockReserveConcurrencyIT`)
+- [x] `FLUSHDB` mid-sale → holds return `503`, rebuild restores the exact correct count.
+      (`StockRebuildIT`, and by hand against real orders on the dev stack)
+- [ ] With 2 replicas, every promoted user receives a pass (pub/sub verified). — **Phase 4**
+- [x] Keyspace listener disabled → sweeper still restores every expired hold, exactly once. Holds
+      trivially, because the listener is not built: the sweeper is the only path (ADR-046).
+- [x] A refresh mid-queue preserves position (`ZADD NX`).
+- [x] `stock.drift` reads zero throughout — and is now exported rather than only asserted.
+
+**Added by Stage 1, beyond the original criteria:** a Redis restart must stop the sale rather than
+oversell it (`StockEpochIT`), because AOF `everysec` brings counters back high and no ordering of
+operations can prevent that.
 
 ---
 

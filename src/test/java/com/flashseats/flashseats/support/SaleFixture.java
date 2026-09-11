@@ -41,7 +41,7 @@ public class SaleFixture {
         jdbc.execute(
                 """
                 TRUNCATE notification_logs, payment_transactions, outbox_events, order_items,
-                         orders, ticket_holds, tier_inventory, ticket_tiers, events
+                         orders, ticket_holds, ticket_tiers, events
                 RESTART IDENTITY CASCADE
                 """);
 
@@ -79,14 +79,12 @@ public class SaleFixture {
                 Long.class,
                 eventId, name, priceCents, capacity);
 
-        jdbc.update(
-                "INSERT INTO tier_inventory (tier_id, event_id, remaining, updated_at) VALUES (?, ?, ?, now())",
-                tierId, eventId, capacity);
+        setStockCounter(eventId, tierId, capacity);
         return tierId;
     }
 
-    /** A tier deliberately left with no counter, to exercise the missing-inventory fault path. */
-    public long tierWithoutInventory(long eventId, String name, long priceCents, int capacity) {
+    /** A tier deliberately left with no counter, to exercise the unreadable-inventory fault path. */
+    public long tierWithoutCounter(long eventId, String name, long priceCents, int capacity) {
         return jdbc.queryForObject(
                 """
                 INSERT INTO ticket_tiers
@@ -105,7 +103,7 @@ public class SaleFixture {
      * <p>The two are one row apart and must never read the same to a buyer (ADR-040).
      */
     public void drainTier(long tierId) {
-        jdbc.update("UPDATE tier_inventory SET remaining = 0 WHERE tier_id = ?", tierId);
+        setStockCounter(eventIdOf(tierId), tierId, 0);
     }
 
     /** Ends a sale's window now, as the clock would. */
@@ -116,10 +114,61 @@ public class SaleFixture {
                 eventId);
     }
 
+    /**
+     * Forces the live counter to a value, as a Redis restart or a lost restore would leave it.
+     *
+     * <p>The only way to stage a counter that disagrees with the ledger: every legitimate path moves
+     * it by exactly one reservation, so drift cannot be produced through the API at all.
+     *
+     * <p>Every key here is spelled out rather than built with catalog's own helper, for the same
+     * reason the rows above are raw SQL: a fixture that shares a bug with the code it verifies
+     * proves nothing.
+     */
+    public void setStockCounter(long eventId, long tierId, int remaining) {
+        redis.opsForValue().set("catalog:stock:" + eventId + ":" + tierId, String.valueOf(remaining));
+    }
+
+    /**
+     * Loses a tier's live counter, as an eviction, a {@code FLUSHDB} or a cold Redis would.
+     *
+     * <p>Distinct from {@link #drainTier}: that sells a tier out, this makes the system unable to
+     * say. The two are one key apart and must never read the same to a buyer (ADR-004, ADR-040).
+     */
+    public void loseStockCounter(long eventId, long tierId) {
+        redis.delete("catalog:stock:" + eventId + ":" + tierId);
+    }
+
+    /**
+     * Makes an event's counters look like a <em>different</em> Redis instance vouched for them.
+     *
+     * <p>Equivalent to restarting the server, without restarting a container the whole suite shares.
+     * What the guard compares is this stored {@code run_id} against the live one, and it cannot tell
+     * which of the two moved.
+     */
+    public void forgeEarlierRedisInstance(long eventId) {
+        redis.opsForValue().set("catalog:vouch:" + eventId, "a-previous-redis-incarnation");
+    }
+
+    /** The live stock counter as Redis holds it, or {@code -1} when the key does not exist. */
+    public int stockCounter(long eventId, long tierId) {
+        String value = redis.opsForValue().get("catalog:stock:" + eventId + ":" + tierId);
+        return value == null ? -1 : Integer.parseInt(value);
+    }
+
+    /**
+     * Seats the system believes are on sale — <strong>the live Redis counter</strong>, not the row.
+     *
+     * <p>The tier's event is looked up rather than passed in, so the two dozen assertions that
+     * already say {@code remaining(tierId)} keep meaning what they meant when the counter was a
+     * column.
+     */
     public int remaining(long tierId) {
-        Integer remaining = jdbc.queryForObject(
-                "SELECT remaining FROM tier_inventory WHERE tier_id = ?", Integer.class, tierId);
-        return remaining == null ? -1 : remaining;
+        return stockCounter(eventIdOf(tierId), tierId);
+    }
+
+    private long eventIdOf(long tierId) {
+        return jdbc.queryForObject(
+                "SELECT event_id FROM ticket_tiers WHERE id = ?", Long.class, tierId);
     }
 
     public String holdStatus(String holdToken) {
@@ -183,6 +232,7 @@ public class SaleFixture {
                 Timestamp.from(Instant.now().minusSeconds(30)),
                 holdToken);
     }
+
 
     /**
      * The invariant the whole system protects:

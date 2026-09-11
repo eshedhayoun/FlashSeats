@@ -249,17 +249,21 @@ A facade is the *only* legal cross-module surface. Every one obeys:
    language allows.
 8. **The graph stays acyclic.** Adding an edge requires checking `ApplicationModules.verify()`.
 
-### The one shared write: the inventory counter
+### There is no shared write — the inventory counter is catalog's alone
 
-Named pattern: **shared counter, single-writer contract.**
+> **Superseded by ADR-046.** This section used to describe a "shared counter, single-writer
+> contract": `catalog` owning `catalog:stock:{eventId}:{tierId}` while `hold` wrote it directly
+> through the Lua scripts, as the one deliberate exception to key ownership.
+>
+> **That exception no longer exists.** The scripts live in `catalog` and are executed there;
+> `hold` moves stock by calling `CatalogFacade.tryReserve` / `restore` and never touches the key.
+> `tier_inventory` is dropped. Ordinary facade rules cover the whole path, so nothing here needs a
+> special case.
+>
+> The original reasoning is kept below, because the *constraint* it identified is still real and is
+> what the scripts exist to satisfy.
 
-- `catalog` **owns** `catalog:stock:{eventId}:{tierId}` and `tier_inventory` — schema, lifecycle,
-  seeding, rebuild, reconciliation.
-- `hold` is the **sole writer** during a sale, in *both* storages, via exactly two operations
-  (`hold_reserve.lua` / `hold_restore.lua` in Phase 2+; one CTE statement in Phase 1).
-- Nothing else reads or writes them.
-
-This is a deliberate, bounded exception, not an oversight: the stock decrement and the reservation
+This was a deliberate, bounded exception, not an oversight: the stock decrement and the reservation
 that justifies it must be atomic, and splitting them across two modules would open a crash window
 that leaks inventory. Documenting it once as a contract is better than pretending it isn't there.
 

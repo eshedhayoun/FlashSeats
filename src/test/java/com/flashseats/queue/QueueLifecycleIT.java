@@ -45,7 +45,7 @@ class QueueLifecycleIT extends IntegrationTest {
         // and reading that 0 as "sold out" told the whole waiting room the sale had ended and then
         // deleted the line (ADR-035).
         long eventId = fixture.openEvent("Un-warmed");
-        fixture.tierWithoutInventory(eventId, "General Admission", 2_500, 100);
+        fixture.tierWithoutCounter(eventId, "General Admission", 2_500, 100);
 
         BuyerSession buyer = new BuyerSession(port);
         buyer.get("/events/" + eventId);
