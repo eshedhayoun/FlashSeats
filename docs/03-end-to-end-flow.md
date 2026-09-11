@@ -29,10 +29,10 @@
 | inventory      |   |                |          |                |    |                |
 +----------------+   +----------------+          +----------------+    +----------------+
 | PG: events,    |   | PG: none       |          | PG: ticket_    |    | PG: orders,    |
-|  ticket_tiers, |   | Redis: ZSET,   |          |  holds (AUTH-  |    | order_items,   |
-|  tier_inventory|   |  pass, admit,  |          |  ORITY)        |    | outbox_events  |
-| Redis: stock   |   |  pubsub        |          | Redis: hold:   |    |                |
-|                |   |                |          |  (timer only)  |    |                |
+|  ticket_tiers  |   | Redis: ZSET,   |          |  holds (AUTH-  |    | order_items,   |
+| Redis: stock   |   |  pass, admit,  |          |  ORITY)        |    | outbox_events  |
+|  (THE count),  |   |  pubsub        |          | Redis: none    |    |                |
+|  vouch         |   |                |          |                |    |                |
 +----------------+   +----------------+          +----------------+    +----------------+
                                                                               |
                                                              +----------------+---------+
@@ -110,8 +110,9 @@ rebuild procedure in §4.1 instead (ADR-004).
 
 `catalog` then fires `EventPrewarmedEvent` for monitoring.
 
-> **Phase 1 (MVP):** no Redis. Pre-warm writes `tier_inventory.remaining = total_capacity` in
-> PostgreSQL. Still correct — it is just a slower counter.
+> **Historical — Phase 1 (MVP):** no Redis. Pre-warm wrote `tier_inventory.remaining =
+> total_capacity` in PostgreSQL. Correct, just slower. Superseded in Stage 1: pre-warm now
+> `SETNX`s the Redis counter and `tier_inventory` is dropped (ADR-046).
 
 ---
 
@@ -308,11 +309,15 @@ The admission session is **not** revoked here — that is the whole point of Ste
 The `-2` case is the fix for the most dangerous line in the original docs, which had a cache miss
 repopulate the counter from `total_capacity` (ADR-004).
 
-> **Phase 1 (MVP):** the atomic primitive is
+> **Historical — Phase 1 (MVP):** the atomic primitive was
 > `UPDATE tier_inventory SET remaining = remaining - :q WHERE tier_id = :t AND remaining >= :q`.
 > One statement, row-locked by PostgreSQL, `rowcount = 1` means the seats are yours. Combined with
-> `CHECK (remaining >= 0)` this makes overbooking impossible in the MVP too — the concurrency story
-> is complete from day one; Phase 2 only makes it faster.
+> `CHECK (remaining >= 0)` this made overbooking impossible in the MVP too — the concurrency story
+> was complete from day one, and Stage 1 only made it faster.
+>
+> The guarantee moved with the counter: `stock_reserve.lua` refuses to decrement below the requested
+> quantity in one atomic step, and `flashseats.stock.drift` watches what the `CHECK` used to
+> (ADR-046).
 
 ---
 

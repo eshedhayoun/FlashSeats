@@ -124,44 +124,50 @@ than a check that races.
 
 | Key | Type | TTL | Purpose |
 | :--- | :--- | :--- | :--- |
-| `hold:{holdToken}` | Hash | **300 s** | **timer only** — fires expiry; serves `GET /holds/{token}` fast |
-| `catalog:stock:{e}:{t}` | String | none | owned by `catalog`; mutated here only |
+| `hold:{holdToken}` | String | **300 s** | timer only — **deferred to Stage 3** (ADR-046) |
 
-Redis holds **no authority**. If every key in this table vanished, `ticket_holds` plus the rebuild
-procedure would reconstruct the correct state. There is no `holdmeta` key: ADR-019 removed it.
+**`hold` owns no live Redis key today.** It moves stock by calling `CatalogFacade`, so it never
+touches `catalog:stock:{e}:{t}`; the "single shared key" exception earlier drafts described is gone
+(ADR-046). And the expiry timer is not built: it is a latency optimisation, the sweeper below is what
+makes expiry correct, and the one thing needing proof about it — that three replicas receiving the
+same broadcast expiry restore a hold exactly once — cannot be observed on one instance.
+
+Redis holds **no authority** here in any case. There is no `holdmeta` key: ADR-019 removed it.
 
 ---
 
 ## 5. Reserve
 
-### Phase 1
+### `CatalogFacade.tryReserve`, then the row — in that order, never in one transaction
 
-```sql
-UPDATE tier_inventory SET remaining = remaining - :q
- WHERE tier_id = :t AND remaining >= :q;     -- rowcount = 1 ⇒ reserved
-INSERT INTO ticket_holds (...) VALUES (..., 'ACTIVE', now() + interval '300 seconds');
+```
+reserve in Redis            stock_reserve.lua, OUTSIDE any transaction
+INSERT INTO ticket_holds    its own short transaction, SQL only
+  └─ constraint rejection   → CatalogFacade.restore, then rethrow
 ```
 
-Row-locked by PostgreSQL, guarded by `CHECK (remaining >= 0)`. Overbooking is impossible in the MVP.
+**The decrement cannot share the hold's transaction, because Redis does not roll back** (ADR-023).
+Phase 1's single `UPDATE` did, and got the compensation for free; that is gone and is now explicit.
 
-### Phase 2+ — `hold_reserve.lua`
+It compensates **only** on a constraint rejection — `idx_holds_one_active_per_session`, the buyer who
+double-clicked. That is the one failure whose outcome is certain: the flush left no row, so the seats
+are unambiguously ours to return. A failure at *commit* is ambiguous and returning seats that may
+still be held would be an oversell, so those fall through to `flashseats.stock.drift` and a rebuild.
+Under-counting is the safe direction and the one this design always takes (ADR-046).
+
+The script is `catalog`'s and runs there — `hold` never touches the key:
 
 ```lua
-local stockKey, holdKey = KEYS[1], KEYS[2]
-local qty, ttl = tonumber(ARGV[1]), tonumber(ARGV[2])
-local sid, eventId, tierId, expiresAt = ARGV[3], ARGV[4], ARGV[5], ARGV[6]
-
-local stock = redis.call('GET', stockKey)
-if stock == false then return -2 end          -- counter ABSENT ⇒ FAULT (ADR-004)
-if tonumber(stock) < qty then return -1 end   -- genuinely insufficient
-
-redis.call('DECRBY', stockKey, qty)
-redis.call('HSET', holdKey,
-    'userSessionId', sid, 'eventId', eventId, 'tierId', tierId,
-    'quantity', tostring(qty), 'status', 'ACTIVE', 'expiresAt', expiresAt)
-redis.call('EXPIRE', holdKey, ttl)
+local stock = redis.call('GET', KEYS[1])
+if not stock then return -2 end                    -- counter ABSENT ⇒ FAULT (ADR-004)
+if tonumber(stock) < tonumber(ARGV[1]) then return -1 end   -- genuinely insufficient
+redis.call('DECRBY', KEYS[1], ARGV[1])
 return 1
 ```
+
+It writes no hold metadata. The earlier version `HSET` the hold's details alongside the decrement —
+`holdmeta` under another name — which ADR-019 had already made unnecessary by putting the authority
+in `ticket_holds`.
 
 | Return | Meaning | HTTP |
 | :--- | :--- | :--- |
@@ -189,29 +195,44 @@ their place in the sale and can pick a different tier (ADR-020).
 
 ## 6. Restore
 
-### Expiry (Phase 2+)
+### The restore happens AFTER the claim commits
 
 ```
-Redis TTL fires → __keyevent@0__:expired → EVERY replica receives it
-  → each runs: UPDATE ticket_holds SET status='EXPIRED', settled_at=now(),
-                    settle_reason='TTL'
-                WHERE hold_token=? AND status='ACTIVE'
-  → PostgreSQL row-locks; exactly one gets rowcount = 1
-  → that one: INCRBY catalog:stock:{e}:{t} qty ; publish TicketHoldExpiredEvent
-  → the others: rowcount = 0, do nothing
+settle-once claim   UPDATE ticket_holds ... WHERE hold_token=? AND status='ACTIVE'
+publish             TicketHoldSettledEvent(claimWon)
+  └─ AFTER_COMMIT   → CatalogFacade.restore  (only if claimWon)
 ```
 
-If the row is already `CONSUMED` — the normal case when checkout's post-commit cleanup did not run —
-**every** replica gets `rowcount = 0` and no stock is returned for seats that were sold.
+**Not inline.** The claim is SQL and the counter is Redis, so a rollback undoes the first and not the
+second: an inline `INCRBY` would put seats back on sale while the hold that owns them returned to
+`ACTIVE`. The sweeper makes it concrete — it settles a whole batch in one transaction, so one failure
+part-way through would return every earlier hold's seats and leave those holds live.
 
-Requires `notify-keyspace-events Ex` (off by default in Redis). `E` selects the key-**event**
-channel `__keyevent@0__:expired`, whose message is the expired key's name. `K` selects the keyspace
-channel, whose message is the event name instead — with `Kx` the listener never fires. Shipped in
-[`docker/redis/redis.conf`](../../docker/redis/redis.conf).
+Waiting for the commit inverts the risk. If the listener never runs, the seats are merely invisible,
+which the drift gauge reports and a rebuild repairs (ADR-046).
+
+Two details that are load-bearing rather than incidental: `fallbackExecution = true`, so a settle that
+ever runs outside a transaction cannot discard its restore silently; and the listener body never
+throws, because Spring invokes after-commit synchronizations in a loop with no `try/catch` of its own
+and one failed increment would abandon every event queued behind it.
+
+### Expiry by keyspace notification — **deferred to Stage 3**
+
+The `hold:{token}` TTL key and the `__keyevent@0__:expired` listener are not built. They reclaim an
+abandoned hold in about a second instead of within a sweeper interval, and nothing else. Proving the
+listener fires means slowing the sweeper, and proving the sweeper still suffices means disabling the
+listener — and the claim that actually matters, that three replicas receiving the same broadcast
+expiry restore a hold exactly once, cannot be observed on one instance at all (ADR-046).
+
+It will need `notify-keyspace-events Ex`, which is off by default in Redis and already shipped in
+[`docker/redis/redis.conf`](../../docker/redis/redis.conf). `E` selects the key-**event** channel
+`__keyevent@0__:expired`, whose message is the expired key's name; `K` selects the keyspace channel,
+whose message is the event name instead, so `Kx` would leave the listener permanently silent while
+looking correctly configured.
 
 ### Sweeper — the actual guarantee
 
-`HoldReconciliationSweeper` runs every 30 s (10 s in Phase 1):
+`HoldReconciliationSweeper` runs every 10 s, and is the **only** thing reclaiming expired holds:
 
 ```sql
 SELECT * FROM ticket_holds WHERE status = 'ACTIVE' AND expires_at < now() LIMIT 500;
@@ -220,9 +241,9 @@ SELECT * FROM ticket_holds WHERE status = 'ACTIVE' AND expires_at < now() LIMIT 
 and performs the identical claim per row.
 
 **Keyspace pub/sub is at-most-once.** A dropped connection, a restarting replica, or a network blip
-loses the event permanently. The listener is therefore a *latency optimisation*; the sweeper is what
-makes expiry correct. Disabling the listener entirely must not change any outcome — that is a
-Phase 2 exit criterion.
+loses the event permanently. That is why the listener is only ever a *latency optimisation* and the
+sweeper is what makes expiry correct — and why the listener could be deferred out of Stage 1 without
+changing a single outcome.
 
 ---
 

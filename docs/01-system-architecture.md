@@ -33,7 +33,7 @@ replica's heap, which is why queue promotions fan out over Redis Pub/Sub (ADR-00
 | **Spring Boot** | **4.1.1** | Framework for all modules: REST, DI, data access. |
 | **Spring Modulith** | **2.1.1** | Compile-time enforcement of the module boundaries this document asserts. |
 | **PostgreSQL** | 16 | ACID ledger: orders, order items, outbox, hold audit, payments, notification logs, bot rules. |
-| **Redis** | 7 | Stock counters, queue ZSET, hold TTLs, rate-limit buckets, idempotency, promotion pub/sub. |
+| **Redis** | 7 | **The live stock counters**, queue ZSET, rate-limit buckets, idempotency, promotion pub/sub. `noeviction` is a correctness setting: see `CLAUDE.md` for the complete key map. |
 | **RabbitMQ** | 3.13 | Async fulfilment between `order` and `notification`. |
 | **springdoc-openapi** | 3.1.0 | Live API documentation. |
 | **Actuator + Micrometer** | managed | `/actuator/health` is the container healthcheck; Prometheus scrape for the metric set in `05-global-standards.md` §9. |
@@ -74,11 +74,11 @@ stream.
 | # | Module | Responsibility | PostgreSQL | Redis |
 | :--- | :--- | :--- | :--- | :--- |
 | 1 | **`bot`** | Signed `fsid` cookie, Redis-backed rate limits, reCAPTCHA v3, IP reputation | `ip_rules`, `bot_audit_logs` | `bot:rate:session:*`, `bot:rate:ip:*`, `bot:block:*`, `bot:captcha:*` |
-| 2 | **`catalog`** | Event metadata, tiers, sale windows, **inventory ownership** | `events`, `ticket_tiers`, `tier_inventory` | `catalog:stock:{e}:{t}` |
+| 2 | **`catalog`** | Event metadata, tiers, sale windows, **inventory ownership** | `events`, `ticket_tiers` | `catalog:stock:{e}:{t}` **(the live count)**, `catalog:vouch:{e}` |
 | 3 | **`queue`** | Virtual waiting room, SSE streaming, HMAC passes, **admission sessions**, admission control | *none* | `queue:waiting:*` (ZSET), `queue:pass:*`, `queue:passes:*`, `queue:admit:*`, `queue:admissions:*`, `queue:hb:*`, `queue:events:*` (pub/sub) |
-| 4 | **`hold`** | Time-bound reservations, atomic stock movement, settle-once restoration | `ticket_holds` **(authority)** | `hold:{token}` (timer only) |
+| 4 | **`hold`** | Time-bound reservations, atomic stock movement, settle-once restoration | `ticket_holds` **(authority)** | *none* — `hold:{token}` is deferred to Phase 4 (ADR-046) |
 | 5 | **`payment`** | Stripe integration, idempotency, webhook reconciliation, refunds | `payment_transactions` | `payment:inflight:{holdToken}` |
-| 6 | **`order`** | ACID ledger, checkout orchestration, transactional outbox | `orders`, `order_items`, `outbox_events` | *none* |
+| 6 | **`order`** | ACID ledger, checkout orchestration, transactional outbox, **stock rebuild + drift gauge** (ADR-046) | `orders`, `order_items`, `outbox_events` | *none* |
 | 7 | **`notification`** | PDF rendering, email delivery, DLQ replay | `notification_logs` | *none* (RabbitMQ + SMTP) |
 | 8 | **`saleflow`** | Read-only rehydration endpoint (ADR-025) | *none* | *none* |
 | — | **`shared`** | Open module: `ProblemDetail`, `ErrorCode`, `SessionId`, `Money` (ADR-021) | *none* | *none* |
@@ -107,7 +107,9 @@ Removing that one edge is what keeps the graph verifiable (ADR-005).
 
 | Safeguard | Prevents |
 | :--- | :--- |
-| Atomic Redis Lua reserve (Phase 2+) / conditional `UPDATE` (Phase 1) | Overbooking under concurrency |
+| Atomic Redis Lua reserve (`stock_reserve.lua`) | Overbooking under concurrency |
+| Every Redis write ordered to under-count, never over-count (ADR-046) | An oversell nothing can recover, in exchange for invisible seats a rebuild can |
+| `catalog:vouch:{e}` vs the live `run_id` | A Redis restart quietly reselling a second of `DECRBY`s |
 | `UNIQUE(hold_token)` on `orders` | One hold producing two orders |
 | **Settle-once claim** — conditional `UPDATE` in PostgreSQL | Stock restored 3× by 3 replicas |
 | Consume inside the order transaction | Inventory leaked permanently on a failed commit |
@@ -151,7 +153,7 @@ Every row exists because the first-pass design lacked it. Rationale for each is 
    Sentinel         noeviction
 ```
 
-**Single Redis primary with Sentinel, not Cluster.** `hold_reserve.lua` touches keys in different
+**Single Redis primary with Sentinel, not Cluster.** As originally argued, `hold_reserve.lua` touched keys in different
 hash slots and would fail with `CROSSSLOT` on Cluster; keyspace notifications are also per-node.
 This workload is a handful of keys at a few hundred thousand ops/s — nowhere near a single primary's
 ceiling (ADR-018).
