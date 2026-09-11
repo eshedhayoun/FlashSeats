@@ -165,6 +165,9 @@ Do not reintroduce these — each cost a real defect in the first pass:
 | **A table written by nobody's reader** | `tier_inventory` outlived its purpose as a write-only copy of a number that had moved to Redis. A stale column named `remaining` reads exactly like the truth (ADR-046) |
 | **Letting a Lua return code escape its repository** | `-1` meant "sold out" at one layer and "no counter at all" one layer up — the precise pair of meanings this design spends its effort separating |
 | **Detecting a fault by consuming its evidence** | The first restart guard stamped a shared key when it fired, so whichever replica noticed used the signal up and the others sold on. Derive the verdict from durable state; do not consume it (ADR-046) |
+| **Adding `proxy_set_header` to an nginx `location`** | It REPLACES the inherited set, it does not merge. Three locations added `Connection ""` and silently dropped `Host` and `X-Forwarded-For`: `Host` fell back to `$proxy_host` = `flashseats_app`, and Tomcat rejects the underscore — *every* proxied API request answered a bare HTML 400, below Spring, with no `code`. Include the shared set in every location (ADR-047) |
+| **A load harness that is one container pretending to be 10,000 buyers** | One source address is one IP bucket: capacity 300, refill 150/s. The run measures the rate limiter, not the sale. Each VU needs its own `X-Forwarded-For` (ADR-047) |
+| **Seeding a load-test sale with `ON CONFLICT DO NOTHING` on id 1** | The postgres volume outlives the run and the dev seeder already owns id 1. The insert silently does nothing and the test asserts a 500-seat capacity against a 700-seat sale (ADR-047) |
 
 ## Implementation order
 
@@ -212,9 +215,29 @@ docker compose up -d postgres                    # strictly-minimal Phase 1
                                                  # application.properties — a default profile there
                                                  # would make SecretsGuard opt-in, ADR-039)
 
+docker/secrets/gen-env.sh                        # fill .env with real secrets (idempotent).
+                                                 # SecretsGuard refuses to start the `docker`
+                                                 # profile without this (ADR-039).
+
 docker compose --profile cluster  up -d --build  # Nginx + 3 replicas on :8080 (Phase 4)
-docker compose --profile loadtest run --rm k6    # 10k virtual buyers
+docker/seed/seed.sh                              # seed event 9001, pre-warm, wait for OPEN.
+                                                 # The `docker` profile seeds no catalog —
+                                                 # CatalogDevSeeder is @Profile("dev") (ADR-047)
+docker/scripts/fanout-check.sh                   # PROVE promotion fan-out across replicas.
+                                                 # 30/30 across >= 2 upstreams or it fails
+docker compose --profile loadtest run --rm k6    # the load run; VUS=n to scale it down
+docker/scripts/sse-cadence.sh 60                 # run DURING a load run: is QueueBroadcaster's
+                                                 # sweep finishing inside its 2s interval?
 ```
+
+Changing the compose network's `ipam` recreates the network, and containers created against the
+**old** one get reattached without their service-name DNS aliases — every service name then resolves
+`NXDOMAIN` and the replicas restart-loop on `Unable to connect to redis`. `docker compose down`
+first; a plain `up -d` is not enough.
+
+Metrics are scraped **per replica**, not through nginx, and nginx deliberately routes only
+`/actuator/health`. `hikaricp_connections_pending` and `flashseats_stock_drift` are per-instance
+gauges; through a load balancer you get one replica at random.
 
 UIs: RabbitMQ `:15672`, Mailpit `:8025`, API docs `/docs`.
 
