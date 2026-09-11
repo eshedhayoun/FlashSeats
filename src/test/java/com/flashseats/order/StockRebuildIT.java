@@ -98,9 +98,6 @@ class StockRebuildIT extends IntegrationTest {
         rebuild();
 
         assertThat(fixture.stockCounter(eventId, tierId)).isEqualTo(CAPACITY - HELD);
-        assertThat(fixture.ledgerRemaining(tierId))
-                .describedAs("the ledger's last-known-good copy is refreshed too")
-                .isEqualTo(CAPACITY - HELD);
     }
 
     @Test
@@ -131,7 +128,7 @@ class StockRebuildIT extends IntegrationTest {
         // seats, so folding it into the drift gauge would report zero for a total loss.
         fixture.reset();
         long freshEvent = fixture.openEvent("Unwarmed");
-        fixture.tierWithoutInventory(freshEvent, "Floor", 4_500, CAPACITY);
+        fixture.tierWithoutCounter(freshEvent, "Floor", 4_500, CAPACITY);
         reconciliation.measureDrift();
 
         assertThat(gauge("flashseats.stock.counters.missing")).isEqualTo(1);

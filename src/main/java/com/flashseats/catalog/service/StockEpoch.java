@@ -1,45 +1,53 @@
 package com.flashseats.catalog.service;
 
+import com.flashseats.catalog.repository.EventRepository;
 import com.flashseats.catalog.repository.StockCounterRepository;
+import java.time.Clock;
+import java.util.HashSet;
 import java.util.Set;
-import java.util.concurrent.ConcurrentHashMap;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Component;
 
 /**
- * Notices that Redis restarted, and refuses to sell from counters that may have lost writes.
+ * Refuses to sell from counters a Redis restart may have rolled back.
  *
  * <p><strong>The failure this exists for.</strong> AOF is {@code appendfsync everysec}, so a restart
  * — or a Sentinel failover to a replica that was a moment behind — replays to roughly a second ago.
- * The decrements in that second are gone; the {@code ticket_holds} rows they paid for are not. The
- * counters come back <em>high</em>, and every seat in that gap is sold twice. It is the one
- * direction this whole design refuses to fail in, and it is the only one that no ordering of
- * operations can prevent, because the loss happens inside Redis.
+ * The decrements in that second are gone; the {@code ticket_holds} rows that paid for them are not.
+ * The counters come back <em>high</em>, and every seat in that gap sells twice.
  *
- * <p>{@code catalog.md} has always said a rebuild is mandatory after any Redis restart. This is what
- * makes that true rather than a note someone has to remember at three in the morning.
+ * <p>It is the only inventory failure no ordering of operations can prevent, because the loss
+ * happens inside Redis. Everything else in this design is arranged to fail toward invisible seats,
+ * which a rebuild recovers. This one cannot be arranged away, only noticed.
  *
- * <p>Trust is restored <strong>per event</strong>, by rebuilding it. An operator can therefore bring
- * one sale back at a time instead of having to repair everything before anything can sell.
+ * <p><strong>Every vouching fact lives in Redis, and the verdict is recomputed from scratch each
+ * tick.</strong> That is what makes it work on more than one replica. An earlier cut kept a single
+ * "something is wrong" flag in memory and stamped a shared key when it fired — so whichever replica
+ * noticed first consumed the signal, and its neighbours went on selling from the same rolled-back
+ * counters. Here each event carries its own vouched {@code run_id}, so every replica reaches the
+ * same verdict independently, and a rebuild on one replica releases the event on all of them.
  */
 @Slf4j
 @Component
 public class StockEpoch {
 
     private final StockCounterRepository stock;
+    private final EventRepository events;
+    private final Clock clock;
 
     /**
-     * Events whose counters existed when a restart was noticed and have not been repaired since.
+     * Events whose counters were vouched for by a different Redis instance than the one running.
      *
-     * <p>Held as a set of the doubtful rather than a single "something is wrong" flag, so that an
-     * event created <em>after</em> the restart is trusted without anyone having to say so, and an
-     * event repaired by a rebuild stops being doubtful without vouching for its neighbours.
+     * <p>Replaced wholesale by {@link #check()} rather than accumulated, so it cannot drift from
+     * what Redis says and cannot grow without bound.
      */
-    private final Set<Long> distrusted = ConcurrentHashMap.newKeySet();
+    private volatile Set<Long> distrusted = Set.of();
 
-    public StockEpoch(StockCounterRepository stock) {
+    public StockEpoch(StockCounterRepository stock, EventRepository events, Clock clock) {
         this.stock = stock;
+        this.events = events;
+        this.clock = clock;
     }
 
     /**
@@ -51,14 +59,25 @@ public class StockEpoch {
         return !distrusted.contains(eventId);
     }
 
-    /** Records that an event's counters have been derived afresh and are sound again. */
-    public void trust(long eventId) {
+    /**
+     * Records that an event's counters have been derived afresh and are sound.
+     *
+     * <p>Called by pre-warm, which builds them from capacity before anything is sold, and by the
+     * rebuild, which derives them from the ledger. Nothing else may vouch for a counter, because
+     * nothing else knows the number is right.
+     */
+    public void vouchFor(long eventId) {
         String runId = stock.serverRunId();
-        if (runId != null) {
-            stock.trustRunId(runId);
+        if (runId == null) {
+            return;
         }
-        if (distrusted.remove(eventId)) {
-            log.warn("Event {} counters trusted again; selling resumes", eventId);
+        stock.vouch(eventId, runId);
+        if (distrusted.contains(eventId)) {
+            // Take effect now rather than at the next tick; the operator is waiting on it.
+            Set<Long> remaining = new HashSet<>(distrusted);
+            remaining.remove(eventId);
+            distrusted = Set.copyOf(remaining);
+            log.warn("Event {} counters vouched for again; selling resumes", eventId);
         }
     }
 
@@ -73,28 +92,28 @@ public class StockEpoch {
             return;
         }
 
-        String sound = stock.readTrustedRunId();
-        if (sound == null) {
-            // Nothing has ever vouched for these counters — a first boot, or the first run after
-            // this guard was added. Adopt the current server rather than halting a healthy sale.
-            stock.trustRunId(current);
-            return;
-        }
-        if (current.equals(sound)) {
-            return;
+        Set<Long> doubtful = new HashSet<>();
+        for (long eventId : events.findOpenEventIds(clock.instant())) {
+            String vouched = stock.vouchedRunId(eventId);
+            if (vouched == null) {
+                // Nobody ever vouched for this event — a sale seeded outside pre-warm, or the first
+                // run after this guard existed. Adopt it rather than halt a sale that is healthy as
+                // far as anyone knows.
+                stock.vouch(eventId, current);
+            } else if (!vouched.equals(current)) {
+                doubtful.add(eventId);
+            }
         }
 
-        Set<Long> doubtful = stock.eventIdsWithCounters();
-        distrusted.addAll(doubtful);
-        // Stamped immediately so this is reported once per restart, not once per tick.
-        stock.trustRunId(current);
-
-        log.error(
-                "Redis restarted (run_id {} -> {}). Counters for event(s) {} may have lost up to a"
-                        + " second of decrements and can now read HIGH, which oversells. Holds are"
-                        + " refused for them until each is rebuilt (ADR-004)",
-                sound,
-                current,
-                doubtful);
+        Set<Long> newlyDoubtful = new HashSet<>(doubtful);
+        newlyDoubtful.removeAll(distrusted);
+        if (!newlyDoubtful.isEmpty()) {
+            log.error(
+                    "Redis is not the instance that vouched for event(s) {}. Their counters may have"
+                            + " lost a second of decrements and can now read HIGH, which oversells."
+                            + " Holds are refused for them until each is rebuilt (ADR-004)",
+                    newlyDoubtful);
+        }
+        distrusted = Set.copyOf(doubtful);
     }
 }

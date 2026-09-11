@@ -68,16 +68,17 @@ class StockEpochIT extends IntegrationTest {
     }
 
     /**
-     * Hands every event back trusted.
+     * Hands every event back vouched for.
      *
-     * <p>Distrust outlives the database: it is held in a bean shared by the whole run, while
-     * {@code reset()} restarts the identity sequence — so the next class's "event 1" is this
-     * class's, and would inherit a verdict about counters that no longer exist. Uses the same
-     * {@code trust} a rebuild calls rather than a test-only hatch.
+     * <p>The verdict is recomputed from Redis on each tick, but it is <em>held</em> in a bean the
+     * whole run shares, and {@code reset()} restarts the identity sequence — so the next class's
+     * "event 1" is this class's and would inherit a verdict about counters that no longer exist
+     * until the next tick caught up. Uses the same {@code vouchFor} a rebuild calls rather than a
+     * test-only hatch.
      */
     @AfterEach
     void releaseDistrust() {
-        createdEvents.forEach(epoch::trust);
+        createdEvents.forEach(epoch::vouchFor);
     }
 
     private long openEvent(String title) {
@@ -95,7 +96,7 @@ class StockEpochIT extends IntegrationTest {
     @Test
     @DisplayName("A restarted server stops the sale, and says so as a fault rather than a sell-out")
     void aRestartRefusesToSell() {
-        fixture.forgeEarlierRedisInstance();
+        fixture.forgeEarlierRedisInstance(eventId);
         epoch.check();
 
         assertThat(catalog.tryReserve(eventId, tierId, 1))
@@ -114,7 +115,8 @@ class StockEpochIT extends IntegrationTest {
         long otherEvent = openEvent("Untouched");
         long otherTier = fixture.tier(otherEvent, "Floor", 4_500, CAPACITY);
 
-        fixture.forgeEarlierRedisInstance();
+        fixture.forgeEarlierRedisInstance(eventId);
+        fixture.forgeEarlierRedisInstance(otherEvent);
         epoch.check();
         assertThat(catalog.tryReserve(eventId, tierId, 1)).isEqualTo(ReserveResult.COUNTER_MISSING);
 
@@ -129,9 +131,26 @@ class StockEpochIT extends IntegrationTest {
     }
 
     @Test
+    @DisplayName("Noticing the restart does not consume it, so every replica sees it too")
+    void theSignalIsNotConsumedByWhoeverNoticesFirst() {
+        // The bug this replaces: the first cut kept one in-memory flag and stamped a shared key when
+        // it fired, so whichever replica noticed a restart used the signal up and its neighbours
+        // went on selling from the same rolled-back counters. Each event now carries its own vouched
+        // run_id, and nothing but a rebuild rewrites it -- so the verdict survives being reached.
+        fixture.forgeEarlierRedisInstance(eventId);
+
+        epoch.check();
+        epoch.check();
+
+        assertThat(catalog.tryReserve(eventId, tierId, 1))
+                .describedAs("a second look must reach the same verdict, on this replica or any other")
+                .isEqualTo(ReserveResult.COUNTER_MISSING);
+    }
+
+    @Test
     @DisplayName("A sale created after the restart is never in doubt")
     void aLaterSaleIsUnaffected() {
-        fixture.forgeEarlierRedisInstance();
+        fixture.forgeEarlierRedisInstance(eventId);
         epoch.check();
 
         // Its counters were written after the restart, so there is nothing they could have lost.

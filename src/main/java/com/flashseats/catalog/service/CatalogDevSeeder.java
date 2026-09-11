@@ -3,11 +3,9 @@ package com.flashseats.catalog.service;
 import com.flashseats.catalog.model.Event;
 import com.flashseats.catalog.model.EventStatus;
 import com.flashseats.catalog.model.TicketTier;
-import com.flashseats.catalog.model.TierInventory;
 import com.flashseats.catalog.repository.EventRepository;
 import com.flashseats.catalog.repository.StockCounterRepository;
 import com.flashseats.catalog.repository.TicketTierRepository;
-import com.flashseats.catalog.repository.TierInventoryRepository;
 import java.time.Clock;
 import java.time.Duration;
 import java.time.Instant;
@@ -26,10 +24,10 @@ import org.springframework.transaction.support.TransactionTemplate;
  * <p>Two events, on purpose:
  *
  * <ul>
- *   <li><strong>An OPEN sale</strong> with inventory written directly. Pre-warm cannot be used here:
- *       it refuses on anything but an {@code UPCOMING} window (ADR-004), so a demo event that is
- *       open on startup would otherwise have no counters and every hold would fail.
- *   <li><strong>An UPCOMING sale</strong> with no inventory, so the countdown and the admin pre-warm
+ *   <li><strong>An OPEN sale</strong> with its counters written directly. Pre-warm cannot be used
+ *       here: it refuses on anything but an {@code UPCOMING} window (ADR-004), so a demo event that
+ *       is open on startup would otherwise have no counters and every hold would answer 503.
+ *   <li><strong>An UPCOMING sale</strong> with no counters, so the countdown and the admin pre-warm
  *       path stay demonstrable.
  * </ul>
  *
@@ -43,7 +41,6 @@ public class CatalogDevSeeder implements ApplicationRunner {
 
     private final EventRepository events;
     private final TicketTierRepository tiers;
-    private final TierInventoryRepository inventory;
     private final StockCounterRepository stock;
     private final TransactionTemplate transactions;
     private final Clock clock;
@@ -51,13 +48,11 @@ public class CatalogDevSeeder implements ApplicationRunner {
     public CatalogDevSeeder(
             EventRepository events,
             TicketTierRepository tiers,
-            TierInventoryRepository inventory,
             StockCounterRepository stock,
             TransactionTemplate transactions,
             Clock clock) {
         this.events = events;
         this.tiers = tiers;
-        this.inventory = inventory;
         this.stock = stock;
         this.transactions = transactions;
         this.clock = clock;
@@ -68,8 +63,8 @@ public class CatalogDevSeeder implements ApplicationRunner {
         if (events.count() > 0) {
             return;
         }
-        // The ledger commits first; the counters follow outside the transaction, because a Redis
-        // write cannot roll back with it (ADR-023).
+        // The events and tiers commit first; their counters follow outside the transaction,
+        // because a Redis write cannot roll back with it (ADR-023).
         List<StockSeed> counters = transactions.execute(status -> seedDatabase());
         counters.forEach(seed -> stock.seedIfAbsent(seed.eventId(), seed.tierId(), seed.capacity()));
     }
@@ -99,7 +94,7 @@ public class CatalogDevSeeder implements ApplicationRunner {
                 now.plus(Duration.ofDays(90)),
                 now.plus(Duration.ofMinutes(30)), // still UPCOMING, so pre-warm is demonstrable
                 now.plus(Duration.ofDays(2)));
-        // Deliberately no inventory row: POST /api/v1/admin/events/{id}/prewarm creates it.
+        // Deliberately no counter: POST /api/v1/admin/events/{id}/prewarm creates it.
         tier(upcoming, "General Admission", 3_000, 200, 4);
 
         log.info(
@@ -141,7 +136,6 @@ public class CatalogDevSeeder implements ApplicationRunner {
     private StockSeed seedTier(
             Event event, String name, long priceCents, int capacity, int maxPerOrder) {
         TicketTier tier = tier(event, name, priceCents, capacity, maxPerOrder);
-        inventory.save(new TierInventory(tier.getId(), event.getId(), capacity));
         return new StockSeed(event.getId(), tier.getId(), capacity);
     }
 }
