@@ -127,6 +127,16 @@ breaking change.
 | `INSUFFICIENT_TIME_REMAINING` | 409 | order | Too little of the hold left to start a charge that could finish (ADR-030). Nothing charged; the order is left resumable |
 | `ORDER_REFUNDED` | 409 | order | A settled charge was refunded because the seats could not be delivered (ADR-012). Distinct from `HOLD_EXPIRED`, whose promise that nothing was charged would be false |
 | `NOTIFICATION_LOG_NOT_FOUND` | 404 | notification | Admin only |
+| `SALE_PAUSED` | 409 | catalog | Pause or resume asked for on an event that is `DRAFT` or `CANCELLED`, where neither means anything (ADR-048) |
+| `NOTIFICATION_PAYLOAD_UNAVAILABLE` | 410 | order | A resend was asked for past `flashseats.outbox.purge-after-days`, so the stored message is gone. `410`, not `404`: the order existed and so did its message — they aged out, and a `404` would send an operator hunting a typo |
+| `ADMIN_AUTH_REQUIRED` | 401 | shared | No operator credentials, or the wrong ones |
+| `ADMIN_FORBIDDEN` | 403 | shared | Authenticated, but not an operator |
+
+The last two are the only codes **not** raised by a `FlashSeatsException`. Spring Security throws
+inside the filter chain, which runs before `DispatcherServlet`, so `GlobalExceptionHandler` cannot
+see them and `AdminProblemResponses` writes the problem at the entry point instead. Until Stage 4
+they were not codes at all: the admin surface answered with Boot's stock error body, making it the
+one place in the API that broke §1 (ADR-048).
 
 ---
 
