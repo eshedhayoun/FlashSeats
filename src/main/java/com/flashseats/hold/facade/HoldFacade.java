@@ -69,4 +69,15 @@ public interface HoldFacade {
      * correctly does nothing.
      */
     void discardTimer(String holdToken);
+
+    /**
+     * Seats currently held on a tier — the {@code active_holds} term of the stock invariant.
+     *
+     * <p>Counts <strong>every</strong> {@code ACTIVE} hold, including ones already past their expiry
+     * that the sweeper has not reached yet. That is deliberate: such a hold still owns its seats and
+     * the sweeper will return them, so a rebuild that excluded it would subtract nothing for it now
+     * and then have the sweeper hand the same seats back a moment later — counting them twice and
+     * overselling.
+     */
+    int sumActiveQuantityForTier(long tierId);
 }
