@@ -40,6 +40,22 @@ public class BuyerSession {
         return send(request(path).GET(), Map.of());
     }
 
+    public Response get(String path, Map<String, String> headers) {
+        return send(request(path).GET(), headers);
+    }
+
+    /**
+     * HTTP Basic for the operator endpoints.
+     *
+     * <p>Built by hand rather than via an HttpClient {@code Authenticator}, which only responds to a
+     * challenge — and one of the things worth asserting about this surface is the challenge itself.
+     */
+    public static Map<String, String> basicAuth(String username, String password) {
+        String encoded = java.util.Base64.getEncoder()
+                .encodeToString((username + ":" + password).getBytes(java.nio.charset.StandardCharsets.UTF_8));
+        return Map.of("Authorization", "Basic " + encoded);
+    }
+
     public Response post(String path, Object body) {
         return post(path, body, Map.of());
     }

@@ -5,6 +5,7 @@ import com.flashseats.catalog.dto.EventDetailResponse;
 import com.flashseats.catalog.dto.EventListItemResponse;
 import com.flashseats.catalog.dto.TierResponse;
 import com.flashseats.catalog.exception.EventNotFoundException;
+import com.flashseats.catalog.exception.EventNotPausableException;
 import com.flashseats.catalog.exception.PrewarmWindowClosedException;
 import com.flashseats.catalog.exception.TierNotFoundException;
 import com.flashseats.catalog.facade.EventSummary;
@@ -154,6 +155,43 @@ public class CatalogService {
     @Transactional(readOnly = true)
     public List<Long> findOpenEventIds() {
         return events.findOpenEventIds(clock.instant());
+    }
+
+    /** Open <em>or paused</em> — what an operator is still answerable for. See the repository. */
+    @Transactional(readOnly = true)
+    public List<Long> findManagedEventIds() {
+        return events.findManagedEventIds(clock.instant());
+    }
+
+    /**
+     * Halts a live sale, or resumes it.
+     *
+     * <p>Nothing is torn down and nothing is lost. The waiting room's ZSET is untouched, every
+     * position survives, live passes and admissions run out their own clocks, and stock stays exactly
+     * where it is — so resuming returns every buyer to precisely where they were. That is the same
+     * reasoning as ADR-035's refusal to delete a waiting room on a sold-out reading: the state an
+     * operator can destroy in a moment takes a sale to rebuild.
+     *
+     * <p>Idempotent, so a second click is not an error.
+     *
+     * @throws EventNotPausableException if the event is {@code DRAFT} or {@code CANCELLED}, where
+     *     "paused" would mean nothing and un-pausing would publish something nobody published
+     */
+    @Transactional
+    public EventStatus setPaused(long eventId, boolean paused) {
+        Event event = requireEvent(eventId);
+        EventStatus current = event.getStatus();
+
+        if (current != EventStatus.PUBLISHED && current != EventStatus.PAUSED) {
+            throw new EventNotPausableException(eventId, current);
+        }
+
+        EventStatus target = paused ? EventStatus.PAUSED : EventStatus.PUBLISHED;
+        if (current != target) {
+            event.setStatus(target);
+            log.warn("Event {} {} by an operator", eventId, paused ? "PAUSED" : "resumed");
+        }
+        return target;
     }
 
     /**

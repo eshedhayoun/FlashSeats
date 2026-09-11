@@ -93,7 +93,10 @@ public class StockEpoch {
         }
 
         Set<Long> doubtful = new HashSet<>();
-        for (long eventId : events.findOpenEventIds(clock.instant())) {
+        // MANAGED, not open. A paused event's counters can have been rolled back by the same
+        // restart, and skipping it would raise the flag only once an operator resumed the sale —
+        // which is to say, once it had already started selling from them.
+        for (long eventId : events.findManagedEventIds(clock.instant())) {
             String vouched = stock.vouchedRunId(eventId);
             if (vouched == null) {
                 // Nobody ever vouched for this event — a sale seeded outside pre-warm, or the first

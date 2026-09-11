@@ -38,6 +38,16 @@ public interface CatalogFacade {
     List<Long> findOpenEventIds();
 
     /**
+     * Ids of events inside their sale window that are open <strong>or paused</strong>.
+     *
+     * <p>Not the same question as {@link #findOpenEventIds}, and the difference matters: a paused
+     * sale admits nobody, but it is still an operator's responsibility and must still be watched.
+     * This is what the {@code stock.drift} gauge iterates, because pausing a sale is exactly what
+     * someone does while investigating a counter.
+     */
+    List<Long> findManagedEventIds();
+
+    /**
      * Total remaining across every tier of an event. Bounds how many buyers the queue admits.
      *
      * @return remaining seats, or {@link #COUNTER_UNAVAILABLE} when <em>any</em> tier of the event

@@ -41,6 +41,11 @@ class CatalogFacadeImpl implements CatalogFacade {
     }
 
     @Override
+    public List<Long> findManagedEventIds() {
+        return catalog.findManagedEventIds();
+    }
+
+    @Override
     public int getRemainingForEvent(long eventId) {
         return catalog.getRemainingForEvent(eventId);
     }
