@@ -1,5 +1,6 @@
 package com.flashseats.order.service;
 
+import com.flashseats.order.dto.AdminOrderResponse;
 import com.flashseats.order.dto.OrderItemResponse;
 import com.flashseats.order.dto.OrderReceiptResponse;
 import com.flashseats.order.exception.OrderNotFoundException;
@@ -31,6 +32,36 @@ public class OrderQueryService {
     public OrderReceiptResponse receiptFor(String orderNumber) {
         return toReceipt(orders.findByOrderNumber(orderNumber)
                 .orElseThrow(() -> new OrderNotFoundException(orderNumber)));
+    }
+
+    /**
+     * An order read by an operator, who has neither the buyer's cookie nor their receipt token.
+     *
+     * <p>{@link #readAuthorised} cannot serve this: its whole job is to refuse a caller presenting
+     * neither, so for an operator it always throws. The authorisation happens one layer up instead,
+     * at {@code ROLE_ADMIN} on {@code /api/v1/admin/**} — which is the right place for it, since
+     * "this person operates the system" is not a fact about the order.
+     *
+     * <p>Returns {@link AdminOrderResponse}, which withholds the receipt token. See that record.
+     */
+    @Transactional(readOnly = true)
+    public AdminOrderResponse readForOperator(String orderNumber) {
+        Order order = orders.findByOrderNumber(orderNumber)
+                .orElseThrow(() -> new OrderNotFoundException(orderNumber));
+
+        return new AdminOrderResponse(
+                order.getOrderNumber(),
+                order.getStatus(),
+                order.getUserEmail(),
+                order.getEventId(),
+                order.getTotalAmountCents(),
+                order.getCurrency(),
+                order.getHoldToken(),
+                order.getPaymentAttempts(),
+                order.getFailureReason(),
+                order.getCreatedAt(),
+                order.getUpdatedAt(),
+                lineItemsOf(order));
     }
 
     /**
@@ -91,15 +122,6 @@ public class OrderQueryService {
     }
 
     private OrderReceiptResponse toReceipt(Order order) {
-        List<OrderItemResponse> lines = items.findByOrderId(order.getId()).stream()
-                .map(item -> new OrderItemResponse(
-                        item.getEventId(),
-                        item.getTierId(),
-                        item.getTierName(),
-                        item.getQuantity(),
-                        item.getUnitPriceCents()))
-                .toList();
-
         return new OrderReceiptResponse(
                 order.getOrderNumber(),
                 order.getStatus(),
@@ -108,6 +130,18 @@ public class OrderQueryService {
                 order.getCurrency(),
                 order.getReceiptToken(),
                 order.getCreatedAt(),
-                lines);
+                lineItemsOf(order));
+    }
+
+    /** Shared by the buyer's receipt and the operator's view; the two differ everywhere else. */
+    private List<OrderItemResponse> lineItemsOf(Order order) {
+        return items.findByOrderId(order.getId()).stream()
+                .map(item -> new OrderItemResponse(
+                        item.getEventId(),
+                        item.getTierId(),
+                        item.getTierName(),
+                        item.getQuantity(),
+                        item.getUnitPriceCents()))
+                .toList();
     }
 }

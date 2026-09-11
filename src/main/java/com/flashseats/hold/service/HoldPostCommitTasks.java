@@ -1,6 +1,7 @@
 package com.flashseats.hold.service;
 
 import com.flashseats.catalog.facade.CatalogFacade;
+import com.flashseats.hold.event.TicketHeldEvent;
 import com.flashseats.hold.event.TicketHoldSettledEvent;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Component;
@@ -22,9 +23,24 @@ import org.springframework.transaction.event.TransactionalEventListener;
 class HoldPostCommitTasks {
 
     private final CatalogFacade catalog;
+    private final HoldTimers timers;
 
-    HoldPostCommitTasks(CatalogFacade catalog) {
+    HoldPostCommitTasks(CatalogFacade catalog, HoldTimers timers) {
         this.catalog = catalog;
+        this.timers = timers;
+    }
+
+    /**
+     * Arms the expiry timer once the hold row it describes actually exists.
+     *
+     * <p>After the commit for the same reason the restore below is: Redis does not roll back, so a
+     * timer armed inline would outlive a hold whose row never committed and fire against nothing.
+     * The direction of failure is the safe one either way — an unarmed timer costs seconds, and the
+     * sweeper is what guarantees the seats come back at all.
+     */
+    @TransactionalEventListener(phase = TransactionPhase.AFTER_COMMIT, fallbackExecution = true)
+    void onTicketHeld(TicketHeldEvent event) {
+        timers.arm(event.holdToken(), event.expiresAt());
     }
 
     /**
@@ -45,6 +61,10 @@ class HoldPostCommitTasks {
         if (!event.claimWon()) {
             return;
         }
+        // The hold is over, so its timer has nothing left to accelerate. Disarmed first and on its
+        // own, because HoldTimers swallows its failures and the restore below must not be reached
+        // through anything that could throw past it.
+        timers.disarm(event.holdToken());
         try {
             catalog.restore(event.eventId(), event.tierId(), event.quantity());
         } catch (RuntimeException restoreFailed) {

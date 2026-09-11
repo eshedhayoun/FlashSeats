@@ -63,4 +63,18 @@ class ProblemResponseIT extends IntegrationTest {
         assertThat(response.errorCode()).isEqualTo("EVENT_NOT_FOUND");
         assertThat(response.text("traceId")).isNotBlank();
     }
+
+    @Test
+    @DisplayName("An unauthenticated admin call is 401 ADMIN_AUTH_REQUIRED, and says how to authenticate")
+    void adminRefusalsCarryACodeToo() {
+        // Spring Security throws in the filter chain, which runs BEFORE DispatcherServlet — so no
+        // @RestControllerAdvice can see it, and Boot's stock error body came back instead. These
+        // were the only endpoints in the API answering without a `code`, on the surface that can
+        // pause a live sale. AdminProblemResponses is what closes that.
+        var response = new BuyerSession(port).post("/admin/events/1/prewarm", Map.of());
+
+        assertThat(response.status()).isEqualTo(401);
+        assertThat(response.errorCode()).isEqualTo("ADMIN_AUTH_REQUIRED");
+        assertThat(response.text("traceId")).isNotBlank();
+    }
 }

@@ -68,13 +68,52 @@ for key in FLASHSEATS_SESSION_SECRET FLASHSEATS_QUEUE_PASS_SECRET FLASHSEATS_REC
     replace_if_default "$key" "dev-only-change-me" "$(openssl rand -base64 48 | tr -d '\n')"
 done
 
-replace_if_default FLASHSEATS_ADMIN_PASSWORD "admin" "$(openssl rand -hex 24)"
+# The admin password is STORED HASHED, so what goes in .env is a bcrypt digest
+# carrying its own algorithm prefix — SecretsGuard refuses to start on any
+# `{noop}` value outside dev/test, which is every plaintext password rather than
+# one known string.
+#
+# htpasswd rather than a hand-rolled hash, and via Docker rather than assuming
+# it is installed: macOS does not ship apache2-utils, and Docker is already a
+# hard requirement for everything else in this workflow. The empty username and
+# the `tr` leave just the digest.
+if grep -qE '^FLASHSEATS_ADMIN_PASSWORD=\{noop\}|^FLASHSEATS_ADMIN_PASSWORD=admin$' "$ENV_FILE"; then
+    ADMIN_PLAINTEXT="$(openssl rand -hex 24)"
+    ADMIN_HASH="$(docker run --rm httpd:alpine \
+        htpasswd -bnBC 12 "" "$ADMIN_PLAINTEXT" 2>/dev/null | tr -d ':\n')"
+
+    if [[ -z "$ADMIN_HASH" ]]; then
+        echo "  FLASHSEATS_ADMIN_PASSWORD  — FAILED to hash (is Docker running?)" >&2
+        exit 1
+    fi
+
+    awk -v v="{bcrypt}${ADMIN_HASH}" \
+        'BEGIN { FS = "="; OFS = "=" }
+         $1 == "FLASHSEATS_ADMIN_PASSWORD" { print $1, v; next }
+         { print }' "$ENV_FILE" > "$ENV_FILE.tmp"
+    mv "$ENV_FILE.tmp" "$ENV_FILE"
+
+    echo "  FLASHSEATS_ADMIN_PASSWORD  — generated and hashed"
+    echo
+    echo "  ############################################################"
+    echo "  #  OPERATOR PASSWORD — shown once, not recoverable from .env"
+    echo "  #"
+    echo "  #    ${ADMIN_PLAINTEXT}"
+    echo "  #"
+    echo "  #  Store it somewhere before you close this terminal."
+    echo "  ############################################################"
+    echo
+else
+    echo "  FLASHSEATS_ADMIN_PASSWORD  — already hashed, left alone"
+fi
 
 # Not a secret, but the cluster is wrong without it and wrong quietly: the rate
 # limiter ignores X-Forwarded-For from an untrusted peer, so every buyer shares
 # nginx's one IP bucket. Pinned to nginx's static compose address (ADR-047).
 replace_if_default FLASHSEATS_TRUSTED_PROXIES "" "172.28.0.10"
 
+echo "Done. Operator username: $(grep -E '^FLASHSEATS_ADMIN_USERNAME=' "$ENV_FILE" | cut -d= -f2-)"
 echo
-echo "Done. The admin password is used by docker/seed/seed.sh for pre-warm:"
-grep -E '^FLASHSEATS_ADMIN_(USERNAME|PASSWORD)=' "$ENV_FILE"
+echo "The password in .env is a bcrypt digest and CANNOT be used to log in. Scripts"
+echo "that call the admin API need the plaintext, so export it for the session:"
+echo "  export FLASHSEATS_ADMIN_PLAINTEXT='<the password above>'"

@@ -110,7 +110,7 @@ it, so if anything fails the hold returns to `ACTIVE` and expires normally.
 
 | Module | Ships now | Deferred |
 | :--- | :--- | :--- |
-| `shared` | `ErrorCode` (37 codes), `ProblemDetails`, one global advice, `SessionId`, `Money`, `Clock`, `SignedToken`, `TraceIdFilter` | — |
+| `shared` | `ErrorCode` (42 codes), `ProblemDetails`, one global advice, `SessionId`, `Money`, `Clock`, `SignedToken`, `TraceIdFilter` | — |
 | `bot` | Signed `fsid` cookie; Redis-backed Bucket4j session + IP buckets; SSE exempt from per-request accounting | reCAPTCHA, `ip_rules`, audit logs. **Writes no tables.** |
 | `catalog` | Events, tiers, window derivation, `serverTime`, bucketed availability, **Redis counters + Lua, the `-2` fault path, pre-warm, the Redis-restart guard** | pause, `TierAvailabilityChangedEvent` |
 | `queue` | `ZADD NX` join, SSE with heartbeats, HMAC passes, admission sessions, promotion worker, **pub/sub fan-out**, measured drain-rate estimates | `RANDOM` ordering, `tier-availability` frame, `Last-Event-ID` replay |
@@ -260,15 +260,18 @@ Honest list. None of these is hidden behind a passing test.
   what `catalog.md` has always demanded after a restart; it is now enforced rather than remembered,
   and an unattended restart therefore stops a sale.
 - **Payment is a stub.** Every idempotency layer is real; the gateway is not.
-- **No admin surface** beyond pre-warm. No pause, no stock rebuild, no DLQ replay.
+- ~~**No admin surface** beyond pre-warm.~~ **Built** (Stage 4, ADR-048): pause/resume, the DLQ
+  listing, a ticket resend, and an operator order view. `rebuild-stock` shipped in Stage 1. Still
+  a single in-memory operator account — now stored bcrypt-hashed rather than in plaintext, with a
+  real identity provider deferred until a second operator exists (§10 S12).
 - **`ORDER_REFUNDED` is written but never consumed** — the refund-notice template is deferred.
 
-- **The outbox relay publishes without confirms.** `rabbit.send()` is fire-and-forget and
-  `spring.rabbitmq.publisher-confirm-type` is unset, so the relay marks a row `PROCESSED` on a
-  successful TCP write. A broker that accepts the frame and dies before persisting loses the message
-  with the outbox row already burned — the one failure the outbox exists to prevent. Deliberately
-  deferred to Stage 3 with the rest of the broker work; the fix is `publisher-confirm-type=correlated`
-  and marking processed only on the ack.
+- ~~**The outbox relay publishes without confirms.**~~ **Fixed** (Stage 4, ADR-048). A row is marked
+  `PROCESSED` only once the broker acknowledges it — and, just as importantly, only once it was
+  *routed*: a confirm means "the broker has this", not "a queue has this", so `mandatory` plus
+  publisher-returns is what stops every ticket being confirmed into an exchange bound to nothing.
+  `OutboxPublisher` is batch-shaped, so an unhealthy broker costs one timeout per batch rather than
+  one per message. Unconfirmed rows stay `PROCESSING` and the stale-claim sweep retries them.
 - **`QueueBroadcaster` does 4 sequential Redis round trips per connection per 2 s tick** — the
   admission `GET`, the pass `GET`, the exhausted `EXISTS` and the waiting `ZRANK`. The cost is linear
   in *connections* against a fixed interval, so past some connection count the sweep cannot finish
@@ -347,9 +350,14 @@ the `-2` fault path end to end, `SETNX` pre-warm restricted to `UPCOMING`, the r
 ledger, `flashseats.stock.drift` as a live gauge, and `catalog:vouch:{eventId}` refusing to sell
 from counters a Redis restart may have rolled back. `tier_inventory` is dropped.
 
-**Deferred to Stage 3, deliberately:** the `hold:{token}` TTL key and the keyspace-expiry listener.
-Latency only — the sweeper is unchanged and still the guarantee — and the claim needing proof about
-them is a multi-replica one.
+~~**Deferred to Stage 3:**~~ the `hold:{token}` TTL key and the keyspace-expiry listener **shipped in
+Stage 4** (ADR-048), two stages later than planned. Latency only — the sweeper is unchanged and still
+the guarantee — and the multi-replica claim is now proven by `docker/scripts/hold-expiry-check.sh`:
+restored exactly once, in 339 ms, across three replicas.
+
+*Correction for the record:* this section previously said the timer had been "built, tested and
+removed". `git log -S` across every commit finds no keyspace listener and no `hold:` key literal
+ever committed, so that work lived only in an uncommitted tree and none of it was recoverable.
 
 ### Stage 2 — Real money and real defence (Phase 3)
 
@@ -363,7 +371,9 @@ them is a multi-replica one.
 - reCAPTCHA v3 on join, cached per session, **failing open** (ADR-011) — this is S5's compensating
   control, so it belongs with the security fixes above.
 - `ip_rules`, `bot_audit_logs` (async, non-`ALLOWED` outcomes only), and `V6__bot.sql`.
-- **All four "must fix" items in §10.**
+- The remaining §10 "must fix" item. (Pass 1 closed S1–S4 and S11; Stage 4 hashed the admin
+  credential, so what is left of S12 is a real identity provider, wanted only once a second
+  operator does.)
 
 ### Stage 3 — Scale and proof (Phase 4) — **done, with two items carried forward**
 
@@ -396,36 +406,46 @@ to run, and would have rate-limited its own load harness to nothing.
   Redis-restart criterion, which is cleanest against a standalone instance that simply stops.
 - **The 10,000-VU run and the p99 number.** Both need a host where the load generator is not
   competing with the system under test; see §9.
-- The `hold:{token}` timer and the `__keyevent@0__:expired` listener. Stage 3 built the rig that can
-  prove them — three replicas receiving one broadcast expiry must restore a hold exactly once — and
-  did not build them.
+- ~~The `hold:{token}` timer and the `__keyevent@0__:expired` listener.~~ **Built in Stage 4**, and
+  proven on the rig Stage 3 left behind: restored exactly once, in 339 ms, across three replicas.
 - The rest of the metric set and its alarms: `outbox.lag.seconds`, `dlq.depth`,
   `queue.promotion.rate`, `payment.decline.ratio`, `jvm.threads.pinned`. `stock.drift` and
   `hikaricp_connections_pending` are exported and were read per replica throughout.
 
-### Stage 4 — The operator surface, and it is not optional (ADR-043)
+### Stage 4 — The operator surface (ADR-043) — **done**
 
-**The docs currently promise eleven `/api/v1/admin/**` endpoints and exactly one exists.** That is
-not a documentation debt, it is a functional gap, because two ADRs already assume an operator who
-can act:
+**It was not optional, and the reason was concrete.** ADR-029 sends deterministic failures straight
+to the DLQ with no retries — correct only if someone can replay them — and ADR-038 went to real
+trouble making a dead-lettered claim re-claimable *so that a replay would send*. Nothing could
+trigger one. Pass 2 found the consequence: a PDF font failure dead-lettered a **paid** buyer's
+ticket into a black hole.
 
-- **ADR-029** sends deterministic failures straight to the DLQ *with no retries* — correct only if
-  someone can replay them. Pass 2 found a PDF font failure that dead-lettered a **paid** buyer's
-  ticket, and with no replay endpoint the DLQ was a black hole. ADR-038 went to real trouble making
-  a dead-lettered claim re-claimable *so that a replay would send*; nothing can trigger that replay.
-- ~~**ADR-004** names a locked rebuild as the only legal recovery from a missing counter.~~ **Built
-  in Stage 1**, as `POST /admin/events/{id}/rebuild-stock` served by `order` — the only module that
-  may read the whole ledger (ADR-046).
+Endpoints live in the module that owns the state; there is no `admin` module, because one would have
+to read every other module's internals. Full account in **ADR-048**.
 
-Endpoints live in the module that owns the state — there is **no `admin` module**, because one would
-have to read every other module's internals (ADR-043).
+| Endpoint | Module | Note |
+| :--- | :--- | :--- |
+| `POST /admin/events/{id}/pause` · `/resume` | `catalog` | `EventStatus.PAUSED`; every gate closes through `SaleWindows` with no new code |
+| `GET /admin/notifications/dlq` | `notification` | paged, capped, on a partial index (`V8`) |
+| `POST /admin/notifications/resend/{orderNumber}` | **`order`** | the payload lives in `outbox_events`, not `notification_logs` |
+| `GET /admin/orders/{orderNumber}` | `order` | a distinct DTO that withholds `receiptToken` |
+| `POST /admin/events/{id}/rebuild-stock` | `order` | shipped in Stage 1 |
+| `POST /admin/events/{id}/prewarm` | `catalog` | shipped in the MVP |
 
-- `POST /admin/events/{id}/pause` — `catalog`. (`rebuild-stock` shipped in Stage 1, served by
-  `order`; the ledger it reads is not catalog's alone.)
-- `GET /admin/notifications/dlq` · `POST /admin/notifications/resend/{orderNumber}` — `notification`
-- `GET /admin/orders/{orderNumber}` — `order`, so support can answer "where is my ticket?"
-- **Replace the in-memory `UserDetailsService` (§10 S12) first.** One hardcoded account is tolerable
-  for one pre-warm endpoint; it is not tolerable for a surface that can pause a sale.
+Three things worth carrying forward as design, not trivia:
+
+- **A resend is one new outbox row.** The relay publishes it and the consumer's `claim()` already
+  falls through to `reclaimDeadLettered`. No DLQ draining, no shovel, no new facade edge — and
+  resending something that already worked sends nothing, because a `SENT` row is not `DLQ`.
+- **`PAUSED` split the event query four ways.** A paused sale leaves the promotion loop and the
+  browse list, but stays in `findManagedEventIds`, which drives the drift gauge *and* `StockEpoch`.
+  Pausing is what an operator does while investigating a counter; a paused event whose counters a
+  Redis restart rolled back must be flagged then, not when someone resumes and starts selling from
+  them. Verified against the cluster.
+- **The admin credential is hashed, not replaced.** §10's S12 says replace the in-memory bean
+  *"before anyone else needs access"*; nobody does, and one row does not want a user-management
+  surface. What was wrong — plaintext storage — is fixed, and `SecretsGuard` now refuses any
+  `{noop}` value rather than one known string. 401/403 finally carry a registry `code`.
 
 A console is presentation and can wait. The endpoints are the capability.
 
@@ -579,7 +599,8 @@ Append one section per pass. Record what was examined, what was found, and what 
 - Every `@Transactional` contains SQL only, and the three bean splits are real proxies (§12.4).
 - `AFTER_COMMIT` is safe to lose: skipping `OrderPostCommitTasks` entirely leaves the system
   correct (§12.5).
-- Eleven registry codes are unreachable, all of them forward contract for deferred stages (§12.7).
+- ~~Eleven registry codes are unreachable~~ — it was ten, and Stage 4 reached three of them
+  (`NOTIFICATION_LOG_NOT_FOUND` remains forward contract). The rest are still deferred stages.
 
 **Deferred, with reasons, to Stage 3:** RabbitMQ publisher confirms and the `QueueBroadcaster`
 fan-out cost. Both are load-path concerns and neither can be validated until the k6 harness runs.
@@ -794,3 +815,46 @@ ever regresses; `docker/scripts/sse-cadence.sh` measures the broadcaster from th
 the decision to batch its reads stays gated on a number.
 
 - **Result:** 68 tests green, unchanged — nothing here touches `src/main/java`.
+
+### Pass 6 — Stage 4, the operator surface and the two loose ends
+
+- **Scope:** the `/api/v1/admin/**` surface ADR-043 calls a correctness dependency, plus the two
+  items Stage 3 deferred into nothing. Full account in **ADR-048**.
+
+**The two loose ends, first, because they were pointing at a stage that had already shipped.**
+
+| Found | Fix |
+| :--- | :--- |
+| The outbox marked a row `PROCESSED` on a successful **TCP write**. A broker that accepted the frame and died before persisting lost the message with the row already burned | Publisher confirms — and `mandatory` + returns, because **a confirm is not a routing guarantee**: an exchange with no binding acks and discards, and the whole topology sits behind `flashseats.notification.enabled`. A "just switch confirms on" change would have shipped that hole intact |
+| Confirms are asynchronous and per-message, but `OutboxPublisher.publish` took one event | Batch-shaped: `List<UUID> publish(List<OutboxEvent>)`. One timeout per batch instead of one per message, and partial success as a return value rather than an exception dance |
+| `RabbitOutboxPublisher` had **no test at all** — the suite runs `transport=log` | A plain JUnit test against a Testcontainers broker, no Spring context. Deliberate: a second context means another set of `@Scheduled` relays and sweepers on the shared containers, which is what killed the hold timer last time |
+| §9 said the hold timer had been "built, tested and removed" | `git log -S` across every commit finds no keyspace listener and no `hold:` key literal ever committed. It was an uncommitted tree; nothing was recoverable, and the entry is corrected |
+| A keyspace listener that trusts the event would tear up a **grace-extended** hold mid-payment | `reclaimExpired` re-reads the row and settles only what the sweeper would have. A hold found alive is **re-armed**, so grace-extended holds keep the fast path |
+| `OrderPostCommitTasks` called `discardTimer` and `revokeAdmission` in one `try` | Fine while `discardTimer` was a no-op; it is a Redis `DEL` now, so an unreachable Redis would have skipped the revoke and left a finished buyer holding an admission that denies someone else theirs |
+| The test Redis ran stock `redis:7-alpine`, so `notify-keyspace-events` was empty | `--notify-keyspace-events Ex`. Without it the suite would have gone green over a fast path that did not exist |
+
+**The operator surface.**
+
+| Found | Fix |
+| :--- | :--- |
+| ADR-038's `reclaimDeadLettered` had **zero callers**. The capability to replay a dead letter was built and could not be triggered | `POST /admin/notifications/resend/{orderNumber}`, served by `order` — the payload lives in `outbox_events`, not `notification_logs`. One new outbox row drives the whole existing pipeline |
+| `notification_logs` had **no index on `status`**, so listing dead letters was a seq scan over every notification ever sent | A partial index (`V8`) on `status = 'DLQ'` — the rows an operator looks for, not the millions they never will |
+| `findOpenEventIds` had **three** callers wanting two different answers | `findManagedEventIds` for the drift gauge and `StockEpoch`. The `StockEpoch` row is the one an easy implementation drops, and it is the dangerous one |
+| 401/403 were the **only** responses in the API with no registry `code` — thrown in the filter chain, where no `@RestControllerAdvice` can reach them | `AdminProblemResponses`, keeping the RFC 7235 `WWW-Authenticate` challenge that replacing the entry point would have dropped |
+| The admin password was stored and compared in **plaintext**, and `SecretsGuard` only refused the literal string `admin` | `DelegatingPasswordEncoder`; the guard now refuses **any** `{noop}` value. The old check passed `hunter2` |
+| `OrderReceiptResponse` carries `receiptToken` — a 90-day bearer capability | A distinct `AdminOrderResponse`. An operator view has no business minting an impersonation link into terminal history |
+
+**Verified against the three-replica cluster, not just the suite.**
+
+| Drill | Result |
+| :--- | :--- |
+| Hold expiry across replicas | Restored **exactly once, in 339 ms**; peak never exceeded the starting counter. The sweeper would have taken up to 10,000 ms |
+| Redis restart while a sale is **paused** | All three replicas flagged it — the `findManagedEventIds` split doing its job. With `findOpenEventIds` the event would have been invisible until someone resumed it |
+| Pause mid-sale | `windowStatus` → `CLOSED`, join → `409`, hold refused, stock untouched; resume restored everything |
+| Mail server killed → buy → DLQ → resend | The DLQ named the buyer and the exact exception; the resend delivered the lost ticket |
+| Resend **again** | Queued, and **no second email**. `SENT` is not `DLQ`, so the re-claim matches nothing |
+| Unauthenticated admin call | `401` with `ADMIN_AUTH_REQUIRED`, a `type` URI, a `traceId` and a challenge |
+| Fan-out and the 3-replica promotion check | Still 30/30 across three replicas — no regression |
+
+- **Result:** 87 tests green, up from 68 at the end of Stage 1. The module graph is unchanged; every
+  endpoint writes only state its own module owns.

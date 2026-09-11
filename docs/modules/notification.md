@@ -166,9 +166,20 @@ hold is gone (ADR-012) — v1 had no way to tell the buyer anything at all in th
 
 | Method | Path | Access |
 | :--- | :--- | :--- |
-| `POST` | `/api/v1/admin/notifications/resend/{orderNumber}` | admin |
-| `GET` | `/api/v1/admin/notifications/logs/{orderNumber}` | admin |
-| `GET` | `/api/v1/admin/notifications/dlq` | admin |
+| `GET` | `/api/v1/admin/notifications/dlq` | admin — **built** (Stage 4). Paged, capped, on a partial index (`V8`) |
+| `POST` | `/api/v1/admin/notifications/resend/{orderNumber}` | admin — **built, and served by `order`** (see below) |
+| `GET` | `/api/v1/admin/notifications/logs/{orderNumber}` | admin — not built; `NOTIFICATION_LOG_NOT_FOUND` is its forward contract |
+
+**The resend is not in this module, and that is deliberate** (ADR-048). Replaying a message needs the
+original **payload**, and `notification_logs` does not carry it — it records that a delivery was
+attempted, never what was in it. The durable copy is `outbox_events.payload`, owned by `order`, so
+the endpoint lives there and writes a new outbox row. The rest is this module's existing machinery:
+the relay publishes it and `NotificationLogService.claim` falls through `claimIfAbsent` to
+`reclaimDeadLettered`, the re-claim ADR-038 added precisely so a replay would send.
+
+A resend for a notification that already succeeded is **safe by construction**: a `SENT` row is not
+`DLQ`, so the re-claim matches nothing and the consumer acknowledges without sending. An operator who
+cannot tell whether the first attempt landed can press it without risking a second ticket.
 
 ```java
 public interface NotificationFacade {

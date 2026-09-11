@@ -124,7 +124,7 @@ than a check that races.
 
 | Key | Type | TTL | Purpose |
 | :--- | :--- | :--- | :--- |
-| `hold:{holdToken}` | String | **300 s** | timer only — **deferred to Stage 3** (ADR-046) |
+| `hold:{holdToken}` | String | hold TTL | timer only. A hint, never an authority (ADR-048) |
 
 **`hold` owns no live Redis key today.** It moves stock by calling `CatalogFacade`, so it never
 touches `catalog:stock:{e}:{t}`; the "single shared key" exception earlier drafts described is gone
@@ -216,15 +216,32 @@ ever runs outside a transaction cannot discard its restore silently; and the lis
 throws, because Spring invokes after-commit synchronizations in a loop with no `try/catch` of its own
 and one failed increment would abandon every event queued behind it.
 
-### Expiry by keyspace notification — **deferred to Stage 3**
+### Expiry by keyspace notification — **built in Stage 4** (ADR-048)
 
-The `hold:{token}` TTL key and the `__keyevent@0__:expired` listener are not built. They reclaim an
-abandoned hold in about a second instead of within a sweeper interval, and nothing else. Proving the
-listener fires means slowing the sweeper, and proving the sweeper still suffices means disabling the
-listener — and the claim that actually matters, that three replicas receiving the same broadcast
-expiry restore a hold exactly once, cannot be observed on one instance at all (ADR-046).
+`hold:{token}` is armed after the hold row commits and deleted when the hold ends. Its expiry
+reclaims an abandoned hold in **339 ms** against the cluster instead of within a sweeper interval,
+and nothing else: the sweeper below is unchanged and is still the guarantee.
 
-It will need `notify-keyspace-events Ex`, which is off by default in Redis and already shipped in
+**Two rules make it safe, and neither is the event.**
+
+*It is a hint, not a verdict.* `HoldService.reclaimExpired` re-reads the row and settles only what
+the sweeper would have settled anyway. `grantGrace` moves a hold's expiry in PostgreSQL, so a key
+treated as authoritative would fire mid-payment and hand back seats the buyer is being charged for.
+A hold found still alive has its timer **re-armed** for the time remaining, so a grace-extended hold
+keeps the fast path instead of silently falling back to the sweeper for the rest of its life.
+
+*The claim is what makes it exactly-once.* Keyspace expiry is broadcast pub/sub: all three replicas
+receive it, all three reach the settle-once `UPDATE ... WHERE status = 'ACTIVE'`, and exactly one
+wins. Restoring stock in the listener would return the seats three times — invisible on one
+instance, which is why the proof is a cluster drill
+([`docker/scripts/hold-expiry-check.sh`](../../docker/scripts/hold-expiry-check.sh)) asserting the
+counter never rises past its starting value.
+
+`__keyevent@0__:expired` is **one channel for the whole database** — queue passes, admissions,
+payment guards, rate-limit buckets — with no server-side filter, so the `hold:` prefix check is the
+listener's first statement.
+
+It needs `notify-keyspace-events Ex`, which is off by default in Redis and shipped in
 [`docker/redis/redis.conf`](../../docker/redis/redis.conf). `E` selects the key-**event** channel
 `__keyevent@0__:expired`, whose message is the expired key's name; `K` selects the keyspace channel,
 whose message is the event name instead, so `Kx` would leave the listener permanently silent while
@@ -242,8 +259,8 @@ and performs the identical claim per row.
 
 **Keyspace pub/sub is at-most-once.** A dropped connection, a restarting replica, or a network blip
 loses the event permanently. That is why the listener is only ever a *latency optimisation* and the
-sweeper is what makes expiry correct — and why the listener could be deferred out of Stage 1 without
-changing a single outcome.
+sweeper is what makes expiry correct — and why the listener could be deferred out of two stages
+without changing a single outcome.
 
 ---
 

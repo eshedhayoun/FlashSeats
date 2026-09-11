@@ -55,6 +55,7 @@ public class HoldService {
     private final QueueFacade queue;
     private final HoldProperties properties;
     private final ApplicationEventPublisher events;
+    private final HoldTimers timers;
     private final Clock clock;
 
     public HoldService(
@@ -63,12 +64,14 @@ public class HoldService {
             QueueFacade queue,
             HoldProperties properties,
             ApplicationEventPublisher events,
+            HoldTimers timers,
             Clock clock) {
         this.holds = holds;
         this.catalog = catalog;
         this.queue = queue;
         this.properties = properties;
         this.events = events;
+        this.timers = timers;
         this.clock = clock;
     }
 
@@ -141,7 +144,13 @@ public class HoldService {
         }
 
         events.publishEvent(new TicketHeldEvent(
-                hold.getHoldToken(), sessionId, eventId, tierId, quantity, clock.instant()));
+                hold.getHoldToken(),
+                sessionId,
+                eventId,
+                tierId,
+                quantity,
+                hold.getExpiresAt(),
+                clock.instant()));
         return hold;
     }
 
@@ -279,6 +288,51 @@ public class HoldService {
             log.info("Sweeper reclaimed {} expired hold(s)", reclaimed);
         }
         return reclaimed;
+    }
+
+    /**
+     * Reclaims one hold whose {@code hold:{token}} timer has just fired.
+     *
+     * <p><strong>The timer is an accelerator, never an authority.</strong> This method re-reads the
+     * row and reclaims only what the sweeper would have reclaimed anyway — the key's disappearance
+     * is a hint that something may be expired, not a statement that it is. Three things make that
+     * distinction matter rather than being pedantry:
+     *
+     * <ul>
+     *   <li>{@code grantGrace} extends a hold's expiry in PostgreSQL. If the key were treated as
+     *       authoritative, the original timer would fire mid-payment and hand back seats the buyer
+     *       is actively being charged for.
+     *   <li>Redis AOF is {@code appendfsync everysec}, so a restart can resurrect or lose a key
+     *       relative to the row it describes.
+     *   <li>A key can be evicted or flushed by an operator. None of those mean a hold ended.
+     * </ul>
+     *
+     * <p>When the hold turns out to be alive and simply not expired yet, the timer is
+     * <strong>re-armed</strong> for whatever time is left. That is what keeps a grace-extended hold
+     * on the fast path instead of silently falling back to the sweeper for the rest of its life, and
+     * it costs nothing when the common case — an ordinary expiry — takes the branch above it.
+     *
+     * <p>Exactly-once across replicas is not this method's doing and needs no coordination: keyspace
+     * expiry is broadcast pub/sub, so all three replicas run this, all three reach
+     * {@code settleAndRestore}, and the conditional {@code UPDATE ... WHERE status = 'ACTIVE'} lets
+     * exactly one win. Restoring stock here directly — rather than through the claim — is how a
+     * naive listener triples a tier's inventory.
+     *
+     * @return true if this replica won the claim and the seats are coming back
+     */
+    @Transactional
+    public boolean reclaimExpired(String holdToken) {
+        TicketHold hold = holds.findByHoldToken(holdToken).orElse(null);
+        if (hold == null || !hold.isActive()) {
+            // Already consumed, released or swept. The ordinary outcome on two of three replicas.
+            return false;
+        }
+        if (hold.getExpiresAt().isAfter(clock.instant())) {
+            timers.arm(holdToken, hold.getExpiresAt());
+            log.debug("Timer for hold {} fired early; re-armed to {}", holdToken, hold.getExpiresAt());
+            return false;
+        }
+        return settleAndRestore(hold, HoldStatus.EXPIRED, SettleReason.TTL);
     }
 
     // ----------------------------------------------------------- reconciliation
