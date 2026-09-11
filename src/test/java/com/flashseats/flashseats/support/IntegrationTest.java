@@ -45,10 +45,21 @@ public abstract class IntegrationTest {
                     .withReuse(true);
         }
 
+        /**
+         * {@code notify-keyspace-events Ex} is not a tuning flag here; without it the hold expiry
+         * listener subscribes successfully and receives nothing, so every test would pass while the
+         * fast path silently did not exist. The stock image ships the setting empty, so it has to be
+         * asked for — {@code docker/redis/redis.conf} does the same for the real stack.
+         *
+         * <p>{@code E} is the key-EVENT channel, whose message is the key name. {@code K} publishes
+         * the event name to a per-key channel instead and the listener never fires (ADR-003).
+         */
         @Bean
         @ServiceConnection
         RedisContainer redis() {
-            return new RedisContainer(DockerImageName.parse("redis:7-alpine")).withReuse(true);
+            return new RedisContainer(DockerImageName.parse("redis:7-alpine"))
+                    .withCommand("redis-server", "--notify-keyspace-events", "Ex")
+                    .withReuse(true);
         }
     }
 }
