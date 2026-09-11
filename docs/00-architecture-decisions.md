@@ -1224,3 +1224,108 @@ in global standards §9 lands with Stage 3.
 
 So: health is done and needs nothing. **Observability is not done**, and it is already scheduled —
 the thing to avoid is mistaking the first for the second because the endpoint returns `UP`.
+
+---
+
+# Stage 1 — decisions the Redis fast path forced (ADR-046)
+
+---
+
+## ADR-046 — Redis is the counter, PostgreSQL is the ledger, and every Redis write fails toward under-counting
+
+**Decision.** `catalog:stock:{eventId}:{tierId}` is the live inventory count. PostgreSQL holds the
+record it can be derived from — `ticket_tiers.total_capacity`, `order_items` and `ticket_holds` —
+and holds no copy of the count itself.
+
+Because Redis cannot roll back with a SQL transaction, **every mutation of a counter sits outside
+the transaction, and the ordering is chosen so that each failure loses seats rather than duplicating
+them**:
+
+| Operation | Order | If it fails half-way |
+| :--- | :--- | :--- |
+| Reserve | decrement, *then* write the `ticket_holds` row | seats decremented with no hold — invisible, drift alarms, rebuild returns them |
+| Restore | win the settle claim, commit, *then* increment | seats never returned — invisible, same recovery |
+| Rebuild | derive from the ledger, *then* overwrite | counters unchanged — the operator runs it again |
+
+The asymmetry is the whole decision. **Invisible seats are lost revenue that a rebuild recovers;
+phantom seats are an oversell that nothing recovers.** Anywhere the two orderings are both
+defensible, choose the one that under-counts.
+
+**Why the reserve is compensated rather than rolled back.** The decrement used to be a SQL `UPDATE`
+sharing the hold's transaction, so a rejected insert rolled it back for free. It does not any more,
+so `HoldService.createHold` catches the constraint violation and returns the seats explicitly. It
+compensates **only** on that violation: a flush rejection is a definite rollback, while a failure at
+*commit* is ambiguous — the row may exist, and returning seats that are still held is the oversell
+this design refuses. Ambiguity falls through to drift. The path is not exotic; a buyer
+double-clicking reaches it.
+
+**Why restoration waits for the commit.** `HoldService.sweepExpired` settles up to 500 holds in one
+transaction. An inline increment would return every earlier hold's seats and then, on any failure,
+put those holds back to `ACTIVE` — on sale and still held at once. The restore moved to
+`@TransactionalEventListener(AFTER_COMMIT)` on the settle event, with `fallbackExecution = true` so
+a settle outside a transaction cannot silently discard it, and with its body wrapped so one failed
+increment cannot abandon the rest of a batch.
+
+**Five departures from what the module specs describe**, all of them recorded here rather than left
+as drift:
+
+1. **The scripts live in `catalog` and are executed by it.** `hold` moves stock by calling
+   `CatalogFacade`, so it never touches the key. The "single exception" to key ownership that
+   `CLAUDE.md` and `catalog.md` described is therefore **gone**, and with it the `CROSSSLOT`
+   footnote in ADR-018. They are named `stock_reserve.lua` / `stock_restore.lua`, because they no
+   longer touch a hold key.
+2. **The reserve script does not write hold metadata.** `hold.md`'s version `HSET`s the hold's
+   details alongside the decrement — `holdmeta` under another name, left over from ADR-003.
+   ADR-019 deleted that authority, so nothing needs to be atomic with the decrement but the
+   decrement.
+3. **`tier_inventory` is dropped** (`V7__redis_inventory.sql`). It had become write-only: pre-warm
+   and rebuild wrote it, nothing read it, and the rebuild derives its numbers from the ledger
+   without consulting it. A write-only table named `tier_inventory` with a column named `remaining`
+   reads exactly like the source of truth it is not. **This costs V1's `CHECK (remaining >= 0)`**,
+   described there as the database-level guarantee that an oversell cannot be persisted; it guarded
+   a number nobody read, and the guarantee now lives in `stock_reserve.lua` and is watched by
+   `flashseats.stock.drift`.
+4. **The rebuild counts *every* `ACTIVE` hold**, dropping `catalog.md`'s `expires_at > now()`
+   filter. A hold past its expiry that the sweeper has not reached still owns its seats and will
+   have them restored, so excluding it means nobody subtracts them now and the sweeper hands them
+   back a moment later — the same seats counted twice.
+5. **Browse degrades to `UNKNOWN`, not to "`tier_inventory` marked approximate."** With the table
+   gone there is nothing to degrade to, and `UNKNOWN` is already ADR-040's answer: clients render it
+   neutrally and keep the tier selectable.
+
+**The rebuild reads the ledger twice.** A reserve decrements Redis a moment before its hold row
+commits, so a single snapshot can miss a hold that is seconds from existing and write a count that
+is too high — an oversell produced by the procedure meant to repair one. Two snapshots a settling
+window apart, and the smaller of the two, make that impossible while still returning seats genuinely
+abandoned, which read the same both times.
+
+**It lives in `order`.** The ledger spans three modules' tables and `order` is the only module that
+may read all three: it owns `order_items`, and `order → hold` and `order → catalog` already exist.
+`catalog` would need its first outbound edge and the graph would cycle; one native query across the
+other modules' tables would hide the same violation where `ApplicationModules.verify()` cannot see
+it. The endpoint is therefore `POST /api/v1/admin/events/{id}/rebuild-stock` served by `order`,
+which is the one place ADR-043's "endpoints live in the module that owns the state" bends — the
+state here is nobody's alone.
+
+**A Redis restart is the one inventory failure no ordering can prevent.** AOF is
+`appendfsync everysec`, so a restart or a Sentinel failover replays to roughly a second ago: the
+decrements in that second are gone while the `ticket_holds` rows that paid for them remain, and the
+counters come back **high**. `catalog.md` has always said a rebuild is mandatory after a Redis
+restart; `StockEpoch` is what makes that true rather than a note someone has to remember at three in
+the morning. Each event carries its own vouched `run_id` in `catalog:vouch:{eventId}`, written only
+by pre-warm and rebuild. An event vouched for by a different instance than the one running refuses
+holds with `503 INVENTORY_UNAVAILABLE` until it is rebuilt.
+
+**Per event, in Redis, recomputed each tick** — all three matter. Per event, so repairing one sale
+vouches for nothing else and a sale created after the restart is never in doubt. In Redis, so every
+replica reaches the same verdict and a rebuild performed on one releases the event on all of them.
+Recomputed rather than accumulated, so noticing the restart does not consume it: an earlier cut kept
+one in-memory flag and stamped a single shared key, which meant whichever replica noticed first used
+the signal up and its neighbours went on selling from the same rolled-back counters.
+
+**What is deliberately *not* in this stage.** The `hold:{token}` TTL key and the
+`__keyevent@0__:expired` listener. They are a latency optimisation — `HoldReconciliationSweeper`
+already reclaims every expired hold and is unchanged — and the one thing needing proof about them,
+that three replicas receiving the same broadcast expiry restore a hold exactly once, cannot be
+observed on one instance. They move to Stage 3 with the rest of the multi-replica work.
+`HoldFacade.discardTimer` stays the no-op it has always been.

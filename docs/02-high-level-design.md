@@ -82,7 +82,11 @@ This is the question the whole system turns on, and the answer changes by phase 
 | Phase | Fast path | Authority | Primitive |
 | :--- | :--- | :--- | :--- |
 | 1 (MVP) | — | `tier_inventory.remaining` in PostgreSQL | `UPDATE … WHERE remaining >= :q` |
-| 2+ | `catalog:stock:{e}:{t}` in Redis | Redis during the sale; PostgreSQL for **rebuild** | `hold_reserve.lua` |
+| **2+ (current)** | `catalog:stock:{e}:{t}` in Redis | **Redis holds the count; PostgreSQL holds what it is derived from** | `stock_reserve.lua` |
+
+Phase 2 arrived in Stage 1 and `tier_inventory` went with it: it had become a write-only copy of a
+number that had moved (ADR-046). What PostgreSQL keeps is the ledger the count is *rebuilt* from —
+`ticket_tiers.total_capacity` minus `order_items` sold minus `ticket_holds` held.
 
 In Phase 1, one statement does everything:
 
@@ -172,7 +176,7 @@ Fails open if Google is unreachable: a deliberate availability-over-security tra
 limits as the compensating control.
 
 ### `catalog` — metadata and inventory ownership
-Owns `events`, `ticket_tiers`, `tier_inventory` and the Redis stock counters. Derives
+Owns `events`, `ticket_tiers` and the Redis stock counters. Derives
 `windowStatus ∈ {UPCOMING, OPEN, CLOSED}` and publishes `serverTime` so the landing-page countdown
 runs on the server's clock, not the device's. Seeds counters via `SETNX` **only while `UPCOMING`**,
 and owns the rebuild procedure.
