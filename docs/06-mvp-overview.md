@@ -236,11 +236,19 @@ attached to the email in Mailpit, and the stock invariant holding across all thr
 
 Honest list. None of these is hidden behind a passing test.
 
-- **Single replica verified.** Promotion fan-out is implemented over Redis Pub/Sub and is correct by
-  construction, but it has not been exercised with `--profile cluster`. That check cannot be made
-  from one instance.
-- **No load test run.** The k6 harness exists but still uses the pre-ADR-020 pass flow; it needs the
-  `/queue/admit` exchange before it will run.
+- ~~**Single replica verified.**~~ **Verified on three** (Stage 3). 30/30 sessions promoted, spread
+  10/10/10 across the replicas, through nginx. `docker/scripts/fanout-check.sh` re-runs it in
+  seconds. ADR-007's fan-out is no longer a construction argument.
+- ~~**No load test run.**~~ **Run** (Stage 3), at 300 and 2,000 VUs: exactly 500 sold, zero
+  overbooking, zero inventory 503s, zero rate-limited requests, `stock.drift` `0.0` on every
+  replica. The harness needed four fixes first, all in ADR-047.
+- **The 10,000-VU run has not happened**, and the limit is the host, not the system. Three JVMs take
+  ~6 GB of the 7.65 GB this machine gives Docker, and k6 costs ~0.33 MB per VU. 2,000 VUs is the
+  ceiling here; at that load Redis sat at 10.5k ops/s and 29 % CPU, so the system was not the thing
+  running out. Needs a host with ~32 GB.
+- **Checkout p99 is 682 ms at 300 VUs and 4.7 s at 2,000**, against a 200 ms exit criterion. Also a
+  host artefact — the load generator and three JVMs were competing for ten cores — but it is
+  unmeasured on real hardware, so it stays an open number rather than a passing one.
 - **`stock.drift` will read non-zero transiently under live traffic.** Redis and PostgreSQL are not
   read in one snapshot, so a hold created between the two reads shows as a momentary gap. The two
   SQL sums *are* one snapshot, which removes the only drift the measurement can manufacture by
@@ -261,10 +269,15 @@ Honest list. None of these is hidden behind a passing test.
   with the outbox row already burned — the one failure the outbox exists to prevent. Deliberately
   deferred to Stage 3 with the rest of the broker work; the fix is `publisher-confirm-type=correlated`
   and marking processed only on the ack.
-- **`QueueBroadcaster` does 3–4 sequential Redis round trips per connection per 2 s tick.** At ten
-  thousand connections one sweep cannot finish inside its own interval. Pass 1 removed one read per
-  session (the window is now resolved once per event) but the shape is unchanged. Needs the k6
-  harness to validate a fix, so it moves with Stage 3.
+- **`QueueBroadcaster` does 4 sequential Redis round trips per connection per 2 s tick** — the
+  admission `GET`, the pass `GET`, the exhausted `EXISTS` and the waiting `ZRANK`. The cost is linear
+  in *connections* against a fixed interval, so past some connection count the sweep cannot finish
+  inside it.
+  **Measured in Stage 3, and it is not that count yet.** At 2,000 VUs the median gap between
+  `position-update` frames was **2,016 ms against a configured 2,000 ms** — the sweep is keeping up,
+  and Redis was at 29 % CPU. So the fix stays deferred on evidence rather than on arithmetic.
+  `docker/scripts/sse-cadence.sh` is the instrument; re-run it at the scale that matters. When the
+  median does drift, the fix is one pipelined round trip per event per tick.
 - **`notification.order-refunded.queue` has no consumer**, so it grows without bound on a durable
   broker. The refund-notice template is Stage 4.
 - **Checkout does not survive a Redis outage.** It opens with `SETNX payment:inflight:{holdToken}`,
@@ -352,21 +365,43 @@ them is a multi-replica one.
 - `ip_rules`, `bot_audit_logs` (async, non-`ALLOWED` outcomes only), and `V6__bot.sql`.
 - **All four "must fix" items in §10.**
 
-### Stage 3 — Scale and proof (Phase 4)
+### Stage 3 — Scale and proof (Phase 4) — **done, with two items carried forward**
 
-- Run `docker compose --profile cluster` and verify promotion fan-out across replicas. **This is the
-  highest-value unverified claim in the system** and the first thing to check.
-- Verify the Redis-restart guard across replicas: every replica must distrust an event, and a
-  rebuild on one must release it on all. Built for this (ADR-046) and observable only here.
-- The `hold:{token}` timer and the `__keyevent@0__:expired` listener, deferred out of Stage 1
-  because the thing to prove — three replicas receiving one broadcast expiry restore a hold exactly
-  once — needs three replicas.
-- Fix `docker/k6/flash-sale.js` for the ADR-020 admission flow, then the 10,000-VU run: 500 tickets,
-  exactly 500 sold, zero overbooking, checkout p99 under 200 ms.
-- Nginx in front, Redis Sentinel behind.
-- The full metric set and its alarms — `stock.drift`, `hikaricp_connections_pending`,
-  `outbox.lag.seconds`, `dlq.depth`, `queue.promotion.rate`, `payment.decline.ratio`,
-  `jvm.threads.pinned`.
+Full account in **ADR-047**. The stage was scoped "infrastructure only, no application code", and
+that held — but only after four unlisted blockers, because the cluster could not start, had no sale
+to run, and would have rate-limited its own load harness to nothing.
+
+**Done:**
+
+- ~~Verify promotion fan-out across replicas.~~ **30/30 sessions promoted, 10/10/10 across the three
+  replicas.** The highest-value unverified claim in the system, now verified and re-runnable in
+  seconds via `docker/scripts/fanout-check.sh`.
+- ~~Verify the Redis-restart guard across replicas.~~ All three independently refused to sell, and a
+  rebuild on **one** released the event on **all three** — ADR-046's per-event, recomputed-each-tick
+  design, observed rather than reasoned about.
+- ~~Fix `docker/k6/flash-sale.js` for the ADR-020 admission flow.~~ It had five defects, not one: no
+  `/queue/admit` exchange, the wrong success code for join (202, not 200/201), `body.state` for a
+  field named `phase`, a read-only mount its own summary write needed, and a `cookies` option k6 has
+  never had. Plus the per-VU `X-Forwarded-For` without which the run measures the rate limiter.
+- ~~Killing one replica mid-sale.~~ 485 sold + 11 active holds + 4 remaining = 500, exactly.
+- ~~Nginx in front.~~ And a defect in it that made **every** proxied API request answer a bare HTTP
+  400 — `proxy_set_header` replaces the inherited set rather than merging, so `Host` fell back to the
+  upstream name and Tomcat rejected the underscore.
+- The load run at the host's ceiling: exactly 500 sold, zero overbooking, zero inventory 503s,
+  `stock.drift` `0.0` everywhere, 677 notifications with zero duplicates and an empty DLQ.
+
+**Carried forward, deliberately:**
+
+- **Redis Sentinel**, deferred in ADR-047. No exit criterion needs failover, and it works against the
+  Redis-restart criterion, which is cleanest against a standalone instance that simply stops.
+- **The 10,000-VU run and the p99 number.** Both need a host where the load generator is not
+  competing with the system under test; see §9.
+- The `hold:{token}` timer and the `__keyevent@0__:expired` listener. Stage 3 built the rig that can
+  prove them — three replicas receiving one broadcast expiry must restore a hold exactly once — and
+  did not build them.
+- The rest of the metric set and its alarms: `outbox.lag.seconds`, `dlq.depth`,
+  `queue.promotion.rate`, `payment.decline.ratio`, `jvm.threads.pinned`. `stock.drift` and
+  `hikaricp_connections_pending` are exported and were read per replica throughout.
 
 ### Stage 4 — The operator surface, and it is not optional (ADR-043)
 
@@ -714,3 +749,48 @@ ADR-040 holding through the change. `rebuild-stock` then reconstructed event 2 a
 from capacity, which is precisely ADR-004's prohibition.
 
 - **Result:** 68 tests green, up from 53.
+
+### Pass 5 — Stage 3, the cluster under load
+
+- **Scope:** infrastructure only — Nginx, k6, the multi-replica drills — with no `src/main/java`
+  change, no new dependency, and no module-spec change. Full rationale in **ADR-047**.
+
+**The stage's own premise was the first thing to fail.** "Infra only, no app code" held, but
+"existing infra just needs running" did not: the cluster could not start, had no sale to run, and
+would have throttled its own load harness.
+
+| Found | Fix |
+| :--- | :--- |
+| **nginx `proxy_set_header` replaces the inherited set rather than merging.** The three locations that set `Connection ""` dropped `Host` and `X-Forwarded-For`; `Host` fell back to `$proxy_host` = `flashseats_app`, and Tomcat rejects underscores in a domain name. **Every proxied API request answered a bare HTML 400** — below Spring, so no `ProblemDetail` and no `code` | The shared set moved to `docker/nginx/proxy-headers.conf` and is `include`d by every proxying location, so adding a location cannot reintroduce it |
+| `isTrustedProxy` takes exact addresses (ADR-039, on purpose), but nothing gave the proxy a fixed one. Unset, all 10k buyers share nginx's one IP bucket | Explicit compose subnet; nginx pinned to `172.28.0.10`, which `FLASHSEATS_TRUSTED_PROXIES` names |
+| **k6 is one container, so 10k VUs are one IP bucket** — capacity 300, refill 150/s. The run would have measured the rate limiter | Per-VU synthetic `X-Forwarded-For`. The faithful simulation, not a bypass: 10k real buyers do come from many addresses |
+| `CatalogDevSeeder` is `@Profile("dev")` and there is no create-event endpoint, so the `docker` profile has an empty catalog | `docker/seed/seed.sql` seeds reserved event **9001** as `UPCOMING`; `seed.sh` pre-warms it — the only sanctioned way to write a counter (ADR-004) — and waits for `OPEN` |
+| Seeding id 1 with `ON CONFLICT DO NOTHING` silently deferred to the dev seeder's 700-seat event while the test asserted a capacity of 500 | Reserved id, and the seed resets its own event in PostgreSQL *and* Redis so a second run is a real second run |
+| `.env` shipped byte-identical to `.env.example`, so `SecretsGuard` refused all three replicas | `docker/secrets/gen-env.sh`, idempotent — it never rotates a secret already set |
+| k6 sent the pass to `/holds` as `X-Queue-Pass-Token`; `/holds` reads `X-Admission-Token`, so no run ever reached checkout | The `/queue/admit` exchange, where ADR-020 revokes the pass |
+| k6 scored join on `200\|\|201` (it is **202**) and read `body.state` (the field is **`phase`**), so `join_success_rate` was always 0 and sold-out was never detected — every VU burned its full 180 s deadline | Both corrected; `checkout_duration_ms` threshold also moved from 2000 ms to the roadmap's actual 200 ms |
+| `handleSummary` wrote to a `:ro` mount, and `cookies: {enabled:true}` is not a k6 option | Mount made writable; the bogus option dropped — k6 gives every VU its own jar by default |
+
+**What the rig then proved.**
+
+| Claim | Result |
+| :--- | :--- |
+| **Promotion fan-out across replicas (ADR-007)** | **30/30 promoted, 10/10/10 across the three upstreams.** The highest-value unverified claim in the system |
+| No overbooking under load | **Exactly 500 sold** at 300 and 2,000 VUs. Zero inventory 503s, zero rate-limited requests |
+| `confirmed + active_holds + remaining == total_capacity` | Held **exactly** on every check, including mid-drain: 485 + 11 + 4 = 500 immediately after a replica was killed, and 485 + 5 + 10 = 500 as the sweeper returned seats |
+| Redis restart mid-sale (ADR-046) | All three replicas independently refused to sell; a rebuild on **one** released the event on **all three** |
+| Killing a replica mid-sale | No stock lost or invented. Five orders left `PENDING` — the in-flight case ADR-034 exists for, recoverable rather than stranded |
+| Fulfilment | 677 notifications `SENT`, **zero** `(order_number, kind)` duplicates, DLQ empty |
+| `stock.drift` | `0.0` on all three replicas after every run |
+| `QueueBroadcaster` sweep cadence | Median gap **2,016 ms against a configured 2,000 ms** at 2,000 VUs — keeping up. The batching fix stays deferred on evidence, not arithmetic |
+
+**Measured, not reached.** The 10,000-VU run and the 200 ms p99 both need a bigger host: three JVMs
+hold ~6 GB of this machine's 7.65 GB Docker allocation and k6 costs ~0.33 MB per VU. At the 2,000-VU
+ceiling Redis ran at 10.5k ops/s and 29 % CPU, so the system was not what ran out — the laptop was.
+Recorded in §9 as open numbers rather than passing ones.
+
+**Two new instruments, both re-runnable.** `docker/scripts/fanout-check.sh` fails loudly if fan-out
+ever regresses; `docker/scripts/sse-cadence.sh` measures the broadcaster from the client side, so
+the decision to batch its reads stays gated on a number.
+
+- **Result:** 68 tests green, unchanged — nothing here touches `src/main/java`.

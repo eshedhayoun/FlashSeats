@@ -1329,3 +1329,110 @@ already reclaims every expired hold and is unchanged — and the one thing needi
 that three replicas receiving the same broadcast expiry restore a hold exactly once, cannot be
 observed on one instance. They move to Stage 3 with the rest of the multi-replica work.
 `HoldFacade.discardTimer` stays the no-op it has always been.
+
+---
+
+## ADR-047 — Proving the cluster: what a load harness must simulate, and what Stage 3 deliberately did not build
+
+**Status:** Accepted (Stage 3)
+**Supersedes:** nothing. **Amends:** the Phase 4 scope in `04-implementation-roadmap.md`.
+
+### Context
+
+Stage 3 was scoped "infrastructure only — Nginx, Sentinel, k6 — no application code", on the
+reasoning that every module was already built and the stage's job was to *run existing code under
+new conditions*. That reasoning held. The scope did not, until four things were fixed that nobody
+had listed, because none of them can be seen from one instance.
+
+The stage's real deliverable is evidence for one claim: **promotion fan-out works across replicas**
+(ADR-007). It is the highest-value unverified claim in the system, it is correct by construction and
+invisible on a single instance, and a naive implementation drops roughly two-thirds of promotions on
+three replicas.
+
+### Decision 1 — The proxy needs a fixed address, because the trust check takes addresses
+
+`RateLimitService.isTrustedProxy` is exact-address set membership. ADR-039 chose that over a CIDR
+parser deliberately: this is the single check that decides whether the rate limiter can be bypassed,
+and a range parser is a good place for a subtle bug to hide.
+
+The consequence had not been drawn. An exact address means the proxy must *have* a fixed one, and a
+compose bridge assigns them dynamically. So the network carries an explicit subnet and **nginx is
+pinned to `172.28.0.10`**, which `FLASHSEATS_TRUSTED_PROXIES` names.
+
+Left unpinned, the failure is silent and total: the header is ignored, every request appears to come
+from nginx, and all ten thousand buyers share one IP bucket of capacity 300 refilling at 150/s.
+
+### Decision 2 — `proxy_set_header` replaces the inherited set; the shared headers are an include
+
+**This one had already broken the cluster, and nothing could have noticed.** nginx does not merge
+`proxy_set_header` — a directive at one level discards the entire set inherited from above. The
+five proxy headers were declared once in the `server` block, and the three locations that added
+their own `proxy_set_header Connection ""` — the SSE stream, `/api/`, and the webhook — silently
+dropped all five.
+
+Two consequences, and the first hid the second:
+
+- With no `Host`, nginx sends `$proxy_host`, which is the upstream name `flashseats_app`. Tomcat
+  rejects it — *"The character [_] is never valid in a domain name"* — so **every proxied API
+  request answered a bare HTML 400** before Spring ever saw it. Not a `ProblemDetail`, not a `code`
+  from the §2 registry: a Tomcat error page, because the request died below the application.
+- With no `X-Forwarded-For`, Decision 1 would have achieved nothing anyway. The address the rate
+  limiter needs was never being sent on the API path.
+
+The set therefore lives in `docker/nginx/proxy-headers.conf` and is `include`d by every location
+that proxies. Repeating it inline would work and would invite the same defect back the next time
+someone adds a location.
+
+### Decision 3 — The load harness must send a per-VU `X-Forwarded-For`
+
+k6 runs as **one container**, so all ten thousand virtual users share one source address and
+therefore one IP bucket. Against a bucket of 300 refilling at 150/s, a ten-thousand-user run
+measures `flashseats.bot.ip-bucket` and nothing else.
+
+So `flash-sale.js` sends each VU its own synthetic `X-Forwarded-For`. **This is the faithful
+simulation, not a bypass of one.** Ten thousand real buyers arrive from thousands of addresses; one
+container pretending to be ten thousand people from one address is the unrealistic case. It works
+because nginx sets `$proxy_add_x_forwarded_for`, which appends rather than replaces, and the filter
+reads `split(",")[0]`. The session bucket — ADR-011's *primary* control — is untouched and still
+applies per VU.
+
+### Decision 4 — The load-test sale is a reserved id, seeded in SQL and pre-warmed over HTTP
+
+`CatalogDevSeeder` is `@Profile("dev")` and the cluster runs `docker`, so the cluster starts with an
+empty catalog and there is no create-event endpoint. Widening the profile was rejected: it would put
+demo-data seeding into the profile the packaged image runs, which is what ADR-039 had just finished
+removing.
+
+The sale is therefore seeded in SQL (`docker/seed/seed.sql`) as **event 9001**, and its counters are
+written by `POST /admin/events/{id}/prewarm` — the only sanctioned path, and the reason the seeded
+window is `UPCOMING`: pre-warm refuses anything else (ADR-004), because seeding `total_capacity`
+into an open sale is precisely the failure that rule names.
+
+The id is reserved rather than `1` because the postgres volume outlives any run. An earlier draft
+seeded id 1 with `ON CONFLICT DO NOTHING`, found the dev seeder's event already there, silently did
+nothing, and pointed the whole load test at a 700-seat sale while asserting against a capacity of
+500. Seeding also resets its own event — in PostgreSQL *and* in Redis — because a second run against
+a drained counter sells nothing and proves nothing.
+
+### Decision 5 — Sentinel is deferred, and the reason is not cost
+
+Sentinel is named in Phase 4 and is **not** built here. No Phase 4 exit criterion needs failover;
+they need fan-out, no-oversell, p99, drift and fulfilment. More importantly it works *against* the
+criterion "restarting Redis mid-sale → reconciliation restores the exact count", which is ADR-046's
+vouch guard and is cleanest to observe against a standalone Redis that simply stops and starts.
+
+Sentinel does not weaken that guard — it makes it matter more, since a failover to a replica that
+lost a second of `DECRBY`s is exactly the case `catalog:vouch:{e}` exists to catch. That is an
+argument for building Sentinel *after* the guard has been proven by hand, not before.
+
+### Consequences
+
+- Three replicas, one nginx, `--profile cluster`: **30/30 sessions promoted across all 3 replicas**.
+  ADR-007's Pub/Sub fan-out is verified rather than asserted. `docker/scripts/fanout-check.sh`
+  re-runs it in seconds and fails loudly if a future change breaks it.
+- A load run is deterministic and repeatable: seed, run, re-seed, run again.
+- `docker/scripts/sse-cadence.sh` measures what `QueueBroadcaster`'s sweep actually costs, from the
+  client side, so the decision to batch its per-connection reads is gated on a number rather than on
+  the arithmetic in §9.
+- The `hold:{token}` timer and the keyspace-expiry listener remain deferred. Stage 3 built the rig
+  that can prove them; it did not build them.

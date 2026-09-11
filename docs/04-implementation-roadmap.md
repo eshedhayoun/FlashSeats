@@ -182,13 +182,41 @@ insert-then-send; `REFUND_NOTICE` template; admin resend.
 **Load harness** — k6 firing 10,000 virtual users at Nginx.
 
 ### Exit criteria
-- [ ] **10,000 users, 500 tickets, exactly 500 sold, zero overbooking.**
-- [ ] 500 PDF emails land in Mailpit; zero duplicates; DLQ empty.
-- [ ] Killing one replica mid-sale loses no orders and no stock.
-- [ ] Restarting Redis mid-sale → reconciliation restores the exact count.
-- [ ] Checkout p99 under 200 ms at peak.
-- [ ] `stock.drift` zero for the entire run.
-- [ ] Every SSE client receives its promotion across all 3 replicas.
+
+Measured in Stage 3 on a 10-core laptop, Docker Desktop capped at 7.65 GB. Every *correctness*
+criterion passes. The one that does not is the latency number, and the reason is the host — see
+below.
+
+- [x] **500 tickets, exactly 500 sold, zero overbooking.** Verified at 300 and 2,000 VUs, and again
+      with a replica killed mid-sale. `confirmed + active_holds + remaining == total_capacity` held
+      exactly on every check.
+- [ ] **10,000 users.** Not run here, and not for want of trying: three JVMs hold ~6 GB of the
+      7.65 GB Docker gets, and k6 needs ~0.33 MB per VU (660 MB at 2,000), so 10,000 VUs wants
+      roughly 3.3 GB that does not exist. **2,000 VUs is this machine's ceiling, not the system's**
+      — at that load Redis ran at 10.5k ops/s and 29 % CPU. The run needs a host with ~32 GB.
+- [x] PDF emails land in Mailpit; **zero duplicates**; DLQ empty. 677 `notification_logs` rows, all
+      `SENT`, zero `(order_number, kind)` duplicates.
+- [x] **Killing one replica mid-sale loses no orders and no stock.** `docker kill` on app-2 at
+      196 remaining: 485 sold + 11 active holds + 4 remaining = 500. Five orders were left `PENDING`
+      — the in-flight case ADR-034 exists for, and recoverable, not stranded.
+- [x] **Restarting Redis mid-sale → reconciliation restores the exact count.** All three replicas
+      independently refused to sell (`catalog:vouch:{e}` no longer matched Redis's `run_id`), and a
+      rebuild issued on **one** replica released the event on **all three**. This is ADR-046's
+      per-event, recomputed-each-tick design doing exactly what it was built for.
+- [ ] **Checkout p99 under 200 ms at peak.** Measured 682 ms at 300 VUs and 4,689 ms at 2,000. Not a
+      verdict on the design: the three JVMs were at 130–190 % CPU each and k6 at 163 % on ten shared
+      cores, with the whole stack plus the load generator on one laptop. Re-measure on a host where
+      the generator is not competing with the system under test.
+- [x] **`stock.drift` zero for the entire run.** `flashseats_stock_drift` read `0.0` on all three
+      replicas after every run.
+- [x] **Every SSE client receives its promotion across all 3 replicas.** 30/30, spread 10/10/10 over
+      the three upstreams, repeatable via `docker/scripts/fanout-check.sh`. **This was the point of
+      the stage** — ADR-007's Pub/Sub fan-out is now verified rather than asserted.
+
+**Not built:** Redis Sentinel, deferred with reasons in ADR-047. Four blockers found and fixed
+before any of the above could run are recorded there too; one of them — nginx dropping `Host` and
+`X-Forwarded-For` in every location that set a header of its own — meant *every* proxied API request
+answered a bare HTTP 400.
 
 ---
 
