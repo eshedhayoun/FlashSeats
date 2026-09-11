@@ -138,10 +138,14 @@ class HoldLifecycleIT extends IntegrationTest {
         assertThat(second.status()).isEqualTo(409);
         assertThat(second.errorCode()).isEqualTo("HOLD_LIMIT_EXCEEDED");
 
-        // The rejected attempt must not have cost the tier any inventory: the decrement and the
-        // insert share a transaction, so the constraint violation rolled both back.
+        // The rejected attempt must not have cost the tier any inventory — and this is no longer
+        // free. The decrement is a Redis write that happens BEFORE the insert and cannot roll back
+        // with it, so those two seats come back only because the constraint violation is caught and
+        // explicitly compensated. A buyer double-clicking is the ordinary way to reach this path;
+        // without the compensation every double-click would quietly burn seats.
         assertThat(fixture.remaining(tierId)).isEqualTo(CAPACITY - 2);
         assertThat(fixture.countHolds("ACTIVE")).isEqualTo(1);
+        assertThat(fixture.stockInvariantHolds(tierId)).isTrue();
     }
 
     @Test

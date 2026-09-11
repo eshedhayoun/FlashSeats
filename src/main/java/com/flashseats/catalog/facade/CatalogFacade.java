@@ -1,6 +1,7 @@
 package com.flashseats.catalog.facade;
 
 import java.util.List;
+import java.util.Map;
 
 /**
  * The only legal way into {@code catalog} from another module.
@@ -37,16 +38,6 @@ public interface CatalogFacade {
     List<Long> findOpenEventIds();
 
     /**
-     * Exact remaining seats for one tier, for internal use only — never rendered to a buyer, who
-     * sees a bucket instead (ADR-027).
-     *
-     * @return remaining seats, or {@code -1} when no counter exists. {@code -1} is a
-     *     <strong>fault</strong> and callers must treat it as one: it means inventory state is
-     *     missing, not that the tier is sold out (ADR-004).
-     */
-    int getRemaining(long tierId);
-
-    /**
      * Total remaining across every tier of an event. Bounds how many buyers the queue admits.
      *
      * @return remaining seats, or {@link #COUNTER_UNAVAILABLE} when <em>any</em> tier of the event
@@ -57,17 +48,60 @@ public interface CatalogFacade {
     int getRemainingForEvent(long eventId);
 
     /**
-     * Atomically takes seats from a tier. <strong>Must be called inside the caller's
-     * transaction</strong> so the reservation that justifies the decrement commits or rolls back
-     * with it.
+     * Atomically takes seats from a tier.
      *
-     * @return true when reserved, false when stock is insufficient
+     * <p><strong>Must not be called inside a SQL transaction.</strong> This is a Redis write, and
+     * Redis does not roll back — a decrement inside a transaction that then fails would leak the
+     * seats permanently (ADR-023). The caller records the hold that justifies it immediately
+     * afterwards and compensates with {@link #restore} if that record cannot be written.
+     *
+     * <p>It used to be the opposite: the decrement was a SQL {@code UPDATE} and
+     * {@code Propagation.MANDATORY} bound it to the caller's transaction so the two rolled back
+     * together. That coupling no longer exists and the annotation would now be a lie about it.
      */
-    boolean tryReserve(long tierId, int quantity);
+    ReserveResult tryReserve(long eventId, long tierId, int quantity);
 
     /**
-     * Returns seats to a tier. Call only after winning the settle-once claim on the hold — that
-     * claim is what makes restoration exactly-once (ADR-019).
+     * Returns seats to a tier.
+     *
+     * <p>Call only after winning the settle-once claim on the hold — that claim, not this call, is
+     * what makes restoration exactly-once (ADR-019) — and only <strong>after the claim has
+     * committed</strong>. Incrementing before the commit would hand the seats back and then let the
+     * transaction put the hold back to {@code ACTIVE}, which is an oversell.
+     *
+     * <p>Does nothing if the tier has no counter: creating one here would conjure inventory out of a
+     * single expiring hold (ADR-004). Those seats are reported by the drift gauge and returned by a
+     * rebuild.
      */
-    void restore(long tierId, int quantity);
+    void restore(long eventId, long tierId, int quantity);
+
+    /**
+     * Every tier of an event and the capacity it was created with.
+     *
+     * <p>The starting point for a rebuild: {@code capacity − confirmed − held} is the only legal way
+     * to work out what a lost counter should hold (ADR-004).
+     */
+    Map<Long, Integer> getTierCapacities(long eventId);
+
+    /**
+     * The live counters as they stand, tier id to remaining.
+     *
+     * <p><strong>A tier with no counter is absent, never zero.</strong> The caller is either
+     * measuring drift or repairing a fault, and both need to tell "nothing left" from "nothing
+     * known" (ADR-035, ADR-040).
+     */
+    Map<Long, Integer> getLiveCounters(long eventId);
+
+    /**
+     * Overwrites the live counters with values derived from the ledger.
+     *
+     * <p><strong>The only legal reseed of an open sale.</strong> Every other path into a counter
+     * either creates it from capacity before the sale opens (pre-warm) or moves it by one
+     * reservation. Passing anything not computed as {@code capacity − confirmed − held} would
+     * resurrect sold tickets, which is the failure ADR-004 exists to prevent.
+     *
+     * <p>Callers must hold the rebuild lock. This method does not take it, because the lock has to
+     * span the ledger read that produced these numbers — and that read happens in the caller.
+     */
+    void applyRebuild(long eventId, Map<Long, Integer> remainingByTier);
 }

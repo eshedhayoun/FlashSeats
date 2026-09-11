@@ -77,17 +77,24 @@ public class HoldService {
     /**
      * Reserves seats.
      *
-     * <p><strong>The stock decrement and the hold row are one transaction, deliberately.</strong> If
-     * the insert is rejected — most often by {@code idx_holds_one_active_per_session}, when a buyer
-     * already holds seats for this event — the decrement rolls back with it. Splitting them would
-     * leak the seats of every rejected attempt.
+     * <p><strong>The decrement is deliberately outside any transaction.</strong> It is a Redis write
+     * now, and Redis does not roll back — holding it inside the transaction that writes the hold row
+     * would leak the seats of every rejected attempt permanently, which is precisely the trap
+     * ADR-023 exists to name. The two are instead ordered and compensated: take the seats, write the
+     * row that justifies them, and give them straight back if that row cannot be written.
+     *
+     * <p>The compensation runs only on a constraint rejection, because that is the one failure whose
+     * outcome is <em>certain</em>. A flush that violates
+     * {@code idx_holds_one_active_per_session} — a buyer double-clicking, the ordinary case — leaves
+     * no row, so the seats are unambiguously ours to return. A failure at commit is ambiguous: the
+     * row may exist, and returning seats that are still held would be an oversell. Those fall
+     * through to {@code flashseats.stock.drift} and a rebuild, which is the safe direction.
      *
      * <p>Note the two distinct failures when the reserve does not succeed. "Not enough seats" is a
      * {@code 409} that means try another tier; "no counter at all" is a {@code 503} fault. Treating
-     * the second as the first would announce a sold-out sale to every buyer because a row was missing
-     * (ADR-004).
+     * the second as the first would announce a sold-out sale to every buyer because a key was
+     * missing (ADR-004).
      */
-    @Transactional
     public TicketHold createHold(
             String sessionId, long eventId, long tierId, int quantity, String admissionToken) {
 
@@ -103,12 +110,12 @@ public class HoldService {
             throw new QuantityExceedsLimitException(quantity, maxQuantity);
         }
 
-        if (!catalog.tryReserve(tierId, quantity)) {
-            if (catalog.getRemaining(tierId) == CatalogFacade.COUNTER_UNAVAILABLE) {
-                log.error("Inventory counter missing for tier {} during an open sale", tierId);
-                throw new InventoryUnavailableException(tierId);
+        switch (catalog.tryReserve(eventId, tierId, quantity)) {
+            case COUNTER_MISSING -> throw new InventoryUnavailableException(tierId);
+            case INSUFFICIENT -> throw new InsufficientStockException(tierId, quantity);
+            case RESERVED -> {
+                /* carry on: the seats are ours until the row below says otherwise */
             }
-            throw new InsufficientStockException(tierId, quantity);
         }
 
         TicketHold hold = new TicketHold(
@@ -119,9 +126,11 @@ public class HoldService {
                 quantity,
                 clock.instant().plusSeconds(properties.getTtlSeconds()));
         try {
-            // Flushed here, not at commit, so the constraint speaks while we can still translate it.
+            // Flushed here, not at commit, so the constraint speaks while we can still translate it
+            // — and while its verdict is still unambiguous enough to compensate on.
             holds.saveAndFlush(hold);
         } catch (DataIntegrityViolationException violation) {
+            catalog.restore(eventId, tierId, quantity);
             if (!isOneActiveHoldPerSession(violation)) {
                 // Some other constraint on this table. Reporting it as "you already hold seats"
                 // would answer a question the buyer never asked and hide a real schema problem —
@@ -272,6 +281,20 @@ public class HoldService {
         return reclaimed;
     }
 
+    // ----------------------------------------------------------- reconciliation
+
+    /**
+     * Seats currently held on a tier, for the stock invariant and the rebuild.
+     *
+     * <p>Includes holds already past their expiry: they are still {@code ACTIVE}, they still own
+     * their seats, and the sweeper will hand those seats back. Excluding them would let a rebuild
+     * and the sweeper each account for the same seats.
+     */
+    @Transactional(readOnly = true)
+    public int sumActiveQuantityForTier(long tierId) {
+        return holds.sumActiveQuantityForTier(tierId);
+    }
+
     // ----------------------------------------------------------------- helpers
 
     /**
@@ -307,16 +330,20 @@ public class HoldService {
     }
 
     /**
-     * Runs the settle-once claim and, only if this caller won it, returns the seats to stock.
+     * Runs the settle-once claim and, if this caller won it, arranges for the seats to come back.
      *
      * <p>Every ending that gives seats back funnels through here, which is what makes "restored
      * exactly once per hold" true by construction rather than by careful call-site discipline.
+     *
+     * <p><strong>The restore itself happens after this transaction commits</strong>, in
+     * {@link HoldPostCommitTasks}, because the counter now lives in Redis and Redis does not roll
+     * back. Incrementing inline would hand the seats out and then let a rollback put the hold
+     * straight back to {@code ACTIVE} — both on sale and still held. {@link #sweepExpired} makes the
+     * danger concrete: it settles a whole batch in one transaction, so a single failure part-way
+     * through would return every earlier hold's seats while leaving those holds live.
      */
     private boolean settleAndRestore(TicketHold hold, HoldStatus status, SettleReason reason) {
         boolean won = holds.settle(hold.getHoldToken(), status, reason, clock.instant()) == 1;
-        if (won) {
-            catalog.restore(hold.getTierId(), hold.getQuantity());
-        }
         events.publishEvent(new TicketHoldSettledEvent(
                 hold.getHoldToken(),
                 hold.getEventId(),
