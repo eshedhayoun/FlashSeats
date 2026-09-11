@@ -29,6 +29,12 @@
 	<properties>
 		<java.version>21</java.version>
 		<spring-modulith.version>2.1.1</spring-modulith.version>
+		<!-- Third-party libraries not managed by the Spring Boot BOM. See docs/01-system-architecture.md -->
+		<bucket4j.version>8.14.0</bucket4j.version>
+		<testcontainers.version>1.21.3</testcontainers.version>
+		<pdfbox.version>3.0.7</pdfbox.version>
+		<!-- Pinned versions for Stage 2, kept so re-adding the dependency is a one-line change:
+		     stripe-java 29.2.0 · resilience4j 2.3.0 -->
 	</properties>
 	<dependencies>
 		<dependency>
@@ -62,15 +68,70 @@
 		</dependency>
 		<dependency>
 			<groupId>org.springframework.modulith</groupId>
-			<artifactId>spring-modulith-events-api</artifactId>
-		</dependency>
-		<dependency>
-			<groupId>org.springframework.modulith</groupId>
 			<artifactId>spring-modulith-starter-core</artifactId>
 		</dependency>
+
+		<!-- ===== Phase 1: operability + schema ===== -->
 		<dependency>
-			<groupId>org.springframework.modulith</groupId>
-			<artifactId>spring-modulith-starter-jpa</artifactId>
+			<groupId>org.springframework.boot</groupId>
+			<artifactId>spring-boot-starter-actuator</artifactId>
+		</dependency>
+		<dependency>
+			<groupId>io.micrometer</groupId>
+			<artifactId>micrometer-registry-prometheus</artifactId>
+			<scope>runtime</scope>
+		</dependency>
+		<!--
+			Boot 4 split Flyway's auto-configuration out of spring-boot-autoconfigure into its own
+			module. With flyway-core alone the migrations are on the classpath but nothing runs
+			them, and the first symptom is Hibernate's `ddl-auto=validate` reporting a missing
+			table — which reads like a mapping bug rather than a missing starter.
+		-->
+		<dependency>
+			<groupId>org.springframework.boot</groupId>
+			<artifactId>spring-boot-starter-flyway</artifactId>
+		</dependency>
+		<dependency>
+			<groupId>org.flywaydb</groupId>
+			<artifactId>flyway-database-postgresql</artifactId>
+			<scope>runtime</scope>
+		</dependency>
+
+		<!-- ===== Phase 3: bot defence + Stripe ===== -->
+		<dependency>
+			<groupId>org.springframework.boot</groupId>
+			<artifactId>spring-boot-starter-security</artifactId>
+		</dependency>
+		<dependency>
+			<groupId>com.bucket4j</groupId>
+			<artifactId>bucket4j_jdk17-core</artifactId>
+			<version>${bucket4j.version}</version>
+		</dependency>
+		<dependency>
+			<groupId>com.bucket4j</groupId>
+			<artifactId>bucket4j_jdk17-lettuce</artifactId>
+			<version>${bucket4j.version}</version>
+		</dependency>
+		<!--
+			Stripe, Resilience4j and Thymeleaf were declared here ahead of the stages that
+			use them, and none of them is on the classpath for a reason yet:
+
+			  - stripe-java      -> Stage 2, with StripeGateway and the webhook receiver
+			  - resilience4j-*   -> Stage 2, as plain beans (the Boot 3 starter does not apply)
+			  - thymeleaf        -> deferred indefinitely; EmailComposer builds the one small
+			                        HTML body in Java on purpose, and there is no templates/
+			                        directory. Its starter also autoconfigures a view resolver
+			                        into an API that returns nothing but JSON.
+
+			An unused dependency is not free: it ships in the image and it carries CVEs that
+			someone has to triage. They come back with the code that needs them.
+		-->
+
+		<!-- ===== Phase 4: async fulfilment ===== -->
+		<dependency>
+			<groupId>org.apache.pdfbox</groupId>
+			<artifactId>pdfbox</artifactId>
+			<version>${pdfbox.version}</version>
 		</dependency>
 
 		<dependency>
@@ -82,11 +143,6 @@
 		<dependency>
 			<groupId>org.postgresql</groupId>
 			<artifactId>postgresql</artifactId>
-			<scope>runtime</scope>
-		</dependency>
-		<dependency>
-			<groupId>org.springframework.modulith</groupId>
-			<artifactId>spring-modulith-events-amqp</artifactId>
 			<scope>runtime</scope>
 		</dependency>
 		<dependency>
@@ -129,6 +185,48 @@
 			<artifactId>spring-modulith-starter-test</artifactId>
 			<scope>test</scope>
 		</dependency>
+
+		<!--
+			Testcontainers. Our correctness claims live in Redis Lua scripts, keyspace
+			expiry notifications and PostgreSQL row-lock semantics — none of which can be
+			exercised against embedded fakes. Real containers or the tests prove nothing.
+		-->
+		<dependency>
+			<groupId>org.springframework.boot</groupId>
+			<artifactId>spring-boot-testcontainers</artifactId>
+			<scope>test</scope>
+		</dependency>
+		<dependency>
+			<groupId>org.testcontainers</groupId>
+			<artifactId>junit-jupiter</artifactId>
+			<scope>test</scope>
+		</dependency>
+		<dependency>
+			<groupId>org.testcontainers</groupId>
+			<artifactId>postgresql</artifactId>
+			<scope>test</scope>
+		</dependency>
+		<dependency>
+			<groupId>com.redis</groupId>
+			<artifactId>testcontainers-redis</artifactId>
+			<version>2.2.4</version>
+			<scope>test</scope>
+		</dependency>
+		<dependency>
+			<groupId>org.testcontainers</groupId>
+			<artifactId>rabbitmq</artifactId>
+			<scope>test</scope>
+		</dependency>
+		<dependency>
+			<groupId>org.awaitility</groupId>
+			<artifactId>awaitility</artifactId>
+			<scope>test</scope>
+		</dependency>
+		<dependency>
+			<groupId>org.springframework.security</groupId>
+			<artifactId>spring-security-test</artifactId>
+			<scope>test</scope>
+		</dependency>
 	</dependencies>
 	<dependencyManagement>
 		<dependencies>
@@ -136,6 +234,13 @@
 				<groupId>org.springframework.modulith</groupId>
 				<artifactId>spring-modulith-bom</artifactId>
 				<version>${spring-modulith.version}</version>
+				<type>pom</type>
+				<scope>import</scope>
+			</dependency>
+			<dependency>
+				<groupId>org.testcontainers</groupId>
+				<artifactId>testcontainers-bom</artifactId>
+				<version>${testcontainers.version}</version>
 				<type>pom</type>
 				<scope>import</scope>
 			</dependency>
@@ -147,6 +252,51 @@
 			<plugin>
 				<groupId>org.springframework.boot</groupId>
 				<artifactId>spring-boot-maven-plugin</artifactId>
+				<configuration>
+					<!--
+						`dev` belongs to the local run, not to the artefact. SecretsGuard is
+						@Profile("!dev & !test"), so a default profile baked into
+						application.properties made the fail-closed secrets check opt-in: a
+						packaged jar started with no SPRING_PROFILES_ACTIVE ran on development
+						secrets and seeded a demo catalog, silently (ADR-039). Setting it here
+						keeps `./mvnw spring-boot:run` working exactly as documented while the
+						jar defaults to refusing.
+					-->
+					<profiles>
+						<profile>dev</profile>
+					</profiles>
+				</configuration>
+			</plugin>
+			<!--
+				Run the *IT classes with the unit tests. They are Testcontainers-backed
+				integration tests, and they carry the guarantees this system exists to make —
+				no overbooking, restore-exactly-once, one order per hold. Relegating them to a
+				separate profile would mean `./mvnw test` reported success without ever having
+				checked the only things that matter.
+			-->
+			<plugin>
+				<groupId>org.apache.maven.plugins</groupId>
+				<artifactId>maven-surefire-plugin</artifactId>
+				<configuration>
+					<includes>
+						<include>**/*Test.java</include>
+						<include>**/*Tests.java</include>
+						<include>**/*IT.java</include>
+					</includes>
+					<systemPropertyVariables>
+						<!--
+							Docker Engine 29 rejects the API version docker-java negotiates by
+							default, and the symptom is badly misleading: /info answers HTTP 400
+							with an empty body, so Testcontainers reports "Could not find a valid
+							Docker environment" on a machine where `docker ps` works fine.
+
+							1.44 sits well inside the supported range (Engine 29 accepts 1.40 and
+							up) and is understood by every Docker since 25, so pinning it costs
+							nothing and saves the next person an hour.
+						-->
+						<api.version>1.44</api.version>
+					</systemPropertyVariables>
+				</configuration>
 			</plugin>
 			<plugin>
 				<groupId>org.apache.maven.plugins</groupId>
