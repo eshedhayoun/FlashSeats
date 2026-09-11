@@ -41,7 +41,7 @@ public class SaleFixture {
         jdbc.execute(
                 """
                 TRUNCATE notification_logs, payment_transactions, outbox_events, order_items,
-                         orders, ticket_holds, tier_inventory, ticket_tiers, events
+                         orders, ticket_holds, ticket_tiers, events
                 RESTART IDENTITY CASCADE
                 """);
 
@@ -79,18 +79,12 @@ public class SaleFixture {
                 Long.class,
                 eventId, name, priceCents, capacity);
 
-        jdbc.update(
-                "INSERT INTO tier_inventory (tier_id, event_id, remaining, updated_at) VALUES (?, ?, ?, now())",
-                tierId, eventId, capacity);
-        // The live counter, which is what every reserve and read actually consults. The row above is
-        // only the ledger's last-known-good copy; seeding one without the other is the state
-        // `tierWithoutInventory` exists to stage.
         setStockCounter(eventId, tierId, capacity);
         return tierId;
     }
 
-    /** A tier deliberately left with no counter, to exercise the missing-inventory fault path. */
-    public long tierWithoutInventory(long eventId, String name, long priceCents, int capacity) {
+    /** A tier deliberately left with no counter, to exercise the unreadable-inventory fault path. */
+    public long tierWithoutCounter(long eventId, String name, long priceCents, int capacity) {
         return jdbc.queryForObject(
                 """
                 INSERT INTO ticket_tiers
@@ -121,17 +115,14 @@ public class SaleFixture {
     }
 
     /**
-     * The live stock counter as Redis holds it, or {@code -1} when the key does not exist.
-     *
-     * <p>The key is spelled out rather than built with catalog's own key helper, for the same reason
-     * every row above is raw SQL: a fixture that shares a bug with the code it verifies proves
-     * nothing.
-     */
-    /**
      * Forces the live counter to a value, as a Redis restart or a lost restore would leave it.
      *
      * <p>The only way to stage a counter that disagrees with the ledger: every legitimate path moves
      * it by exactly one reservation, so drift cannot be produced through the API at all.
+     *
+     * <p>Every key here is spelled out rather than built with catalog's own helper, for the same
+     * reason the rows above are raw SQL: a fixture that shares a bug with the code it verifies
+     * proves nothing.
      */
     public void setStockCounter(long eventId, long tierId, int remaining) {
         redis.opsForValue().set("catalog:stock:" + eventId + ":" + tierId, String.valueOf(remaining));
@@ -148,16 +139,17 @@ public class SaleFixture {
     }
 
     /**
-     * Makes the counters look like they were vouched for by a <em>different</em> Redis instance.
+     * Makes an event's counters look like a <em>different</em> Redis instance vouched for them.
      *
      * <p>Equivalent to restarting the server, without restarting a container the whole suite shares.
-     * What the guard actually compares is the stored {@code run_id} against the live one, and it
-     * cannot tell which of the two moved.
+     * What the guard compares is this stored {@code run_id} against the live one, and it cannot tell
+     * which of the two moved.
      */
-    public void forgeEarlierRedisInstance() {
-        redis.opsForValue().set("catalog:stock:runid", "a-previous-redis-incarnation");
+    public void forgeEarlierRedisInstance(long eventId) {
+        redis.opsForValue().set("catalog:vouch:" + eventId, "a-previous-redis-incarnation");
     }
 
+    /** The live stock counter as Redis holds it, or {@code -1} when the key does not exist. */
     public int stockCounter(long eventId, long tierId) {
         String value = redis.opsForValue().get("catalog:stock:" + eventId + ":" + tierId);
         return value == null ? -1 : Integer.parseInt(value);
@@ -172,13 +164,6 @@ public class SaleFixture {
      */
     public int remaining(long tierId) {
         return stockCounter(eventIdOf(tierId), tierId);
-    }
-
-    /** The ledger's last-known-good copy, written only by pre-warm and rebuild. */
-    public int ledgerRemaining(long tierId) {
-        Integer remaining = jdbc.queryForObject(
-                "SELECT remaining FROM tier_inventory WHERE tier_id = ?", Integer.class, tierId);
-        return remaining == null ? -1 : remaining;
     }
 
     private long eventIdOf(long tierId) {

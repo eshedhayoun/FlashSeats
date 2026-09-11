@@ -37,7 +37,7 @@ class CatalogAvailabilityIT extends IntegrationTest {
     @DisplayName("A tier with no counter reads UNKNOWN, never SOLD_OUT")
     void unwarmedTierIsUnknownNotSoldOut() {
         long eventId = fixture.upcomingEvent("Midnight Sessions");
-        fixture.tierWithoutInventory(eventId, "General Admission", 3_000, 200);
+        fixture.tierWithoutCounter(eventId, "General Admission", 3_000, 200);
 
         String availability = new BuyerSession(port)
                 .get("/events/" + eventId)

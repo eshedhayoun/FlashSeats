@@ -1,14 +1,11 @@
 package com.flashseats.catalog.repository;
 
+import com.flashseats.catalog.facade.ReserveResult;
 import java.util.HashMap;
-import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Properties;
-import java.util.Set;
-import org.springframework.data.redis.core.Cursor;
 import org.springframework.data.redis.core.RedisCallback;
-import org.springframework.data.redis.core.ScanOptions;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.data.redis.core.script.RedisScript;
 import org.springframework.stereotype.Repository;
@@ -20,22 +17,28 @@ import org.springframework.stereotype.Repository;
  * moves stock by calling {@link com.flashseats.catalog.facade.CatalogFacade}, so the scripts below
  * are the only code anywhere that touches the key.
  *
- * <p>Redis is the live counter; {@code tier_inventory} is the ledger's last-known-good copy,
- * refreshed by pre-warm and rebuild. If every key here vanished, the rebuild would reconstruct all of
- * them from {@code ticket_tiers}, {@code order_items} and {@code ticket_holds} — which is why losing
- * one is a fault to repair and never a reason to guess.
+ * <p><strong>There is no copy of this number in PostgreSQL.</strong> The database holds the ledger
+ * it can be derived from — {@code ticket_tiers} minus what {@code order_items} sold and
+ * {@code ticket_holds} is holding — and that derivation is the rebuild. Losing a key is therefore a
+ * fault to repair from the ledger, and never a reason to guess.
  */
 @Repository
 public class StockCounterRepository {
 
-    /** {@link #reserve} took the seats. */
-    public static final long RESERVED = 1;
+    /**
+     * What the scripts answer with.
+     *
+     * <p>Private, and deliberately so. These numbers are the Lua protocol and nothing above this
+     * class should speak it — {@code -1} here would mean "sold out" while {@code -1} one layer up
+     * means "no counter at all", which is the exact pair of meanings this design spends its effort
+     * keeping apart.
+     */
+    private static final long RESERVED = 1;
 
-    /** {@link #reserve} found a counter, and it was too low. Genuinely sold out. */
-    public static final long INSUFFICIENT = -1;
+    private static final long NO_COUNTER = -2;
 
-    /** There is no counter. A fault to alarm on and rebuild, never "sold out" (ADR-004). */
-    public static final long NO_COUNTER = -2;
+    private static final String COUNTER_PREFIX = "catalog:stock:";
+    private static final String VOUCH_PREFIX = "catalog:vouch:";
 
     private final StringRedisTemplate redis;
     private final RedisScript<Long> reserveScript;
@@ -50,20 +53,28 @@ public class StockCounterRepository {
         this.restoreScript = stockRestoreScript;
     }
 
-    private static final String KEY_PREFIX = "catalog:stock:";
-
     public static String key(long eventId, long tierId) {
-        return KEY_PREFIX + eventId + ":" + tierId;
+        return COUNTER_PREFIX + eventId + ":" + tierId;
     }
 
-    /** @return {@link #RESERVED}, {@link #INSUFFICIENT} or {@link #NO_COUNTER} */
-    public long reserve(long eventId, long tierId, int quantity) {
-        return run(reserveScript, eventId, tierId, quantity);
+    /** Takes seats atomically, telling a sold-out tier from an unreadable one. */
+    public ReserveResult reserve(long eventId, long tierId, int quantity) {
+        long answer = run(reserveScript, eventId, tierId, quantity);
+        if (answer == RESERVED) {
+            return ReserveResult.RESERVED;
+        }
+        return answer == NO_COUNTER ? ReserveResult.COUNTER_MISSING : ReserveResult.INSUFFICIENT;
     }
 
-    /** @return the counter's new value, or {@link #NO_COUNTER} if there was nothing to restore */
-    public long restore(long eventId, long tierId, int quantity) {
-        return run(restoreScript, eventId, tierId, quantity);
+    /**
+     * Gives seats back.
+     *
+     * @return false if there was no counter to give them back to. Those seats are invisible until a
+     *     rebuild runs, which is the safe direction — creating a counter here would conjure
+     *     inventory out of one expiring hold (ADR-004).
+     */
+    public boolean restore(long eventId, long tierId, int quantity) {
+        return run(restoreScript, eventId, tierId, quantity) != NO_COUNTER;
     }
 
     /**
@@ -135,38 +146,23 @@ public class StockCounterRepository {
     }
 
     /**
-     * Every event that currently has at least one live counter.
+     * Which Redis instance was running when this event's counters were last derived from scratch.
      *
-     * <p>Exactly the set a Redis restart puts in doubt: a counter that exists may have rolled back,
-     * while an event with none has nothing to roll back to. Scanned rather than derived from SQL so
-     * the answer describes what Redis actually holds, which is the thing in question.
+     * <p>Per event, and in Redis rather than in a replica's memory, because both halves matter: per
+     * event so that rebuilding one sale does not vouch for its neighbours, and in Redis so that
+     * every replica reaches the same verdict and a rebuild performed on one releases the event on
+     * all of them.
+     *
+     * @return null if nothing has ever vouched for this event
      */
-    public Set<Long> eventIdsWithCounters() {
-        Set<Long> eventIds = new HashSet<>();
-        try (Cursor<String> keys =
-                redis.scan(ScanOptions.scanOptions().match(KEY_PREFIX + "*").count(256).build())) {
-            while (keys.hasNext()) {
-                // catalog:stock:{eventId}:{tierId} — anything else under the prefix is not a counter.
-                String[] parts = keys.next().split(":");
-                if (parts.length == 4) {
-                    eventIds.add(Long.parseLong(parts[2]));
-                }
-            }
-        }
-        return eventIds;
+    public String vouchedRunId(long eventId) {
+        return redis.opsForValue().get(VOUCH_PREFIX + eventId);
     }
 
-    /** The {@code run_id} that was running when the counters were last known to be sound. */
-    public String readTrustedRunId() {
-        return redis.opsForValue().get(RUN_ID_KEY);
+    /** Records that this event's counters are sound as of the given server incarnation. */
+    public void vouch(long eventId, String runId) {
+        redis.opsForValue().set(VOUCH_PREFIX + eventId, runId);
     }
-
-    /** Records that the counters are sound as of this server incarnation. */
-    public void trustRunId(String runId) {
-        redis.opsForValue().set(RUN_ID_KEY, runId);
-    }
-
-    private static final String RUN_ID_KEY = "catalog:stock:runid";
 
     private long run(RedisScript<Long> script, long eventId, long tierId, int quantity) {
         Long result = redis.execute(

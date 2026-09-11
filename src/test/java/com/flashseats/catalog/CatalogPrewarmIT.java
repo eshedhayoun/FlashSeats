@@ -44,7 +44,7 @@ class CatalogPrewarmIT extends IntegrationTest {
     @DisplayName("An upcoming tier gains a counter holding its full capacity")
     void prewarmSeedsTheCounter() {
         long eventId = fixture.upcomingEvent("Midnight Sessions");
-        long tierId = fixture.tierWithoutInventory(eventId, "General Admission", 3_000, 200);
+        long tierId = fixture.tierWithoutCounter(eventId, "General Admission", 3_000, 200);
 
         assertThat(fixture.stockCounter(eventId, tierId)).isEqualTo(-1);
 
@@ -59,7 +59,7 @@ class CatalogPrewarmIT extends IntegrationTest {
     @DisplayName("Running it twice seeds nothing the second time")
     void prewarmIsIdempotent() {
         long eventId = fixture.upcomingEvent("Midnight Sessions");
-        long tierId = fixture.tierWithoutInventory(eventId, "General Admission", 3_000, 200);
+        long tierId = fixture.tierWithoutCounter(eventId, "General Admission", 3_000, 200);
 
         prewarm(eventId);
         BuyerSession.Response second = prewarm(eventId);
@@ -76,7 +76,7 @@ class CatalogPrewarmIT extends IntegrationTest {
         // The counter is deliberately absent, so a successful reseed would be visible. On a real
         // open sale it would not be: it would silently put every sold ticket back on the shelf.
         long eventId = fixture.openEvent("Aurora Fest");
-        long tierId = fixture.tierWithoutInventory(eventId, "VIP", 7_500, 50);
+        long tierId = fixture.tierWithoutCounter(eventId, "VIP", 7_500, 50);
 
         BuyerSession.Response response = prewarm(eventId);
 

@@ -17,7 +17,6 @@ import com.flashseats.catalog.model.TicketTier;
 import com.flashseats.catalog.repository.EventRepository;
 import com.flashseats.catalog.repository.StockCounterRepository;
 import com.flashseats.catalog.repository.TicketTierRepository;
-import com.flashseats.catalog.repository.TierInventoryRepository;
 import java.time.Clock;
 import java.time.Instant;
 import java.util.HashMap;
@@ -26,7 +25,6 @@ import java.util.Map;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
-import org.springframework.transaction.support.TransactionTemplate;
 
 /** Event metadata, sale windows, and every movement of the inventory counter. */
 @Slf4j
@@ -42,29 +40,23 @@ public class CatalogService {
 
     private final EventRepository events;
     private final TicketTierRepository tiers;
-    private final TierInventoryRepository inventory;
     private final StockCounterRepository stock;
     private final StockEpoch epoch;
     private final CatalogProperties properties;
-    private final TransactionTemplate transactions;
     private final Clock clock;
 
     public CatalogService(
             EventRepository events,
             TicketTierRepository tiers,
-            TierInventoryRepository inventory,
             StockCounterRepository stock,
             StockEpoch epoch,
             CatalogProperties properties,
-            TransactionTemplate transactions,
             Clock clock) {
         this.events = events;
         this.tiers = tiers;
-        this.inventory = inventory;
         this.stock = stock;
         this.epoch = epoch;
         this.properties = properties;
-        this.transactions = transactions;
         this.clock = clock;
     }
 
@@ -209,28 +201,24 @@ public class CatalogService {
      */
     public ReserveResult tryReserve(long eventId, long tierId, int quantity) {
         if (!epoch.isTrusted(eventId)) {
-            // Redis restarted and this event has not been rebuilt since. Its counter may read high
-            // by whatever the AOF lost, and selling from it would oversell (ADR-004).
+            // Redis is not the instance that vouched for this event. Its counter may read high by
+            // whatever the AOF lost, and selling from it would oversell (ADR-004).
             log.error(
-                    "Refusing to reserve from event {}: counters untrusted since a Redis restart."
-                            + " Rebuild this event to resume selling",
+                    "Refusing to reserve from event {}: counters not vouched for by the running"
+                            + " Redis. Rebuild this event to resume selling",
                     eventId);
             return ReserveResult.COUNTER_MISSING;
         }
 
-        long result = stock.reserve(eventId, tierId, quantity);
-        if (result == StockCounterRepository.RESERVED) {
-            return ReserveResult.RESERVED;
-        }
-        if (result == StockCounterRepository.NO_COUNTER) {
+        ReserveResult result = stock.reserve(eventId, tierId, quantity);
+        if (result == ReserveResult.COUNTER_MISSING) {
             log.error(
                     "No inventory counter for tier {} of event {}; reserve refused. Rebuild required"
                             + " (ADR-004)",
                     tierId,
                     eventId);
-            return ReserveResult.COUNTER_MISSING;
         }
-        return ReserveResult.INSUFFICIENT;
+        return result;
     }
 
     /**
@@ -246,7 +234,7 @@ public class CatalogService {
      * by {@code flashseats.stock.drift} and returned by a rebuild.
      */
     public void restore(long eventId, long tierId, int quantity) {
-        if (stock.restore(eventId, tierId, quantity) == StockCounterRepository.NO_COUNTER) {
+        if (!stock.restore(eventId, tierId, quantity)) {
             log.error(
                     "Cannot restore {} seats to tier {} of event {}: no counter. Those seats are"
                             + " invisible until a rebuild runs",
@@ -265,32 +253,24 @@ public class CatalogService {
      * resurrect every ticket already sold — the highest-severity defect the design review found
      * (ADR-004). Recovery during a live sale is a rebuild from the ledger, never a reseed.
      *
-     * <p><strong>The ledger commits before Redis is touched.</strong> The transaction is explicit
-     * rather than an annotation because it must <em>end</em> partway through this method: a Redis
-     * write inside a SQL transaction cannot roll back with it (ADR-023).
-     *
      * @return how many tier counters this call created. A repeat pre-warm returns 0 and changes
      *     nothing.
      */
     public int prewarm(long eventId) {
-        List<TicketTier> eventTiers = transactions.execute(status -> {
-            Event event = requireEvent(eventId);
-            if (SaleWindows.statusOf(event, clock.instant()) != EventWindowStatus.UPCOMING) {
-                throw new PrewarmWindowClosedException(eventId);
-            }
-            inventory.seedFromCapacity(eventId);
-            return tiers.findByEventIdOrderByPriceCentsDesc(eventId);
-        });
+        Event event = requireEvent(eventId);
+        if (SaleWindows.statusOf(event, clock.instant()) != EventWindowStatus.UPCOMING) {
+            throw new PrewarmWindowClosedException(eventId);
+        }
 
         int seeded = 0;
-        for (TicketTier tier : eventTiers) {
+        for (TicketTier tier : tiers.findByEventIdOrderByPriceCentsDesc(eventId)) {
             if (stock.seedIfAbsent(eventId, tier.getId(), tier.getTotalCapacity())) {
                 seeded++;
             }
         }
         // Sound by construction: nothing has been sold from an UPCOMING sale, so these counters owe
         // nothing to whatever a Redis restart may have lost.
-        epoch.trust(eventId);
+        epoch.vouchFor(eventId);
 
         log.info("Pre-warmed event {}: {} tier counters seeded", eventId, seeded);
         return seeded;
@@ -321,19 +301,15 @@ public class CatalogService {
     /**
      * Writes ledger-derived counts over the live counters.
      *
-     * <p>The ledger copy commits first and Redis follows outside the transaction, for the same
-     * reason as {@link #prewarm}: Redis cannot roll back with a SQL transaction (ADR-023). If the
-     * process dies between the two, the counters are still missing or stale — which is the state the
-     * operator was already recovering from, so the rebuild is simply run again.
+     * <p>Pure Redis, and there is nowhere else for it to be: the counter has no copy in PostgreSQL
+     * to keep in step. The numbers came from the ledger — {@code ticket_tiers} minus what
+     * {@code order_items} sold and {@code ticket_holds} is holding — and go straight onto the keys.
      */
     public void applyRebuild(long eventId, Map<Long, Integer> remainingByTier) {
         Map<Long, Integer> before = stock.readAll(eventId, List.copyOf(remainingByTier.keySet()));
 
-        transactions.executeWithoutResult(status -> remainingByTier.forEach(
-                (tierId, remaining) -> inventory.upsertRemaining(eventId, tierId, remaining)));
-
         remainingByTier.forEach((tierId, remaining) -> stock.overwrite(eventId, tierId, remaining));
-        epoch.trust(eventId);
+        epoch.vouchFor(eventId);
 
         // WARN, not INFO: reaching this method at all means a counter was lost or had drifted, and
         // the two maps are the only record of how far. A tier absent from `before` had no counter.

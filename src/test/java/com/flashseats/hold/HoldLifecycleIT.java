@@ -169,7 +169,7 @@ class HoldLifecycleIT extends IntegrationTest {
         // oversells. That pause is the subject of QueueLifecycleIT; what this test is about is what
         // the buyer sees when they reach a tier whose counter is missing.
         BuyerSession buyer = admittedBuyer();
-        long unwarmedTier = fixture.tierWithoutInventory(eventId, "Balcony", 3_000, 50);
+        long unwarmedTier = fixture.tierWithoutCounter(eventId, "Balcony", 3_000, 50);
 
         var response = buyer.post(
                 "/holds",
