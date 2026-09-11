@@ -100,7 +100,10 @@ public class StockReconciliationService {
         int worst = 0;
         int missing = 0;
 
-        for (long eventId : catalog.findOpenEventIds()) {
+        // MANAGED, not open: a paused sale is still measured. Pausing is what an operator does
+        // *while* investigating a counter, so losing the drift gauge at that exact moment would
+        // take the instrument away from the person using it.
+        for (long eventId : catalog.findManagedEventIds()) {
             Map<Long, Integer> counters = catalog.getLiveCounters(eventId);
             for (Map.Entry<Long, Integer> expected : ledgerSnapshot(eventId).entrySet()) {
                 Integer live = counters.get(expected.getKey());

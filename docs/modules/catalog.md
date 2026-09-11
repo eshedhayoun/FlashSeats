@@ -183,7 +183,23 @@ holds until it is rebuilt (ADR-046).
 | `GET` | `/api/v1/events/{eventId}` | public — `windowStatus`, `serverTime`, **bucketed** availability |
 | `POST` | `/api/v1/admin/events/{eventId}/prewarm` | admin — `UPCOMING` only |
 | `POST` | `/api/v1/admin/events/{eventId}/rebuild-stock` | admin — **served by `order`** (ADR-046) |
-| `POST` | `/api/v1/admin/events/{eventId}/pause` | admin — halt promotions and new holds |
+| `POST` | `/api/v1/admin/events/{eventId}/pause` · `/resume` | admin — **built** (Stage 4). `EventStatus.PAUSED` |
+
+**Pause is a publication state, not a window status** (ADR-048). `SaleWindows.statusOf` already reads
+anything but `PUBLISHED` as `CLOSED`, so the queue join, the hold and the checkout all refuse with no
+change to `SaleWindows` — whereas a fourth `EventWindowStatus` would have to be handled correctly by
+every consumer, and the one that forgot would be a sale still selling while an operator believed it
+had stopped.
+
+Nothing is destroyed: the waiting room keeps every position, live passes and admissions run out their
+own clocks, and stock stays exactly where it is, so `/resume` returns every buyer to where they were.
+Idempotent; refused on `DRAFT` or `CANCELLED`, where pausing would claim to halt something that was
+never running.
+
+A paused event leaves `findOpenEventIds` — the promotion loop and the browse list — but **stays in
+`findManagedEventIds`**, which drives the `stock.drift` gauge and `StockEpoch`. Pausing is what an
+operator does *while* investigating a counter, and a paused event whose counters a Redis restart
+rolled back must be flagged then, not when someone resumes and starts selling from them.
 
 ```java
 public interface CatalogFacade {

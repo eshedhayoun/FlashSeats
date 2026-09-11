@@ -6,6 +6,7 @@ import jakarta.persistence.QueryHint;
 import java.time.Instant;
 import java.util.Collection;
 import java.util.List;
+import java.util.Optional;
 import java.util.UUID;
 import org.springframework.data.domain.Limit;
 import org.springframework.data.jpa.repository.JpaRepository;
@@ -16,6 +17,21 @@ import org.springframework.data.jpa.repository.QueryHints;
 import org.springframework.data.repository.query.Param;
 
 public interface OutboxEventRepository extends JpaRepository<OutboxEvent, UUID> {
+
+    /**
+     * The most recent message published for an order, whatever became of it.
+     *
+     * <p>This is what makes an operator resend possible at all. The payload is a complete,
+     * self-contained snapshot of everything needed to render a ticket (ADR-015), and this table is
+     * the only place it durably lives — {@code notification_logs} records that a delivery was
+     * attempted, not what was in it.
+     *
+     * <p>Bounded by {@code flashseats.outbox.purge-after-days}: past that the nightly purge has
+     * removed the row and the message cannot be reconstructed. The resend endpoint says so rather
+     * than inventing one.
+     */
+    Optional<OutboxEvent> findFirstByAggregateIdAndEventTypeOrderByCreatedAtDesc(
+            String aggregateId, String eventType);
 
     /**
      * Takes a batch of pending events for this replica alone.

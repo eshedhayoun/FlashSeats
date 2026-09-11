@@ -229,9 +229,20 @@ synchronously, `payment → order` only by event (ADR-005).
 | `POST` | `/api/v1/orders/checkout` | `fsid` |
 | `POST` | `/api/v1/orders/checkout/resume` | `fsid` — 3-D Secure second leg; same `holdToken` |
 | `GET` | `/api/v1/orders/{orderNumber}` | `fsid` match **or** `?receiptToken=…` |
+| `POST` | `/api/v1/admin/events/{eventId}/rebuild-stock` | admin — the ledger spans three modules and only this one may read it (ADR-046) |
+| `GET` | `/api/v1/admin/orders/{orderNumber}` | admin — **built** (Stage 4) |
+| `POST` | `/api/v1/admin/notifications/resend/{orderNumber}` | admin — **built**; the payload lives in `outbox_events` (ADR-048) |
 
 v1 left the lookup fully public against a guessable `TK-98213` reference, returning the buyer's
 email — an IDOR (ADR-010).
+
+**The operator view is a different DTO, not the buyer's receipt.** `OrderReceiptResponse` carries
+`receiptToken`, a bearer capability good for ninety days from any device; returning it to an operator
+would mint a durable impersonation link into terminal history and any log that records response
+bodies, to answer a question that never needed it. `AdminOrderResponse` withholds it and adds what
+support actually asks for — payment attempts, failure reason, and the hold the order was built from.
+`readAuthorised` cannot serve this at all: its job is to refuse a caller presenting neither cookie
+nor token, so for an operator it always throws. Authorisation happens one layer up, at `ROLE_ADMIN`.
 
 ```java
 public interface OrderFacade {

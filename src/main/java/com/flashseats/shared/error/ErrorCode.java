@@ -85,7 +85,29 @@ public enum ErrorCode {
     ORDER_REFUNDED(HttpStatus.CONFLICT),
 
     // --- notification -------------------------------------------------------
-    NOTIFICATION_LOG_NOT_FOUND(HttpStatus.NOT_FOUND);
+    NOTIFICATION_LOG_NOT_FOUND(HttpStatus.NOT_FOUND),
+
+    // --- admin --------------------------------------------------------------
+    /**
+     * No operator credentials, or the wrong ones.
+     *
+     * <p>Thrown from the Spring Security filter chain, which runs <strong>before</strong>
+     * {@code DispatcherServlet} — so {@code GlobalExceptionHandler} never sees it and cannot supply
+     * this. {@code AdminProblemResponses} wires it in at the entry point instead. Without that, the
+     * admin surface was the one part of this API answering with a body that carried no {@code code}
+     * at all (global standards §1).
+     */
+    ADMIN_AUTH_REQUIRED(HttpStatus.UNAUTHORIZED),
+    /** Authenticated, but not an operator. Same filter-chain origin as the code above. */
+    ADMIN_FORBIDDEN(HttpStatus.FORBIDDEN),
+    /** The sale is paused, so it admits nobody and reserves nothing until an operator resumes it. */
+    SALE_PAUSED(HttpStatus.CONFLICT),
+    /**
+     * A resend was asked for but the original message is gone: {@code outbox_events} keeps payloads
+     * for {@code flashseats.outbox.purge-after-days} and this order is past it. Distinct from
+     * {@code NOTIFICATION_LOG_NOT_FOUND}, which means the notification itself was never recorded.
+     */
+    NOTIFICATION_PAYLOAD_UNAVAILABLE(HttpStatus.GONE);
 
     private static final String TYPE_PREFIX = "https://flashseats.dev/problems/";
 

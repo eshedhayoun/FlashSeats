@@ -2,7 +2,10 @@ package com.flashseats.notification.repository;
 
 import com.flashseats.notification.model.NotificationKind;
 import com.flashseats.notification.model.NotificationLog;
+import com.flashseats.notification.model.NotificationStatus;
 import java.util.Optional;
+import org.springframework.data.domain.Page;
+import org.springframework.data.domain.Pageable;
 import org.springframework.data.jpa.repository.JpaRepository;
 import org.springframework.data.jpa.repository.Modifying;
 import org.springframework.data.jpa.repository.Query;
@@ -11,6 +14,20 @@ import org.springframework.data.repository.query.Param;
 public interface NotificationLogRepository extends JpaRepository<NotificationLog, Long> {
 
     Optional<NotificationLog> findByOrderNumberAndKind(String orderNumber, NotificationKind kind);
+
+    /**
+     * The dead letters, newest first — what an operator reads to answer "whose ticket did not
+     * arrive?".
+     *
+     * <p>Backed by the partial index in {@code V8__notification_dlq_index.sql}. Paged rather than
+     * returning a list, because this is the one query here whose result set is unbounded in
+     * principle: a broker or mail outage dead-letters everything it touches, and that is exactly the
+     * moment someone opens this.
+     */
+    Page<NotificationLog> findByStatusOrderByUpdatedAtDesc(NotificationStatus status, Pageable page);
+
+    /** How many dead letters there are in total, so a paged listing can say what it is a page of. */
+    long countByStatus(NotificationStatus status);
 
     /**
      * <strong>The delivery claim.</strong> Inserts the row that makes a second send impossible, and

@@ -1,10 +1,13 @@
 package com.flashseats.notification.service;
 
+import com.flashseats.notification.dto.DeadLetterResponse;
 import com.flashseats.notification.model.NotificationKind;
 import com.flashseats.notification.model.NotificationStatus;
 import com.flashseats.notification.repository.NotificationLogRepository;
 import java.time.Clock;
+import java.util.List;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.data.domain.PageRequest;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Propagation;
 import org.springframework.transaction.annotation.Transactional;
@@ -64,6 +67,33 @@ public class NotificationLogService {
         }
         log.debug("{} for {} was already handled", kind, orderNumber);
         return false;
+    }
+
+    /**
+     * The dead letters an operator can act on, newest first.
+     *
+     * <p>{@code DLQ} is the one status that means <strong>the work did not happen</strong>, which is
+     * what makes every row here safely replayable — and why nothing writes {@code DLQ} once the mail
+     * server has accepted a message (ADR-038).
+     */
+    @Transactional(readOnly = true)
+    public List<DeadLetterResponse> deadLetters(int page, int size) {
+        return logs
+                .findByStatusOrderByUpdatedAtDesc(
+                        NotificationStatus.DLQ, PageRequest.of(page, size))
+                .map(entry -> new DeadLetterResponse(
+                        entry.getOrderNumber(),
+                        entry.getKind(),
+                        entry.getRecipientEmail(),
+                        entry.getRetryCount(),
+                        entry.getFailureReason(),
+                        entry.getUpdatedAt()))
+                .getContent();
+    }
+
+    @Transactional(readOnly = true)
+    public long deadLetterCount() {
+        return logs.countByStatus(NotificationStatus.DLQ);
     }
 
     @Transactional(propagation = Propagation.REQUIRES_NEW)

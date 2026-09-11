@@ -3,6 +3,7 @@ package com.flashseats.hold.facade;
 import com.flashseats.hold.model.SettleReason;
 import com.flashseats.hold.model.TicketHold;
 import com.flashseats.hold.service.HoldService;
+import com.flashseats.hold.service.HoldTimers;
 import java.time.Instant;
 import java.util.Optional;
 import org.springframework.stereotype.Component;
@@ -12,9 +13,11 @@ import org.springframework.stereotype.Component;
 class HoldFacadeImpl implements HoldFacade {
 
     private final HoldService holds;
+    private final HoldTimers timers;
 
-    HoldFacadeImpl(HoldService holds) {
+    HoldFacadeImpl(HoldService holds, HoldTimers timers) {
         this.holds = holds;
+        this.timers = timers;
     }
 
     @Override
@@ -44,8 +47,12 @@ class HoldFacadeImpl implements HoldFacade {
 
     @Override
     public void discardTimer(String holdToken) {
-        // No timer to discard while PostgreSQL carries expiry alone. The method exists now so the
-        // AFTER_COMMIT call site in `order` is written once and never has to move.
+        // A consumed hold is the one ending that does NOT publish TicketHoldSettledEvent — there are
+        // no seats to give back — so this is the only thing that clears its timer. Skipping it would
+        // still be correct: the key would expire on its own and the listener would find the hold
+        // already CONSUMED and do nothing. It is swept up here so the key does not sit around
+        // announcing an expiry nobody needs.
+        timers.disarm(holdToken);
     }
 
     @Override

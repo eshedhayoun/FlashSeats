@@ -31,15 +31,27 @@ public class OrderPostCommitTasks {
         this.queue = queue;
     }
 
+    /**
+     * <strong>One {@code try} each, not one around both.</strong> They shared a block while
+     * {@code discardTimer} was a no-op that could not fail. It is a Redis {@code DEL} now, so a
+     * single block would let an unreachable Redis skip {@code revokeAdmission} — quietly leaving a
+     * buyer who has finished their purchase holding an admission that denies someone else theirs.
+     * Two independent best-effort cleanups must fail independently.
+     */
     @TransactionalEventListener(phase = TransactionPhase.AFTER_COMMIT)
     public void onOrderConfirmed(OrderConfirmedEvent event) {
         try {
             holds.discardTimer(event.holdToken());
+        } catch (RuntimeException cleanupFailed) {
+            log.warn("Could not discard the hold timer for order {}", event.orderNumber(), cleanupFailed);
+        }
+
+        try {
             // The buyer has what they came for. Keeping their place in the sale would deny it to
             // someone still waiting.
             queue.revokeAdmission(event.userSessionId(), event.eventId());
         } catch (RuntimeException cleanupFailed) {
-            log.warn("Post-commit cleanup failed for order {}", event.orderNumber(), cleanupFailed);
+            log.warn("Could not revoke admission for order {}", event.orderNumber(), cleanupFailed);
         }
     }
 }
