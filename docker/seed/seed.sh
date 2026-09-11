@@ -37,15 +37,27 @@ if [[ ! -f .env ]]; then
     exit 1
 fi
 
-# Only the two values needed here, and without `source`: .env holds base64
-# secrets with characters a shell would happily interpret.
+# Without `source`: .env holds base64 secrets and a bcrypt digest, both full of
+# characters a shell would happily interpret.
 ADMIN_USER="$(grep -E '^FLASHSEATS_ADMIN_USERNAME=' .env | head -1 | cut -d= -f2-)"
-ADMIN_PASS="$(grep -E '^FLASHSEATS_ADMIN_PASSWORD=' .env | head -1 | cut -d= -f2-)"
 
-if [[ "$ADMIN_PASS" == "admin" || -z "$ADMIN_PASS" ]]; then
-    echo "error: FLASHSEATS_ADMIN_PASSWORD is still the default." >&2
-    echo "       SecretsGuard will have refused to start the replicas (ADR-039)." >&2
-    echo "       Run docker/secrets/gen-env.sh." >&2
+# The PLAINTEXT, which by design is not in .env — that file holds the bcrypt
+# digest the application verifies against, and a digest cannot be used to log in.
+# gen-env.sh prints the password once; export it for the session.
+ADMIN_PASS="${FLASHSEATS_ADMIN_PLAINTEXT:-}"
+
+if [[ -z "$ADMIN_PASS" ]]; then
+    STORED="$(grep -E '^FLASHSEATS_ADMIN_PASSWORD=' .env | head -1 | cut -d= -f2-)"
+    if [[ "$STORED" == '{noop}admin' || "$STORED" == 'admin' ]]; then
+        echo "error: FLASHSEATS_ADMIN_PASSWORD is still the default." >&2
+        echo "       SecretsGuard will have refused to start the replicas (ADR-039)." >&2
+        echo "       Run docker/secrets/gen-env.sh." >&2
+    else
+        echo "error: FLASHSEATS_ADMIN_PLAINTEXT is not set." >&2
+        echo "       .env holds the bcrypt digest, which cannot authenticate. Export the" >&2
+        echo "       password gen-env.sh printed:" >&2
+        echo "         export FLASHSEATS_ADMIN_PLAINTEXT='...'" >&2
+    fi
     exit 1
 fi
 

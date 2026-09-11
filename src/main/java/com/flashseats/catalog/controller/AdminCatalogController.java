@@ -27,4 +27,26 @@ public class AdminCatalogController {
     public Map<String, Object> prewarm(@PathVariable long eventId) {
         return Map.of("eventId", eventId, "tiersSeeded", catalog.prewarm(eventId));
     }
+
+    /**
+     * Halts a live sale.
+     *
+     * <p>Every gate closes immediately — the queue admits nobody, no hold can be taken, no checkout
+     * starts — because a paused event is not {@code PUBLISHED} and {@code SaleWindows} already reads
+     * the window as {@code CLOSED}.
+     *
+     * <p><strong>Nothing is destroyed.</strong> The waiting room keeps every position, live passes
+     * and admissions run out their own clocks, and stock stays exactly where it is, so
+     * {@code /resume} puts every buyer back where they were. Idempotent.
+     */
+    @PostMapping("/{eventId}/pause")
+    public Map<String, Object> pause(@PathVariable long eventId) {
+        return Map.of("eventId", eventId, "status", catalog.setPaused(eventId, true));
+    }
+
+    /** Puts a paused sale back on sale. Idempotent. */
+    @PostMapping("/{eventId}/resume")
+    public Map<String, Object> resume(@PathVariable long eventId) {
+        return Map.of("eventId", eventId, "status", catalog.setPaused(eventId, false));
+    }
 }
