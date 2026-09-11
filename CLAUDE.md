@@ -10,7 +10,7 @@ PDF ticket, 68 tests green. **Inventory lives in Redis** (Stage 1, ADR-046): `ca
 is the live count and PostgreSQL keeps no copy of it.
 
 **Read [`docs/00-architecture-decisions.md`](docs/00-architecture-decisions.md) before changing
-anything.** It contains 46 ADRs. Most record a defect and its fix — 034-039 come from the first
+anything.** It contains 48 ADRs. Most record a defect and its fix — 034-039 come from the first
 review pass over the built code, 040-042 from the second — and several look like over-engineering
 until you read the failure they prevent. 043-045 are the exception: forward-looking decisions about
 the operator surface, buyer accounts and what health should report, with nothing built against them
@@ -22,7 +22,7 @@ security posture, next stages, and the review-pass log. It is the doc to update 
 ## Document precedence
 
 ```
-00-architecture-decisions.md      ← highest authority (46 ADRs)
+00-architecture-decisions.md      ← highest authority (48 ADRs)
 05-global-standards.md            ← cross-cutting contract; module docs conform to it
 FE_SPEC.md                        ← client contract (repo root)
 03-end-to-end-flow.md             ← the authoritative user journey
@@ -168,6 +168,12 @@ Do not reintroduce these — each cost a real defect in the first pass:
 | **Adding `proxy_set_header` to an nginx `location`** | It REPLACES the inherited set, it does not merge. Three locations added `Connection ""` and silently dropped `Host` and `X-Forwarded-For`: `Host` fell back to `$proxy_host` = `flashseats_app`, and Tomcat rejects the underscore — *every* proxied API request answered a bare HTML 400, below Spring, with no `code`. Include the shared set in every location (ADR-047) |
 | **A load harness that is one container pretending to be 10,000 buyers** | One source address is one IP bucket: capacity 300, refill 150/s. The run measures the rate limiter, not the sale. Each VU needs its own `X-Forwarded-For` (ADR-047) |
 | **Seeding a load-test sale with `ON CONFLICT DO NOTHING` on id 1** | The postgres volume outlives the run and the dev seeder already owns id 1. The insert silently does nothing and the test asserts a 500-seat capacity against a 700-seat sale (ADR-047) |
+| **Treating a publisher confirm as proof of delivery** | A confirm means the *broker* has the message, not that a *queue* does. An exchange with no matching binding acks and discards — and the whole notification topology sits behind a property. `mandatory` + publisher-returns, and treat a return like a nack (ADR-048) |
+| **Trusting a `hold:{token}` expiry event** | `grantGrace` moves a hold's expiry in PostgreSQL, so the original timer fires mid-payment. Re-read the row and settle only what the sweeper would have; re-arm anything still alive (ADR-048) |
+| **A per-message wait on an asynchronous ack** | A batch of 100 against a sick broker is 100 sequential timeouts on the relay thread. Send the batch, await it once (ADR-048) |
+| **Reusing "is it on sale?" to mean "should we still watch it?"** | Pausing a sale dropped it from the drift gauge *and* the Redis-restart guard — so a paused event's rolled-back counters were flagged only once someone resumed and started selling from them (ADR-048) |
+| **Returning `OrderReceiptResponse` from an admin endpoint** | `receiptToken` is a 90-day bearer capability. An operator view would mint a durable impersonation link into terminal history and any log that records bodies (ADR-048) |
+| **Guarding a password with `equals("admin")`** | It refuses one known string. `{noop}hunter2` passes and is stored in plaintext. Refuse the *encoding*, not the value (ADR-048) |
 
 ## Implementation order
 
@@ -196,7 +202,7 @@ rather than one module's corner:
 | `queue:exhausted:{e}` | `queue` | String | sale end | derived sold-out marker; deleted the moment stock returns (ADR-035) |
 | `payment:inflight:{holdToken}` | `payment` | String | 90 s | duplicate-charge guard, anchored to the hold (ADR-014) |
 | `bot:rate:*` | `bot` | Bucket4j | rolling | session-first rate limiting, IP as a coarse backstop (ADR-011) |
-| `hold:{token}` | `hold` | String | 300 s | expiry timer — **deferred to Stage 3** (ADR-046) |
+| `hold:{token}` | `hold` | String | hold TTL | expiry timer. A **hint, never an authority** — the listener re-reads the row and the settle-once claim is what makes three replicas restore once (ADR-048) |
 
 Two rules over that table: a module touches only its own prefix, and **no key here is ever the
 authority for anything**. Lose the lot and `ticket_holds` plus the rebuild reconstruct the state;
@@ -218,6 +224,10 @@ docker compose up -d postgres                    # strictly-minimal Phase 1
 docker/secrets/gen-env.sh                        # fill .env with real secrets (idempotent).
                                                  # SecretsGuard refuses to start the `docker`
                                                  # profile without this (ADR-039).
+                                                 # The admin password is stored BCRYPT-HASHED and
+                                                 # printed once; .env cannot authenticate. Scripts
+                                                 # read FLASHSEATS_ADMIN_PLAINTEXT (ADR-048):
+                                                 #   export FLASHSEATS_ADMIN_PLAINTEXT='...'
 
 docker compose --profile cluster  up -d --build  # Nginx + 3 replicas on :8080 (Phase 4)
 docker/seed/seed.sh                              # seed event 9001, pre-warm, wait for OPEN.
@@ -225,6 +235,8 @@ docker/seed/seed.sh                              # seed event 9001, pre-warm, wa
                                                  # CatalogDevSeeder is @Profile("dev") (ADR-047)
 docker/scripts/fanout-check.sh                   # PROVE promotion fan-out across replicas.
                                                  # 30/30 across >= 2 upstreams or it fails
+docker/scripts/hold-expiry-check.sh              # PROVE the expiry listener restores seats exactly
+                                                 # once, and faster than the sweeper (ADR-048)
 docker compose --profile loadtest run --rm k6    # the load run; VUS=n to scale it down
 docker/scripts/sse-cadence.sh 60                 # run DURING a load run: is QueueBroadcaster's
                                                  # sweep finishing inside its 2s interval?

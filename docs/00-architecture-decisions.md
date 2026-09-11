@@ -1436,3 +1436,143 @@ argument for building Sentinel *after* the guard has been proven by hand, not be
   the arithmetic in §9.
 - The `hold:{token}` timer and the keyspace-expiry listener remain deferred. Stage 3 built the rig
   that can prove them; it did not build them.
+
+---
+
+## ADR-048 — The operator surface, and the two guarantees Stage 3 left behind
+
+**Status:** Accepted (Stage 4)
+**Amends:** ADR-039 (how the admin credential is stored), ADR-046 (which events the vouch guard
+covers). **Completes:** ADR-029 and ADR-038, both of which assumed this surface.
+
+### Context
+
+ADR-029 sends deterministic failures straight to the dead-letter queue **with no retries**. That is
+right — a render that fails once fails identically three times and only delays the queue — and it is
+right **only if someone can replay them**. ADR-038 then went to real trouble making a dead-lettered
+claim re-claimable *so that* a replay would send. Nothing could list a dead letter and nothing could
+trigger a replay, so the DLQ was a black hole; pass 2 found a paid buyer's ticket in it, lost to a
+font that could not draw a Hebrew event title.
+
+Two items also arrived here from Stage 3 — RabbitMQ publisher confirms, and the `hold:{token}` timer
+— having been deferred out of two stages in a row.
+
+### Decision 1 — A confirm is not a delivery, and a confirm alone is not enough either
+
+`rabbit.send()` returns when the frame reaches the socket. The relay read that as delivery, so a
+broker that accepted the bytes and died before persisting them lost the message with the outbox row
+already `PROCESSED`.
+
+Publisher confirms fix that. **They do not fix the other half**: a confirm means *the broker has this
+message*, not *a queue has this message*. An exchange with no matching binding acknowledges happily
+and discards — and the entire notification topology sits behind
+`flashseats.notification.enabled`, so a deployment with it off everywhere would confirm every ticket
+into nothing. `publisher-returns` plus `template.mandatory` turns that into a failure, and the
+publisher treats a return exactly like a nack. This is the case a "just switch confirms on" change
+would have missed entirely, and `RabbitOutboxPublisherTest` pins it.
+
+**`OutboxPublisher` became batch-shaped** — `List<UUID> publish(List<OutboxEvent>)`. Confirms are
+asynchronous and per-message, so a one-at-a-time interface forces the caller to block on each in
+turn: a batch of a hundred against a sick broker is a hundred sequential timeouts on the relay
+thread. Sending the batch and awaiting it once bounds that to a single timeout, and makes partial
+success a **return value rather than an exception**. Nothing is lost when a confirm does not arrive:
+the row stays `PROCESSING`, the stale-claim sweep returns it, and the consumer's
+`UNIQUE(order_number, kind)` absorbs the duplicate.
+
+### Decision 2 — The hold timer accelerates expiry; it never decides it
+
+`hold` gains its first Redis key. `HoldReconciliationSweeper` is unchanged and is still the
+guarantee — keyspace notifications are at-most-once pub/sub and a restarting replica loses them
+permanently — so the timer only removes the up-to-10s that abandoned seats spend invisible. Measured
+at 339 ms against the cluster.
+
+Two properties make it safe, and **neither is the event**:
+
+- **It is a hint, not a verdict.** `HoldService.reclaimExpired` re-reads the row and settles only
+  what the sweeper would have settled anyway. `grantGrace` moves a hold's expiry in PostgreSQL, so a
+  key treated as authoritative would fire mid-payment and return seats a buyer is being charged for.
+  A hold found alive has its timer **re-armed**, which keeps grace-extended holds on the fast path
+  instead of silently falling back to the sweeper for the rest of their life.
+- **The claim is what makes it exactly-once.** All three replicas receive the expiry, all three reach
+  `UPDATE ... WHERE status = 'ACTIVE'`, exactly one wins. Restoring stock in the listener would
+  return the seats three times — invisible on one instance, which is why
+  `docker/scripts/hold-expiry-check.sh` asserts against the cluster that the counter never rises
+  past its starting value.
+
+`__keyevent@0__:expired` is one channel for the whole database — queue passes, admissions, payment
+guards, rate-limit buckets — with no server-side filter, so the `hold:` prefix check is the
+listener's first statement.
+
+### Decision 3 — A resend lives where the payload lives, which is `order`
+
+A resend needs the original **payload**; `notification_logs` records that a delivery was attempted,
+never what was in it. The durable copy is `outbox_events.payload`, owned by `order`. So
+`POST /admin/notifications/resend/{orderNumber}` is served by `order` and writes a **new outbox
+row** — the same split `rebuild-stock` makes, where the path names what the operator is thinking
+about and the module is where the state lives (ADR-043).
+
+The existing pipeline then does everything: the relay publishes, and
+`NotificationLogService.claim` already falls through `claimIfAbsent` to `reclaimDeadLettered`. **No
+DLQ draining, no shovel, no new publish path, and no new facade edge.** The alternatives were worse:
+draining the AMQP dead-letter queue to find one message means re-enqueueing everything that does not
+match, and having `notification` ask `order` for the payload would add a facade edge across an
+asynchronous boundary that exists precisely so the two can deploy independently.
+
+**Resending something that already worked is safe by construction**, and that is what makes the
+endpoint usable by someone who cannot tell whether the first attempt landed: a `SENT` row is not
+`DLQ`, the re-claim matches nothing, and the consumer acknowledges without sending. Verified against
+the cluster — a second resend queued a message and delivered no second ticket.
+
+Bounded by `flashseats.outbox.purge-after-days`. Past that the payload is gone and the answer is
+`410 NOTIFICATION_PAYLOAD_UNAVAILABLE` rather than a reconstructed message: rebuilding one from the
+current catalog would render a ticket for the event as it is *now*, not as it was sold.
+
+### Decision 4 — `PAUSED` is a publication state, and it splits the event query four ways
+
+`EventStatus.PAUSED`. `SaleWindows.statusOf` already reads anything but `PUBLISHED` as `CLOSED`, so
+every gate — queue join, hold, checkout — shuts with **no change to `SaleWindows`**. That is the
+reason pause is a publication state rather than a fourth `EventWindowStatus`: a new window status
+would have to be handled correctly by every consumer, and the one that forgot would be a sale still
+selling while an operator believed it stopped. Nothing is destroyed — the waiting room keeps every
+position and stock stays put — so resuming returns every buyer exactly where they were, which is
+ADR-035's reasoning about never deleting a waiting room.
+
+The real work was that `findOpenEventIds` had **three** callers wanting two different answers:
+
+| Caller | A paused event is… | Why |
+| :--- | :--- | :--- |
+| `PromotionWorker` | excluded | that is what pause means |
+| `CatalogService.list` | excluded | it is not on sale |
+| `StockReconciliationService.measureDrift` | **included** | pausing is what an operator does *while* investigating a counter; losing the gauge then takes the instrument from the person using it |
+| **`StockEpoch`** | **included** | a paused event whose counters a Redis restart rolled back must be flagged *now*, not when someone resumes — which is to say, not once it has started selling from them |
+
+Hence `findManagedEventIds`. Reusing `findOpenEventIds` for all four is the easy version and the
+wrong one; the drill in §9 restarts Redis against a paused sale and confirms all three replicas
+still flag it.
+
+### Decision 5 — The admin credential is hashed, not replaced
+
+§10's S12 asks for the in-memory `UserDetailsService` to be replaced *"before anyone else needs
+access."* Nobody does. A table, a migration and a user-management surface to administer one row is
+machinery guarding nothing, and the day a second operator or an audit trail of who paused a sale is
+wanted, that one bean is what changes — which is the property worth keeping.
+
+What was genuinely wrong is that the credential was stored and compared in **plaintext**. It is now
+a `DelegatingPasswordEncoder` value naming its own algorithm, and **`SecretsGuard` refuses any
+`{noop}` value outside `dev`/`test`** rather than the one literal string `admin` — strictly
+stronger, since the old check passed `hunter2` and stored it in the clear.
+
+**401 and 403 now carry a registry `code`.** Spring Security throws inside the filter chain, before
+`DispatcherServlet`, so no `@RestControllerAdvice` could ever see it and Boot's stock body came back:
+these were the only endpoints in the API answering without a code, on the surface that can pause a
+live sale. `AdminProblemResponses` writes RFC 7807 at the entry point and keeps the RFC 7235
+`WWW-Authenticate` challenge that replacing the entry point would otherwise have dropped.
+
+### Consequences
+
+- The module graph is **unchanged**. Every endpoint writes only state its own module owns.
+- The `.env` admin password is now a digest and cannot authenticate. `gen-env.sh` prints the
+  plaintext once; scripts read it from `FLASHSEATS_ADMIN_PLAINTEXT`.
+- `flashseats.outbox.transport` is bound on `OutboxProperties` instead of being a loose string.
+- Still deferred: the refund-notice template and a consumer for
+  `notification.order-refunded.queue`, which still grows without bound.
