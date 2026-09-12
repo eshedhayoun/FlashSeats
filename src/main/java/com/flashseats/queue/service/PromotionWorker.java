@@ -39,6 +39,7 @@ public class PromotionWorker {
     private final CatalogFacade catalog;
     private final QueueTokens tokens;
     private final QueueProperties properties;
+    private final GlobalPromotionBudget globalBudget;
     private final ObjectMapper json;
     private final Clock clock;
 
@@ -47,12 +48,14 @@ public class PromotionWorker {
             CatalogFacade catalog,
             QueueTokens tokens,
             QueueProperties properties,
+            GlobalPromotionBudget globalBudget,
             ObjectMapper json,
             Clock clock) {
         this.redis = redis;
         this.catalog = catalog;
         this.tokens = tokens;
         this.properties = properties;
+        this.globalBudget = globalBudget;
         this.json = json;
         this.clock = clock;
     }
@@ -128,10 +131,20 @@ public class PromotionWorker {
             return;
         }
 
-        for (String sessionId : front) {
-            issuePass(eventId, sessionId, now);
+        long budgeted = globalBudget.claim(front.size());
+        if (budgeted <= 0) {
+            return;
         }
-        log.debug("Promoted {} session(s) for event {}", front.size(), eventId);
+
+        long promoted = 0;
+        for (String sessionId : front) {
+            if (promoted >= budgeted) {
+                break;
+            }
+            issuePass(eventId, sessionId, now);
+            promoted++;
+        }
+        log.debug("Promoted {} session(s) for event {}", promoted, eventId);
     }
 
     /**

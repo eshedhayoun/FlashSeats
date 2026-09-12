@@ -112,12 +112,12 @@ it, so if anything fails the hold returns to `ACTIVE` and expires normally.
 | :--- | :--- | :--- |
 | `shared` | `ErrorCode` (42 codes), `ProblemDetails`, one global advice, `SessionId`, `Money`, `Clock`, `SignedToken`, `TraceIdFilter` | — |
 | `bot` | Signed `fsid` cookie; Redis-backed Bucket4j session + IP buckets; SSE exempt from per-request accounting | reCAPTCHA, `ip_rules`, audit logs. **Writes no tables.** |
-| `catalog` | Events, tiers, window derivation, `serverTime`, bucketed availability, **Redis counters + Lua, the `-2` fault path, pre-warm, the Redis-restart guard** | pause, `TierAvailabilityChangedEvent` |
-| `queue` | `ZADD NX` join, SSE with heartbeats, HMAC passes, admission sessions, promotion worker, **pub/sub fan-out**, measured drain-rate estimates | `RANDOM` ordering, `tier-availability` frame, `Last-Event-ID` replay |
-| `hold` | `ticket_holds` authority, the settle-once claim, atomic reserve **with compensation**, **after-commit restore**, bounded grace, sweeper, all three endpoints | the `hold:{token}` Redis timer and the keyspace listener (Stage 3) |
+| `catalog` | Events, tiers, window derivation, metadata cache, `serverTime`, bucketed availability, **Redis counters + Lua, the `-2` fault path, pre-warm, pause/resume, the Redis-restart guard** | create-event endpoint, `TierAvailabilityChangedEvent` |
+| `queue` | `ZADD NX` join, `FIFO`/`RANDOM` ordering, SSE with heartbeats, HMAC passes, admission sessions, promotion worker, **pub/sub fan-out**, measured drain-rate estimates, `tier-availability` frame | `Last-Event-ID` replay |
+| `hold` | `ticket_holds` authority, the settle-once claim, atomic reserve **with compensation**, **after-commit restore**, bounded grace, sweeper, all three endpoints, `hold:{token}` Redis timers and the keyspace listener | — |
 | `payment` | Real `PaymentFacade`, `payment_transactions`, three idempotency layers, stub gateway behind the final interface | Stripe, webhooks, 3-D Secure, Resilience4j |
 | `order` | Full orchestration, find-or-create, server-side pricing, receipt tokens, outbox relay with `SKIP LOCKED`, compensating refund, **the stock rebuild and the drift gauge** | `PaymentSettledEvent` listener, `/checkout/resume` |
-| `notification` | Rabbit topology + DLX, insert-then-send consumer, PDFBox tickets, HTML email, Mailpit | Failure classification, DLQ inspection, admin resend, refund-notice template |
+| `notification` | Rabbit topology + DLX, insert-then-send consumers, PDFBox tickets, HTML email, refund notices, Mailpit | Failure classification |
 | `saleflow` | `GET /sale/{id}/state`, failing soft per section | — |
 
 ### What gets replaced later
@@ -264,7 +264,8 @@ Honest list. None of these is hidden behind a passing test.
   listing, a ticket resend, and an operator order view. `rebuild-stock` shipped in Stage 1. Still
   a single in-memory operator account — now stored bcrypt-hashed rather than in plaintext, with a
   real identity provider deferred until a second operator exists (§10 S12).
-- **`ORDER_REFUNDED` is written but never consumed** — the refund-notice template is deferred.
+- ~~**`ORDER_REFUNDED` is written but never consumed.**~~ **Fixed:** refund notices now have a
+  dedicated consumer and template.
 
 - ~~**The outbox relay publishes without confirms.**~~ **Fixed** (Stage 4, ADR-048). A row is marked
   `PROCESSED` only once the broker acknowledges it — and, just as importantly, only once it was
@@ -287,8 +288,8 @@ Honest list. None of these is hidden behind a passing test.
 - **The emitter registry is a flat map keyed by session id.** "Sessions watching event X" streams the
   whole map and allocates a `Set`, so a sweep costs `O(connections × events)` traversals before it
   makes a single Redis call. A per-event index removes it.
-- **`notification.order-refunded.queue` has no consumer**, so it grows without bound on a durable
-  broker. The refund-notice template is Stage 4.
+- ~~**`notification.order-refunded.queue` has no consumer.**~~ **Fixed:** `OrderRefundedConsumer`
+  consumes the durable queue and sends `REFUND_NOTICE` mail.
 - **Checkout does not survive a Redis outage.** It opens with `SETNX payment:inflight:{holdToken}`,
   and `POST /holds` verifies admission against Redis. Both fail closed, which for a payment is the
   right direction — but §12's "does checkout keep working?" now has a written answer: no.
@@ -307,37 +308,33 @@ Honest list. None of these is hidden behind a passing test.
 - **`seed-concurrent.sql` had an ambiguous `id`** in its confirmation query — `events` and
   `ticket_tiers` both have one — so the seeder failed at its last statement.
 
-**Found in Pass 7 (the plan-correctness pass), all open:**
+**Found in Pass 7 (the plan-correctness pass), with current status:**
 
-- **Admission is budgeted per sale against a shared pool.** The promotion worker loops every open
+- **Admission was budgeted per sale against a shared pool.** The promotion worker loops every open
   event and applies `promotion-batch-size` per event; the tick lock is per event too. At the newly
   adopted `E = 3..10` envelope the cluster admits up to `R × E × 45` per second into `R × 30`
-  connections. ADR-049 is the fix and is **specified, not built**. This is the largest open risk in
-  the system.
+  connections. ADR-049 is now built as a global Redis budget, with the per-event batch kept as a
+  secondary cap; the next concurrent-sales run must verify the new pool-saturation numbers.
 - **A checkout costs eight sequential database transactions**, and a full buyer session about
   fifteen — not the ~1 that ADR-028's "capacity to serve" model implicitly prices. Both limits were
   therefore generous even at `E = 1`.
-- **Nothing is cached.** `events` changes only on operator pause/resume and `ticket_tiers` never
-  changes after creation, yet every window check, event summary, tier summary and tier-id lookup is a
-  PostgreSQL transaction — on the landing page, the queue-status poll and the rehydration endpoint.
-  Highest-leverage single change for the multi-sale envelope.
-- **`queue:hb:{sid}` is written by every join and every status poll and read by nobody.** The
-  "abandonment metric" its Javadoc names was never built. It is also unscoped by event, and its
-  expiries flood the shared `__keyevent@0__:expired` channel that the hold listener filters on every
-  replica. ADR-046's *"a table written by nobody's reader"* trap, in Redis.
-- **`sumActiveQuantityForTier` has no supporting index.** `idx_holds_event_tier` needs a leading
-  `event_id`; `idx_holds_sweeper` leads on `expires_at`. The drift gauge runs this per tier, per
-  event, **per replica**, every 60 s, over a table that accumulates every hold ever created — so the
-  cost grows with sale history and never falls.
+- **Catalog metadata is cached.** `events` and `ticket_tiers` now sit behind `CatalogService`, with
+  eviction on pause/resume and live stock still read from Redis on every availability path. The next
+  concurrent-sales run should show whether this removed the expected PostgreSQL pressure.
+- **The write-only `queue:hb:{sid}` key is gone.** Pass 7 found that it was written by every join and
+  every status poll and read by nobody; the current queue code drains by promotion, never by evicting
+  abandoned sessions. The remaining work is to keep the docs and key map aligned with that reality.
+- **`sumActiveQuantityForTier` now has a supporting index.** `V9__hold_active_tier_index.sql` adds
+  `idx_holds_active_tier` on active holds, with `quantity` included for the drift gauge's aggregate.
 - **The drift gauge is computed three times to produce one global answer.** Read-only and therefore
   "safe on every replica", but all three replicas compute the same number.
-- **There is no way to retrieve a ticket.** The PDF exists only as an email attachment; a typo'd
-  address is unrecoverable, and the operator resend replays the same payload to the same wrong
-  address. ADR-050, **specified, not built**.
-- **Dead surface:** `OrderFacade.getOrderSummary` has zero callers anywhere; `HoldFacade.releaseHold`,
-  `HoldReleaseReason` and the service method behind them are reached only from a test.
-- **Session identity spans `bot` and `shared`**, coupled by a request-attribute string constant, with
-  the signing secret under `flashseats.bot.*`. `bot` is abuse defence; identity is not.
+- ~~**There is no way to retrieve a ticket.**~~ **Fixed:** `GET /orders/{orderNumber}/ticket.pdf`
+  serves the same renderer used by notification, authorised by matching session or receipt token.
+- ~~**Dead facade surface.**~~ **Fixed:** the unused order summary and hold release facade paths are
+  gone; the remaining facades are the module contracts production uses.
+- ~~**Session identity spans `bot` and `shared`.**~~ **Fixed:** identity lives under
+  `shared/identity`, with `flashseats.session.*` configuration and module boundaries verified by
+  `ApplicationModules.verify()`.
 - **The operator surface is curl-only.** ADR-043 calls it a correctness dependency; one that can only
   be driven by hand-written Basic-auth curl during an incident is half-built.
 
@@ -505,11 +502,12 @@ A console is presentation and can wait. The endpoints are the capability.
 
 ### Stage 4b — Fulfilment and client polish
 
-- The refund-notice template, so `ORDER_REFUNDED` reaches the buyer — and a consumer for
-  `notification.order-refunded.queue`, which currently has none and grows without bound.
+- ~~The refund-notice template, so `ORDER_REFUNDED` reaches the buyer — and a consumer for
+  `notification.order-refunded.queue`.~~ Built.
 - Notification failure classification (ADR-029): transient failures earn the retry chain; the
   deterministic ones already skip it.
-- `tier-availability` frames in the waiting room (ADR-027); `RANDOM` queue ordering (ADR-024).
+- `tier-availability` frames in the waiting room (ADR-027) and `RANDOM` queue ordering (ADR-024) are
+  built; keep the next UI work focused on browser coverage rather than another API-only proof.
 - The React SPA against `FE_SPEC.md`, if the demo client is outgrown.
 - **The Playwright suite specified in `FE_SPEC.md` §8.** Every one of the four client rules is a
   browser behaviour — a skewed clock, a real reload, a live `EventSource` — so none of them is
@@ -523,26 +521,28 @@ dependency order. Everything in the first two groups is cheap; the third is the 
 
 **Delete what nothing uses** (no behaviour change):
 
-- `queue:hb:{sid}` and the `touchHeartbeat` call on the hottest polling path — a write-only key.
-- `OrderFacade.getOrderSummary` (zero callers) and `HoldFacade.releaseHold` + `HoldReleaseReason` +
-  the service method behind them (test-only).
-- The `ORDER_REFUNDED` decision: build the Stage 4b consumer, or stop writing the rows. Carrying it a
-  fifth time is not an option.
+- ~~`OrderFacade.getOrderSummary` (zero callers) and `HoldFacade.releaseHold` +
+  `HoldReleaseReason` + the service method behind them (test-only).~~ Built.
+- ~~The `ORDER_REFUNDED` decision: build the Stage 4b consumer, or stop writing the rows.~~ Built as
+  `OrderRefundedConsumer`.
 
 **Fix the bugs:**
 
-- `V9`: `CREATE INDEX idx_holds_active_tier ON ticket_holds (tier_id) WHERE status = 'ACTIVE'`.
-- `GET /orders/{orderNumber}/ticket.pdf`, with `TicketPdfRenderer` moved to `shared` (**ADR-050**).
-- Move the `fsid` filter from `bot` to `shared/identity`; rename to `flashseats.session.*`.
-  `ApplicationModules.verify()` is the check.
+- ~~`V9`: `CREATE INDEX idx_holds_active_tier ON ticket_holds (tier_id) WHERE status = 'ACTIVE'`.~~
+  Built, with `quantity` included.
+- ~~`GET /orders/{orderNumber}/ticket.pdf`, with `TicketPdfRenderer` moved to `shared`
+  (**ADR-050**).~~ Built.
+- ~~Move the `fsid` filter from `bot` to `shared/identity`; rename to `flashseats.session.*`.~~
+  Built, with `ApplicationModules.verify()` as the check.
 
 **Then concurrent sales** (**ADR-049**), in leverage order, each measurable on its own:
 
-1. Cache `events` + `ticket_tiers` behind `CatalogService`, evicted on pause/resume. The single
-   highest-leverage change, and the smallest.
-2. The global admission budget, with the per-event batch as a secondary cap.
-3. Hoist the exhausted `EXISTS` out of the per-session loop; pipeline the rest of the sweep.
-4. A per-event index in the emitter registry.
+1. Cache `events` + `ticket_tiers` behind `CatalogService`, evicted on pause/resume. Built; verify
+   its effect in the next concurrent-sales run.
+2. The global admission budget, with the per-event batch as a secondary cap. Built; the next
+   concurrent-sales run should verify the pool-saturation numbers.
+3. Hoist the exhausted `EXISTS` out of the per-session loop. Built; pipeline the rest of the sweep.
+4. A per-event index in the emitter registry. Built.
 5. Make the drift gauge a singleton under the promotion tick's Redis-lock pattern.
 
 **The drill — built in Pass 7, and NOT YET RUN.** Every other instrument here runs one event, and so
@@ -1042,10 +1042,10 @@ same second against one shared pool: `R × E × 45` admissions per second into `
 The second half of the same error is that a checkout costs **eight** sequential transactions, not one.
 **ADR-049** adds a global admission budget and re-scopes ADR-028 as the per-sale cap.
 
-**Bugs found by reading, not by failing.** Each is recorded in §9 and none is fixed yet: the
-write-only `queue:hb` key, the missing partial index behind `sumActiveQuantityForTier`, the absent
-ticket-retrieval endpoint (**ADR-050**), the triple-computed drift gauge, two dead facade methods, and
-session identity split across `bot` and `shared`.
+**Bugs found by reading, not by failing.** Each is recorded in §9. The write-only `queue:hb` key, the
+partial index behind `sumActiveQuantityForTier`, the ticket-retrieval endpoint (**ADR-050**), the dead
+facade methods, and the session identity split are already closed; what remains here is the
+triple-computed drift gauge and the next concurrent-sales proof.
 
 **One rule added to stop this recurring.** `CLAUDE.md` now carries *"Updating the docs is part of the
 change, not follow-up"* — a table mapping what you changed to what you must update, and two standing

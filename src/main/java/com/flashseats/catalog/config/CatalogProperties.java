@@ -21,6 +21,12 @@ public class CatalogProperties {
      */
     private int epochCheckIntervalMs = 5_000;
 
+    /**
+     * Keeps event and tier metadata out of the hottest queue/status paths. Tests disable it because
+     * their fixtures write rows directly and restart ids between methods.
+     */
+    private boolean metadataCacheEnabled = true;
+
     public int getLimitedThresholdPercent() {
         return limitedThresholdPercent;
     }
@@ -35,5 +41,13 @@ public class CatalogProperties {
 
     public void setEpochCheckIntervalMs(int epochCheckIntervalMs) {
         this.epochCheckIntervalMs = epochCheckIntervalMs;
+    }
+
+    public boolean isMetadataCacheEnabled() {
+        return metadataCacheEnabled;
+    }
+
+    public void setMetadataCacheEnabled(boolean metadataCacheEnabled) {
+        this.metadataCacheEnabled = metadataCacheEnabled;
     }
 }

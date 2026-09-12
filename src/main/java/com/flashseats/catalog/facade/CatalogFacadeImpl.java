@@ -51,6 +51,11 @@ class CatalogFacadeImpl implements CatalogFacade {
     }
 
     @Override
+    public List<TierAvailability> getTierAvailability(long eventId) {
+        return catalog.getTierAvailability(eventId);
+    }
+
+    @Override
     public ReserveResult tryReserve(long eventId, long tierId, int quantity) {
         return catalog.tryReserve(eventId, tierId, quantity);
     }
