@@ -34,6 +34,10 @@ build/
 
 # Local environment overrides (see .env.example)
 .env
+# ...and every backup/variant of it. A `.env.bak` holds the same secrets the
+# original does, and only `.env` being listed here let one reach a commit.
+.env.*
+!.env.example
 .env.local
 
 # Load-test output

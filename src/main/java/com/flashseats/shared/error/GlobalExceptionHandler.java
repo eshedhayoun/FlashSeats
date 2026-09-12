@@ -10,6 +10,7 @@ import org.springframework.http.ProblemDetail;
 import org.springframework.http.ResponseEntity;
 import org.springframework.http.converter.HttpMessageNotReadableException;
 import org.springframework.web.ErrorResponse;
+import org.springframework.web.HttpMediaTypeNotAcceptableException;
 import org.springframework.web.HttpMediaTypeNotSupportedException;
 import org.springframework.web.HttpRequestMethodNotSupportedException;
 import org.springframework.web.bind.MethodArgumentNotValidException;
@@ -96,12 +97,22 @@ public class GlobalExceptionHandler {
     }
 
     /**
-     * Wrong method or wrong content type. Kept apart from the {@code 400}s because the status is
-     * part of the answer — {@code 405} and {@code 415} tell a client something {@code 400} does not.
+     * Wrong method, wrong content type, or an {@code Accept} we cannot satisfy. Kept apart from the
+     * {@code 400}s because the status is part of the answer — {@code 405}, {@code 415} and
+     * {@code 406} each tell a client something {@code 400} does not.
+     *
+     * <p><strong>{@code HttpMediaTypeNotAcceptableException} was missing here</strong> until the
+     * ticket download (ADR-050) gave this API its first non-JSON response and immediately tripped
+     * over it. ADR-041's rule is that every exception Spring itself throws must be named before the
+     * {@code Exception} backstop, because {@code ExceptionHandlerExceptionResolver} runs first and
+     * the backstop therefore owns whatever is not listed. This one was not, so a content-negotiation
+     * failure answered {@code 500 INTERNAL_ERROR} with no registry {@code code} — the exact shape of
+     * defect ADR-041 was written to eliminate, one exception short of complete.
      */
     @ExceptionHandler({
         HttpRequestMethodNotSupportedException.class,
-        HttpMediaTypeNotSupportedException.class
+        HttpMediaTypeNotSupportedException.class,
+        HttpMediaTypeNotAcceptableException.class
     })
     public ResponseEntity<ProblemDetail> onUnsupportedRequest(ErrorResponse ex) {
         HttpStatusCode status = ex.getStatusCode();

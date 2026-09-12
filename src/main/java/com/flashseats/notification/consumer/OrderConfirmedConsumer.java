@@ -6,7 +6,8 @@ import com.flashseats.notification.model.NotificationKind;
 import com.flashseats.notification.service.EmailComposer;
 import com.flashseats.notification.service.EmailDispatcher;
 import com.flashseats.notification.service.NotificationLogService;
-import com.flashseats.notification.service.TicketPdfRenderer;
+import com.flashseats.shared.ticket.TicketDocument;
+import com.flashseats.shared.ticket.TicketPdfRenderer;
 import com.rabbitmq.client.Channel;
 import java.io.IOException;
 import lombok.extern.slf4j.Slf4j;
@@ -80,7 +81,7 @@ public class OrderConfirmedConsumer {
                 return;
             }
 
-            byte[] ticket = pdf.render(payload);
+            byte[] ticket = pdf.render(toDocument(payload));
             dispatcher.send(
                     payload.userEmail(),
                     composer.subjectFor(payload),
@@ -101,6 +102,24 @@ public class OrderConfirmedConsumer {
             // requeue=false: straight to the dead-letter queue, where an operator can see it.
             channel.basicNack(deliveryTag, false, false);
         }
+    }
+
+    /**
+     * Maps the wire payload onto the renderer's own narrower input (ADR-050).
+     *
+     * <p>The renderer is in {@code shared} so {@code order} can serve the same bytes as a download.
+     * It deliberately cannot see {@code receiptToken} or the amount — a ticket is what someone holds
+     * at a door, and a renderer with no access to a bearer capability cannot print one onto a page.
+     */
+    private static TicketDocument toDocument(OrderConfirmedPayload payload) {
+        return new TicketDocument(
+                payload.orderNumber(),
+                payload.event().title(),
+                payload.event().venueName(),
+                payload.event().startTime(),
+                payload.items().stream()
+                        .map(item -> new TicketDocument.Seat(item.tierName(), item.quantity()))
+                        .toList());
     }
 
     /**

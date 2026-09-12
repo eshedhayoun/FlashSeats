@@ -44,4 +44,22 @@ public class EmailDispatcher {
 
         mailSender.send(message);
     }
+
+    /**
+     * Sends a message with no attachment — the refund notice.
+     *
+     * <p>{@code multipart = false}, which is not merely a simplification: a multipart message with
+     * one part is a message some clients render as an empty body with a mysterious attachment.
+     */
+    public void send(String to, String subject, String htmlBody) throws MessagingException {
+        MimeMessage message = mailSender.createMimeMessage();
+        MimeMessageHelper helper = new MimeMessageHelper(message, false, "UTF-8");
+
+        helper.setFrom(fromAddress);
+        helper.setTo(to);
+        helper.setSubject(subject);
+        helper.setText(htmlBody, true);
+
+        mailSender.send(message);
+    }
 }

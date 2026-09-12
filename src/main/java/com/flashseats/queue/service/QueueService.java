@@ -68,7 +68,6 @@ public class QueueService {
                         sessionId,
                         (double) clock.instant().toEpochMilli());
         expireWithSale(QueueKeys.waiting(eventId), event.saleEndTime());
-        touchHeartbeat(sessionId);
 
         return status(sessionId, eventId, event.windowStatus());
     }
@@ -85,7 +84,6 @@ public class QueueService {
     }
 
     private QueueStatusResponse status(String sessionId, long eventId, EventWindowStatus window) {
-        touchHeartbeat(sessionId);
         QueueState state = getQueueState(sessionId, eventId, window);
         Integer position = state.position();
 
@@ -211,19 +209,5 @@ public class QueueService {
     public void revokeAdmission(String sessionId, long eventId) {
         redis.delete(QueueKeys.admission(eventId, sessionId));
         redis.opsForZSet().remove(QueueKeys.admissions(eventId), sessionId);
-    }
-
-    // ---------------------------------------------------------------- internal
-
-    /**
-     * Refreshes the liveness marker. Advisory only — it feeds an abandonment metric and is never
-     * consulted before promoting or removing anyone (ADR-026).
-     */
-    void touchHeartbeat(String sessionId) {
-        redis.opsForValue()
-                .set(
-                        QueueKeys.heartbeat(sessionId),
-                        "1",
-                        Duration.ofSeconds(properties.getHeartbeatTtlSeconds()));
     }
 }
