@@ -88,8 +88,12 @@ public class QueueController {
     public SseEmitter stream(@RequestParam long eventId, SessionId session) {
         SseEmitter emitter = emitters.register(session.value(), eventId, STREAM_TIMEOUT_MS);
 
-        // Send the current position immediately: an empty stream for the first two seconds looks
-        // like a failure to connect.
+        // Flush the stream immediately even if this buyer is already promoted, admitted or
+        // exhausted and therefore has no position frame to send.
+        emitters.comment(session.value(), "connected");
+
+        // Send the current position immediately when one exists: an empty stream for the first two
+        // seconds looks like a failure to connect.
         var state = queue.getQueueState(session.value(), eventId);
         if (state.position() != null) {
             emitters.sendPosition(session.value(), state.position(), state.estWaitSeconds());

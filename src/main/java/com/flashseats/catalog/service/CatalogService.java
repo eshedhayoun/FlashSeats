@@ -11,6 +11,7 @@ import com.flashseats.catalog.exception.TierNotFoundException;
 import com.flashseats.catalog.facade.EventSummary;
 import com.flashseats.catalog.facade.EventWindowStatus;
 import com.flashseats.catalog.facade.ReserveResult;
+import com.flashseats.catalog.facade.TierAvailability;
 import com.flashseats.catalog.facade.TierSummary;
 import com.flashseats.catalog.model.Event;
 import com.flashseats.catalog.model.EventStatus;
@@ -23,6 +24,7 @@ import java.time.Instant;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
@@ -45,6 +47,8 @@ public class CatalogService {
     private final StockEpoch epoch;
     private final CatalogProperties properties;
     private final Clock clock;
+    private final Map<Long, Event> eventCache = new ConcurrentHashMap<>();
+    private final Map<Long, List<TicketTier>> tierCache = new ConcurrentHashMap<>();
 
     public CatalogService(
             EventRepository events,
@@ -86,9 +90,9 @@ public class CatalogService {
      * event's metadata and its inventory.
      */
     public EventDetailResponse getEventDetail(long eventId) {
-        Event event = requireEvent(eventId);
+        Event event = cachedEvent(eventId);
         Instant now = clock.instant();
-        List<TicketTier> eventTiers = tiers.findByEventIdOrderByPriceCentsDesc(eventId);
+        List<TicketTier> eventTiers = cachedTiers(eventId);
 
         // One round trip for every counter, not one per tier: every visitor loads this before the
         // sale and reloads it while they wait.
@@ -115,9 +119,10 @@ public class CatalogService {
 
     @Transactional(readOnly = true)
     public TierSummary getTierSummary(long eventId, long tierId) {
-        Event event = requireEvent(eventId);
-        TicketTier tier = tiers.findById(tierId)
-                .filter(t -> t.getEventId().equals(eventId))
+        Event event = cachedEvent(eventId);
+        TicketTier tier = cachedTiers(eventId).stream()
+                .filter(t -> t.getId().equals(tierId))
+                .findFirst()
                 .orElseThrow(() -> new TierNotFoundException(eventId, tierId));
 
         return new TierSummary(
@@ -136,7 +141,7 @@ public class CatalogService {
 
     @Transactional(readOnly = true)
     public EventSummary getEventSummary(long eventId) {
-        Event event = requireEvent(eventId);
+        Event event = cachedEvent(eventId);
         return new EventSummary(
                 event.getId(),
                 event.getTitle(),
@@ -149,7 +154,7 @@ public class CatalogService {
 
     @Transactional(readOnly = true)
     public EventWindowStatus getWindowStatus(long eventId) {
-        return SaleWindows.statusOf(requireEvent(eventId), clock.instant());
+        return SaleWindows.statusOf(cachedEvent(eventId), clock.instant());
     }
 
     @Transactional(readOnly = true)
@@ -189,6 +194,7 @@ public class CatalogService {
         EventStatus target = paused ? EventStatus.PAUSED : EventStatus.PUBLISHED;
         if (current != target) {
             event.setStatus(target);
+            evictMetadata(eventId);
             log.warn("Event {} {} by an operator", eventId, paused ? "PAUSED" : "resumed");
         }
         return target;
@@ -219,6 +225,23 @@ public class CatalogService {
             return COUNTER_UNAVAILABLE;
         }
         return counters.values().stream().mapToInt(Integer::intValue).sum();
+    }
+
+    /**
+     * The same bucket view as the landing page, packaged for the waiting-room stream.
+     *
+     * <p>The queue module deliberately receives only buckets, not counts. Exact live inventory
+     * would become a public feed the moment it crossed the SSE boundary (ADR-027).
+     */
+    public List<TierAvailability> getTierAvailability(long eventId) {
+        List<TicketTier> eventTiers = cachedTiers(eventId);
+        Map<Long, Integer> remainingByTier =
+                stock.readAll(eventId, eventTiers.stream().map(TicketTier::getId).toList());
+
+        return eventTiers.stream()
+                .map(tier -> new TierAvailability(
+                        tier.getId(), toTierResponse(tier, remainingByTier).availability().name()))
+                .toList();
     }
 
     // ------------------------------------------------------ inventory movement
@@ -301,7 +324,7 @@ public class CatalogService {
         }
 
         int seeded = 0;
-        for (TicketTier tier : tiers.findByEventIdOrderByPriceCentsDesc(eventId)) {
+        for (TicketTier tier : cachedTiers(eventId)) {
             if (stock.seedIfAbsent(eventId, tier.getId(), tier.getTotalCapacity())) {
                 seeded++;
             }
@@ -320,7 +343,7 @@ public class CatalogService {
     @Transactional(readOnly = true)
     public Map<Long, Integer> getTierCapacities(long eventId) {
         Map<Long, Integer> capacities = new HashMap<>();
-        for (TicketTier tier : tiers.findByEventIdOrderByPriceCentsDesc(eventId)) {
+        for (TicketTier tier : cachedTiers(eventId)) {
             capacities.put(tier.getId(), tier.getTotalCapacity());
         }
         return capacities;
@@ -357,13 +380,31 @@ public class CatalogService {
     // ----------------------------------------------------------------- helpers
 
     private List<Long> tierIds(long eventId) {
-        return tiers.findByEventIdOrderByPriceCentsDesc(eventId).stream()
-                .map(TicketTier::getId)
-                .toList();
+        return cachedTiers(eventId).stream().map(TicketTier::getId).toList();
     }
 
     private Event requireEvent(long eventId) {
         return events.findById(eventId).orElseThrow(() -> new EventNotFoundException(eventId));
+    }
+
+    private Event cachedEvent(long eventId) {
+        if (!properties.isMetadataCacheEnabled()) {
+            return requireEvent(eventId);
+        }
+        return eventCache.computeIfAbsent(eventId, this::requireEvent);
+    }
+
+    private List<TicketTier> cachedTiers(long eventId) {
+        if (!properties.isMetadataCacheEnabled()) {
+            return tiers.findByEventIdOrderByPriceCentsDesc(eventId);
+        }
+        return tierCache.computeIfAbsent(
+                eventId, id -> List.copyOf(tiers.findByEventIdOrderByPriceCentsDesc(id)));
+    }
+
+    private void evictMetadata(long eventId) {
+        eventCache.remove(eventId);
+        tierCache.remove(eventId);
     }
 
     /**

@@ -2,9 +2,13 @@ package com.flashseats.queue.service;
 
 import com.flashseats.catalog.facade.CatalogFacade;
 import com.flashseats.catalog.facade.EventWindowStatus;
+import com.flashseats.catalog.facade.TierAvailability;
 import com.flashseats.queue.facade.QueuePhase;
 import java.time.Clock;
+import java.util.List;
 import java.util.Map;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.scheduling.annotation.Scheduled;
@@ -29,6 +33,7 @@ public class QueueBroadcaster {
     private final CatalogFacade catalog;
     private final StringRedisTemplate redis;
     private final Clock clock;
+    private final Map<Long, List<TierAvailability>> lastAvailability = new ConcurrentHashMap<>();
 
     public QueueBroadcaster(
             SseEmitterRegistry emitters,
@@ -61,7 +66,9 @@ public class QueueBroadcaster {
             fixedDelayString = "${flashseats.queue.sse-position-interval-ms}",
             initialDelayString = "${flashseats.queue.sse-position-interval-ms}")
     public void pushPositions() {
-        for (long eventId : emitters.watchedEventIds()) {
+        Set<Long> watchedEventIds = emitters.watchedEventIds();
+        lastAvailability.keySet().removeIf(eventId -> !watchedEventIds.contains(eventId));
+        for (long eventId : watchedEventIds) {
             try {
                 sweep(eventId);
             } catch (RuntimeException failure) {
@@ -75,15 +82,18 @@ public class QueueBroadcaster {
         EventWindowStatus window = catalog.getWindowStatus(eventId);
 
         if (window == EventWindowStatus.CLOSED) {
+            lastAvailability.remove(eventId);
             emitters.closeAll(
                     eventId, "sale-closed", Map.of("closedAt", clock.instant().toString()));
             return;
         }
 
         sampleDepth(eventId);
+        publishAvailabilityIfChanged(eventId);
+        boolean exhausted = queue.isExhausted(eventId);
 
         for (String sessionId : emitters.sessionsWatching(eventId)) {
-            var state = queue.getQueueState(sessionId, eventId, window);
+            var state = queue.getQueueState(sessionId, eventId, window, exhausted);
             if (state.phase() == QueuePhase.EXHAUSTED) {
                 // Derived from live stock, so it is not terminal for the connection: if seats come
                 // back the marker clears and this buyer's position is still theirs (ADR-035).
@@ -91,6 +101,14 @@ public class QueueBroadcaster {
             } else if (state.position() != null) {
                 emitters.sendPosition(sessionId, state.position(), state.estWaitSeconds());
             }
+        }
+    }
+
+    private void publishAvailabilityIfChanged(long eventId) {
+        List<TierAvailability> current = catalog.getTierAvailability(eventId);
+        List<TierAvailability> previous = lastAvailability.put(eventId, current);
+        if (!current.equals(previous)) {
+            emitters.broadcast(eventId, "tier-availability", Map.of("tiers", current));
         }
     }
 

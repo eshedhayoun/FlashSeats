@@ -2,7 +2,7 @@ package com.flashseats.queue.config;
 
 import org.springframework.boot.context.properties.ConfigurationProperties;
 
-/** Waiting-room tunables (ADR-007, ADR-020, ADR-026, ADR-028). */
+/** Waiting-room tunables (ADR-007, ADR-020, ADR-026, ADR-028, ADR-049). */
 @ConfigurationProperties(prefix = "flashseats.queue")
 public class QueueProperties {
 
@@ -28,10 +28,26 @@ public class QueueProperties {
     private int promotionBatchSize = 45;
 
     /**
+     * Cluster-wide database connection budget available to promoted buyers each promotion interval
+     * (ADR-049). This is shared across every open sale; {@link #promotionBatchSize} remains the
+     * per-event fairness cap.
+     */
+    private int globalAdmissionConnectionBudget = 90;
+
+    /**
+     * Estimated database connection cost of one buyer admitted into checkout (ADR-049). The global
+     * admission count per tick is {@code globalAdmissionConnectionBudget / databaseConnectionsPerBuyer}.
+     */
+    private int databaseConnectionsPerBuyer = 8;
+
+    /**
      * Hold-to-order conversion is well under 100%, so admitting exactly {@code remainingStock}
      * buyers leaves the sale under-filled. Every real waiting room tunes this (ADR-020).
      */
     private double oversubscribeFactor = 1.5;
+
+    /** FIFO is the explainable default; RANDOM is the fair drop mode from ADR-024. */
+    private QueueOrdering ordering = QueueOrdering.FIFO;
 
     private long ssePositionIntervalMs = 2_000;
 
@@ -88,12 +104,43 @@ public class QueueProperties {
         this.promotionBatchSize = promotionBatchSize;
     }
 
+    public int getGlobalAdmissionConnectionBudget() {
+        return globalAdmissionConnectionBudget;
+    }
+
+    public void setGlobalAdmissionConnectionBudget(int globalAdmissionConnectionBudget) {
+        this.globalAdmissionConnectionBudget = globalAdmissionConnectionBudget;
+    }
+
+    public int getDatabaseConnectionsPerBuyer() {
+        return databaseConnectionsPerBuyer;
+    }
+
+    public void setDatabaseConnectionsPerBuyer(int databaseConnectionsPerBuyer) {
+        this.databaseConnectionsPerBuyer = databaseConnectionsPerBuyer;
+    }
+
+    public long getGlobalAdmissionBudgetPerTick() {
+        if (globalAdmissionConnectionBudget <= 0 || databaseConnectionsPerBuyer <= 0) {
+            return 0;
+        }
+        return globalAdmissionConnectionBudget / databaseConnectionsPerBuyer;
+    }
+
     public double getOversubscribeFactor() {
         return oversubscribeFactor;
     }
 
     public void setOversubscribeFactor(double oversubscribeFactor) {
         this.oversubscribeFactor = oversubscribeFactor;
+    }
+
+    public QueueOrdering getOrdering() {
+        return ordering;
+    }
+
+    public void setOrdering(QueueOrdering ordering) {
+        this.ordering = ordering;
     }
 
     public long getSsePositionIntervalMs() {

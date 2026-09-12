@@ -4,12 +4,17 @@ import com.flashseats.catalog.exception.SaleNotOpenException;
 import com.flashseats.catalog.facade.CatalogFacade;
 import com.flashseats.catalog.facade.EventSummary;
 import com.flashseats.catalog.facade.EventWindowStatus;
+import com.flashseats.queue.config.QueueOrdering;
 import com.flashseats.queue.config.QueueProperties;
 import com.flashseats.queue.dto.AdmitResponse;
 import com.flashseats.queue.dto.QueueStatusResponse;
 import com.flashseats.queue.exception.QueuePassInvalidException;
 import com.flashseats.queue.facade.QueuePhase;
 import com.flashseats.queue.facade.QueueState;
+import java.nio.ByteBuffer;
+import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
 import java.time.Clock;
 import java.time.Duration;
 import java.time.Instant;
@@ -55,6 +60,9 @@ public class QueueService {
      * arrival time and send the buyer to the <em>back</em> of the line — the exact opposite of the
      * fairness the queue exists to provide (ADR-008). Rejoining is therefore idempotent, and that is
      * a feature.
+     *
+     * <p>{@code RANDOM} ordering is still idempotent: the score is a deterministic random draw from
+     * the event id and session id, not a fresh number on every refresh (ADR-024).
      */
     public QueueStatusResponse join(String sessionId, long eventId) {
         EventSummary event = catalog.getEventSummary(eventId);
@@ -66,10 +74,28 @@ public class QueueService {
                 .addIfAbsent(
                         QueueKeys.waiting(eventId),
                         sessionId,
-                        (double) clock.instant().toEpochMilli());
+                        queueScore(sessionId, eventId));
         expireWithSale(QueueKeys.waiting(eventId), event.saleEndTime());
 
         return status(sessionId, eventId, event.windowStatus());
+    }
+
+    private double queueScore(String sessionId, long eventId) {
+        if (properties.getOrdering() == QueueOrdering.RANDOM) {
+            return randomDrawScore(sessionId, eventId);
+        }
+        return (double) clock.instant().toEpochMilli();
+    }
+
+    private double randomDrawScore(String sessionId, long eventId) {
+        try {
+            MessageDigest digest = MessageDigest.getInstance("SHA-256");
+            byte[] hash = digest.digest((eventId + ":" + sessionId).getBytes(StandardCharsets.UTF_8));
+            long draw = ByteBuffer.wrap(hash).getLong() & ((1L << 53) - 1);
+            return (double) draw;
+        } catch (NoSuchAlgorithmException impossible) {
+            throw new IllegalStateException("SHA-256 is required by the JVM", impossible);
+        }
     }
 
     private void expireWithSale(String key, Instant saleEndTime) {
@@ -101,6 +127,10 @@ public class QueueService {
         return getQueueState(sessionId, eventId, catalog.getWindowStatus(eventId));
     }
 
+    boolean isExhausted(long eventId) {
+        return Boolean.TRUE.equals(redis.hasKey(QueueKeys.exhausted(eventId)));
+    }
+
     /**
      * Assembles a session's whole position in the sale.
      *
@@ -125,6 +155,10 @@ public class QueueService {
      * it once rather than once per session.
      */
     QueueState getQueueState(String sessionId, long eventId, EventWindowStatus window) {
+        return getQueueState(sessionId, eventId, window, isExhausted(eventId));
+    }
+
+    QueueState getQueueState(String sessionId, long eventId, EventWindowStatus window, boolean exhausted) {
         if (window == EventWindowStatus.CLOSED) {
             return new QueueState(QueuePhase.CLOSED, null, null, null, null);
         }
@@ -141,7 +175,7 @@ public class QueueService {
             return new QueueState(QueuePhase.PROMOTED, null, null, null, passToken);
         }
 
-        if (Boolean.TRUE.equals(redis.hasKey(QueueKeys.exhausted(eventId)))) {
+        if (exhausted) {
             return new QueueState(QueuePhase.EXHAUSTED, null, null, null, null);
         }
 
