@@ -113,7 +113,7 @@ it, so if anything fails the hold returns to `ACTIVE` and expires normally.
 | `shared` | `ErrorCode` (42 codes), `ProblemDetails`, one global advice, `SessionId`, `Money`, `Clock`, `SignedToken`, `TraceIdFilter` | — |
 | `bot` | Signed `fsid` cookie; Redis-backed Bucket4j session + IP buckets; SSE exempt from per-request accounting | reCAPTCHA, `ip_rules`, audit logs. **Writes no tables.** |
 | `catalog` | Events, tiers, window derivation, `serverTime`, bucketed availability, **Redis counters + Lua, the `-2` fault path, pre-warm, the Redis-restart guard** | pause, `TierAvailabilityChangedEvent` |
-| `queue` | `ZADD NX` join, SSE with heartbeats, HMAC passes, admission sessions, promotion worker, **pub/sub fan-out**, measured drain-rate estimates | `RANDOM` ordering, `tier-availability` frame, `Last-Event-ID` replay |
+| `queue` | `ZADD NX` join, `FIFO`/`RANDOM` ordering, SSE with heartbeats, HMAC passes, admission sessions, promotion worker, **pub/sub fan-out**, measured drain-rate estimates, `tier-availability` frame | `Last-Event-ID` replay |
 | `hold` | `ticket_holds` authority, the settle-once claim, atomic reserve **with compensation**, **after-commit restore**, bounded grace, sweeper, all three endpoints | the `hold:{token}` Redis timer and the keyspace listener (Stage 3) |
 | `payment` | Real `PaymentFacade`, `payment_transactions`, three idempotency layers, stub gateway behind the final interface | Stripe, webhooks, 3-D Secure, Resilience4j |
 | `order` | Full orchestration, find-or-create, server-side pricing, receipt tokens, outbox relay with `SKIP LOCKED`, compensating refund, **the stock rebuild and the drift gauge** | `PaymentSettledEvent` listener, `/checkout/resume` |
@@ -309,11 +309,11 @@ Honest list. None of these is hidden behind a passing test.
 
 **Found in Pass 7 (the plan-correctness pass), all open:**
 
-- **Admission is budgeted per sale against a shared pool.** The promotion worker loops every open
+- **Admission was budgeted per sale against a shared pool.** The promotion worker loops every open
   event and applies `promotion-batch-size` per event; the tick lock is per event too. At the newly
   adopted `E = 3..10` envelope the cluster admits up to `R × E × 45` per second into `R × 30`
-  connections. ADR-049 is the fix and is **specified, not built**. This is the largest open risk in
-  the system.
+  connections. ADR-049 is now built as a global Redis budget, with the per-event batch kept as a
+  secondary cap; the next concurrent-sales run must verify the new pool-saturation numbers.
 - **A checkout costs eight sequential database transactions**, and a full buyer session about
   fifteen — not the ~1 that ADR-028's "capacity to serve" model implicitly prices. Both limits were
   therefore generous even at `E = 1`.
@@ -509,7 +509,8 @@ A console is presentation and can wait. The endpoints are the capability.
   `notification.order-refunded.queue`, which currently has none and grows without bound.
 - Notification failure classification (ADR-029): transient failures earn the retry chain; the
   deterministic ones already skip it.
-- `tier-availability` frames in the waiting room (ADR-027); `RANDOM` queue ordering (ADR-024).
+- `tier-availability` frames in the waiting room (ADR-027) and `RANDOM` queue ordering (ADR-024) are
+  built; keep the next UI work focused on browser coverage rather than another API-only proof.
 - The React SPA against `FE_SPEC.md`, if the demo client is outgrown.
 - **The Playwright suite specified in `FE_SPEC.md` §8.** Every one of the four client rules is a
   browser behaviour — a skewed clock, a real reload, a live `EventSource` — so none of them is
@@ -540,7 +541,8 @@ dependency order. Everything in the first two groups is cheap; the third is the 
 
 1. Cache `events` + `ticket_tiers` behind `CatalogService`, evicted on pause/resume. The single
    highest-leverage change, and the smallest.
-2. The global admission budget, with the per-event batch as a secondary cap.
+2. The global admission budget, with the per-event batch as a secondary cap. Built; the next
+   concurrent-sales run should verify the pool-saturation numbers.
 3. Hoist the exhausted `EXISTS` out of the per-session loop; pipeline the rest of the sweep.
 4. A per-event index in the emitter registry.
 5. Make the drift gauge a singleton under the promotion tick's Redis-lock pattern.

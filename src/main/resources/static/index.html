@@ -415,6 +415,10 @@ function openStream() {
     renderPosition(d.position, d.estWaitSeconds);
   });
   es.addEventListener("queue-promoted", (e) => admit(JSON.parse(e.data).passToken));
+  es.addEventListener("tier-availability", (e) => {
+    const d = JSON.parse(e.data);
+    applyTierAvailability(d.tiers || []);
+  });
   es.addEventListener("sale-exhausted", () => terminal("Sold out", "The last ticket went while you were waiting."));
   es.addEventListener("sale-closed", () => terminal("Sales have ended", "This sale is over."));
 
@@ -423,6 +427,29 @@ function openStream() {
 }
 
 function closeStream() { if (state.stream) { state.stream.close(); state.stream = null; } }
+
+function applyTierAvailability(tiers) {
+  const byId = new Map(tiers.map((t) => [Number(t.tierId), t.level]));
+  state.event.tiers.forEach((tier) => {
+    if (byId.has(Number(tier.tierId))) tier.availability = byId.get(Number(tier.tierId));
+  });
+
+  document.querySelectorAll("[data-tier]").forEach((el) => {
+    const level = byId.get(Number(el.dataset.tier));
+    if (!level) return;
+    el.setAttribute("aria-disabled", level === "SOLD_OUT");
+    if (level === "SOLD_OUT" && Number(state.tierId) === Number(el.dataset.tier)) {
+      state.tierId = null;
+      el.setAttribute("aria-selected", "false");
+      $("btn-reserve").disabled = true;
+    }
+    const badge = el.querySelector(".badge");
+    if (badge) {
+      badge.className = `badge ${level}`;
+      badge.textContent = availabilityLabel(level);
+    }
+  });
+}
 
 function connection(live) {
   $("q-dot").className = "dot" + (live ? "" : " off");

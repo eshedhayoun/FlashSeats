@@ -11,6 +11,7 @@ import com.flashseats.catalog.exception.TierNotFoundException;
 import com.flashseats.catalog.facade.EventSummary;
 import com.flashseats.catalog.facade.EventWindowStatus;
 import com.flashseats.catalog.facade.ReserveResult;
+import com.flashseats.catalog.facade.TierAvailability;
 import com.flashseats.catalog.facade.TierSummary;
 import com.flashseats.catalog.model.Event;
 import com.flashseats.catalog.model.EventStatus;
@@ -219,6 +220,23 @@ public class CatalogService {
             return COUNTER_UNAVAILABLE;
         }
         return counters.values().stream().mapToInt(Integer::intValue).sum();
+    }
+
+    /**
+     * The same bucket view as the landing page, packaged for the waiting-room stream.
+     *
+     * <p>The queue module deliberately receives only buckets, not counts. Exact live inventory
+     * would become a public feed the moment it crossed the SSE boundary (ADR-027).
+     */
+    public List<TierAvailability> getTierAvailability(long eventId) {
+        List<TicketTier> eventTiers = tiers.findByEventIdOrderByPriceCentsDesc(eventId);
+        Map<Long, Integer> remainingByTier =
+                stock.readAll(eventId, eventTiers.stream().map(TicketTier::getId).toList());
+
+        return eventTiers.stream()
+                .map(tier -> new TierAvailability(
+                        tier.getId(), toTierResponse(tier, remainingByTier).availability().name()))
+                .toList();
     }
 
     // ------------------------------------------------------ inventory movement
