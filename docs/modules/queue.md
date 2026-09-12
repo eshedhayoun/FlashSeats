@@ -121,18 +121,18 @@ for sid in ZRANGE queue:waiting:{e} 0 admittable-1:
 **The batch size is per sale, and that is now a known limit rather than the whole story.**
 ADR-028 derives `batchSize ≤ hikariMax × 1.5` for a single sale. This worker loops every open event
 and applies the cap per event, so at `E` concurrent sales the cluster admits `R × E × batchSize` per
-second into one shared pool. **ADR-049 adds a global budget. Specified, not built.**
+second into one shared pool. ADR-049 adds a Redis-backed global budget before each promotion tick,
+with the per-sale batch size kept as a secondary cap.
 
 ---
 
 ## 5. Ordering
 
-**FIFO by arrival millisecond, and not configurable.** `flashseats.queue.ordering` was declared in
-`application.properties` with no backing field and was silently ignored; the property is gone.
+`flashseats.queue.ordering` supports two ZSET score strategies:
 
-ADR-024 records the case for a randomized draw — arrival-millisecond FIFO rewards whoever has the
-lowest RTT and the most aggressive automation — and the change is one line, the ZSET score. It is
-**specified, not built.**
+- **`FIFO`** — default; score is the join timestamp in epoch milliseconds.
+- **`RANDOM`** — score is a deterministic per-event draw from `eventId:sessionId`, so refreshes keep
+  the same position while the sale avoids pure latency ordering.
 
 ---
 
@@ -143,7 +143,7 @@ lowest RTT and the most aggressive automation — and the change is one line, th
 | **The broadcaster does 4 Redis round trips per connection per tick** | Admission `GET`, pass `GET`, exhausted `EXISTS`, waiting `ZRANK`. The `EXISTS` is per *event* and is being re-read per *session*. Measured fine at 2,000 VUs on **one** sale; the cost is linear in connections × events, so that evidence does not carry to `E = 5` |
 | **The emitter registry is a flat map** | Keyed on session id alone, so "sessions watching event X" streams the whole map. `O(connections × events)` per tick |
 | **No queue metrics** | Depth, promotion rate and active SSE connections are all specified in `03` §7 and none is built |
-| **`tier-availability` frame** | ADR-027 specifies pushing per-tier availability into the waiting room. Not built |
+| **No `Last-Event-ID` replay** | The stream sends live state and heartbeats, but does not replay missed frames after a disconnect |
 
 ---
 

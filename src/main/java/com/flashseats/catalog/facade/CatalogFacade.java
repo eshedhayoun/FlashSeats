@@ -58,6 +58,14 @@ public interface CatalogFacade {
     int getRemainingForEvent(long eventId);
 
     /**
+     * Public availability buckets for every tier in the event.
+     *
+     * <p>Used by the waiting-room stream to push {@code tier-availability} frames without copying
+     * bucket rules out of {@code catalog} (ADR-027).
+     */
+    List<TierAvailability> getTierAvailability(long eventId);
+
+    /**
      * Atomically takes seats from a tier.
      *
      * <p><strong>Must not be called inside a SQL transaction.</strong> This is a Redis write, and
