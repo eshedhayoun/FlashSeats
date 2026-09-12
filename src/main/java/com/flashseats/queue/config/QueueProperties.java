@@ -2,7 +2,7 @@ package com.flashseats.queue.config;
 
 import org.springframework.boot.context.properties.ConfigurationProperties;
 
-/** Waiting-room tunables (ADR-007, ADR-020, ADR-026, ADR-028). */
+/** Waiting-room tunables (ADR-007, ADR-020, ADR-026, ADR-028, ADR-049). */
 @ConfigurationProperties(prefix = "flashseats.queue")
 public class QueueProperties {
 
@@ -26,6 +26,19 @@ public class QueueProperties {
      * Must stay at or below {@code hikari.maximum-pool-size × 1.5}.
      */
     private int promotionBatchSize = 45;
+
+    /**
+     * Cluster-wide database connection budget available to promoted buyers each promotion interval
+     * (ADR-049). This is shared across every open sale; {@link #promotionBatchSize} remains the
+     * per-event fairness cap.
+     */
+    private int globalAdmissionConnectionBudget = 90;
+
+    /**
+     * Estimated database connection cost of one buyer admitted into checkout (ADR-049). The global
+     * admission count per tick is {@code globalAdmissionConnectionBudget / databaseConnectionsPerBuyer}.
+     */
+    private int databaseConnectionsPerBuyer = 8;
 
     /**
      * Hold-to-order conversion is well under 100%, so admitting exactly {@code remainingStock}
@@ -86,6 +99,29 @@ public class QueueProperties {
 
     public void setPromotionBatchSize(int promotionBatchSize) {
         this.promotionBatchSize = promotionBatchSize;
+    }
+
+    public int getGlobalAdmissionConnectionBudget() {
+        return globalAdmissionConnectionBudget;
+    }
+
+    public void setGlobalAdmissionConnectionBudget(int globalAdmissionConnectionBudget) {
+        this.globalAdmissionConnectionBudget = globalAdmissionConnectionBudget;
+    }
+
+    public int getDatabaseConnectionsPerBuyer() {
+        return databaseConnectionsPerBuyer;
+    }
+
+    public void setDatabaseConnectionsPerBuyer(int databaseConnectionsPerBuyer) {
+        this.databaseConnectionsPerBuyer = databaseConnectionsPerBuyer;
+    }
+
+    public long getGlobalAdmissionBudgetPerTick() {
+        if (globalAdmissionConnectionBudget <= 0 || databaseConnectionsPerBuyer <= 0) {
+            return 0;
+        }
+        return globalAdmissionConnectionBudget / databaseConnectionsPerBuyer;
     }
 
     public double getOversubscribeFactor() {
