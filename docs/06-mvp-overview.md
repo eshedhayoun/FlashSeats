@@ -251,12 +251,18 @@ Honest list. None of these is hidden behind a passing test.
   them, while each sits at **114–142 % of one core** with a 2,000-VU k6 competing for the same ten.
   2,000 VUs is still the ceiling here, but a 32 GB machine would not move it — a machine where the
   load generator is not sharing cores with the system under test would.
-- **Checkout p99 is 682 ms at 300 VUs and 4.7 s at 2,000 on one sale**, against a 200 ms exit
-  criterion, and **~30 s at five sales in every Pass 8 configuration — including the one whose pool sat
-  idle.** That last detail is what identifies it: with `connections_pending` at `0.0` throughout, p99 of
-  34 s is not the pool and not admission, it is ten cores shared between three JVMs and 2,000 VUs. It
-  stays an open number rather than a passing one, and it is the measurement that most needs a second
-  machine.
+- **Checkout p99 is 682 ms at 300 VUs on one sale, 9.3 s at 300 VUs across five, and ~30–45 s at
+  2,000 VUs across five** — against a 200 ms exit criterion. The 2,000-VU figures are the host: ten
+  cores shared between three JVMs and the load generator, with `connections_pending` peaking at 10 of 90
+  in the run that sold 76 % of capacity. **The 300-VU five-sale number is the real open one**: 682 ms →
+  9.3 s for the same VU count spread over five sales is a 13× cost that the pool does not explain, and
+  finding what does is the next latency question. It needs a host where k6 is not competing for cores.
+- **A pool timeout surfaces to a buyer as `500 INTERNAL_ERROR` mid-checkout.** With
+  `connection-timeout=3000`, CPU starvation produced 1,218 of them across three replicas in one Pass 8
+  run; one order was left `FAILED`. The compensation held — that tier's `sold + held + redis` was still
+  exactly 500, so no seats were stranded — and a buyer's documented recovery (re-POST the same body)
+  works because checkout is find-or-create. But `INTERNAL_ERROR` is the least actionable code in the
+  registry for what is really back-pressure, and `503` with a `Retry-After` would be the honest answer.
 - **`stock.drift` will read non-zero transiently under live traffic.** Redis and PostgreSQL are not
   read in one snapshot, so a hold created between the two reads shows as a momentary gap. The two
   SQL sums *are* one snapshot, which removes the only drift the measurement can manufacture by
@@ -565,15 +571,27 @@ dependency order. Everything in the first two groups is cheap; the third is the 
    that instance, leaving a live connection in a set nothing iterates.
 5. Make the drift gauge a singleton under the promotion tick's Redis-lock pattern. **Still open** —
    all three replicas compute the same global number every 60 s.
+6. **New, from the Pass 8 runs:** tune the allowance on the 300-VU rig. Run E denied 13,349 admissions
+   while `pending` peaked at 10 of 90 — the cluster could serve more than 11 per tick, and the crossing
+   point where `pending` starts to lift is the number ADR-049 asks for.
 
 **The drill — built in Pass 7, and NOT YET RUN.** Every other instrument here runs one event, and so
 did every measurement the capacity numbers rest on.
 
 ```bash
 docker/seed/seed-concurrent.sh                 # 9001..9005, all opening at once
-docker/scripts/pool-pressure.sh 300 &          # THE instrument
-docker compose --profile loadtest run --rm -e VUS=2000 k6-concurrent
+docker/scripts/pool-pressure.sh 300 &          # THE instrument for pool pressure
+docker compose --profile loadtest run --rm -e VUS=300 k6-concurrent
+docker/scripts/sold-count.sh                   # THE instrument for "did it sell, and did it oversell?"
 ```
+
+**`VUS=300`, not 2,000, on a ten-core host.** At 2,000 the load generator competes with the three JVMs
+for the same cores and every number becomes a statement about the host: the same build sold 6 % at 2,000
+VUs and **76 %** at 300. Use 2,000 to look for pool saturation, 300 to measure a sale.
+
+**And read `sold-count.sh`, not k6's summary, for what was sold.** k6 counts responses that arrive and
+abandons in-flight requests at its 60 s timeout and at ramp-down, so it under-reported by 8× in the run
+where latency was worst. The ledger is the authority, and it is also where the no-oversell check lives.
 
 `k6-concurrent` asserts no-oversell **per event** — a global cap would pass while one sale oversold
 and another undersold by the same amount. `pool-pressure.sh` samples
@@ -640,27 +658,88 @@ a much stronger reason to bound admission globally than p99 was.
 Both fixes are property-driven, so the drill was run three times on one host, back to back, to separate
 them. 5 sales × 500 seats, 2,000 VUs, three replicas.
 
-| Run | Configuration | peak `connections_pending` | tickets sold | checkout p99 |
-| :--- | :--- | :--- | :--- | :--- |
-| *(Pass 7)* | no cache, per-event cap only | **202** | 370 / 2,500 | 31.3 s |
-| **A** | cache **off**, allowance unlimited | **1,004** | 0 / 2,500 | 30.5 s |
-| **B** | cache **on**, allowance unlimited | **330** | 0 / 2,500 | — (no checkout completed) |
-| **C** | cache **on**, allowance 11/tick | **0.0 at every sample** | 21 / 2,500 | 34.6 s |
+| Run | VUs | Configuration | peak `pending` | admitted | **seats sold (ledger)** | checkout p99 |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+| *(Pass 7)* | 2,000 | no cache, per-event cap only | **202** | — | 370 *(client count)* | 31.3 s |
+| **A** | 2,000 | cache **off**, allowance unlimited | **1,004** | 857 | not measurable | 30.5 s |
+| **B** | 2,000 | cache **on**, allowance unlimited | **330** | 246 | not measurable | — |
+| **C** | 2,000 | cache **on**, allowance 11/tick | sampled 0, logged **217** | 352 | 162 | 34.6 s |
+| **D** | 2,000 | + promoter off the pool | **54** | 308 | 203 | 45.0 s |
+| **E** | **300** | same as D | **10** | **1,414** | **1,904 / 2,500 — 76 %** | 9.3 s |
 
-**The pool stopped being the bottleneck, which is exactly what ADR-049 claimed.** `pool-pressure.sh`
-exits 2 on sustained pressure: it did for A and B and **not** for C, where `pending` read `0.0` on all
-three replicas at every five-second sample while `active` moved between 2 and 24 of 30. The allowance
-was doing the work the numbers say it was — `flashseats.queue.admissions` totalled **352** across the
-cluster against **3,358** on `admission.budget.denied`.
+**Run E is the one that answers "can it sell a lot without overbooking?", and the answer is yes.**
+Five simultaneous sales, **1,904 of 2,500 seats sold, no oversell and no drift** — `sold + held + redis`
+exactly 500 on every tier. The only thing that changed between D and E is the number of virtual users
+the *load generator* ran on the same ten cores as the system under test.
+
+```
+event  tier  cap  sold  held  redis   sum
+9001   9001  500   363     0    137   500
+9002   9002  500   387     5    108   500
+9003   9003  500   392     0    108   500
+9004   9004  500   336     0    164   500
+9005   9005  500   426    21     53   500
+```
+
+**So the 6–8 % figures in runs A–D are not results about this system.** They are what happens when k6
+with 2,000 VUs and three JVMs contend for ten cores: every request takes tens of seconds, holds expire
+before their buyer can pay, and the funnel never fills. At 300 VUs the same build sells 76 % of five
+sales in three and a half minutes, and would approach capacity given a longer window — 26 seats were
+still held when the run ended.
+
+**Run E also confirms the harness defect from the other direction.** Its client count (1,898) and the
+ledger (1,904) agree to within six seats, because almost nothing timed out. The 8× gap in run C was
+entirely in-flight purchases k6 abandoned.
+
+**The pool stopped being the bottleneck, which is what ADR-049 claimed.** `pool-pressure.sh` exits 2 on
+sustained pressure: it did for A and B and **not** for C. The allowance was doing the work the counters
+say it was — `flashseats.queue.admissions` totalled **352** across the cluster against **3,358** on
+`admission.budget.denied`.
 
 **Caching alone is worth about 3×** on pool pressure (1,004 → 330) and nothing else on its own: B still
 saturated, just later. That is the ordering the plan assumed, confirmed rather than argued.
 
-**And the throughput number is not a result.** Nought, nought and 21 tickets sold, with p99 around 30 s
-in every configuration including the one with an idle pool, is not a statement about the system — it is
-a statement about the host. `docker stats` during the runs: each replica **114–142 % of one core** and
-**~350 MiB of 7.65 GiB**. Ten cores, shared between three JVMs and a 2,000-VU k6 inside the same Docker
-VM.
+**Two things this run first reported wrongly, both now fixed.**
+
+**1. "Tickets sold" was a client-observed floor, and it under-reported by 8×.** k6 counts checkout
+responses that *arrived*; its default request timeout is 60 s and the scenario ends with a graceful
+ramp-down, so every request still in flight when either fires is scored as a failure and counted as
+nothing — while the server went on to commit the order. The run logged **757 interrupted iterations**.
+k6 said 21 tickets. The ledger held **109 confirmed orders and 162 seats**, and the invariant was exact
+on all five tiers:
+
+```
+event  tier  cap  sold  held  redis   sum
+9001   9001  500    39     0    461   500
+9002   9002  500    39     0    461   500
+9003   9003  500    37     0    463   500
+9004   9004  500    16     0    484   500
+9005   9005  500    31     0    469   500
+```
+
+`docker/scripts/sold-count.sh` now reads that from PostgreSQL and Redis and checks the invariant, and
+the k6 summary labels its own number as a floor and points at it. A and B are "not measurable" because
+each run's seed deletes the previous one's orders — only the last run's ledger survives, which is its
+own lesson about the drill.
+
+**2. "`pending` read 0.0 at every sample" overstated the instrument.** `pool-pressure.sh` rotates one
+replica per five-second tick, so each replica is sampled every ~15 s. The application logs from the same
+run show `waiting` reaching **217**. The honest claim is *no sustained pressure at 15-second
+resolution*, which is what the script is built to detect and is still the ADR-049 result — but the
+spikes were real and the sampler cannot see them.
+
+**And the residual latency is CPU starvation, now with evidence rather than inference.** 1,218
+HikariCP timeouts across the three replicas in run C, and their pool state at the moment of throwing:
+
+```
+timed out after 9821ms (total=30, active=5, idle=25, waiting=75)
+```
+
+**Twenty-five of thirty connections idle while seventy-five threads wait**, and a timeout configured at
+3,000 ms firing at 9,821 ms. A pool with idle connections does not make callers wait; an unscheduled
+thread does. `docker stats` agrees — each replica at **114–142 % of one core** on **~350 MiB of
+7.65 GiB** — but the Hikari numbers are the proof: ten cores shared between three JVMs and a 2,000-VU k6
+inside the same Docker VM.
 
 **That corrects a claim this section has carried since Stage 3.** "Three JVMs take ~6 GB of the 7.65 GB
 this machine gives Docker" is wrong — measured, they take about **1 GB between them**. The 10,000-VU
@@ -669,11 +748,29 @@ machine where the load generator is not competing for the same ten cores is the 
 RAM changes nothing; Docker's allocation is a fixed VM size either way.
 
 **What the runs do and do not license.** They license the two fixes: pool saturation under concurrent
-sales is gone, and the cache is what makes that affordable. They do not license the committed allowance
-of **11 per tick** as a *tuned* number — at 11/s a 2,500-seat sale needs over three minutes of admission
-alone, and the run holds for three and a half. On a host that can actually serve checkout, C is the run
-to repeat with the allowance raised until `pending` starts to lift; that crossing point is the number
-ADR-049 wants, and it has not been found yet.
+sales is gone, the cache is what makes that affordable, **no tier oversold or drifted**, and the system
+sells 76 % of five concurrent sales in three and a half minutes. They do not license the allowance of
+**11 per tick** as a *tuned* number: run E denied **13,349** admissions against 1,414 granted while
+`pending` peaked at 10 of 90, which says plainly that the cluster could have served more. Raising
+`global-admission-connection-budget` until `pending` starts to lift is the next measurement, and run E
+at 300 VUs is now the rig to do it on — the 2,000-VU runs cannot answer it on this host.
+
+**Nothing in the sale path ever failed, in any run.** In run C's 2,000-VU conditions, 145 holds were
+created and **every one was a `201`** — no `409`, no `503` — and 109 of them became orders. The funnel
+was starved at the top, not broken in the middle. Run E's 76 % is the same code with the host out of
+the way.
+
+**Two hypotheses were tested and killed on the way to that, which is worth recording so nobody retests
+them.** Neither was the limiter:
+
+- **Scheduler serialisation.** Nine `@Scheduled` jobs share one scheduler; if it had a single thread,
+  a slow promotion tick would stall the outbox relay and the sweeper too. `/proc/1/task/*/comm` in a
+  live container shows **nine** scheduler threads for nine jobs. They do not serialise.
+- **The promoter's own database dependency.** Real, fixed, and **not worth a throughput number**:
+  admissions went 352 → 308 across runs C and D, which is noise. The fix stands on its availability
+  argument alone (ADR-051's amendment) — a component that bounds admission must not be able to queue
+  behind the buyers it admits — but it did not unlock anything, because the pool was not what was
+  blocking at 2,000 VUs. CPU was.
 
 **One transient drift sample of 1.0** appeared in run C and read `0.0` on all three replicas afterwards
 with no rebuild — the documented behaviour for a gauge that does not read Redis and PostgreSQL in one
@@ -1174,7 +1271,29 @@ the drill script sourced `.env` — which expands the bcrypt digest's `$$` to th
 it over Compose's own value, re-creating ADR-048's corrupted-hash defect from the other side, and every
 admin call answered `401`. The repo's own scripts `grep | cut` a single value for exactly this reason.
 
+**And the drill's headline number was wrong, which is the finding this pass nearly missed.** The run
+reported "21 tickets sold" and the first write-up accepted it, reaching for the host as the explanation.
+Two questions — *"0 or 370 sold, that's not a lot, I thought the point was to sell a lot without
+overbooking"* and then *"shouldn't these numbers be much better?"* — are what forced it open. Three
+things came out:
+
+1. **The ledger held 109 orders and 162 seats, not 21.** k6 counts responses that *arrive*, times out at
+   60 s, and ends with a graceful ramp-down, so 757 in-flight purchases were scored as nothing. This is
+   the same class of defect as ADR-047's four: **the harness measured itself and the summary presented
+   it as the sale.** `docker/scripts/sold-count.sh` now reads the ledger and checks
+   `sold + held + redis == capacity` per tier, and the k6 summary labels its own number as a floor.
+2. **The residual latency is scheduling, not the pool** — 25 idle connections with 75 waiters and a 3 s
+   timeout firing at 9.8 s — and the claim that `pending` stayed at `0.0` was an artefact of a sampler
+   that rotates replicas every ~15 s. It reached 217.
+3. **At 300 VUs the same build sells 1,904 of 2,500 seats across five concurrent sales, with no oversell
+   and no drift.** That is run E, and it is the number that answers what the drill was for. Everything
+   below ~10 % in runs A–D was the load generator competing with the system for ten cores.
+
+The lesson is not about k6. Three of this pass's nine findings and all four of its wrong turns came from
+trusting a summary line over a ledger — and the drill was *built* in Pass 7 specifically because a green
+harness had hidden the failure it was written to find.
+
 - **Result:** the two highest-leverage concurrent-sales fixes are built, tested and measured;
-  `hikaricp_connections_pending` reaches `0.0` where it reached 1,004 without them. The allowance
-  itself is not yet tuned, and the host cannot answer the latency question — both are stated as open in
-  §9 and §11 rather than implied by a green run.
+  `hikaricp_connections_pending` stops being sustained where it reached 1,004 without them, and no tier
+  oversold or drifted. The allowance itself is not yet tuned, and the host cannot answer the latency
+  question — both are stated as open in §9 and §11 rather than implied by a green run.

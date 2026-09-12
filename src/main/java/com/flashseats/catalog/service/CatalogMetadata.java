@@ -2,6 +2,7 @@ package com.flashseats.catalog.service;
 
 import com.flashseats.catalog.config.CatalogProperties;
 import com.flashseats.catalog.exception.EventNotFoundException;
+import com.flashseats.catalog.model.EventStatus;
 import com.flashseats.catalog.repository.EventRepository;
 import com.flashseats.catalog.repository.TicketTierRepository;
 import com.flashseats.shared.cache.DerivedStateCache;
@@ -58,8 +59,12 @@ public class CatalogMetadata implements DerivedStateCache {
     private final CatalogProperties properties;
     private final Clock clock;
 
+    /** The single key the event-list cache lives under; it is not per event. */
+    private static final long ALL = -1L;
+
     private final Map<Long, Entry<EventRow>> eventCache = new ConcurrentHashMap<>();
     private final Map<Long, Entry<List<TierRow>>> tierCache = new ConcurrentHashMap<>();
+    private final Map<Long, Entry<List<EventRow>>> listCache = new ConcurrentHashMap<>();
 
     private final Counter hits;
     private final Counter misses;
@@ -100,6 +105,27 @@ public class CatalogMetadata implements DerivedStateCache {
     }
 
     /**
+     * Every {@code PUBLISHED} or {@code PAUSED} event, ordered by sale start.
+     *
+     * <p><strong>This one is cached for availability, not for cost.</strong> The three list reads
+     * derived from it — open ids, managed ids, the public listing — are a handful of queries a second
+     * cluster-wide, so caching them saves nothing worth mentioning. What it buys is that
+     * {@code PromotionWorker.tick()} needs <em>no pooled connection</em>.
+     *
+     * <p>That matters because the first version left it uncached on exactly the cost argument, and the
+     * Pass 8 drill showed the argument was the wrong one. Under pool pressure the tick waited on the
+     * same queue as the buyers it existed to admit — one logged wait was <strong>16 seconds inside a
+     * one-second tick</strong> — so nobody was promoted, the waiting room did not drain, and the buyers kept
+     * polling. The component that protects the pool must not be able to starve on it.
+     *
+     * <p>Safe to cache because, unlike the reads derived from it, it is not parameterised by the
+     * clock: the window comparison happens in memory against this snapshot.
+     */
+    public List<EventRow> selectableEvents() {
+        return read(listCache, ALL, properties.getMetadataEventTtlMs(), this::loadSelectable);
+    }
+
+    /**
      * The tiers as PostgreSQL has them right now, bypassing the cache and dropping what it held.
      *
      * <p>For pre-warm and for a rebuild only. Both write inventory counters derived from this list,
@@ -113,10 +139,16 @@ public class CatalogMetadata implements DerivedStateCache {
         return fresh;
     }
 
-    /** Drops one event's snapshots. Unconditional, so a no-op pause is still safe. */
+    /**
+     * Drops one event's snapshots, and the list they appear in.
+     *
+     * <p>Unconditional, so a no-op pause is still safe. The list goes too because pausing is exactly
+     * what moves an event out of {@code findOpenEventIds}.
+     */
     public void invalidate(long eventId) {
         eventCache.remove(eventId);
         tierCache.remove(eventId);
+        listCache.clear();
     }
 
     /**
@@ -132,6 +164,7 @@ public class CatalogMetadata implements DerivedStateCache {
     public void invalidateAll() {
         eventCache.clear();
         tierCache.clear();
+        listCache.clear();
     }
 
     /**
@@ -184,6 +217,14 @@ public class CatalogMetadata implements DerivedStateCache {
     private EventRow loadEvent(long eventId) {
         return EventRow.of(
                 events.findById(eventId).orElseThrow(() -> new EventNotFoundException(eventId)));
+    }
+
+    private List<EventRow> loadSelectable() {
+        return events.findByStatusInOrderBySaleStartTimeAsc(
+                        List.of(EventStatus.PUBLISHED, EventStatus.PAUSED))
+                .stream()
+                .map(EventRow::of)
+                .toList();
     }
 
     private List<TierRow> loadTiers(long eventId) {
