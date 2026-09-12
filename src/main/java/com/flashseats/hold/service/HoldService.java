@@ -218,13 +218,6 @@ public class HoldService {
         settleAndRestore(hold, HoldStatus.RELEASED, SettleReason.USER_CANCEL);
     }
 
-    /** Used by {@code order} to hand seats back when a charge cannot be completed. */
-    @Transactional
-    public void releaseInternal(String holdToken, SettleReason reason) {
-        holds.findByHoldToken(holdToken)
-                .ifPresent(hold -> settleAndRestore(hold, HoldStatus.RELEASED, reason));
-    }
-
     // ------------------------------------------------------------------ extend
 
     /**

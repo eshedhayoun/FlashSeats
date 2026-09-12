@@ -176,7 +176,16 @@ services:
       app-2: { condition: service_healthy }
       app-3: { condition: service_healthy }
     healthcheck:
-      test: ["CMD", "wget", "-qO-", "http://localhost/nginx-health"]
+      # 127.0.0.1, NOT localhost. In this image `localhost` resolves to `::1`
+      # only, and `listen 80` binds IPv4 only — so the check connected to an
+      # address nothing was listening on and nginx reported `unhealthy` for its
+      # entire life while proxying perfectly.
+      #
+      # A healthcheck that lies is worse than none: `depends_on: service_healthy`
+      # on this service would never be satisfied, and an operator reading
+      # `docker compose ps` during an incident is told the load balancer is the
+      # problem when it is the only thing working.
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1/nginx-health"]
       interval: 10s
       timeout: 3s
       retries: 6
@@ -208,6 +217,32 @@ services:
     volumes:
       - ./docker/k6:/scripts
     entrypoint: ["k6", "run", "/scripts/flash-sale.js"]
+    networks: [flashseats]
+
+  # The ADR-049 drill: E sales open at once, contending for one connection pool.
+  #
+  # A separate service rather than an env var on `k6` above, because the two runs
+  # are not variants of each other. `k6` asserts no-oversell on one sale — a
+  # CORRECTNESS property. This asserts the same per event, but exists to measure
+  # a LATENCY failure that produces no error at all, and it is only half an
+  # instrument: docker/scripts/pool-pressure.sh reads the gauge that actually
+  # shows it. Run them together or the drill proves nothing.
+  #
+  #   docker/seed/seed-concurrent.sh
+  #   docker/scripts/pool-pressure.sh 300 &
+  #   docker compose --profile loadtest run --rm -e VUS=2000 k6-concurrent
+  k6-concurrent:
+    image: grafana/k6:latest
+    profiles: ["loadtest"]
+    environment:
+      BASE_URL: ${K6_BASE_URL:-http://nginx:80}
+      FIRST_ID: ${K6_FIRST_ID:-9001}
+      EVENTS: ${K6_EVENTS:-5}
+      VUS: ${K6_VUS:-10000}
+      CAPACITY: ${K6_CAPACITY:-500}
+    volumes:
+      - ./docker/k6:/scripts
+    entrypoint: ["k6", "run", "/scripts/concurrent-sales.js"]
     networks: [flashseats]
 
 volumes:

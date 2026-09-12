@@ -39,13 +39,6 @@ public class QueueProperties {
     private long sseHeartbeatMs = 15_000;
 
     /**
-     * Advisory only — an abandonment metric, <strong>never</strong> a reason to evict (ADR-026). A
-     * Wi-Fi to cellular handover routinely outlasts any heartbeat, and evicting on one deletes live
-     * buyers from the line through no fault of their own.
-     */
-    private int heartbeatTtlSeconds = 90;
-
-    /**
      * How long this module's per-sale keys outlive the sale itself (ADR-036).
      *
      * <p>Every queue key expires; none is deleted by the application. An hour past
@@ -117,14 +110,6 @@ public class QueueProperties {
 
     public void setSseHeartbeatMs(long sseHeartbeatMs) {
         this.sseHeartbeatMs = sseHeartbeatMs;
-    }
-
-    public int getHeartbeatTtlSeconds() {
-        return heartbeatTtlSeconds;
-    }
-
-    public void setHeartbeatTtlSeconds(int heartbeatTtlSeconds) {
-        this.heartbeatTtlSeconds = heartbeatTtlSeconds;
     }
 
     public long getKeyRetentionAfterSaleSeconds() {

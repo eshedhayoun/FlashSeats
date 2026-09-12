@@ -27,6 +27,52 @@ public class EmailComposer {
         return "Your tickets for " + payload.event().title() + " (" + payload.orderNumber() + ")";
     }
 
+    // ------------------------------------------------------------ refund notice
+
+    public String refundSubjectFor(OrderConfirmedPayload payload) {
+        return "Refund issued for " + payload.orderNumber();
+    }
+
+    /**
+     * The refund notice.
+     *
+     * <p><strong>It must not dereference {@code event} or {@code items}.</strong> The refund payload
+     * is written by {@code markRefunded}, which carries a null {@code event} and an empty item list —
+     * there were no seats to describe, which is the entire reason a refund happened. A composer that
+     * assumed the confirmation shape would throw here, and a deterministic render failure on the
+     * refund path dead-letters the one message telling a buyer their money is coming back.
+     *
+     * <p>The tone is deliberate. This email reaches someone who was charged and did not get what
+     * they paid for, so it leads with the refund, names the amount, and does not open with an
+     * apology that buries the fact.
+     */
+    public String refundBodyFor(OrderConfirmedPayload payload) {
+        return """
+                <!doctype html>
+                <html><body style="font-family:system-ui,-apple-system,'Segoe UI',sans-serif;
+                                   color:#1b1e1c; max-width:560px; margin:0 auto; padding:24px;">
+                  <h1 style="font-size:20px; margin:0 0 4px;">We've refunded you in full.</h1>
+                  <p style="margin:0 0 20px; color:#4c534e;">
+                    Your payment of <strong>%s</strong> has been refunded. It usually reaches your
+                    account within a few working days, depending on your bank.
+                  </p>
+
+                  <p style="margin:0 0 20px; color:#4c534e;">
+                    We took the payment but could not complete the booking, so the seats were not
+                    held and you have not been charged for them. <strong>You do not need to do
+                    anything.</strong>
+                  </p>
+
+                  <p style="margin:24px 0 0; font-size:13px; color:#79817b;">
+                    Order reference <strong>%s</strong>
+                  </p>
+                </body></html>
+                """
+                .formatted(
+                        money(payload.totalAmountCents(), payload.currency()),
+                        escape(payload.orderNumber()));
+    }
+
     public String bodyFor(OrderConfirmedPayload payload) {
         StringBuilder lines = new StringBuilder();
         for (OrderConfirmedPayload.Item item : payload.items()) {

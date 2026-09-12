@@ -1,341 +1,169 @@
 # Module: `order`
 
-> **Status:** aligned to [`../00-architecture-decisions.md`](../00-architecture-decisions.md) and
-> [`../05-global-standards.md`](../05-global-standards.md). Structural rewrite to the §10 template
-> is pending.
+> **Describes what is built.** No class names — see [`../../CLAUDE.md`](../../CLAUDE.md), "Updating
+> the docs is part of the change".
 
-**Package:** `com.flashseats.order` · **Phase:** 1 · **Storage:** PostgreSQL only
+**Package:** `com.flashseats.order` · **Storage:** PostgreSQL only
+**Depends on:** `hold`, `catalog`, `payment`, `queue`, `shared`
 
 ---
 
 ## 1. Scope
 
-The transactional authority and **the checkout orchestrator**. There is exactly one checkout
-entry point in the system, and it lives here.
+Checkout orchestration, the order ledger, the transactional outbox, and — because it is the only
+module that can legally read all three of the ledger's tables — **stock reconciliation and rebuild**.
 
-`order` validates the hold, prices the purchase server-side, reserves a durable order row, drives
-the charge, and — in a single transaction — consumes the hold, writes the ledger, and enqueues
-fulfilment. It also owns every compensation path: decline, refund, and webhook reconciliation.
-
-**Forbidden:** touching stock counters, managing queue positions, rendering PDFs or sending email,
-calling Stripe directly. **No Redis keys of any kind.**
+This module owns **no Redis key at all.**
 
 ---
 
-## 2. Package layout
+## 2. What it owns
 
-```
-com.flashseats.order
-├── controller   OrderController
-├── service      OrderService + impl (orchestration), OutboxPublisher
-├── facade       OrderFacade + impl
-├── repository   OrderRepository, OrderItemRepository, OutboxEventRepository
-├── model        Order, OrderItem, OutboxEvent, OrderStatus
-├── dto          CheckoutRequestDTO, OrderReceiptDTO, OrderItemDTO, OrderSummaryDTO
-├── event        PaymentSettledEventListener   ← webhook reconciliation
-└── exception    InvalidHold(409), PaymentFailed(402), OrderNotFound(404),
-                 OrderAlreadyExists(409), SaleWindowClosed(409)
-```
-
----
-
-## 3. Schema
-
-```sql
-CREATE TABLE orders (
-    id                       BIGSERIAL PRIMARY KEY,
-    order_number             VARCHAR(64)  NOT NULL UNIQUE,
-    hold_token               VARCHAR(64)  NOT NULL UNIQUE,   -- ADR-002
-    user_session_id          VARCHAR(255) NOT NULL,
-    user_email               VARCHAR(255) NOT NULL,
-    receipt_token            VARCHAR(128) NOT NULL,          -- signed capability (ADR-010)
-    event_id                 BIGINT       NOT NULL,
-    total_amount_cents       BIGINT       NOT NULL CHECK (total_amount_cents >= 0),
-    currency                 CHAR(3)      NOT NULL DEFAULT 'USD',
-    status                   VARCHAR(32)  NOT NULL DEFAULT 'PENDING',
-    payment_transaction_ref  VARCHAR(64),
-    stripe_payment_intent_id VARCHAR(255),
-    payment_attempts         INT          NOT NULL DEFAULT 0,
-    failure_reason           VARCHAR(255),
-    created_at               TIMESTAMPTZ  NOT NULL DEFAULT now(),
-    updated_at               TIMESTAMPTZ  NOT NULL DEFAULT now()
-);
-CREATE INDEX idx_orders_session ON orders(user_session_id);
-CREATE INDEX idx_orders_intent  ON orders(stripe_payment_intent_id);
-CREATE INDEX idx_orders_email   ON orders(user_email);
-```
-
-**`UNIQUE(hold_token)` is the strongest overbooking guard in the system**, and v1 did not have it —
-`orders` carried no reference to the hold, the payment, or the Stripe intent at all, making webhook
-correlation and support lookups impossible.
-
-```sql
-CREATE TABLE order_items (
-    id               BIGSERIAL PRIMARY KEY,
-    order_id         BIGINT NOT NULL REFERENCES orders(id) ON DELETE CASCADE,
-    event_id         BIGINT NOT NULL,
-    tier_id          BIGINT NOT NULL,
-    tier_name        VARCHAR(100) NOT NULL,   -- snapshot
-    quantity         INT    NOT NULL CHECK (quantity > 0),
-    unit_price_cents BIGINT NOT NULL CHECK (unit_price_cents >= 0),
-    created_at       TIMESTAMPTZ NOT NULL DEFAULT now()
-);
-CREATE INDEX idx_order_items_order ON order_items(order_id);
-CREATE INDEX idx_order_items_tier  ON order_items(tier_id);   -- for the stock-drift query
-
-CREATE TABLE outbox_events (
-    id             UUID PRIMARY KEY,
-    aggregate_type VARCHAR(64) NOT NULL,
-    aggregate_id   VARCHAR(64) NOT NULL,
-    event_type     VARCHAR(64) NOT NULL,      -- ORDER_CONFIRMED | ORDER_REFUNDED
-    payload        JSONB       NOT NULL,
-    status         VARCHAR(32) NOT NULL DEFAULT 'PENDING',
-    retry_count    INT         NOT NULL DEFAULT 0,   -- added
-    last_error     VARCHAR(500),                     -- added
-    processed_at   TIMESTAMPTZ,                      -- added
-    created_at     TIMESTAMPTZ NOT NULL DEFAULT now()
-);
-CREATE INDEX idx_outbox_pending ON outbox_events(created_at) WHERE status = 'PENDING';
-```
-
-`retry_count`, `last_error` and `processed_at` were missing, as was any purge policy — the table
-grew forever. Purge `PROCESSED` rows older than 7 days.
-
-### Status
-
-```
- (none) ──► PENDING ──► CONFIRMED    terminal, success
-              │  ▲
-              │  └── retry after decline (same order_number)
-              ├──► FAILED            retryable; hold retained
-              └──► REFUNDED          terminal; charged but seats unobtainable
-```
-
----
-
-## 4. Checkout
-
-`POST /api/v1/orders/checkout`
-
-```json
-{
-  "holdToken": "hld_9f8b2c1a4d3e2f10b98a",
-  "userEmail": "buyer@example.com",
-  "paymentMethodId": "pm_card_visa",
-  "idempotencyKey": "cli_4f2a9c81e70b"
-}
-```
-
-`userSessionId` comes from the `fsid` cookie, never the body.
-
-```
- 1. HoldFacade.getActiveHold(holdToken, sid)         → 409 if missing/expired/not yours
- 2. CatalogFacade.getTierSummary(eventId, tierId)    → price + window
- 3. windowStatus OPEN, or CLOSED within 15 min of sale_end_time  → else 409
- 4. amountCents = priceCents × quantity              SERVER-SIDE ONLY (ADR-013)
- 5. find-or-create orders row on hold_token, status = PENDING
- 6. HoldFacade.extendHold(holdToken, 120)            once; ceiling 420s
-       └─ throws ⇒ ABORT 410 HOLD_EXPIRED. DO NOT CHARGE.          ← ADR-023
- 7. PaymentFacade.authorize(orderNumber, amountCents, currency, pmId, idempotencyKey)
-                                                     ← OUTSIDE any transaction
- 8. @Transactional {          ← SQL ONLY. No Redis, no HTTP, no broker.
-        HoldFacade.consumeHold(holdToken)            conditional UPDATE; joins THIS tx
-             └─ rowcount 0 ⇒ throw ⇒ rollback ⇒ refund (step 10)
-        orders.status = CONFIRMED, payment refs recorded
-        INSERT order_items
-        INSERT outbox_events (ORDER_CONFIRMED, PENDING)
-    }
- 9. @TransactionalEventListener(AFTER_COMMIT)  — best-effort, safe to lose:
-        HoldFacade.discardTimer(holdToken)           DEL hold:{token}
-        QueueFacade.revokeAdmission(sid, eventId)
-10. on rollback after a settled charge: PaymentFacade.refund(...) → REFUNDED
-11. 201 Created + OrderReceiptDTO
-```
-
-### Find-or-create (ADR-002)
-
-| Existing row | Behaviour |
+| PostgreSQL | Contents |
 | :--- | :--- |
-| none | insert `PENDING` |
-| `PENDING` | `409` — charge in flight |
-| `FAILED` | reset to `PENDING`, retry on the **same** `order_number` (≤ 3 attempts) |
-| `CONFIRMED` | `200` — return the existing receipt (idempotent replay) |
-| `REFUNDED` | `409` — terminal |
+| `orders` | order number, **`UNIQUE(hold_token)`**, session, email, receipt token, status, amount, attempts |
+| `order_items` | per-tier lines: tier, quantity, unit price |
+| `outbox_events` | aggregate, type, JSON payload, status, `claimed_at` |
+| `order_number_seq` | a database sequence, so three replicas cannot mint the same number |
 
-### Why charge before consuming
-
-Consuming first would need a `CONSUMED → RELEASED` transition the hold state machine forbids, and
-would briefly release inventory the buyer is actively paying for. Charging first means a hold is
-only ever destroyed by a transaction that is about to commit.
-
-v1 specified **both** orderings across two different documents, and also specified two competing
-orchestrators (`order` driving, and `PaymentSucceededEvent → order`). ADR-001 settles it.
-
-### Transaction boundaries (ADR-023)
-
-| Step | Inside `@Transactional`? | Why |
-| :--- | :--- | :--- |
-| Hold lookup, pricing, order row | short tx each | SQL only |
-| **Stripe charge** | **no** | an HTTP call holding row locks would throttle the connection pool |
-| `consumeHold` | **yes — deliberately** | it is a conditional `UPDATE`; it must roll back with the order |
-| `order_items`, `outbox_events` | yes | same tx as the status flip |
-| `DEL hold:{token}`, `revokeAdmission` | **no — `AFTER_COMMIT`** | Redis cannot roll back |
-| Outbox publish to RabbitMQ | **no** | see the three-transaction relay in §6 |
-
-The interim design had `consumeHold` mutate **Redis** inside this transaction. Redis does not roll
-back: a failed commit left the claim spent, the timer deleted, and no order — and those seats became
-**permanently unsellable**. Making the claim a SQL `UPDATE` removes the failure mode rather than
-compensating for it (ADR-019).
-
-Under virtual threads the connection pool is the system's real concurrency limit, so a slow call
-inside a transaction does not just delay one request — it throttles checkout for everyone.
+`UNIQUE(hold_token)` is the single-use guard: **one hold can never become two orders** (ADR-002).
 
 ---
 
-## 5. Failure paths
-
-| Case | Handling |
-| :--- | :--- |
-| Hold missing / expired / not yours | `409 HOLD_EXPIRED_OR_INVALID`. Nothing charged |
-| Card declined | `FAILED`, **hold retained**, `402 PAYMENT_DECLINED` with `retryable: true`, `attemptsRemaining`, `expiresAt`. **No new grace extension** — the budget is per hold (ADR-030) |
-| Retry with < 45 s left | `409 INSUFFICIENT_TIME_REMAINING` + `expiresAt`. **Nothing charged and the hold is retained** — the grace budget is spent, so the buyer releases and re-reserves. The UI must offer *Release seats*, not re-route: re-routing rehydrates onto the same live hold and returns to a screen whose timer guarantees the same `409` |
-| 4th attempt | `402 PAYMENT_ATTEMPTS_EXHAUSTED`; **the hold is retained**. A further charge cannot be accepted, but taking the seats away as well would be a second punishment for a card problem — the UI offers *Release seats* (`FE_SPEC.md` §3). This row previously said "hold released" and contradicted both the code and the client spec |
-| Double submit | `payment:inflight` SETNX → `UNIQUE(hold_token)` → Stripe `Idempotency-Key` |
-| Gateway timeout | `503`; order stays `PENDING`; the webhook settles it |
-| **Charge OK, commit fails** | `PaymentFacade.refund()`, `REFUNDED`, `ORDER_REFUNDED` outbox event |
-| **Webhook arrives, hold gone** | Refund, `REFUNDED`, buyer notified. v1 would have confirmed an order for re-sold seats (ADR-012) |
-| Sale window closed | `409 SALE_WINDOW_CLOSED` |
-
-### Webhook reconciliation
-
-```java
-@ApplicationModuleListener
-void on(PaymentSettledEvent e) {
-    // idempotent: no-op unless the order is still PENDING
-    // hold consumable  → CONFIRMED + ORDER_CONFIRMED outbox event
-    // hold gone        → refund + REFUNDED + ORDER_REFUNDED outbox event
-}
-```
-
-This is the only inbound cross-module event, and it keeps the facade graph acyclic: `order → payment`
-synchronously, `payment → order` only by event (ADR-005).
-
----
-
-## 6. Interfaces
+## 3. What it exposes
 
 | Method | Path | Auth |
 | :--- | :--- | :--- |
-| `POST` | `/api/v1/orders/checkout` | `fsid` |
-| `POST` | `/api/v1/orders/checkout/resume` | `fsid` — 3-D Secure second leg; same `holdToken` |
-| `GET` | `/api/v1/orders/{orderNumber}` | `fsid` match **or** `?receiptToken=…` |
-| `POST` | `/api/v1/admin/events/{eventId}/rebuild-stock` | admin — the ledger spans three modules and only this one may read it (ADR-046) |
-| `GET` | `/api/v1/admin/orders/{orderNumber}` | admin — **built** (Stage 4) |
-| `POST` | `/api/v1/admin/notifications/resend/{orderNumber}` | admin — **built**; the payload lives in `outbox_events` (ADR-048) |
+| `POST` | `/api/v1/orders/checkout` | `fsid` + a live hold |
+| `GET` | `/api/v1/orders/{orderNumber}` | `fsid` **or** `receiptToken` |
+| `GET` | `/api/v1/orders/{orderNumber}/ticket.pdf` | `fsid` **or** `receiptToken` |
+| `POST` | `/api/v1/admin/events/{eventId}/rebuild-stock` | `ROLE_ADMIN` |
+| `GET` | `/api/v1/admin/orders/{orderNumber}` | `ROLE_ADMIN` |
+| `POST` | `/api/v1/admin/notifications/resend/{orderNumber}` | `ROLE_ADMIN` |
 
-v1 left the lookup fully public against a guessable `TK-98213` reference, returning the buyer's
-email — an IDOR (ADR-010).
+The admin order view returns a **distinct shape** from the buyer's receipt. `receiptToken` is a
+90-day bearer capability; an operator view has no business minting a durable impersonation link into
+terminal history and any log that records bodies (ADR-048).
 
-**The operator view is a different DTO, not the buyer's receipt.** `OrderReceiptResponse` carries
-`receiptToken`, a bearer capability good for ninety days from any device; returning it to an operator
-would mint a durable impersonation link into terminal history and any log that records response
-bodies, to answer a question that never needed it. `AdminOrderResponse` withholds it and adds what
-support actually asks for — payment attempts, failure reason, and the hold the order was built from.
-`readAuthorised` cannot serve this at all: its job is to refuse a caller presenting neither cookie
-nor token, so for an operator it always throws. Authorisation happens one layer up, at `ROLE_ADMIN`.
+The resend is served here, not by `notification`, because the payload lives in `outbox_events`. One
+new outbox row drives the whole existing pipeline.
 
-```java
-public interface OrderFacade {
-    OrderSummaryDTO getOrderSummary(String orderNumber);
-    boolean         isOrderConfirmed(String orderNumber);
+**The ticket download is the recovery path for an unverified email** (ADR-050). It renders through
+`shared`'s `TicketPdfRenderer`, so a downloaded ticket is byte-identical to the emailed one by
+construction. Two guards: authorisation is *identical* to the receipt read, and **only a
+`CONFIRMED` order has a ticket** — anything else answers `TICKET_NOT_AVAILABLE`, because rendering
+for a `REFUNDED` order would mint a document that still admits someone at a door for money that has
+already gone back. An unauthorised caller gets `404`, never `403`.
 
-    /** Read-only rehydration for saleflow (ADR-025) — the facade's first real caller. */
-    Optional<OrderSummaryDTO> findPendingOrder(String userSessionId, long eventId);
-}
-```
-
-### Outbox payload (ADR-015)
-
-Self-contained — `notification` calls no facades and knows nothing about `catalog`:
-
-```json
-{
-  "eventType": "ORDER_CONFIRMED",
-  "orderNumber": "TK-98213",
-  "receiptToken": "rcp_a91f…",
-  "userEmail": "buyer@example.com",
-  "totalAmountCents": 15000,
-  "currency": "USD",
-  "confirmedAt": "2026-08-30T10:04:12Z",
-  "event": {
-    "eventId": 101,
-    "title": "Summer Fest 2026",
-    "venueName": "Riverside Arena",
-    "startTime": "2026-09-14T19:00:00Z"
-  },
-  "items": [
-    { "tierId": 501, "tierName": "VIP Admission", "quantity": 2, "unitPriceCents": 7500 }
-  ]
-}
-```
-
-`items` is an **array**. v1's payload was flat (`tierName`, `quantity`) and would have rendered a
-wrong PDF for any multi-tier order.
-
-### Outbox publisher
-
-**Three short transactions, never one** (ADR-023):
-
-```sql
--- tx1: claim, then COMMIT immediately
-UPDATE outbox_events SET status='PROCESSING', claimed_at=now()
- WHERE id IN (SELECT id FROM outbox_events WHERE status='PENDING'
-               ORDER BY created_at FOR UPDATE SKIP LOCKED LIMIT 100)
- RETURNING *;
-
--- publish to RabbitMQ — OUTSIDE any transaction
-
--- tx2
-UPDATE outbox_events SET status='PROCESSED', processed_at=now() WHERE id = ANY(?);
-```
-
-`FOR UPDATE SKIP LOCKED` stops three replicas from publishing every event three times (ADR-009).
-Publishing **outside** the transaction is what stops a slow broker from holding row locks and
-starving the connection pool. A crash between `tx1` and `tx2` re-publishes on the next sweep of
-stale `PROCESSING` rows — at-least-once, absorbed by the consumer's unique constraint.
-
-The poller is `@Scheduled` and runs on all three replicas; `SKIP LOCKED` makes that harmless.
+**Facade:** `findLatestOrder` (rehydration for `saleflow`) — and nothing else. A `getOrderSummary`
+existed with zero callers anywhere and was deleted in Pass 7.
 
 ---
 
-## 7. Changes from v1
+## 4. Checkout, in order
 
-1. Single checkout orchestration settled: `order` drives, charge first, consume second (ADR-001).
-2. `hold_token UNIQUE` + find-or-create retry semantics (ADR-002).
-3. `payment_transaction_ref`, `stripe_payment_intent_id`, `currency`, `receipt_token`,
-   `payment_attempts`, `event_id`, `failure_reason` columns added.
-4. Server-side pricing; no client-supplied amount (ADR-013).
-5. Webhook reconciliation with auto-refund when the hold is gone (ADR-012).
-6. `REFUNDED` is now actually reachable — v1 defined the enum value and never set it.
-7. Order lookup access-controlled (ADR-010).
-8. Outbox: `SKIP LOCKED`, retry columns, purge policy, complete payload with a line-item array.
-9. Email collected at checkout — v1 required it `NOT NULL` but collected it nowhere.
-10. Sale-window enforcement with a 15-minute post-close checkout grace (ADR-016).
+The sequence *is* the design (ADR-001):
 
-### Added in the 2nd pass
+```
+0. already bought?          → return the receipt          ← must be first
+1. validate the hold        → live, and this session's
+2. price server-side        → from the tier, never the request
+3. sale window              → OPEN, or CLOSED within the 15-min grace
+4. find-or-create the order → UNIQUE(hold_token)
+5. grant the one grace      → and ABORT if it cannot be granted
+6. CHARGE                   → outside every transaction
+7. ONE TRANSACTION          → consume the hold, confirm, write items, write the outbox row
+8. AFTER_COMMIT             → best-effort cleanup, safe to lose
+9. commit failed post-charge→ refund, and say so
+```
 
-11. **`consumeHold` is now a SQL `UPDATE` inside the transaction** — closes a permanent inventory
-    leak on rollback (ADR-019).
-12. Redis cleanup and admission revocation moved to `AFTER_COMMIT` (ADR-023).
-13. Outbox relay split into three short transactions; publish happens outside any of them (ADR-023).
-14. `extendHold` failure aborts checkout **before** charging (ADR-023).
-15. `POST /api/v1/orders/checkout/resume` added for the 3-D Secure second leg.
-16. `findPendingOrder` added for `saleflow` (ADR-025).
-17. Error codes and `ProblemDetail` extensions aligned to `05-global-standards.md` §1–§2.
+**Step 0 must come first.** A successful purchase consumes its hold, so validating the hold first
+answers a resubmission with `410 HOLD_EXPIRED` when the buyer in fact already owns the seats.
 
-### Added in the 3rd pass
+**Step 6 is outside every transaction.** A transaction spanning an external provider holds a pooled
+connection across a network round trip, and under virtual threads the pool — not the thread count —
+is the real concurrency limit, so one slow gateway would throttle checkout for everyone (ADR-023).
 
-18. **Grace budget is per hold, not per attempt** (ADR-030). The single +120 s extension is granted
-    before the *first* charge; retries consume the remaining time. Granting one per attempt would
-    allow 300 + 3×120 = 660 s, blowing the 420 s ceiling and making seat-squatting cheap — three
-    deliberate declines would buy eleven minutes of inventory.
+**Step 7 is one transaction.** The hold claim joins it, so if anything below fails the hold returns
+to `ACTIVE` and expires normally. The outbox row is written *here*, not after: an order that is
+confirmed but whose ticket was never queued is not a state this system can reach.
+
+**`PENDING` is in-flight, never terminal** (ADR-034). The row is committed before the charge, so any
+exit that recorded no outcome would otherwise strand the buyer holding live seats behind a `409`
+about a charge they never made. Two rules make it recoverable: every thrown exit marks the order
+`FAILED`, and a `PENDING` row older than `stale-pending-seconds` is resumable on the **same order
+number** — three declined attempts should not produce three references to explain to support.
+
+**A decline does not release the hold.** The UX promises the buyer they can try another card.
+
+---
+
+## 5. The outbox
+
+Three short transactions, never one:
+
+1. **claim** a batch `FOR UPDATE SKIP LOCKED`, mark `PROCESSING`, **commit**
+2. **publish** to RabbitMQ — no transaction open
+3. **mark `PROCESSED`**, and only for what the broker actually confirmed
+
+Publishing inside the claim transaction would hold row locks across a broker round trip.
+
+**A publisher confirm is not proof of delivery.** A confirm means the *broker* has the message, not
+that a *queue* does — an exchange with no matching binding acks and discards, and the whole
+notification topology sits behind a property. `mandatory` + publisher-returns is what closes that,
+and a return is treated exactly like a nack (ADR-048).
+
+**The wait is per batch, not per message.** A batch of 100 against a sick broker would otherwise be
+100 sequential timeouts on the relay thread. Send the batch, await it once.
+
+A row claimed but never published — a crash between the two — returns to `PENDING` after
+`stale-claim-seconds`. At-least-once, which the consumer's unique constraint absorbs.
+
+**This is hand-rolled deliberately.** The Spring Modulith event-publication starters were removed;
+only `-starter-core` and `-starter-test` remain, purely for `ApplicationModules.verify()` (ADR-009).
+
+---
+
+## 6. Reconciliation and rebuild
+
+**Why here.** The invariant spans three modules' tables — `ticket_tiers`, `order_items`,
+`ticket_holds` — and `order` is the only module that can legally reach all three. Putting it in
+`catalog` would give `catalog` its first outbound dependency and make the graph cyclic; reading the
+other modules' tables with one native query would hide the same violation somewhere
+`ApplicationModules.verify()` cannot see it.
+
+**The drift gauge** recomputes `|counter − ledger|` every 60 s over **managed** events. The two SQL
+sums are taken at `REPEATABLE_READ` so they see one instant — under `READ COMMITTED` a checkout
+committing between them moves a hold from `ACTIVE` to `CONFIRMED` without either query seeing it,
+inventing drift that does not exist. Redis and PostgreSQL are still not one snapshot, so **alarm on
+sustained non-zero, not on one sample.**
+
+**The rebuild** takes two ledger snapshots a settling window apart and writes the **smaller**. A
+reserve decrements Redis just before its hold row commits, so a lone snapshot can miss a hold that is
+about to exist and write an oversell created by the repair itself. The lock is transaction-scoped and
+retaken for each snapshot rather than held across the sleep — sleeping inside a transaction is
+exactly what ADR-023 forbids.
+
+---
+
+## 7. Known gaps
+
+| Gap | Detail |
+| :--- | :--- |
+| **Checkout costs eight sequential transactions** | Steps 0, 1, 2, 4, 5, the payment store, 7 and the closing read are each their own connection acquisition. ADR-049 budgets admission against this figure |
+| **No outbox lag metric** | `flashseats.outbox.lag.seconds` is specified in `03` §7 and not built; a stalled relay currently surfaces as buyers not receiving tickets |
+
+---
+
+## 8. What it must never do
+
+- Own a Redis key.
+- Charge before confirming the hold extension, or consume the hold before charging.
+- Let a client value reach an amount.
+- Treat `PENDING` as terminal.
+- Release the hold on a decline.
+- Publish to the broker inside the outbox transaction, or mark `PROCESSED` before the broker confirms
+  **and routes**.
+- Return `receiptToken` from an admin endpoint.
+- Use `@Modifying(clearAutomatically = true)` on the settle claim — it detaches every other entity in
+  the transaction and the order's status change is silently discarded.

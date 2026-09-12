@@ -84,6 +84,17 @@ public enum ErrorCode {
      */
     ORDER_REFUNDED(HttpStatus.CONFLICT),
 
+    /**
+     * The order exists and is the caller's, but it has no ticket to hand over (ADR-050).
+     *
+     * <p>Distinct from {@code ORDER_NOT_FOUND}, which is what an <em>unauthorised</em> caller gets
+     * and must stay indistinguishable from "no such order". This one is only ever returned to
+     * someone who has already proved the order is theirs, so it can afford to say why: a
+     * {@code PENDING} order may have a ticket shortly, and a {@code REFUNDED} one never will. The
+     * client needs to tell "wait" from "stop waiting", and a bare {@code 404} tells it neither.
+     */
+    TICKET_NOT_AVAILABLE(HttpStatus.CONFLICT),
+
     // --- notification -------------------------------------------------------
     NOTIFICATION_LOG_NOT_FOUND(HttpStatus.NOT_FOUND),
 
