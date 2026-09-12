@@ -293,6 +293,20 @@ Honest list. None of these is hidden behind a passing test.
   and `POST /holds` verifies admission against Redis. Both fail closed, which for a payment is the
   right direction — but §12's "does checkout keep working?" now has a written answer: no.
 
+**Found by running the Pass 7 drill, both FIXED:**
+
+- **Docker Compose silently corrupted the admin bcrypt hash, so the operator surface could never
+  authenticate.** A digest is `$2y$12$<salt><hash>` — three `$`, each of which Compose reads as the
+  start of a variable name in a `.env` *value* and substitutes the empty string for. The container
+  received **57 characters and two `$`** where the file held 68 and three. Nothing caught it: the
+  value still begins `{bcrypt}`, so `SecretsGuard` — which refuses `{noop}` and dev defaults — waved
+  it through, the app booted happily, and every admin call returned `401` looking exactly like a
+  typo. ADR-043 calls the operator surface a correctness dependency; it had been unusable since the
+  day `gen-env.sh` first hashed a password. `gen-env.sh` now escapes `$` as `$$`, which Compose
+  un-escapes on the way into the container.
+- **`seed-concurrent.sql` had an ambiguous `id`** in its confirmation query — `events` and
+  `ticket_tiers` both have one — so the seeder failed at its last statement.
+
 **Found in Pass 7 (the plan-correctness pass), all open:**
 
 - **Admission is budgeted per sale against a shared pool.** The promotion worker loops every open
@@ -551,10 +565,54 @@ expected failure is requests queuing on HikariCP while p99 collapses — under v
 produces no error, no 500 and no drift, so the harness reports a green run over the exact condition
 it was built to find.
 
-**Status: the harness is verified, the run is not.** Syntax, compose wiring and the k6 script all
-parse; `seed-concurrent.sh` needs `FLASHSEATS_ADMIN_PLAINTEXT` exported (pre-warm is `ROLE_ADMIN`,
-and `.env` holds only the bcrypt digest). Until someone runs it, **ADR-049 is arithmetic, not
-evidence** — which is not the standard the rest of this project has held to.
+**Status: RUN, and ADR-049 is confirmed with numbers.** 5 sales x 500 seats, 2,000 VUs, three
+replicas, 12 Sept 2026.
+
+| Measure | Single sale, 2,000 VUs | **Five sales, 2,000 VUs** |
+| :--- | :--- | :--- |
+| checkout p99 | 4.7 s | **31.3 s** |
+| `hikaricp_connections_pending` peak | (not measured) | **202**, against a pool of 30 |
+| tickets sold | 500 / 500 | **370 / 2,500** |
+| inventory 503s | 0 | 0 |
+| rate limited | 0 | 0 |
+
+**The pool is the bottleneck, exactly where ADR-049 said it was.** Pending peaked at 202, 146 and
+109 on the three replicas in turn while `active` sat at the pool maximum of 30. Nothing errored —
+that is the whole point, and it is why `pool-pressure.sh` exists rather than the load harness
+answering this. p99 went from 4.7 s to 31.3 s for the same VU count spread over five sales, against
+a 200 ms exit criterion.
+
+**The system could not drain its own queues.** 370 tickets sold out of 2,500 available: buyers were
+admitted faster than checkout could serve them, so they sat in a saturated pool until their holds
+expired. Five sales with plenty of stock left behind ended up selling less than one sale did.
+
+**And the saturation cost real inventory.** `flashseats.stock.drift` reached **7**, with **14 seats
+invisible** across three of the five tiers:
+
+```
+tier   cap  confirmed  held  redis   sum   drift
+9001   500         54     3    443    500    +0
+9002   500        102    14    378    494    -6
+9003   500        108    13    378    499    -1
+9004   500        120    27    346    493    -7
+9005   500         79    20    401    500    +0
+```
+
+**The sign is the reassuring part.** Drift is *negative* — under-counted, never phantom. That is
+invariant 12 holding under the exact pressure it was written for: a reserve took seats from Redis and
+its hold row then failed to commit ambiguously, so the compensation correctly declined to return
+them (ADR-046). Invisible seats are lost revenue a rebuild recovers; phantom seats would be an
+oversell nothing recovers.
+
+**The documented recovery works.** `POST /admin/events/{id}/rebuild-stock` on the three affected
+events returned the seats, and drift read `0.0` on all three replicas at the next gauge interval.
+No oversell at any point, on any tier.
+
+**So the argument for ADR-049 is no longer latency alone.** Pool saturation under concurrent sales
+*loses inventory* — recoverable only by an operator who notices the gauge and runs a rebuild. That is
+a much stronger reason to bound admission globally than p99 was.
+
+**Two bugs the drill found on its way to the answer**, both in §9.
 
 ### Stage 5 — Buyer accounts, as an overlay (ADR-044)
 
