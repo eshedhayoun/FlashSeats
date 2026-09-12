@@ -80,7 +80,9 @@ FROM generate_series(0, :events - 1) AS n;
 SELECT setval('events_id_seq',       (SELECT MAX(id) FROM events),       true);
 SELECT setval('ticket_tiers_id_seq', (SELECT MAX(id) FROM ticket_tiers), true);
 
-SELECT id AS event_id, title, total_capacity
+-- Every column qualified: `events` and `ticket_tiers` both have an `id`, so a
+-- bare `id` here is ambiguous and the join fails outright.
+SELECT e.id AS event_id, e.title, t.id AS tier_id, t.total_capacity
   FROM events e JOIN ticket_tiers t ON t.event_id = e.id
  WHERE e.id BETWEEN :first_id AND :first_id + :events - 1
  ORDER BY e.id;

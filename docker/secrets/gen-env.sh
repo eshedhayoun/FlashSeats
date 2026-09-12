@@ -87,7 +87,27 @@ if grep -qE '^FLASHSEATS_ADMIN_PASSWORD=\{noop\}|^FLASHSEATS_ADMIN_PASSWORD=admi
         exit 1
     fi
 
-    awk -v v="{bcrypt}${ADMIN_HASH}" \
+    # ESCAPE EVERY `$` AS `$$` BEFORE IT GOES IN .env.
+    #
+    # Docker Compose interpolates variables in .env VALUES, and a bcrypt digest
+    # is `$2y$12$<22-char salt><31-char hash>` — three dollar signs, each
+    # starting what Compose reads as a variable name. It substitutes the empty
+    # string for every one it cannot resolve, so the container receives a
+    # SILENTLY TRUNCATED digest: measured here, 68 characters became 57 and
+    # three `$` became two.
+    #
+    # Nothing catches that downstream. The value still starts with `{bcrypt}`,
+    # so SecretsGuard — which refuses `{noop}` and dev defaults — waves it
+    # through, and the app starts happily with a digest no password on earth
+    # verifies against. The operator surface ADR-043 calls a correctness
+    # dependency is then unusable, and the only symptom is a 401 that looks
+    # exactly like a typo.
+    #
+    # `$$` is Compose's own escape and it un-escapes to a single `$` on the way
+    # into the container, so the application sees the digest that was written.
+    ESCAPED_HASH="${ADMIN_HASH//\$/\$\$}"
+
+    awk -v v="{bcrypt}${ESCAPED_HASH}" \
         'BEGIN { FS = "="; OFS = "=" }
          $1 == "FLASHSEATS_ADMIN_PASSWORD" { print $1, v; next }
          { print }' "$ENV_FILE" > "$ENV_FILE.tmp"
