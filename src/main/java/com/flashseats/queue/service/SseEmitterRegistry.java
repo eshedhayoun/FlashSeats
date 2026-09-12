@@ -139,6 +139,21 @@ public class SseEmitterRegistry {
         }
     }
 
+    public boolean comment(String sessionId, String comment) {
+        Connection connection = connections.get(sessionId);
+        if (connection == null) {
+            return false;
+        }
+        try {
+            connection.emitter().send(SseEmitter.event().comment(comment));
+            return true;
+        } catch (IOException | IllegalStateException disconnected) {
+            remove(sessionId, connection);
+            connection.emitter().complete();
+            return false;
+        }
+    }
+
     /** Delivers to every local watcher of an event. Terminal frames use this. */
     public void broadcast(long eventId, String eventName, Object data) {
         sessionsWatching(eventId).forEach(sessionId -> send(sessionId, eventName, data));
@@ -150,16 +165,7 @@ public class SseEmitterRegistry {
      */
     public void heartbeat(long eventId) {
         for (String sessionId : sessionsWatching(eventId)) {
-            Connection connection = connections.get(sessionId);
-            if (connection == null) {
-                continue;
-            }
-            try {
-                connection.emitter().send(SseEmitter.event().comment("hb"));
-            } catch (IOException | IllegalStateException disconnected) {
-                remove(sessionId, connection);
-                connection.emitter().complete();
-            }
+            comment(sessionId, "hb");
         }
     }
 
