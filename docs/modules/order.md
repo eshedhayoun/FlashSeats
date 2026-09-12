@@ -47,8 +47,8 @@ terminal history and any log that records bodies (ADR-048).
 The resend is served here, not by `notification`, because the payload lives in `outbox_events`. One
 new outbox row drives the whole existing pipeline.
 
-**Facade:** `findLatestOrder` (rehydration for `saleflow`). `getOrderSummary` also exists with
-**zero callers anywhere** — see §7.
+**Facade:** `findLatestOrder` (rehydration for `saleflow`) — and nothing else. A `getOrderSummary`
+existed with zero callers anywhere and was deleted in Pass 7.
 
 ---
 
@@ -143,8 +143,6 @@ exactly what ADR-023 forbids.
 | Gap | Detail |
 | :--- | :--- |
 | **No ticket retrieval endpoint** | The PDF exists only as an email attachment. A typo'd address means the buyer can never obtain what they paid for, and the operator resend replays the same payload to the same wrong address. **ADR-050. Specified, not built** |
-| **`getOrderSummary` has zero callers** | In `src/main` and `src/test` alike. Slated for deletion |
-| **`ORDER_REFUNDED` is written and never consumed** | The rows queue to `notification.order-refunded.queue`, which has no consumer and grows without bound on a durable broker. Either build the refund-notice template or stop writing the rows |
 | **Checkout costs eight sequential transactions** | Steps 0, 1, 2, 4, 5, the payment store, 7 and the closing read are each their own connection acquisition. ADR-049 budgets admission against this figure |
 | **No outbox lag metric** | `flashseats.outbox.lag.seconds` is specified in `03` §7 and not built; a stalled relay currently surfaces as buyers not receiving tickets |
 

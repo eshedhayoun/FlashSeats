@@ -16,11 +16,6 @@ class OrderFacadeImpl implements OrderFacade {
     }
 
     @Override
-    public Optional<OrderSummary> getOrderSummary(String orderNumber) {
-        return orders.findByOrderNumber(orderNumber).map(OrderFacadeImpl::toSummary);
-    }
-
-    @Override
     public Optional<OrderSummary> findLatestOrder(String userSessionId, long eventId) {
         return orders.findLatest(userSessionId, eventId).map(OrderFacadeImpl::toSummary);
     }

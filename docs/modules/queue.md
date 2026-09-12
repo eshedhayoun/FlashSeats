@@ -35,7 +35,6 @@ correctness-neutral: delete the whole module and the sale is still correct, just
 | `queue:exhausted:{e}` | String | sale end + retention | derived sold-out marker; deleted the moment stock returns (ADR-035) |
 | `queue:promote:{e}` | String | 900 ms | makes the promotion tick a singleton across replicas (ADR-032) |
 | `queue:events:{e}` | Pub/Sub | — | promotion fan-out to whichever replica holds the SSE connection (ADR-007) |
-| `queue:hb:{sid}` | String | 90 s | **write-only. Nothing reads it. Slated for deletion** — see §6 |
 
 Every per-buyer key is **scoped by event**. One visitor in two concurrent sales would otherwise have
 one promotion overwrite the other (ADR-036).
@@ -141,7 +140,6 @@ lowest RTT and the most aggressive automation — and the change is one line, th
 
 | Gap | Detail |
 | :--- | :--- |
-| **`queue:hb:{sid}` is write-only** | Written on every `join` and every `status`; **nothing in the repo reads it**. The "abandonment metric" its Javadoc names does not exist. It also floods the shared `__keyevent@0__:expired` channel that `hold`'s expiry listener filters on every replica. Slated for deletion |
 | **The broadcaster does 4 Redis round trips per connection per tick** | Admission `GET`, pass `GET`, exhausted `EXISTS`, waiting `ZRANK`. The `EXISTS` is per *event* and is being re-read per *session*. Measured fine at 2,000 VUs on **one** sale; the cost is linear in connections × events, so that evidence does not carry to `E = 5` |
 | **The emitter registry is a flat map** | Keyed on session id alone, so "sessions watching event X" streams the whole map. `O(connections × events)` per tick |
 | **No queue metrics** | Depth, promotion rate and active SSE connections are all specified in `03` §7 and none is built |
@@ -156,6 +154,8 @@ lowest RTT and the most aggressive automation — and the change is one line, th
 - Create holds, take payment, or write orders.
 - Touch PostgreSQL.
 - Delete `queue:waiting:{e}`. It expires with the sale; nothing deletes it (ADR-035).
-- Consult `queue:hb` before promoting or evicting anyone (ADR-026) — moot once it is deleted.
+- Reintroduce a liveness key. `queue:hb:{sid}` was deleted in Pass 7 — written on every join and
+  every status poll, read by nobody. ADR-026's rule needs no key: the queue drains by promotion and
+  nothing is ever evicted. Liveness telemetry, if ever wanted, is a Micrometer counter.
 - Treat a Lua or facade sentinel as a count. `COUNTER_UNAVAILABLE` is a fault, never "sold out"
   (ADR-004, ADR-040).

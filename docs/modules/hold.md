@@ -49,7 +49,11 @@ owns the truth. This is the `holdmeta` key ADR-019 deleted, and it is not coming
 A hold that is not yours answers `404`, not `403`, so tokens cannot be enumerated.
 
 **Facade:** `getActiveHold`, `findActiveHold`, `consumeHold`, `grantGrace`, `discardTimer`,
-`sumActiveQuantityForTier`. (`releaseHold` exists with **no production caller** — see §6.)
+`sumActiveQuantityForTier`.
+
+There is deliberately **no** `releaseHold`. One existed, reached only from a test: nothing in
+production releases another module's hold, because ADR-001 has a decline *retain* it. A buyer
+cancels through `DELETE /holds/{token}`, and the sweeper handles everything else.
 
 ---
 
@@ -123,7 +127,6 @@ publishes the event name to a per-key channel and the listener never fires (ADR-
 
 | Gap | Detail |
 | :--- | :--- |
-| **`releaseHold` has no production caller** | The facade method, the `HoldReleaseReason` enum and the service method behind them are reached only from a test. Nothing in production releases a hold this way, and ADR-001 is why: a decline deliberately **retains** the hold. Slated for deletion |
 | **`sumActiveQuantityForTier` has no supporting index** | It filters `tier_id + status = 'ACTIVE'`; `idx_holds_event_tier` needs a leading `event_id` and `idx_holds_sweeper` leads on `expires_at`. The drift gauge runs it per tier, per event, per replica, every 60 s, over a table that accumulates every hold ever created. Needs a partial index on `(tier_id) WHERE status = 'ACTIVE'` |
 | **No conversion metric** | `flashseats.hold.conversion.ratio` is specified in `03` §7 and not built — it is the number the 1.5× oversubscribe factor is currently guessing at |
 

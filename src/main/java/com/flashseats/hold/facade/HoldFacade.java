@@ -40,15 +40,6 @@ public interface HoldFacade {
     HoldSummary consumeHold(String holdToken);
 
     /**
-     * Hands seats back, restoring stock if this caller wins the settle-once claim.
-     *
-     * <p>The reason is recorded as the hold's {@code settle_reason} and is the only trace of why it
-     * ended. It took a {@code String} that was discarded, so every release read as
-     * {@code USER_CANCEL} whoever asked for it.
-     */
-    void releaseHold(String holdToken, HoldReleaseReason reason);
-
-    /**
      * Grants the single grace extension, if this hold has not used it (ADR-030).
      *
      * <p>Idempotent by design: a retry after a decline gets the current expiry back rather than a
@@ -64,9 +55,9 @@ public interface HoldFacade {
     /**
      * Best-effort cleanup of the hold's expiry timer, called from {@code AFTER_COMMIT}.
      *
-     * <p>A no-op until Redis carries the timer. It is safe to lose entirely: if it never runs, the
-     * key expires by itself and the expiry handler finds the hold already {@code CONSUMED} and
-     * correctly does nothing.
+     * <p>Deletes {@code hold:{token}} (ADR-048). Safe to lose entirely: if it never runs, the key
+     * expires by itself and the listener finds the hold already {@code CONSUMED} and correctly does
+     * nothing — which is why it never throws.
      */
     void discardTimer(String holdToken);
 

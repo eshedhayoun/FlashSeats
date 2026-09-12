@@ -9,7 +9,6 @@ import com.flashseats.flashseats.support.IntegrationTest;
 import com.flashseats.flashseats.support.SaleFixture;
 import com.flashseats.hold.exception.HoldAlreadySettledException;
 import com.flashseats.hold.facade.HoldFacade;
-import com.flashseats.hold.facade.HoldReleaseReason;
 import java.time.Duration;
 import java.util.Map;
 import java.util.concurrent.CountDownLatch;
@@ -76,7 +75,12 @@ class HoldLifecycleIT extends IntegrationTest {
     @Test
     @DisplayName("Ten threads releasing the same hold restore its seats once, not ten times")
     void concurrentReleasesRestoreOnce() throws Exception {
-        String holdToken = newHold(3);
+        // Driven through DELETE /holds/{token} — the path a buyer actually takes. This used to call
+        // HoldFacade.releaseHold, which no production code ever called: the facade method, its enum
+        // and the service method behind it existed so this test could reach them. Nothing in the
+        // system releases a hold that way, because ADR-001 has a decline deliberately RETAIN it.
+        BuyerSession buyer = admittedBuyer();
+        String holdToken = reserve(buyer, admissionToken, 3).text("holdToken");
         assertThat(fixture.remaining(tierId)).isEqualTo(CAPACITY - 3);
 
         int racers = 10;
@@ -87,7 +91,7 @@ class HoldLifecycleIT extends IntegrationTest {
             for (int i = 0; i < racers; i++) {
                 pool.submit(() -> {
                     startLine.await();
-                    holds.releaseHold(holdToken, HoldReleaseReason.USER_CANCEL);
+                    buyer.delete("/holds/" + holdToken);
                     completed.incrementAndGet();
                     return null;
                 });
