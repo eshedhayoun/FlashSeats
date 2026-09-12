@@ -1,13 +1,26 @@
 # FlashSeats — Front-End Design Specification
 
-**Stack:** React 18 + TypeScript (Vite) · MUI v5 · native `EventSource` · Stripe.js
+**Stack:** React 18 + TypeScript (Vite) · MUI v5 · native `EventSource`
 **Backend contract:** [`docs/03-end-to-end-flow.md`](docs/03-end-to-end-flow.md) ·
 [`docs/05-global-standards.md`](docs/05-global-standards.md) ·
 [`docs/00-architecture-decisions.md`](docs/00-architecture-decisions.md)
 
+> **Read this first if you are new.** This is the **target**, not a description of what exists. What
+> ships today is a single hand-written `src/main/resources/static/index.html` (~700 lines of vanilla
+> JS) that implements the four rules in §0 informally and covers the happy path. It is a demo, not
+> the deliverable. Where this document describes something the server does not offer yet, it says
+> **"specified, not built"** — build against the contract, not against the demo client.
+>
+> **Two things changed in the Sept 2026 plan-correctness pass, and they change the client:**
+>
+> 1. **The system now targets 3–10 concurrent sales** ([`03`](docs/03-end-to-end-flow.md) §2). Every
+>    piece of client state must therefore be **scoped by `eventId`** — see rule 5. The current demo
+>    client is single-sale and would corrupt itself with two tabs on two sales.
+> 2. **A ticket will be retrievable, not only emailed** (ADR-050). V5 gains a download.
+
 ---
 
-## 0. Four rules that override everything else
+## 0. Five rules that override everything else
 
 **1. The server owns the clock.** Compute an offset **once** per page load and derive every countdown
 from it. Never `Date.now()` directly, never a decrementing local counter as the source of truth.
@@ -31,6 +44,26 @@ speeds the first paint; the server is the truth.
 **4. A timer reaching zero is a prompt to ask, not a conclusion.** Never navigate away or show
 "expired" because a local countdown hit `00:00`. Call the API and let it say so.
 
+**5. Every piece of client state is scoped by `eventId`.** A buyer may be in several sales at once —
+queued for one, holding seats in another, reading a receipt for a third — in separate tabs or the
+same one. There is no "current event".
+
+```ts
+// Correct. One namespace per sale.
+const k = (eventId: number, name: string) => `fs.${eventId}.${name}`;
+sessionStorage.setItem(k(eventId, 'holdToken'), token);
+
+// Wrong, and silently destructive.
+sessionStorage.setItem('fs.holdToken', token);   // ← tab B overwrites tab A's hold
+```
+
+This mirrors the server, where every per-buyer Redis key carries the event id for exactly this
+reason: one visitor in two concurrent sales had one promotion overwrite the other (ADR-036). A
+global client key reintroduces that bug above the API.
+
+The same rule governs live connections: **one `EventSource` per event**, closed when its view
+unmounts, never a shared singleton reassigned to whichever sale was opened last.
+
 ---
 
 ## 1. View state machine
@@ -53,6 +86,11 @@ speeds the first paint; the server is the truth.
 This list **is** the router, and it is **ordered**. Evaluate top to bottom and take the first match.
 Do not derive the view from navigation history — a buyer who reloads, hits Back, or opens a second
 tab must land on the view the server says they are in.
+
+**It is evaluated per event, against that event's own state** (rule 5). `routeFor` is a function of
+one `SaleState`, and a buyer in three sales has three independent answers — there is no single
+"current view" for the session. Every route in this document is therefore `/events/:eventId/…`: the
+event id is in the URL because it is what selects the state, not because it is a detail of the page.
 
 Three positions in that order are load-bearing:
 
@@ -98,7 +136,7 @@ because a row was missing, which is precisely what shipped (ADR-004, ADR-040).
 The enum has grown once and may grow again; the safe default is "we do not know", never "it is gone".
 
 **At `T-0`:** flip the CTA live client-side from the countdown. Do **not** auto-submit — a self-firing
-join at exactly `t=0` from every open tab is indistinguishable from a bot, and reCAPTCHA will score
+join at exactly `t=0` from every open tab is indistinguishable from a bot, and a challenge will score
 it accordingly.
 
 **Poll** `GET /api/v1/events/{eventId}` every 30 s while `UPCOMING`; every 10 s in the final minute.
@@ -202,7 +240,7 @@ should reflect that.
 
 The highest-stakes screen. Money is involved and a timer is running.
 
-**Renders:** order summary, **sticky hold countdown**, email input, Stripe Payment Element, pay CTA,
+**Renders:** order summary, **sticky hold countdown**, email input, a payment element, pay CTA,
 "release seats" secondary.
 
 **The hold timer — the anxiety surface:**
@@ -231,16 +269,17 @@ if (remainingMs <= 0) {
 }
 ```
 
-A charge already submitted to Stripe **will complete**. The webhook finalises the order even if the
-browser is closed (ADR-012). Telling a buyer their reservation expired while their card is being
-charged is the worst possible message and it would be false.
+A charge already submitted **will complete**, and once a real gateway ships its webhook finalises the
+order even if the browser is closed (ADR-012). Telling a buyer their reservation expired while their
+card is being charged is the worst possible message, and it would be false.
 
 **Payment submission:**
 
 ```ts
-const idempotencyKey = sessionStorage.getItem('fs.idem')
+const key = (name: string) => `fs.${eventId}.${name}`;      // rule 5
+const idempotencyKey = sessionStorage.getItem(key('idem'))
   ?? crypto.randomUUID();                   // generated ONCE per hold, reused on every retry
-sessionStorage.setItem('fs.idem', idempotencyKey);
+sessionStorage.setItem(key('idem'), idempotencyKey);
 setPaymentInFlight(true);                   // disables CTA and freezes the expiry branch
 ```
 
@@ -253,29 +292,29 @@ the gateway-level guard (ADR-014).
 | :--- | :--- |
 | `201` / `200` | → V5 |
 | `402 PAYMENT_DECLINED` | Inline: "Card declined — try another." Form stays populated except the card. **Hold is retained.** Show `attemptsRemaining`. **No timer extension** (ADR-030) |
-| `402 PAYMENT_ACTION_REQUIRED` | 3-D Secure → see below |
 | `402 PAYMENT_ATTEMPTS_EXHAUSTED` | Terminal. Offer re-entry to the queue |
-| `409` + `expiresAt` < 45 s | "Not enough time left to complete this safely." Offer release + re-queue |
+| `409 INSUFFICIENT_TIME_REMAINING` | "Not enough time left to complete this safely." Offer release + re-queue. Nothing was charged (ADR-030) |
 | `410 HOLD_EXPIRED` | Expired panel. Nothing charged — **say so explicitly** |
 | `503 PAYMENT_GATEWAY_UNAVAILABLE` | "Payment provider is having trouble. **Your seats are held.**" Retry after `retryAfterSeconds` |
 | `409 DUPLICATE_PAYMENT` | Ignore — a charge is in flight. Poll `/sale/state` every 2 s |
+| `409 ORDER_REFUNDED` | Terminal. The charge succeeded and could not be completed, so it was **refunded**. Say that plainly and name the order number |
+| `402 PAYMENT_ACTION_REQUIRED` | **Unreachable today.** Reserved for 3-DS in Stage 2 — see below |
 
-**3-D Secure:**
+**A retry is the same request.** Re-POST `/orders/checkout` with the same body and the same
+`idempotencyKey`. Find-or-create on `UNIQUE(hold_token)` retries on the same order number, so three
+declines produce one reference rather than three (ADR-002, ADR-034). Regenerating the key per attempt
+defeats the gateway-level guard (ADR-014).
 
-```ts
-if (code === 'PAYMENT_ACTION_REQUIRED') {
-  sessionStorage.setItem('fs.pi', stripePaymentIntentId);   // survives the redirect
-  const { error } = await stripe.handleNextAction({ clientSecret });
-  if (!error) await post('/api/v1/orders/checkout/resume', { holdToken });
-}
-```
+**3-D Secure — specified, not built.** The gateway is a stub; there is no `clientSecret`, no
+`handleNextAction`, and no redirect. When Stage 2 brings a real provider, `paymentInFlight` must stay
+`true` for the entire challenge, per-event storage must carry whatever survives a redirect, and the
+return path is `/sale/{eventId}/state` — **not** a bespoke resume endpoint. The +120 s grace is
+granted before the charge, so the challenge window is already covered (ADR-006, ADR-030).
 
-`paymentInFlight` stays `true` for the entire challenge. Some methods redirect away entirely — on
-return, `fs.pi` in sessionStorage plus `/sale/state` restores the flow. The +120 s grace was granted
-before the charge, so the challenge window is already covered (ADR-006, ADR-030).
-
-**Email:** validated client-side for shape only. Show it back on V5 prominently — a typo means the
-tickets go nowhere and there is no recovery path.
+**Email:** validated client-side for shape only — shape validation catches `foo@@bar`, never
+`jhon@gmial.com`. Show it back on V5 prominently. Today a typo means the tickets go nowhere with no
+recovery path; ADR-050's download is what turns that from terminal into recoverable, and until it
+ships this screen is the buyer's only chance to catch it.
 
 ---
 
@@ -284,15 +323,26 @@ tickets go nowhere and there is no recovery path.
 **Route:** `/orders/:orderNumber`
 
 **Renders:** success state, `TK-98213` in large monospace with copy-to-clipboard, item summary,
-total, buyer email, "check your inbox" notice, download CTA.
+total, buyer email, "check your inbox" notice, and a **download CTA**.
 
 Email delivery is **asynchronous** — the PDF may take a few seconds. Do not promise it has arrived:
 
 > "We're sending your tickets to **buyer@example.com**. They usually arrive within a minute."
 
-Clear `fs.holdToken`, `fs.idem`, `fs.pi`. **Keep** `orderNumber` and `receiptToken` — they are how a
-buyer returns to this page. The URL carries `?receiptToken=…` so the page survives a cookie clear
-and works from the confirmation email (ADR-010).
+**The download is not a convenience — it is the recovery path.** The address is collected once at
+checkout and never verified, so a typo currently means the buyer can never obtain what they paid
+for: the ticket goes to a stranger or bounces, and even an operator resend replays to the same wrong
+address. `GET /orders/{orderNumber}/ticket.pdf` closes that (**ADR-050 — specified, not built**), and
+it is authorised exactly like this page: session cookie **or** `receiptToken`.
+
+Until it ships, V5 must at minimum **show the email address it sent to, prominently enough to
+proofread**, and offer a route to support. A buyer who spots the typo on this screen can still be
+helped; one who discovers it two days later cannot.
+
+Clear `fs.{eventId}.holdToken` and `fs.{eventId}.idem`. **Keep** `orderNumber` and `receiptToken` —
+they are how a buyer returns here — and append the order to `fs.recentOrders`, which is what lets
+someone buying into several sales find all of their tickets. The URL carries `?receiptToken=…` so the
+page survives a cookie clear and works from the confirmation email (ADR-010), subject to §3.1.
 
 ---
 
@@ -320,19 +370,30 @@ Base `/api/v1`. `fsid` is an `HttpOnly` cookie — **JavaScript never reads or s
 | V1 | `GET` | `/events` | — | — | `200` | — |
 | V1 | `GET` | `/events/{eventId}` | — | — | `200` | `EVENT_NOT_FOUND` |
 | all | `GET` | `/sale/{eventId}/state` | — | — | `200` | `EVENT_NOT_FOUND` |
-| V1→V2 | `POST` | `/queue/join` | — | `{eventId, recaptchaToken}` | `202` | `SALE_NOT_OPEN`, `RATE_LIMITED`, `BOT_VERIFICATION_FAILED` |
+| V1→V2 | `POST` | `/queue/join` | — | `{eventId}` | `202` | `SALE_NOT_OPEN`, `SALE_PAUSED`, `RATE_LIMITED` |
 | V2 | `GET` | `/queue/stream?eventId=` | `Accept: text/event-stream` | — | SSE | — |
 | V2 | `GET` | `/queue/status?eventId=` | — | — | `200` | `NOT_IN_QUEUE` |
 | V2→V3 | `POST` | `/queue/admit` | `X-Queue-Pass-Token` | `{eventId}` | `200` | `QUEUE_PASS_INVALID`, `QUEUE_PASS_EXPIRED`, `VALIDATION_FAILED` |
 | V3 | `POST` | `/holds` | `X-Admission-Token` | `{eventId, tierId, quantity}` | `201` | `INSUFFICIENT_STOCK`, `QUANTITY_EXCEEDS_LIMIT`, `HOLD_LIMIT_EXCEEDED`, `ADMISSION_EXPIRED`, `INVENTORY_UNAVAILABLE` |
 | V4 | `GET` | `/holds/{holdToken}` | — | — | `200` | `HOLD_NOT_FOUND`, `HOLD_EXPIRED` |
 | V4 | `DELETE` | `/holds/{holdToken}` | — | — | `204` | `HOLD_NOT_FOUND` |
-| V4 | `POST` | `/orders/checkout` | — | `{holdToken, userEmail, paymentMethodId, idempotencyKey}` | `201`/`200` | `PAYMENT_DECLINED`, `PAYMENT_ACTION_REQUIRED`, `PAYMENT_ATTEMPTS_EXHAUSTED`, `HOLD_EXPIRED`, `DUPLICATE_PAYMENT`, `PAYMENT_GATEWAY_UNAVAILABLE`, `CHECKOUT_WINDOW_CLOSED` |
-| V4 | `POST` | `/orders/checkout/resume` | — | `{holdToken}` | `201`/`200` | as above |
+| V4 | `POST` | `/orders/checkout` | — | `{holdToken, userEmail, paymentMethodId, idempotencyKey}` | `201`/`200` | `PAYMENT_DECLINED`, `PAYMENT_ATTEMPTS_EXHAUSTED`, `HOLD_EXPIRED`, `DUPLICATE_PAYMENT`, `PAYMENT_GATEWAY_UNAVAILABLE`, `CHECKOUT_WINDOW_CLOSED`, `INSUFFICIENT_TIME_REMAINING`, `ORDER_REFUNDED` |
 | V5 | `GET` | `/orders/{orderNumber}?receiptToken=` | — | — | `200` | `ORDER_NOT_FOUND` |
+| V5 | `GET` | `/orders/{orderNumber}/ticket.pdf?receiptToken=` | — | — | `200` | `ORDER_NOT_FOUND` — **specified, not built (ADR-050)** |
 
 > **`userSessionId` is never sent** — not in a body, not in a header, not in a query string. Identity
 > comes from the signed cookie alone (ADR-010). A request that carries it will be rejected.
+
+**There is no `/orders/checkout/resume`.** An earlier draft specified one; it does not exist and is
+not needed. **Re-POST the same `/orders/checkout` body** — the endpoint is find-or-create on
+`UNIQUE(hold_token)`, so a resubmission after a decline retries on the *same* order number, and a
+resubmission after success replays the receipt with `200` instead of `201` (ADR-002, ADR-034). That
+is the whole retry mechanism; do not build a second one.
+
+**Three registry codes are currently unreachable** and a client must not branch on them yet:
+`BOT_VERIFICATION_FAILED` (no challenge provider — §5), `PAYMENT_ACTION_REQUIRED` (no 3-DS; the
+gateway is a stub) and `WEBHOOK_SIGNATURE_INVALID` (no webhook). Handle them defensively as generic
+failures; they arrive with Stage 2.
 
 ### Error envelope — RFC 7807
 
@@ -372,20 +433,45 @@ Show `detail` to the user. Show `traceId` in a support footer on `5xx`. Switch o
 inherit a stale `holdToken` and desynchronise. Closing the tab discards checkout state, which is the
 correct default for a payment flow on a shared machine.
 
+**Every key is namespaced by `eventId`** (rule 5). The sale a key belongs to is part of its identity,
+not context the tab happens to remember.
+
 | Key | Contents | Lifetime |
 | :--- | :--- | :--- |
-| `fs.admissionToken` | admission token (V3–V4) | until admission expires |
-| `fs.holdToken` | active hold | until settled |
-| `fs.idem` | idempotency key, **one per hold** | until settled |
-| `fs.pi` | Stripe PaymentIntent id | across the 3-DS redirect |
+| `fs.{eventId}.admissionToken` | admission token (V3–V4) | until admission expires |
+| `fs.{eventId}.holdToken` | active hold | until settled |
+| `fs.{eventId}.idem` | idempotency key, **one per hold** | until settled |
+| `fs.{eventId}.lastEventId` | SSE `Last-Event-ID` | per tab |
 | `fs.clockOffsetMs` | server-clock delta | per tab |
-| `fs.lastEventId` | SSE `Last-Event-ID` | per tab |
+
+`fs.clockOffsetMs` is the **one** deliberately global key: there is a single server clock, and every
+`serverTime` in every response refreshes the same offset.
+
+There is no `fs.pi`. Stripe PaymentIntents and the 3-DS redirect they exist for are Stage 2; the
+gateway is a stub today and no redirect occurs.
 
 **`localStorage`:** only `fs.recentOrders` — a list of `{orderNumber, receiptToken, eventTitle}` so a
-returning buyer can find their tickets. Nothing security-sensitive; nothing the server needs.
+returning buyer can find their tickets across sales. It is keyed by nothing because it spans
+everything, and it is the only client state that is *meant* to outlive a tab. Nothing
+security-sensitive beyond the receipt tokens it exists to hold — treat it accordingly (§3.1).
 
 **Never stored anywhere:** `fsid` (HttpOnly by design), card data, `queuePassToken` (lives ~2 s in
 memory before being exchanged).
+
+### 3.1 `receiptToken` is a bearer capability
+
+It authorises reading an order — and, once ADR-050 ships, **downloading its ticket** — from any
+browser for **90 days**, with no cookie. It is what makes the link in the confirmation email work.
+
+Consequences a client must respect:
+
+- Put it in the query string of a link the buyer chooses to open. **Never** in a URL the app
+  navigates to automatically, where it lands in history and any `Referer`.
+- Never log it, never send it to an analytics or error-reporting service.
+- Never render it as visible text. Render the *link*.
+
+The server enforces the same separation: the admin order view returns a shape **without** it, so an
+operator cannot accidentally mint an impersonation link (ADR-048).
 
 ### Rehydration — the recovery protocol
 
@@ -394,8 +480,15 @@ async function bootstrap(eventId: number) {
   const state = await api<SaleState>(`/sale/${eventId}/state`);
   clockOffsetMs = Date.parse(state.serverTime) - Date.now();
 
-  if (state.hold)  sessionStorage.setItem('fs.holdToken', state.hold.holdToken);
-  else             sessionStorage.removeItem('fs.holdToken');
+  const key = (name: string) => `fs.${eventId}.${name}`;      // rule 5
+  if (state.hold)  sessionStorage.setItem(key('holdToken'), state.hold.holdToken);
+  else             sessionStorage.removeItem(key('holdToken'));
+
+  if (state.partial?.length) {
+    // A section the server could not read. Render the rest; do NOT treat a missing
+    // section as an absent one — "no hold" and "could not read holds" differ.
+    markDegraded(state.partial);
+  }
 
   return routeFor(state);          // the §1 table
 }
@@ -404,6 +497,12 @@ async function bootstrap(eventId: number) {
 Runs on: initial mount, `visibilitychange` → visible, `online`, SSE reconnect, and after any `409`
 or `410`. It is cheap (four in-process facade reads) and it is the difference between a resilient
 SPA and a fragile one.
+
+**`partial` is part of the contract and most clients forget it.** `/sale/{id}/state` fails soft per
+section: if the queue read throws, `queue` comes back `null` and `"queue"` appears in `partial`. A
+client that reads `queue === null` as "not in the queue" will route a waiting buyer to the landing
+page and invite them to join a line they are already in. **Absent and unreadable are different
+facts** — the same distinction the server maintains between `SOLD_OUT` and `UNKNOWN`.
 
 **Recovery matrix — every reload point:**
 
@@ -414,13 +513,14 @@ SPA and a fragile one.
 | V2, promoted during reload | `PROMOTED` + `passToken` | Auto-admit → V3. The pass was waiting in Redis |
 | V3, no hold | `ADMITTED` | Seat picker, admission timer resumed |
 | V4, hold live | `hold` + remaining TTL | Checkout, timer resumed from `expiresAt` |
-| V4, mid-3-DS | `order: PENDING` | Resume panel; poll every 2 s |
+| V4, mid-charge | `order: PENDING` | Resume panel; poll every 2 s. **Re-POST `/orders/checkout`**, do not invent a resume endpoint |
 | V4, charge settled during reload | `order: CONFIRMED` | Straight to V5 — **the reload cost nothing** |
 | V4, hold expired while away | `hold: null` | Expired panel, "nothing was charged" |
 | **V5, reloaded after buying** | `hold: null`, `order: CONFIRMED` | **Receipt, not the landing page.** Rehydration returned only *pending* orders, so a completed purchase was invisible and the buyer was invited to queue for seats they already owned (ADR-037) |
 | **V2, sale closed while waiting** | `queue.state: CLOSED` | V6. The window is resolved before ZSET rank, and the broadcaster sends `sale-closed` and completes the stream (ADR-036) |
 | **V2, counter unreadable** | `queue.state` unchanged, promotion paused | **Stay in V2.** A missing counter is a fault, never a sold-out sale (ADR-004, ADR-035) |
-| Second tab opened | same session | Both tabs converge on the same state |
+| Second tab, **same** sale | same session | Both tabs converge on the same state |
+| **Second tab, a different sale** | independent per-event state | **Both sales proceed independently.** Queued for A while holding seats in B is a legitimate, supported state. This is what rule 5 exists for, and the current demo client fails it |
 
 ### Checkout error handling — one rule per code
 
@@ -515,31 +615,41 @@ Browsers cap ~6 connections per origin: **one `EventSource` per tab**, closed on
 
 ---
 
-## 5. reCAPTCHA v3
+## 5. Abuse defence — what the client actually does
 
-Loaded once on V1. Executed **only** on the "Join Flash Sale" press — tokens expire in 120 s, so
-executing on page load yields a stale token for anyone who reads the page first.
+**There is no reCAPTCHA.** No challenge provider is integrated, `/queue/join` accepts no
+`recaptchaToken`, and no property for one exists. An earlier draft of this document specified a full
+reCAPTCHA v3 integration; building against it would send a field the server ignores and branch on a
+code it never returns.
+
+Defence today is **session-first rate limiting with an IP backstop** (ADR-011), enforced in a servlet
+filter before any handler. The client's entire responsibility is to handle being limited well.
+
+### Handling `429 RATE_LIMITED`
 
 ```ts
-async function joinSale(eventId: number) {
-  const token = await grecaptcha.execute(SITE_KEY, { action: 'join_sale' });
-  return api('/queue/join', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ eventId, recaptchaToken: token }),
-  });
-}
+// Exponential backoff with full jitter, and a ceiling. Never a fixed retry interval:
+// ten thousand clients retrying on the same 1 s tick is the thundering herd the
+// waiting room exists to prevent, recreated above the API.
+const delay = Math.random() * Math.min(30_000, 500 * 2 ** attempt);
 ```
 
-`action` must be exactly `join_sale` — the server validates it. This is the only endpoint that takes
-a token; the verdict is cached server-side for 30 min (ADR-011).
+- **Respect `Retry-After` when present**; it is the server's own estimate and beats any local guess.
+- **Never retry automatically more than a handful of times.** Surface a manual "Try again" and stop.
+- **Say what is true:** "We're handling a lot of traffic right now." Not "you look like a bot" — a
+  shared corporate gateway or a carrier NAT can trip the IP bucket through no fault of the buyer,
+  which is exactly why that bucket is deliberately loose.
 
-**On `403 BOT_VERIFICATION_FAILED`:** never say "you look like a bot." Say "We couldn't verify your
-browser. Please try again," and allow one retry with a fresh token. False positives are real, and
-accusing a paying customer is worse than admitting a few scripts.
+The same copy rule applies to `BOT_VERIFICATION_FAILED` if a challenge provider ever ships: never
+accuse a paying customer. False positives are real, and accusing one is worse than admitting a few
+scripts.
 
-**If reCAPTCHA fails to load:** submit without a token. The server fails open and relies on rate
-limits (ADR-011). Do not block the sale on a third-party script.
+### When it ships (Stage 2)
+
+A challenge is executed **on the "Join Flash Sale" press, never on page load** — tokens are
+short-lived, so executing early yields a stale one for anyone who reads the page first. It applies to
+`/queue/join` only, and **if the provider script fails to load, submit anyway**: the server falls back
+to rate limits, and no sale should be blocked on a third-party script.
 
 ---
 
@@ -557,7 +667,7 @@ containers resize, the whole page jitters.
 `tabular-nums` alone fixes most of it — proportional digits make `#111` narrower than `#888`.
 
 **Isolate high-frequency updates.** The countdown re-renders every second; it must not re-render the
-Stripe Element.
+payment element — remounting one mid-checkout loses whatever the buyer has typed.
 
 ```tsx
 const HoldCountdown = memo(({ expiresAt }: { expiresAt: string }) => { … });
@@ -703,9 +813,14 @@ one.
 
 ### Not in scope for the first cut
 
-Visual regression, axe/accessibility assertions, mobile viewport matrices, and multi-replica runs
-behind the `cluster` profile. All of them are worth doing; none of them is worth blocking the
-recovery-matrix coverage on.
+Visual regression, axe/accessibility assertions and mobile viewport matrices. Worth doing; not worth
+blocking recovery-matrix coverage on.
+
+**Multi-replica runs behind the `cluster` profile are now in scope**, and so are the concurrent-sales
+boxes in §9. Both were deferred when the target was one sale on one instance. They are the two places
+a client can be correct on a developer's laptop and wrong in front of buyers: promotion fan-out only
+exists across replicas (ADR-007), and per-event state isolation only fails once there are two sales
+to confuse. `docker/seed/seed.sh` seeds the sale; the concurrent-sales drill seeds five.
 
 ---
 
@@ -728,8 +843,29 @@ recovery-matrix coverage on.
 - [ ] `aria-live` announces thresholds, not every tick
 - [ ] `prefers-reduced-motion` respected
 - [ ] Pay button disabled on click, not debounced
-- [ ] Two tabs on the same session converge on the same view
+- [ ] Two tabs on the same session **and the same sale** converge on the same view
+
+**Concurrent sales** (rule 5 — the current demo client fails every box below):
+
+- [ ] Every `sessionStorage` key is namespaced `fs.{eventId}.*`; the only global one is
+      `fs.clockOffsetMs`
+- [ ] One `EventSource` per event, closed on unmount — never a singleton reassigned between sales
+- [ ] Queued for sale A **and** holding seats in sale B, in two tabs, corrupts neither
+- [ ] The same journey in **one** tab, navigating between two sales, corrupts neither
+- [ ] Two concurrent holds in two different sales each run their own countdown
+- [ ] `fs.recentOrders` lists tickets across sales and survives a tab close
+- [ ] A promotion in sale A while the tab is showing sale B is not lost — it is in Redis, and
+      rehydrating A recovers it
+
+**Contract honesty:**
+
+- [ ] `partial` from `/sale/state` renders as degraded, never as absent
+- [ ] Retries re-POST `/orders/checkout`; no client invents a resume endpoint
+- [ ] No `recaptchaToken` is sent; `RATE_LIMITED` backs off with full jitter and a ceiling
+- [ ] `receiptToken` never reaches history, `Referer`, a log, or an analytics call (§3.1)
+- [ ] The buyer's email is legible on V5, and a ticket download exists once ADR-050 ships
 
 **Not yet covered by any automated test.** Every box above is verified by hand today. §8 specifies
 the Playwright suite that should own them; until it exists, this list is a checklist a person walks,
-and the twelve reload points are the ones most likely to rot between passes.
+and the reload points are the ones most likely to rot between passes. The concurrent-sales boxes are
+the newest and the least exercised — they are where a new client is most likely to be quietly wrong.
