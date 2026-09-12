@@ -121,7 +121,7 @@ conclusion independently, and a rebuild performed on one releases the event on a
 
 | Gap | Detail |
 | :--- | :--- |
-| **No caching** | `events` changes only on operator pause/resume and `ticket_tiers` never changes after creation, yet every `getWindowStatus`, `getEventSummary`, `getTierSummary` and tier-id lookup is a PostgreSQL transaction. On the landing page and the queue-status poll this is the dominant cost at `E > 1` |
+| **No cross-replica cache invalidation event** | `events` and `ticket_tiers` are cached inside each `CatalogService` instance and evicted locally on pause/resume. A later `TierAvailabilityChangedEvent` or metadata-change event is still needed before richer operator edits exist across replicas |
 | **No create-event endpoint** | Events are seeded by a `dev`-profile seeder or by `docker/seed/seed.sql`. An operator cannot create a sale through the API |
 
 ---

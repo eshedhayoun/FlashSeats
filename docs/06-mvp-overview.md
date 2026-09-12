@@ -112,7 +112,7 @@ it, so if anything fails the hold returns to `ACTIVE` and expires normally.
 | :--- | :--- | :--- |
 | `shared` | `ErrorCode` (42 codes), `ProblemDetails`, one global advice, `SessionId`, `Money`, `Clock`, `SignedToken`, `TraceIdFilter` | — |
 | `bot` | Signed `fsid` cookie; Redis-backed Bucket4j session + IP buckets; SSE exempt from per-request accounting | reCAPTCHA, `ip_rules`, audit logs. **Writes no tables.** |
-| `catalog` | Events, tiers, window derivation, `serverTime`, bucketed availability, **Redis counters + Lua, the `-2` fault path, pre-warm, the Redis-restart guard** | pause, `TierAvailabilityChangedEvent` |
+| `catalog` | Events, tiers, window derivation, metadata cache, `serverTime`, bucketed availability, **Redis counters + Lua, the `-2` fault path, pre-warm, pause/resume, the Redis-restart guard** | create-event endpoint, `TierAvailabilityChangedEvent` |
 | `queue` | `ZADD NX` join, `FIFO`/`RANDOM` ordering, SSE with heartbeats, HMAC passes, admission sessions, promotion worker, **pub/sub fan-out**, measured drain-rate estimates, `tier-availability` frame | `Last-Event-ID` replay |
 | `hold` | `ticket_holds` authority, the settle-once claim, atomic reserve **with compensation**, **after-commit restore**, bounded grace, sweeper, all three endpoints | the `hold:{token}` Redis timer and the keyspace listener (Stage 3) |
 | `payment` | Real `PaymentFacade`, `payment_transactions`, three idempotency layers, stub gateway behind the final interface | Stripe, webhooks, 3-D Secure, Resilience4j |
@@ -317,10 +317,9 @@ Honest list. None of these is hidden behind a passing test.
 - **A checkout costs eight sequential database transactions**, and a full buyer session about
   fifteen — not the ~1 that ADR-028's "capacity to serve" model implicitly prices. Both limits were
   therefore generous even at `E = 1`.
-- **Nothing is cached.** `events` changes only on operator pause/resume and `ticket_tiers` never
-  changes after creation, yet every window check, event summary, tier summary and tier-id lookup is a
-  PostgreSQL transaction — on the landing page, the queue-status poll and the rehydration endpoint.
-  Highest-leverage single change for the multi-sale envelope.
+- **Catalog metadata is cached.** `events` and `ticket_tiers` now sit behind `CatalogService`, with
+  eviction on pause/resume and live stock still read from Redis on every availability path. The next
+  concurrent-sales run should show whether this removed the expected PostgreSQL pressure.
 - **`queue:hb:{sid}` is written by every join and every status poll and read by nobody.** The
   "abandonment metric" its Javadoc names was never built. It is also unscoped by event, and its
   expiries flood the shared `__keyevent@0__:expired` channel that the hold listener filters on every
@@ -539,8 +538,8 @@ dependency order. Everything in the first two groups is cheap; the third is the 
 
 **Then concurrent sales** (**ADR-049**), in leverage order, each measurable on its own:
 
-1. Cache `events` + `ticket_tiers` behind `CatalogService`, evicted on pause/resume. The single
-   highest-leverage change, and the smallest.
+1. Cache `events` + `ticket_tiers` behind `CatalogService`, evicted on pause/resume. Built; verify
+   its effect in the next concurrent-sales run.
 2. The global admission budget, with the per-event batch as a secondary cap. Built; the next
    concurrent-sales run should verify the pool-saturation numbers.
 3. Hoist the exhausted `EXISTS` out of the per-session loop; pipeline the rest of the sweep.
