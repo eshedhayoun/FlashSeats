@@ -127,6 +127,10 @@ public class QueueService {
         return getQueueState(sessionId, eventId, catalog.getWindowStatus(eventId));
     }
 
+    boolean isExhausted(long eventId) {
+        return Boolean.TRUE.equals(redis.hasKey(QueueKeys.exhausted(eventId)));
+    }
+
     /**
      * Assembles a session's whole position in the sale.
      *
@@ -151,6 +155,10 @@ public class QueueService {
      * it once rather than once per session.
      */
     QueueState getQueueState(String sessionId, long eventId, EventWindowStatus window) {
+        return getQueueState(sessionId, eventId, window, isExhausted(eventId));
+    }
+
+    QueueState getQueueState(String sessionId, long eventId, EventWindowStatus window, boolean exhausted) {
         if (window == EventWindowStatus.CLOSED) {
             return new QueueState(QueuePhase.CLOSED, null, null, null, null);
         }
@@ -167,7 +175,7 @@ public class QueueService {
             return new QueueState(QueuePhase.PROMOTED, null, null, null, passToken);
         }
 
-        if (Boolean.TRUE.equals(redis.hasKey(QueueKeys.exhausted(eventId)))) {
+        if (exhausted) {
             return new QueueState(QueuePhase.EXHAUSTED, null, null, null, null);
         }
 

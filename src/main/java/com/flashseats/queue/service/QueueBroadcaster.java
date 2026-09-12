@@ -90,9 +90,10 @@ public class QueueBroadcaster {
 
         sampleDepth(eventId);
         publishAvailabilityIfChanged(eventId);
+        boolean exhausted = queue.isExhausted(eventId);
 
         for (String sessionId : emitters.sessionsWatching(eventId)) {
-            var state = queue.getQueueState(sessionId, eventId, window);
+            var state = queue.getQueueState(sessionId, eventId, window, exhausted);
             if (state.phase() == QueuePhase.EXHAUSTED) {
                 // Derived from live stock, so it is not terminal for the connection: if seats come
                 // back the marker clears and this buyer's position is still theirs (ADR-035).
