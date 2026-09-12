@@ -722,8 +722,15 @@ $("btn-leave").onclick = () => { closeStream(); showLanding(); };
 $("btn-reserve").onclick = reserve;
 $("btn-pay").onclick = pay;
 $("btn-release").onclick = release;
-$("btn-restart").onclick = () => { sessionStorage.clear(); location.href = location.pathname; };
-$("btn-restart-2").onclick = () => { sessionStorage.clear(); location.href = location.pathname; };
+$("btn-restart").onclick = restartSession;
+$("btn-restart-2").onclick = restartSession;
+
+async function restartSession() {
+  closeStream();
+  sessionStorage.clear();
+  try { await api("/session/reset", { method: "POST" }); } catch { /* reload still rehydrates safely */ }
+  location.href = location.pathname;
+}
 
 document.addEventListener("visibilitychange", () => { if (document.visibilityState === "visible") route(); });
 window.addEventListener("online", () => { state.attempt = 0; route(); });
