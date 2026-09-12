@@ -6,13 +6,19 @@ import static org.awaitility.Awaitility.await;
 import com.flashseats.flashseats.support.BuyerSession;
 import com.flashseats.flashseats.support.IntegrationTest;
 import com.flashseats.flashseats.support.SaleFixture;
+import com.flashseats.queue.config.QueueOrdering;
+import com.flashseats.queue.config.QueueProperties;
+import com.flashseats.queue.service.QueueKeys;
+import com.flashseats.queue.service.QueueService;
 import java.time.Duration;
 import java.util.Map;
+import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.web.server.LocalServerPort;
+import org.springframework.data.redis.core.StringRedisTemplate;
 
 /**
  * The waiting room's terminal states, which is where the first pass was weakest.
@@ -33,9 +39,26 @@ class QueueLifecycleIT extends IntegrationTest {
     @Autowired
     private SaleFixture fixture;
 
+    @Autowired
+    private QueueService queue;
+
+    @Autowired
+    private QueueProperties properties;
+
+    @Autowired
+    private StringRedisTemplate redis;
+
+    private QueueOrdering originalOrdering;
+
     @BeforeEach
     void reset() {
         fixture.reset();
+        originalOrdering = properties.getOrdering();
+    }
+
+    @AfterEach
+    void restoreProperties() {
+        properties.setOrdering(originalOrdering);
     }
 
     @Test
@@ -152,5 +175,33 @@ class QueueLifecycleIT extends IntegrationTest {
             var state = second.get("/sale/" + eventId + "/state");
             assertThat(state.json().get("queue").get("state").asText()).isIn("WAITING", "PROMOTED", "ADMITTED");
         });
+    }
+
+    @Test
+    @DisplayName("RANDOM ordering is stable for one buyer and orders the queue by the draw")
+    void randomOrderingUsesStablePerEventDraw() {
+        properties.setOrdering(QueueOrdering.RANDOM);
+        long eventId = fixture.openEvent("Draw Sale");
+        fixture.tierWithoutCounter(eventId, "GA", 2_500, 100);
+
+        String first = "session-first";
+        String second = "session-second";
+
+        queue.join(first, eventId);
+        Double firstDraw = redis.opsForZSet().score(QueueKeys.waiting(eventId), first);
+        queue.join(second, eventId);
+        Double secondDraw = redis.opsForZSet().score(QueueKeys.waiting(eventId), second);
+        queue.join(first, eventId);
+
+        assertThat(redis.opsForZSet().score(QueueKeys.waiting(eventId), first)).isEqualTo(firstDraw);
+        assertThat(firstDraw).isNotEqualTo(secondDraw);
+
+        var firstState = queue.status(first, eventId);
+        var secondState = queue.status(second, eventId);
+        if (firstDraw < secondDraw) {
+            assertThat(firstState.position()).isLessThan(secondState.position());
+        } else {
+            assertThat(secondState.position()).isLessThan(firstState.position());
+        }
     }
 }

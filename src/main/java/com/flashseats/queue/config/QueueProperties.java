@@ -46,6 +46,9 @@ public class QueueProperties {
      */
     private double oversubscribeFactor = 1.5;
 
+    /** FIFO is the explainable default; RANDOM is the fair drop mode from ADR-024. */
+    private QueueOrdering ordering = QueueOrdering.FIFO;
+
     private long ssePositionIntervalMs = 2_000;
 
     /** Comment frames that keep proxies from closing an idle stream. */
@@ -130,6 +133,14 @@ public class QueueProperties {
 
     public void setOversubscribeFactor(double oversubscribeFactor) {
         this.oversubscribeFactor = oversubscribeFactor;
+    }
+
+    public QueueOrdering getOrdering() {
+        return ordering;
+    }
+
+    public void setOrdering(QueueOrdering ordering) {
+        this.ordering = ordering;
     }
 
     public long getSsePositionIntervalMs() {
