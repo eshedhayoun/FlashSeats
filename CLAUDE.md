@@ -6,17 +6,17 @@ Guidance for Claude Code when working in this repository.
 
 FlashSeats — a high-concurrency ticket flash-sale engine. Modular monolith, Java 21, Spring Boot
 4.1.1. The **MVP is built and running**: all nine modules, the full journey from landing page to emailed
-PDF ticket, 68 tests green. **Inventory lives in Redis** (Stage 1, ADR-046): `catalog:stock:{e}:{t}`
+PDF ticket, 108 tests green. **Inventory lives in Redis** (Stage 1, ADR-046): `catalog:stock:{e}:{t}`
 is the live count and PostgreSQL keeps no copy of it.
 
 **Read [`docs/00-architecture-decisions.md`](docs/00-architecture-decisions.md) before changing
-anything.** It contains 50 ADRs. Most record a defect and its fix — 034-039 come from the first
+anything.** It contains 51 ADRs. Most record a defect and its fix — 034-039 come from the first
 review pass over the built code, 040-042 from the second — and several look like over-engineering
 until you read the failure they prevent. 043-045 are the exception: forward-looking decisions about
 the operator surface, buyer accounts and what health should report, with nothing built against them
 yet. **046 is Stage 1** — Redis as the counter, and the five places it departs from the module specs.
-**049-050 are Stage 5** — the concurrent-sales admission budget and ticket retrieval, both planned
-and not yet built.
+**049 and 051 are the concurrent-sales work**, both built in Pass 8: the cluster-wide admission
+allowance and the metadata cache that had to come before it. **050 is ticket retrieval**, built.
 
 **The operating envelope is 3–10 concurrent sales**, not one
 ([`03-end-to-end-flow.md`](docs/03-end-to-end-flow.md) §2). Every capacity number written before
@@ -28,7 +28,7 @@ security posture, next stages, and the review-pass log. It is the doc to update 
 ## Document precedence
 
 ```
-00-architecture-decisions.md      ← highest authority (50 ADRs)
+00-architecture-decisions.md      ← highest authority (51 ADRs)
 05-global-standards.md            ← cross-cutting contract; module docs conform to it
 FE_SPEC.md                        ← client contract (repo root)
 03-end-to-end-flow.md             ← the authoritative user journey AND the operating envelope
@@ -213,6 +213,14 @@ Do not reintroduce these — each cost a real defect in the first pass:
 | **Reusing "is it on sale?" to mean "should we still watch it?"** | Pausing a sale dropped it from the drift gauge *and* the Redis-restart guard — so a paused event's rolled-back counters were flagged only once someone resumed and started selling from them (ADR-048) |
 | **Returning `OrderReceiptResponse` from an admin endpoint** | `receiptToken` is a 90-day bearer capability. An operator view would mint a durable impersonation link into terminal history and any log that records bodies (ADR-048) |
 | **Guarding a password with `equals("admin")`** | It refuses one known string. `{noop}hunter2` passes and is stored in plaintext. Refuse the *encoding*, not the value (ADR-048) |
+| **Editing a migration that has already been applied — even only its comments** | Flyway checksums the whole file. `V9`'s comment block was rewritten after the measurement that motivated it, and **every container then refused to start**: `Validate failed … checksum mismatch for version 9`, with identical DDL. A migration is immutable the moment any database has run it; new understanding goes in a new migration, an ADR, or the code that issues the query. Recovery is `UPDATE flyway_schema_history SET checksum = <resolved> WHERE version = …` (what `flyway repair` does) on every database that applied the old one |
+| **A cache with no TTL** | Eviction reaches one replica. A paused sale then answers `OPEN` on the other two *for the life of the process*, and the window status gates join, holds and checkout — so pause stops nothing. The TTL **is** the cross-replica invalidation (ADR-051) |
+| **Loading a cache entry inside `computeIfAbsent`** | The loader runs inside `ConcurrentHashMap`'s per-bin `synchronized`, so a blocking JDBC read there **pins carrier threads** — the Redisson failure (ADR-022), reached through a cache. Load outside the map: `get`, load, `put` (ADR-051) |
+| **A recovery path that reads a cache** | `prewarm` and the rebuild write inventory counters *derived from the tier list*. A stale list leaves a tier with no counter — a `503` for the rest of the sale — or rebuilds the wrong set. Probably-right input, definitely-wrong counter (ADR-051) |
+| **Caching a value derived from the clock** | A window status flips with no write to evict on, so the one thing nothing can detect goes stale. Cache the row; derive the status every call (ADR-051) |
+| **Disabling a feature in the test profile so the suite passes** | The configuration production runs then has no coverage at all. Give the fixture a seam instead — `SaleFixture.reset()` clears every `DerivedStateCache` (ADR-051) |
+| **Iterating open events in a fixed order while spending a shared budget** | Every replica reads the same ascending list, so the lowest event id takes the whole allowance every tick and the other sales stand still. Shuffle the order (ADR-049) |
+| **Deriving a "random" queue draw from the session id** | Idempotent and *precomputable*: ids are free to mint, so a bot grinds candidates offline until it holds a low draw. `ZADD NX` already makes a fresh draw idempotent (ADR-024) |
 
 ## Implementation order
 
@@ -237,6 +245,7 @@ rather than one module's corner:
 | `queue:admissions:{e}` | `queue` | ZSET | sale end | live admissions, same trick as `passes` |
 | `queue:events:{e}` | `queue` | Pub/Sub | — | promotion fan-out to whichever replica holds the SSE connection (ADR-007) |
 | `queue:promote:{e}` | `queue` | String | 900 ms | makes the promotion tick a singleton across replicas (ADR-032) |
+| `queue:budget` | `queue` | String | one tick | **the cluster-wide admission allowance**, shared by every open sale. The one key here deliberately *not* scoped by event; its TTL is the window, so replicas need not agree on the time (ADR-049) |
 | `queue:exhausted:{e}` | `queue` | String | sale end | derived sold-out marker; deleted the moment stock returns (ADR-035) |
 | `payment:inflight:{holdToken}` | `payment` | String | 90 s | duplicate-charge guard, anchored to the hold (ADR-014) |
 | `bot:rate:*` | `bot` | Bucket4j | rolling | session-first rate limiting, IP as a coarse backstop (ADR-011) |

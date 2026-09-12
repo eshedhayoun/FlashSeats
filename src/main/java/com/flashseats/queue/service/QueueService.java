@@ -11,14 +11,11 @@ import com.flashseats.queue.dto.QueueStatusResponse;
 import com.flashseats.queue.exception.QueuePassInvalidException;
 import com.flashseats.queue.facade.QueuePhase;
 import com.flashseats.queue.facade.QueueState;
-import java.nio.ByteBuffer;
-import java.nio.charset.StandardCharsets;
-import java.security.MessageDigest;
-import java.security.NoSuchAlgorithmException;
 import java.time.Clock;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.OptionalDouble;
+import java.util.concurrent.ThreadLocalRandom;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.stereotype.Service;
@@ -61,8 +58,12 @@ public class QueueService {
      * fairness the queue exists to provide (ADR-008). Rejoining is therefore idempotent, and that is
      * a feature.
      *
-     * <p>{@code RANDOM} ordering is still idempotent: the score is a deterministic random draw from
-     * the event id and session id, not a fresh number on every refresh (ADR-024).
+     * <p><strong>{@code ZADD NX} is also what makes a random draw safe</strong> (ADR-024). A fresh
+     * draw is taken on every attempt and the second one is simply discarded, so rejoining keeps the
+     * place the first join won. Deriving the score from the session id instead would be idempotent
+     * too — and grindable: session ids cost nothing to mint, so a bot would generate candidates
+     * offline until it held a low draw and walk to the front deterministically, which is the exact
+     * advantage a random draw exists to remove.
      */
     public QueueStatusResponse join(String sessionId, long eventId) {
         EventSummary event = catalog.getEventSummary(eventId);
@@ -80,22 +81,19 @@ public class QueueService {
         return status(sessionId, eventId, event.windowStatus());
     }
 
+    /**
+     * The ZSET score, which is the ordering (ADR-024).
+     *
+     * <p>{@code FIFO} is arrival epoch-millis: intuitive, explicable, and decided by whoever has the
+     * lowest network latency. {@code RANDOM} is a draw bounded at 2^53 so it stays exactly
+     * representable as the double a ZSET score is — anything larger would collide after rounding and
+     * hand two buyers the same position.
+     */
     private double queueScore(String sessionId, long eventId) {
         if (properties.getOrdering() == QueueOrdering.RANDOM) {
-            return randomDrawScore(sessionId, eventId);
+            return ThreadLocalRandom.current().nextLong(1L << 53);
         }
         return (double) clock.instant().toEpochMilli();
-    }
-
-    private double randomDrawScore(String sessionId, long eventId) {
-        try {
-            MessageDigest digest = MessageDigest.getInstance("SHA-256");
-            byte[] hash = digest.digest((eventId + ":" + sessionId).getBytes(StandardCharsets.UTF_8));
-            long draw = ByteBuffer.wrap(hash).getLong() & ((1L << 53) - 1);
-            return (double) draw;
-        } catch (NoSuchAlgorithmException impossible) {
-            throw new IllegalStateException("SHA-256 is required by the JVM", impossible);
-        }
     }
 
     private void expireWithSale(String key, Instant saleEndTime) {
