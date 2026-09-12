@@ -320,10 +320,9 @@ Honest list. None of these is hidden behind a passing test.
 - **Catalog metadata is cached.** `events` and `ticket_tiers` now sit behind `CatalogService`, with
   eviction on pause/resume and live stock still read from Redis on every availability path. The next
   concurrent-sales run should show whether this removed the expected PostgreSQL pressure.
-- **`queue:hb:{sid}` is written by every join and every status poll and read by nobody.** The
-  "abandonment metric" its Javadoc names was never built. It is also unscoped by event, and its
-  expiries flood the shared `__keyevent@0__:expired` channel that the hold listener filters on every
-  replica. ADR-046's *"a table written by nobody's reader"* trap, in Redis.
+- **The write-only `queue:hb:{sid}` key is gone.** Pass 7 found that it was written by every join and
+  every status poll and read by nobody; the current queue code drains by promotion, never by evicting
+  abandoned sessions. The remaining work is to keep the docs and key map aligned with that reality.
 - **`sumActiveQuantityForTier` has no supporting index.** `idx_holds_event_tier` needs a leading
   `event_id`; `idx_holds_sweeper` leads on `expires_at`. The drift gauge runs this per tier, per
   event, **per replica**, every 60 s, over a table that accumulates every hold ever created — so the
@@ -523,7 +522,6 @@ dependency order. Everything in the first two groups is cheap; the third is the 
 
 **Delete what nothing uses** (no behaviour change):
 
-- `queue:hb:{sid}` and the `touchHeartbeat` call on the hottest polling path — a write-only key.
 - `OrderFacade.getOrderSummary` (zero callers) and `HoldFacade.releaseHold` + `HoldReleaseReason` +
   the service method behind them (test-only).
 - The `ORDER_REFUNDED` decision: build the Stage 4b consumer, or stop writing the rows. Carrying it a
@@ -1043,8 +1041,8 @@ same second against one shared pool: `R × E × 45` admissions per second into `
 The second half of the same error is that a checkout costs **eight** sequential transactions, not one.
 **ADR-049** adds a global admission budget and re-scopes ADR-028 as the per-sale cap.
 
-**Bugs found by reading, not by failing.** Each is recorded in §9 and none is fixed yet: the
-write-only `queue:hb` key, the missing partial index behind `sumActiveQuantityForTier`, the absent
+**Bugs found by reading, not by failing.** Each is recorded in §9. The write-only `queue:hb` key is
+already gone; what remains is the missing partial index behind `sumActiveQuantityForTier`, the absent
 ticket-retrieval endpoint (**ADR-050**), the triple-computed drift gauge, two dead facade methods, and
 session identity split across `bot` and `shared`.
 
