@@ -274,18 +274,58 @@ Honest list. None of these is hidden behind a passing test.
   one per message. Unconfirmed rows stay `PROCESSING` and the stale-claim sweep retries them.
 - **`QueueBroadcaster` does 4 sequential Redis round trips per connection per 2 s tick** — the
   admission `GET`, the pass `GET`, the exhausted `EXISTS` and the waiting `ZRANK`. The cost is linear
-  in *connections* against a fixed interval, so past some connection count the sweep cannot finish
-  inside it.
-  **Measured in Stage 3, and it is not that count yet.** At 2,000 VUs the median gap between
-  `position-update` frames was **2,016 ms against a configured 2,000 ms** — the sweep is keeping up,
-  and Redis was at 29 % CPU. So the fix stays deferred on evidence rather than on arithmetic.
-  `docker/scripts/sse-cadence.sh` is the instrument; re-run it at the scale that matters. When the
-  median does drift, the fix is one pipelined round trip per event per tick.
+  in **connections × open events**, not in connections alone: the sweep loops watched events and
+  re-runs the per-session reads inside each. Past some product of the two the sweep cannot finish
+  inside its interval.
+  **Measured in Stage 3 on ONE sale, and it was not that point yet.** At 2,000 VUs the median gap
+  between `position-update` frames was **2,016 ms against a configured 2,000 ms** — keeping up, with
+  Redis at 29 % CPU. **That evidence does not generalise to the `E = 3..10` envelope** adopted in
+  ADR-049, and re-measuring at `E = 5` is what decides whether the fix stays deferred.
+  `docker/scripts/sse-cadence.sh` is the instrument. Two of the four round trips are removable
+  cheaply: the exhausted `EXISTS` is per *event* and is currently re-read per *session*, and the
+  remaining reads batch into one pipelined round trip per event per tick.
+- **The emitter registry is a flat map keyed by session id.** "Sessions watching event X" streams the
+  whole map and allocates a `Set`, so a sweep costs `O(connections × events)` traversals before it
+  makes a single Redis call. A per-event index removes it.
 - **`notification.order-refunded.queue` has no consumer**, so it grows without bound on a durable
   broker. The refund-notice template is Stage 4.
 - **Checkout does not survive a Redis outage.** It opens with `SETNX payment:inflight:{holdToken}`,
   and `POST /holds` verifies admission against Redis. Both fail closed, which for a payment is the
   right direction — but §12's "does checkout keep working?" now has a written answer: no.
+
+**Found in Pass 7 (the plan-correctness pass), all open:**
+
+- **Admission is budgeted per sale against a shared pool.** The promotion worker loops every open
+  event and applies `promotion-batch-size` per event; the tick lock is per event too. At the newly
+  adopted `E = 3..10` envelope the cluster admits up to `R × E × 45` per second into `R × 30`
+  connections. ADR-049 is the fix and is **specified, not built**. This is the largest open risk in
+  the system.
+- **A checkout costs eight sequential database transactions**, and a full buyer session about
+  fifteen — not the ~1 that ADR-028's "capacity to serve" model implicitly prices. Both limits were
+  therefore generous even at `E = 1`.
+- **Nothing is cached.** `events` changes only on operator pause/resume and `ticket_tiers` never
+  changes after creation, yet every window check, event summary, tier summary and tier-id lookup is a
+  PostgreSQL transaction — on the landing page, the queue-status poll and the rehydration endpoint.
+  Highest-leverage single change for the multi-sale envelope.
+- **`queue:hb:{sid}` is written by every join and every status poll and read by nobody.** The
+  "abandonment metric" its Javadoc names was never built. It is also unscoped by event, and its
+  expiries flood the shared `__keyevent@0__:expired` channel that the hold listener filters on every
+  replica. ADR-046's *"a table written by nobody's reader"* trap, in Redis.
+- **`sumActiveQuantityForTier` has no supporting index.** `idx_holds_event_tier` needs a leading
+  `event_id`; `idx_holds_sweeper` leads on `expires_at`. The drift gauge runs this per tier, per
+  event, **per replica**, every 60 s, over a table that accumulates every hold ever created — so the
+  cost grows with sale history and never falls.
+- **The drift gauge is computed three times to produce one global answer.** Read-only and therefore
+  "safe on every replica", but all three replicas compute the same number.
+- **There is no way to retrieve a ticket.** The PDF exists only as an email attachment; a typo'd
+  address is unrecoverable, and the operator resend replays the same payload to the same wrong
+  address. ADR-050, **specified, not built**.
+- **Dead surface:** `OrderFacade.getOrderSummary` has zero callers anywhere; `HoldFacade.releaseHold`,
+  `HoldReleaseReason` and the service method behind them are reached only from a test.
+- **Session identity spans `bot` and `shared`**, coupled by a request-attribute string constant, with
+  the signing secret under `flashseats.bot.*`. `bot` is abuse defence; identity is not.
+- **The operator surface is curl-only.** ADR-043 calls it a correctness dependency; one that can only
+  be driven by hand-written Basic-auth curl during an incident is half-built.
 
 ---
 
@@ -461,6 +501,40 @@ A console is presentation and can wait. The endpoints are the capability.
   browser behaviour — a skewed clock, a real reload, a live `EventSource` — so none of them is
   reachable from the API suite, and the twelve reload points are checked by hand today. Two of the
   defects Pass 1 fixed were reload-path defects. The spec is written; the implementation is not.
+
+### Stage 4c — Correctness cleanup and concurrent sales (Pass 7 findings)
+
+**The gate:** Pass 7 was a plan-correctness pass and changed no code. These are its findings, in
+dependency order. Everything in the first two groups is cheap; the third is the real work.
+
+**Delete what nothing uses** (no behaviour change):
+
+- `queue:hb:{sid}` and the `touchHeartbeat` call on the hottest polling path — a write-only key.
+- `OrderFacade.getOrderSummary` (zero callers) and `HoldFacade.releaseHold` + `HoldReleaseReason` +
+  the service method behind them (test-only).
+- The `ORDER_REFUNDED` decision: build the Stage 4b consumer, or stop writing the rows. Carrying it a
+  fifth time is not an option.
+
+**Fix the bugs:**
+
+- `V9`: `CREATE INDEX idx_holds_active_tier ON ticket_holds (tier_id) WHERE status = 'ACTIVE'`.
+- `GET /orders/{orderNumber}/ticket.pdf`, with `TicketPdfRenderer` moved to `shared` (**ADR-050**).
+- Move the `fsid` filter from `bot` to `shared/identity`; rename to `flashseats.session.*`.
+  `ApplicationModules.verify()` is the check.
+
+**Then concurrent sales** (**ADR-049**), in leverage order, each measurable on its own:
+
+1. Cache `events` + `ticket_tiers` behind `CatalogService`, evicted on pause/resume. The single
+   highest-leverage change, and the smallest.
+2. The global admission budget, with the per-event batch as a secondary cap.
+3. Hoist the exhausted `EXISTS` out of the per-session loop; pipeline the rest of the sweep.
+4. A per-event index in the emitter registry.
+5. Make the drift gauge a singleton under the promotion tick's Redis-lock pattern.
+
+**The drill this needs and does not have:** every existing instrument runs one event. Seed five
+(9001–9005), run `flash-sale.js` against all of them at once with `VUS` split across them, and watch
+`hikaricp_connections_pending` and `flashseats_stock_drift` **per replica**. Without it, item 2 is
+arithmetic; with it, it is evidence — which is the standard the rest of this project has held to.
 
 ### Stage 5 — Buyer accounts, as an overlay (ADR-044)
 
@@ -858,3 +932,47 @@ the decision to batch its reads stays gated on a number.
 
 - **Result:** 87 tests green, up from 68 at the end of Stage 1. The module graph is unchanged; every
   endpoint writes only state its own module owns.
+
+### Pass 7 — the plan-correctness pass
+
+- **Scope:** no production code. A full re-read of the built system against every document that
+  claims to describe it, plus one decision that changes the design's target: **the operating envelope
+  is 3–10 concurrent sales, not one.**
+
+**The premise.** Six passes had asserted the pre-existing work was correct. This pass tested that by
+deriving the real module graph, the real endpoint list, the real Redis key set and the real
+transaction counts from the code, and diffing them against the docs.
+
+**The graph survived the audit intact.** The edge list derived from actual `import com.flashseats.*`
+statements is acyclic, `notification` and `payment` have zero outbound module edges, `saleflow` is a
+true leaf, and no module reaches into another's `service`, `repository` or `model` package —
+including in test code. This is the part of the system that was exactly as advertised.
+
+**What the docs claimed and the code did not do.**
+
+| Found | Fix |
+| :--- | :--- |
+| **The nine module specs referenced 22 classes that never existed** — `BotFacade`, `RecaptchaService`, `StripeGatewayService`, `QueueRedisRepository`, `HoldRedisRepository`, `OrderService` and more. `queue.md` described a *different system*: pass keys unscoped by event, a PostgreSQL advisory lock for the promotion tick, draining the waiting ZSET on exhaustion, a `tier-availability` frame, a configurable ordering property — every one of them contradicted by an ADR that superseded it | All nine rewritten to a fixed **owns / exposes / never** shape, against the code. **No spec lists class names any more**: a class list is what drifts, owned state and exposed contract are what a test can catch |
+| `03-end-to-end-flow.md` §1 still described `catalog:stock:{e}:{t}` as **"the one shared key"**, mutated by `hold` through scripts living in `hold` — the design ADR-046 explicitly replaced, and which never shipped | Rewritten to state the rule that actually holds: `catalog` owns the key outright, `hold` moves stock through the facade, and the boundary has no exception |
+| §6 listed a configurable queue ordering, a 30 s sweeper and a reCAPTCHA threshold; §7 listed **eight metrics of which two exist** | Tunables corrected against `application.properties`; metrics split into **built** and **specified, not built**, so the gap is legible instead of implied |
+| `CLAUDE.md` drew `filter ──► bot`. There is no `filter` module — it is a package inside `bot` | Corrected |
+
+**The decision that changes the target.** ADR-028 derives the promotion batch from the connection
+pool and is sound **for one sale**, which it never said. The worker loops every open event and applies
+the cap per event, and `queue:promote:{e}` is per event, so replicas promote different sales in the
+same second against one shared pool: `R × E × 45` admissions per second into `R × 30` connections.
+The second half of the same error is that a checkout costs **eight** sequential transactions, not one.
+**ADR-049** adds a global admission budget and re-scopes ADR-028 as the per-sale cap.
+
+**Bugs found by reading, not by failing.** Each is recorded in §9 and none is fixed yet: the
+write-only `queue:hb` key, the missing partial index behind `sumActiveQuantityForTier`, the absent
+ticket-retrieval endpoint (**ADR-050**), the triple-computed drift gauge, two dead facade methods, and
+session identity split across `bot` and `shared`.
+
+**One rule added to stop this recurring.** `CLAUDE.md` now carries *"Updating the docs is part of the
+change, not follow-up"* — a table mapping what you changed to what you must update, and two standing
+rules: **never list class names in a module spec**, and **mark anything aspirational as such**. Doc
+drift is what produced most of the defects in passes 1 and 2; it is now a checklist rather than a
+habit.
+
+- **Result:** 88 `@Test` methods, untouched — nothing in this pass changes `src/`.

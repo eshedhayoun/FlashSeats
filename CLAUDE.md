@@ -10,11 +10,17 @@ PDF ticket, 68 tests green. **Inventory lives in Redis** (Stage 1, ADR-046): `ca
 is the live count and PostgreSQL keeps no copy of it.
 
 **Read [`docs/00-architecture-decisions.md`](docs/00-architecture-decisions.md) before changing
-anything.** It contains 48 ADRs. Most record a defect and its fix — 034-039 come from the first
+anything.** It contains 50 ADRs. Most record a defect and its fix — 034-039 come from the first
 review pass over the built code, 040-042 from the second — and several look like over-engineering
 until you read the failure they prevent. 043-045 are the exception: forward-looking decisions about
 the operator surface, buyer accounts and what health should report, with nothing built against them
 yet. **046 is Stage 1** — Redis as the counter, and the five places it departs from the module specs.
+**049-050 are Stage 5** — the concurrent-sales admission budget and ticket retrieval, both planned
+and not yet built.
+
+**The operating envelope is 3–10 concurrent sales**, not one
+([`03-end-to-end-flow.md`](docs/03-end-to-end-flow.md) §2). Every capacity number written before
+ADR-049 silently assumed a single sale. Check which assumption a limit rests on before trusting it.
 
 **For what is actually built**, read [`docs/06-mvp-overview.md`](docs/06-mvp-overview.md) — scope,
 security posture, next stages, and the review-pass log. It is the doc to update after every pass.
@@ -22,19 +28,50 @@ security posture, next stages, and the review-pass log. It is the doc to update 
 ## Document precedence
 
 ```
-00-architecture-decisions.md      ← highest authority (48 ADRs)
+00-architecture-decisions.md      ← highest authority (50 ADRs)
 05-global-standards.md            ← cross-cutting contract; module docs conform to it
 FE_SPEC.md                        ← client contract (repo root)
-03-end-to-end-flow.md             ← the authoritative user journey
+03-end-to-end-flow.md             ← the authoritative user journey AND the operating envelope
 01 / 02 (architecture, HLD)
-docs/modules/*.md                 ← lowest; structural rewrite still pending
+docs/modules/*.md                 ← lowest; one page per module: owns / exposes / never
 ```
 
-**ADR-019 supersedes ADR-003** and **ADR-020 amends ADR-006** — the originals are kept for the
-record but do not describe the current design.
+**ADR-019 supersedes ADR-003**, **ADR-020 amends ADR-006**, **ADR-049 amends ADR-028** — the
+originals are kept for the record but do not describe the current design.
 
 When a module spec contradicts an ADR, the ADR wins and the module spec is stale — fix the module
 spec rather than the code.
+
+## Updating the docs is part of the change, not follow-up
+
+**Every code change updates the documents it touches, in the same commit.** This is not tidiness. In
+this repo the docs are *instructions* — the line above says a stale spec is to be fixed rather than
+the code, so a spec describing an unbuilt design is a standing order to build the wrong thing. Doc
+drift is how most of the defects in passes 1 and 2 were created.
+
+A pass over the specs in Sept 2026 found **22 class names that never existed** and whole sections
+describing superseded designs. That is the failure mode this rule exists to stop.
+
+**Before you finish a change, check each of these and update what the change touched:**
+
+| You changed | Update |
+| :--- | :--- |
+| Anything with a rationale worth keeping | a **new ADR** — amend, never silently rewrite an old one |
+| A module's owned tables, Redis prefixes, facade or endpoints | that module's [`docs/modules/*.md`](docs/modules/) |
+| The buyer's journey, a timer, or a tunable | [`03-end-to-end-flow.md`](docs/03-end-to-end-flow.md) §2 and §6 |
+| An error code | the §2 registry in [`05-global-standards.md`](docs/05-global-standards.md) |
+| A Redis key | the key table in **this file**, and the owning module's spec |
+| A metric or an alarm | `03` §7 — and say whether it is **built** or **specified** |
+| An API request/response shape | [`FE_SPEC.md`](FE_SPEC.md) §2 |
+| Anything at all, at the end of a pass | [`06-mvp-overview.md`](docs/06-mvp-overview.md) §9, §11, §13 |
+
+**Two rules that keep the specs honest:**
+
+1. **Never list class names in a module spec.** A class list is what drifts; it goes stale the first
+   time something is renamed and nothing fails. Specs describe **owned state, exposed contract, and
+   prohibitions** — all three are things a test or `ApplicationModules.verify()` can catch.
+2. **Mark anything aspirational as such, explicitly.** A doc that describes a plan in the present
+   tense is indistinguishable from one describing the build. Write "specified, not built".
 
 ## Facts that are easy to get wrong
 
@@ -65,7 +102,7 @@ spec rather than the code.
 ```
                     shared        ← open module; everyone may depend on it
 
-filter   ──► bot
+bot      ──► shared only          ← servlet filters; `filter` is a PACKAGE in `bot`, not a module
 queue    ──► catalog
 hold     ──► queue, catalog
 order    ──► hold, catalog, payment, queue
@@ -196,7 +233,7 @@ rather than one module's corner:
 | `queue:passes:{e}` | `queue` | ZSET | sale end | live passes, scored by expiry, so a count is one `ZCOUNT` |
 | `queue:admit:{e}:{sid}` | `queue` | String | 600 s | proof of admission into the sale (ADR-020) |
 | `queue:admissions:{e}` | `queue` | ZSET | sale end | live admissions, same trick as `passes` |
-| `queue:hb:{sid}` | `queue` | String | short | advisory liveness. **Never** consulted before promoting or evicting (ADR-026) |
+| `queue:hb:{sid}` | `queue` | String | short | **write-only — nothing reads it. Slated for deletion.** The "abandonment metric" its Javadoc names was never built |
 | `queue:events:{e}` | `queue` | Pub/Sub | — | promotion fan-out to whichever replica holds the SSE connection (ADR-007) |
 | `queue:promote:{e}` | `queue` | String | 900 ms | makes the promotion tick a singleton across replicas (ADR-032) |
 | `queue:exhausted:{e}` | `queue` | String | sale end | derived sold-out marker; deleted the moment stock returns (ADR-035) |
