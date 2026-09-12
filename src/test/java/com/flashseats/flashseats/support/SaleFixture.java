@@ -216,6 +216,12 @@ public class SaleFixture {
                 holdToken);
     }
 
+    /** The order number written against a hold, whoever wrote it. */
+    public String orderNumberFor(String holdToken) {
+        return jdbc.queryForObject(
+                "SELECT order_number FROM orders WHERE hold_token = ?", String.class, holdToken);
+    }
+
     /** Backdates an order so the staleness rule sees it as stranded rather than in flight. */
     public void ageOrder(String holdToken, java.time.Duration by) {
         jdbc.update(

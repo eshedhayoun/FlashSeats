@@ -63,7 +63,7 @@ public class SecretsGuard {
     }
 
     private static final List<Secret> GUARDED = List.of(
-            new Secret("flashseats.bot.session-secret", "FLASHSEATS_SESSION_SECRET", DEFAULT_SECRET),
+            new Secret("flashseats.session.secret", "FLASHSEATS_SESSION_SECRET", DEFAULT_SECRET),
             new Secret("flashseats.queue.pass-secret", "FLASHSEATS_QUEUE_PASS_SECRET", DEFAULT_SECRET),
             new Secret("flashseats.order.receipt-secret", "FLASHSEATS_RECEIPT_SECRET", DEFAULT_SECRET),
             new Secret("flashseats.admin.password", "FLASHSEATS_ADMIN_PASSWORD", null));

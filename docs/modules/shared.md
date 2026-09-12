@@ -34,9 +34,10 @@ so no client could reliably switch on them. That is the gap this closes.
 | Area | Provides |
 | :--- | :--- |
 | `error` | the canonical `ErrorCode` enum (standards §2), the `ProblemDetail` factory, the base exception that carries a code, and the single `@RestControllerAdvice` |
-| `identity` | the `SessionId` value type over a verified `fsid`, and the argument resolver that is the **only** way identity enters a handler |
+| `identity` | **the filter that mints and verifies the `fsid` cookie**, the `SessionId` value type over it, and the argument resolver that is the **only** way identity enters a handler. Configured by `flashseats.session.*` |
 | `security` | signed-token minting and verification — HMAC-SHA256 with a **length-prefixed `kind`**, so a token of one kind never verifies as another (ADR-039) |
 | `time` | the injectable `Clock` every timer flows from, and a shared expiry type |
+| `ticket` | the PDF renderer and its input record (ADR-050) |
 | `web` | the trace-id filter that puts a correlation id on every `ProblemDetail` |
 
 There is no `money` package and no `AmountCents` type — amounts are `long` cents plus a currency
@@ -78,9 +79,16 @@ All errors are RFC 7807 `ProblemDetail` with a `code` from the §2 registry. The
 business change, it does not belong. A kernel that accumulates behaviour stops being a kernel and
 becomes a distributed monolith inside a modular one.
 
-**The PDF renderer is the one planned addition** (ADR-050): it is a pure function from a payload to
-bytes, which is exactly what the kernel is for, and putting it here lets `order` serve a ticket
-download without creating the first synchronous edge into `notification`. **Specified, not built.**
+**The PDF renderer lives here** (ADR-050). It is a pure function from a payload to bytes — no
+repository, no facade, no state — which is exactly what the kernel is for. Putting it here lets
+`order` serve a ticket download without creating the first synchronous edge into `notification`, and
+makes "a resent ticket is byte-identical to the original" structural rather than coincidental.
+
+Its input, `TicketDocument`, is **the renderer's parameter type, not a DTO shared between two
+modules** — the rule above forbids the latter. Nothing is passed between modules: each maps its own
+payload into the shape and calls a function. It is deliberately narrower than either caller's type,
+carrying no email, no receipt token and no amount, so a renderer cannot print a bearer capability
+onto a page by accident.
 
 ---
 
@@ -88,7 +96,7 @@ download without creating the first synchronous edge into `notification`. **Spec
 
 | Gap | Detail |
 | :--- | :--- |
-| **Identity is split with `bot`** | The cookie is minted and signed by a filter in `bot`, using `flashseats.bot.session-secret`; the type and resolver are here, coupled by a request-attribute string constant. The filter belongs here. Specified, not built |
+| *(none outstanding)* | The `bot`/`shared` identity split and the renderer's placement were both closed in Pass 7 |
 
 ---
 

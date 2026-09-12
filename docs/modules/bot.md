@@ -9,10 +9,14 @@
 
 ## 1. Scope
 
-Two servlet filters that run before everything else: one issues and verifies the signed `fsid`
-cookie, one enforces rate limits.
+**Rate limiting, and nothing else.** One servlet filter, running before everything else.
 
 `filter` is a **package inside this module**, not a module of its own.
+
+The `fsid` cookie used to be minted here too. It moved to `shared/identity` in Pass 7, along with
+`flashseats.bot.session-secret` → `flashseats.session.secret`: identity is what every module's
+authorisation rests on, and it had no business living in the abuse-defence module with its
+mint/verify half a package away from its type/resolve half. The environment variable is unchanged.
 
 ---
 
@@ -53,16 +57,16 @@ The SSE stream is **counted once, not exempted**. An exempt endpoint is an unmet
 
 ---
 
-## 4. Identity
+## 4. Identity — not here any more
 
-The `fsid` cookie is `base64url(uuid).base64url(HMAC-SHA256(uuid, secret))`, `HttpOnly`, with the
-signed bytes length-prefixed by a `kind` so a token of one kind never verifies as another (ADR-039).
+The `fsid` cookie, its signing secret and the filter that issues it moved to
+[`shared`](shared.md) in Pass 7. This module **reads** the resolved session id to key its primary
+bucket and owns none of it.
 
-**A tampered cookie is replaced, not rejected.** The visitor did nothing an error page would help
-with, and a hard failure on a corrupted cookie strands them with no way to recover.
-
-Identity reaches a handler **only** as a resolved `SessionId` parameter. There is no path by which a
-body field, query parameter or custom header can supply one (ADR-010).
+That matters for one reason worth stating: the session bucket is the primary rate-limit control, and
+a visitor who drops their cookie mints a fresh one. The IP bucket is the backstop for exactly that,
+which is why `X-Forwarded-For` may only be believed from a trusted peer (ADR-039) — without both
+halves, ADR-011's design enforces nothing.
 
 ---
 
@@ -70,7 +74,6 @@ body field, query parameter or custom header can supply one (ADR-010).
 
 | Gap | Detail |
 | :--- | :--- |
-| **Identity lives in the wrong module** | The cookie filter, the `"fsid"` kind and the signing secret (`flashseats.bot.session-secret`) are here; the `SessionId` type and its argument resolver are in `shared`. The two are coupled by a request-attribute string constant. `bot` is abuse defence and identity is not abuse defence — **the filter should move to `shared/identity` and the property to `flashseats.session.*`**. Specified, not built |
 | **No challenge provider** | reCAPTCHA appears in older diagrams. **It does not exist**, no property for it exists, and no code references it. Stage 2 |
 | **No IP reputation, no audit log, no admin surface** | Earlier drafts specified all three. None is built, and none is required by anything |
 | **No rate-limit metrics** | Rejections are invisible except in logs |

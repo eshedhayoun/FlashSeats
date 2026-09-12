@@ -96,6 +96,8 @@ describing superseded designs. That is the failure mode this rule exists to stop
   profile. Generate them per `.env.example` (ADR-039).
 - Every signed token declares a **`kind`**, length-prefixed into the signed bytes. `SignedToken.sign`
   and `.verify` both take it; a token of one kind never verifies as another.
+- Session identity is **`flashseats.session.*` in `shared`**, not `flashseats.bot.*`. The env var
+  `FLASHSEATS_SESSION_SECRET` is unchanged. `bot` is rate limiting only.
 
 ## Module boundaries — enforced, not advisory
 

@@ -1,7 +1,5 @@
-package com.flashseats.bot.filter;
+package com.flashseats.shared.identity;
 
-import com.flashseats.bot.config.BotProperties;
-import com.flashseats.shared.identity.SessionId;
 import com.flashseats.shared.security.SignedToken;
 import jakarta.servlet.FilterChain;
 import jakarta.servlet.ServletException;
@@ -30,6 +28,11 @@ import org.springframework.web.filter.OncePerRequestFilter;
  * <p>A tampered cookie is <strong>replaced</strong> with a fresh identity rather than rejected. The
  * visitor did nothing an error page would help with, and a hard failure on a corrupted cookie would
  * strand them with no way to recover.
+ *
+ * <p><strong>It lives in the kernel, beside {@link SessionIdArgumentResolver}.</strong> It used to be
+ * in {@code bot}, which meant the one thing every module's authorisation rests on was owned by the
+ * abuse-defence module, and the mint/verify half was a package away from the type/resolve half with
+ * nothing but a request-attribute string joining them. {@code bot} is now purely rate limiting.
  */
 @Component
 @Order(Ordered.HIGHEST_PRECEDENCE + 20)
@@ -38,9 +41,9 @@ public class SessionIdentityFilter extends OncePerRequestFilter {
     /** Domain-separates the cookie's signature from every other signed token (ADR-039). */
     private static final String KIND = "fsid";
 
-    private final BotProperties properties;
+    private final SessionProperties properties;
 
-    public SessionIdentityFilter(BotProperties properties) {
+    public SessionIdentityFilter(SessionProperties properties) {
         this.properties = properties;
     }
 
@@ -63,18 +66,18 @@ public class SessionIdentityFilter extends OncePerRequestFilter {
                 .filter(c -> properties.getCookie().getName().equals(c.getName()))
                 .map(Cookie::getValue)
                 .flatMap(value ->
-                        SignedToken.verify(KIND, value, properties.getSessionSecret()).stream())
+                        SignedToken.verify(KIND, value, properties.getSecret()).stream())
                 .findFirst();
     }
 
     private String issueTo(HttpServletResponse response) {
         String sessionId = UUID.randomUUID().toString();
-        BotProperties.Cookie config = properties.getCookie();
+        SessionProperties.Cookie config = properties.getCookie();
 
         ResponseCookie cookie = ResponseCookie
                 .from(
                         config.getName(),
-                        SignedToken.sign(KIND, sessionId, properties.getSessionSecret()))
+                        SignedToken.sign(KIND, sessionId, properties.getSecret()))
                 .httpOnly(true)
                 .secure(config.isSecure())
                 .sameSite(config.getSameSite())

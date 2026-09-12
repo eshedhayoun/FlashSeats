@@ -27,6 +27,9 @@ Two indexes are load-bearing:
 - `idx_holds_one_active_per_session` — a **partial unique** index capping a session at one live hold.
   A double-click therefore fails at the database, not in a check-then-act.
 - `idx_holds_sweeper (expires_at) WHERE status = 'ACTIVE'` — what makes the sweeper cheap.
+- `idx_holds_active_tier (tier_id) INCLUDE (quantity) WHERE status = 'ACTIVE'` (`V9`) — what makes
+  the drift gauge cheap. Without it `sumActiveQuantityForTier` had no usable index and scanned a
+  table that accumulates every hold ever created, per tier, per event, **per replica**, every 60 s.
 
 | Redis key | TTL | Purpose |
 | :--- | :--- | :--- |
@@ -127,7 +130,6 @@ publishes the event name to a per-key channel and the listener never fires (ADR-
 
 | Gap | Detail |
 | :--- | :--- |
-| **`sumActiveQuantityForTier` has no supporting index** | It filters `tier_id + status = 'ACTIVE'`; `idx_holds_event_tier` needs a leading `event_id` and `idx_holds_sweeper` leads on `expires_at`. The drift gauge runs it per tier, per event, per replica, every 60 s, over a table that accumulates every hold ever created. Needs a partial index on `(tier_id) WHERE status = 'ACTIVE'` |
 | **No conversion metric** | `flashseats.hold.conversion.ratio` is specified in `03` §7 and not built — it is the number the 1.5× oversubscribe factor is currently guessing at |
 
 ---
