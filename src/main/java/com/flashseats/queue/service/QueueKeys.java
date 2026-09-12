@@ -57,11 +57,6 @@ public final class QueueKeys {
         return "queue:admissions:" + eventId;
     }
 
-    /** Advisory liveness marker. Never consulted before promoting or evicting (ADR-026). */
-    public static String heartbeat(String sessionId) {
-        return "queue:hb:" + sessionId;
-    }
-
     /**
      * Pub/Sub channel carrying promotions to whichever replica holds the buyer's SSE connection.
      *

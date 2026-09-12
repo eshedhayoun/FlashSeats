@@ -1,6 +1,5 @@
 package com.flashseats.hold.facade;
 
-import com.flashseats.hold.model.SettleReason;
 import com.flashseats.hold.model.TicketHold;
 import com.flashseats.hold.service.HoldService;
 import com.flashseats.hold.service.HoldTimers;
@@ -36,11 +35,6 @@ class HoldFacadeImpl implements HoldFacade {
     }
 
     @Override
-    public void releaseHold(String holdToken, HoldReleaseReason reason) {
-        holds.releaseInternal(holdToken, toSettleReason(reason));
-    }
-
-    @Override
     public Instant grantGrace(String holdToken) {
         return holds.grantGrace(holdToken);
     }
@@ -58,14 +52,6 @@ class HoldFacadeImpl implements HoldFacade {
     @Override
     public int sumActiveQuantityForTier(long tierId) {
         return holds.sumActiveQuantityForTier(tierId);
-    }
-
-    /** The public reason, mapped onto the internal one the ledger stores. */
-    private static SettleReason toSettleReason(HoldReleaseReason reason) {
-        return switch (reason) {
-            case USER_CANCEL -> SettleReason.USER_CANCEL;
-            case ORDER_ABORT -> SettleReason.ORDER_ABORT;
-        };
     }
 
     private static HoldSummary toSummary(TicketHold hold) {

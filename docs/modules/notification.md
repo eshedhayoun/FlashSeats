@@ -59,6 +59,12 @@ Fixed by ADR-023:
 3. **record the outcome** — one short transaction
 4. **acknowledge**
 
+**Two consumers share it.** `TICKET_DELIVERY` renders a PDF and attaches it; `REFUND_NOTICE` sends
+a body and nothing else. The refund payload carries a **null `event` and no items** — there were no
+seats to describe, which is why a refund happened — so its composer must not dereference either. A
+composer that assumed the confirmation shape would throw deterministically and dead-letter the one
+message telling a buyer their money is coming back.
+
 A crash between sending and acknowledging can resend once on redelivery. At-least-once delivery of an
 email beats a design that can silently never send it.
 
@@ -87,7 +93,6 @@ ticket with no retry that could help (ADR-042).
 
 | Gap | Detail |
 | :--- | :--- |
-| **`notification.order-refunded.queue` has no consumer** | `order` writes `ORDER_REFUNDED` outbox rows and they queue here forever on a durable broker. The refund-notice template is unbuilt. Decide: build it, or stop writing the rows |
 | **The renderer is not reachable outside the consumer** | ADR-050 moves it to `shared` so `order` can serve a ticket download. **Specified, not built** |
 | **No DLQ depth alarm** | The DLQ is listable by an operator; nothing alarms on it |
 | **Email is never verified** | The address is taken from the checkout body. A typo is currently unrecoverable |

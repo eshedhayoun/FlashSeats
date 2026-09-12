@@ -233,7 +233,6 @@ rather than one module's corner:
 | `queue:passes:{e}` | `queue` | ZSET | sale end | live passes, scored by expiry, so a count is one `ZCOUNT` |
 | `queue:admit:{e}:{sid}` | `queue` | String | 600 s | proof of admission into the sale (ADR-020) |
 | `queue:admissions:{e}` | `queue` | ZSET | sale end | live admissions, same trick as `passes` |
-| `queue:hb:{sid}` | `queue` | String | short | **write-only — nothing reads it. Slated for deletion.** The "abandonment metric" its Javadoc names was never built |
 | `queue:events:{e}` | `queue` | Pub/Sub | — | promotion fan-out to whichever replica holds the SSE connection (ADR-007) |
 | `queue:promote:{e}` | `queue` | String | 900 ms | makes the promotion tick a singleton across replicas (ADR-032) |
 | `queue:exhausted:{e}` | `queue` | String | sale end | derived sold-out marker; deleted the moment stock returns (ADR-035) |
