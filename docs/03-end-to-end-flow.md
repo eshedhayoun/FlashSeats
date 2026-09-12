@@ -17,8 +17,8 @@
                               |  HTTP        |  SSE        |  HTTP
                               v              v             v
                        +---------------------------------------------+
-                       |            `bot`  SERVLET FILTER            |
-                       |  fsid cookie · Bucket4j (Redis) · reCAPTCHA |
+                       |            `bot`  SERVLET FILTERS           |
+                       |  fsid cookie · Bucket4j (Redis, session+IP) |
                        +---------------------------------------------+
                                             |
         +---------------------+-------------+-------------+---------------------+
@@ -31,8 +31,8 @@
 | PG: events,    |   | PG: none       |          | PG: ticket_    |    | PG: orders,    |
 |  ticket_tiers  |   | Redis: ZSET,   |          |  holds (AUTH-  |    | order_items,   |
 | Redis: stock   |   |  pass, admit,  |          |  ORITY)        |    | outbox_events  |
-|  (THE count),  |   |  pubsub        |          | Redis: none    |    |                |
-|  vouch         |   |                |          |                |    |                |
+|  (THE count),  |   |  pubsub        |          | Redis: hold:   |    |                |
+|  vouch         |   |                |          |  {token} timer |    |                |
 +----------------+   +----------------+          +----------------+    +----------------+
                                                                               |
                                                              +----------------+---------+
@@ -77,21 +77,79 @@ Two additions from the 2nd-pass audit:
   `queue`, because `queue` would then need `HoldFacade` while `hold → queue` already exists — a
   cycle. A leaf that depends on many and is depended on by none is the standard answer (ADR-025).
 
-### The one shared key, and its contract
+### There is no shared key — *corrected by ADR-046*
 
-`catalog:stock:{eventId}:{tierId}` is the sole piece of state touched by two modules.
+Earlier drafts of this document described `catalog:stock:{eventId}:{tierId}` as "the one shared key
+in the system", mutated by `hold` through scripts that lived in `hold`. **That is not the design and
+never shipped.**
 
-* **`catalog` owns it.** It seeds the key (only while the window is `UPCOMING`), reads it for
-  display, rebuilds it during recovery, and reconciles it after the sale.
-* **`hold` mutates it**, exclusively through `hold_reserve.lua` and `hold_restore.lua`. Those two
-  scripts are the entire mutation surface, and they live in `hold` because a decrement and the
-  creation of the reservation that justifies it must be one atomic operation.
+* **`catalog` owns the key outright.** It seeds it (only while the window is `UPCOMING`), reads it
+  for display, moves it through `stock_reserve.lua` / `stock_restore.lua`, and rebuilds it from the
+  ledger during recovery. Those scripts live in
+  [`src/main/resources/redis/`](../src/main/resources/redis/) and are invoked only by
+  [`StockCounterRepository`](../src/main/java/com/flashseats/catalog/repository/StockCounterRepository.java).
+* **`hold` moves stock through `CatalogFacade`**, like every other caller. It touches no
+  `catalog:` key.
 
-No other module reads or writes it. This exception is deliberate, narrow, and written down.
+The boundary rule has no exception. A module reads only its own tables and its own Redis prefixes,
+and `ApplicationModules.verify()` fails the build otherwise.
 
 ---
 
 ## 2. The User Journey
+
+### The whole journey on one page
+
+Everything below this table is the same journey with its reasoning attached. This is the reference
+card: what the buyer does, what authorises it, and what clock is running.
+
+| # | Buyer does | Endpoint | Authorised by | Bounded by |
+| :-- | :--- | :--- | :--- | :--- |
+| 0 | *(operator)* seeds counters | `POST /admin/events/{id}/prewarm` | HTTP Basic, `ROLE_ADMIN` | window must be `UPCOMING` |
+| 1 | Opens the landing page | `GET /events/{id}` | — (public) | — |
+| 2 | Joins the line | `POST /queue/join` | `fsid` cookie | window must be `OPEN` |
+| 3 | Watches their position | `GET /queue/stream` (SSE)<br>`GET /queue/status` (fallback) | `fsid` cookie | stream 1 h; position pushed every 2 s |
+| 4 | *(is promoted)* | — server-initiated | — | **pass TTL 120 s** |
+| 5 | Enters the sale | `POST /queue/admit` + `X-Queue-Pass-Token` | the pass, **spent here** | **admission TTL 600 s** |
+| 6 | Reserves seats | `POST /holds` + `X-Admission-Token` | the admission session | **hold TTL 300 s**, ceiling 420 s |
+| 7 | Re-syncs the countdown | `GET /holds/{token}` | `fsid` cookie + ownership | — |
+| 8 | Pays | `POST /orders/checkout` | `fsid` cookie + live hold | 3 attempts; one +120 s grace per hold |
+| 9 | Reads the receipt | `GET /orders/{orderNumber}` | `fsid` cookie **or** `receiptToken` | receipt token 90 d |
+| 10 | *(receives the ticket)* | email, via outbox → RabbitMQ | — | at-least-once, deduped on `(order_number, kind)` |
+| — | Reloads at any point | `GET /sale/{id}/state` | `fsid` cookie | rehydrates steps 2–10 |
+
+Three nested timers, each strictly inside the one before it: **pass (120 s) → admission (600 s) →
+hold (300 s, ceiling 420 s)** (ADR-020). Releasing a hold returns the buyer to step 6, not step 2 —
+the admission session deliberately survives, which is the entire reason the middle tier exists.
+
+### The operating envelope
+
+The capacity arithmetic in this system used to assume one sale at a time. It does not any more, and
+every limit below is stated at the scale it actually has to hold at.
+
+```
+  E   concurrent open sales             3 .. 10
+  N   waiting buyers per sale           up to 10,000
+  R   application replicas              3
+      DB connections                    30 per replica  ->  90 cluster-wide
+      admission budget                  GLOBAL across E, then capped per sale   (ADR-049)
+```
+
+**`E` is the number that was missing.** ADR-028 derives the promotion batch size from the connection
+pool — `batchSize <= hikariMax x 1.5` — and that derivation is sound for exactly one sale. The
+promotion worker loops every open event and applies the cap *per event*, and the tick lock
+`queue:promote:{e}` is per event too, so replicas promote different sales in the same second. At
+`E = 5` the cluster admits up to `3 x 5 x 45 = 675` buyers per second into 90 connections. Nothing
+errors — under virtual threads the requests simply queue on HikariCP while p99 collapses, which is
+the exact failure ADR-028 exists to prevent.
+
+**A checkout is not one connection, either.** It is eight sequential transactions
+(`findConfirmedReceiptFor`, `getActiveHold`, `getTierSummary`, `findOrCreate`, `grantGrace`, the
+payment store, `confirm`, `receiptFor`), and a buyer's full session costs roughly fifteen including
+`POST /holds` and `GET /sale/state`. ADR-049 budgets against that figure rather than against one.
+
+Alarm on `hikaricp_connections_pending`, per replica — it is scraped per instance, and through a
+load balancer you get one replica at random.
 
 ### Step 0 — Pre-sale setup and inventory warming *(admin)*
 
@@ -273,38 +331,42 @@ identity would let anyone act as anyone (ADR-010).
 2. `CatalogFacade.getTierSummary(eventId, tierId)` — tier exists, belongs to the event, window is
    `OPEN`.
 3. Limits: `quantity ≤ 6`; at most one `ACTIVE` hold per session per event (ADR-017).
-4. `hold_reserve.lua` — one atomic script:
+4. `CatalogFacade.tryReserve(eventId, tierId, quantity)` — **outside any transaction**, because
+   Redis does not roll back (ADR-023). Behind it, `catalog`'s `stock_reserve.lua`, which touches
+   **one key** and does one job:
 
 ```lua
-local stockKey, holdKey = KEYS[1], KEYS[2]
-local qty, ttl = tonumber(ARGV[1]), tonumber(ARGV[2])
-
-local stock = redis.call('GET', stockKey)
-if stock == false then return -2 end          -- key absent: FAULT, never "sold out" (ADR-004)
-if tonumber(stock) < qty then return -1 end   -- genuinely insufficient
-
-redis.call('DECRBY', stockKey, qty)
-redis.call('HSET', holdKey,
-    'userSessionId', ARGV[3], 'eventId', ARGV[4], 'tierId', ARGV[5],
-    'quantity', tostring(qty), 'status', 'ACTIVE', 'expiresAt', ARGV[6])
-redis.call('EXPIRE', holdKey, ttl)
+-- KEYS[1] catalog:stock:{eventId}:{tierId}   ARGV[1] quantity
+local stock = redis.call('GET', KEYS[1])
+if not stock then return -2 end                    -- no counter: FAULT, never "sold out" (ADR-004)
+if tonumber(stock) < tonumber(ARGV[1]) then return -1 end   -- genuinely insufficient
+redis.call('DECRBY', KEYS[1], ARGV[1])
 return 1
 ```
 
-> There is no `holdmeta` key any more. ADR-019 moved the settle-once claim into PostgreSQL, and
-> `holdmeta` only ever existed because a Redis expiry event carries no payload — a problem that
-> disappears once the expiry handler reads `ticket_holds` by token.
+> **The script lives in `catalog` and so does the key.** Earlier drafts had `hold` run a
+> `hold_reserve.lua` against catalog's key and also write a `holdmeta` hash. Neither exists.
+> ADR-019 moved the settle-once claim into PostgreSQL — `holdmeta` had only ever existed because a
+> Redis expiry event carries no payload, which stops being a problem once the expiry handler reads
+> `ticket_holds` by token. ADR-046 then confirmed the key is `catalog`'s alone.
+>
+> The return codes do **not** escape `catalog`'s repository: `-1` means "sold out" there and
+> "no counter" one layer up, which is the precise pair of meanings this design keeps apart. Callers
+> see `RESERVED` / `INSUFFICIENT` / `COUNTER_MISSING`.
 
-5. Insert the `ticket_holds` row with `status = ACTIVE`. **This row is the authority**, not the
-   Redis key.
+5. Insert the `ticket_holds` row with `status = ACTIVE`, flushed so the one-live-hold constraint
+   speaks. **This row is the authority**, not any Redis key. On a constraint rejection — and only
+   then — the seats are restored, because that is the one failure whose outcome is certain.
+6. After commit: arm the `hold:{token}` expiry timer (ADR-048). Best-effort; the sweeper is the
+   guarantee.
 
 The admission session is **not** revoked here — that is the whole point of Step 2b.
 
-| Script result | Response |
+| Reserve result | Response |
 | :--- | :--- |
-| `1` | `201` + `HoldResponseDTO` |
-| `-1` | `409 INSUFFICIENT_STOCK` |
-| `-2` | `503 INVENTORY_UNAVAILABLE` + alarm — **never** treated as sold out |
+| `RESERVED` | `201` + the hold |
+| `INSUFFICIENT` | `409 INSUFFICIENT_STOCK` — try another tier |
+| `COUNTER_MISSING` | `503 INVENTORY_UNAVAILABLE` + alarm — **never** treated as sold out |
 
 The `-2` case is the fix for the most dangerous line in the original docs, which had a cache miss
 repopulate the counter from `total_capacity` (ADR-004).
@@ -723,7 +785,7 @@ Every value below is a named property in `application.properties`.
 | Queue pass TTL | 120 s, single-use | 006 / 020 |
 | **Admission session TTL** | **600 s**, reusable | **020** |
 | **Admission oversubscribe factor** | **1.5** | **020** |
-| **Queue ordering** | **`FIFO` (default) or `RANDOM`** | **024** |
+| Queue ordering | FIFO by arrival millisecond — **not configurable** | 024 |
 | Hold TTL | 300 s | 006 |
 | Payment grace | +120 s once, ceiling 420 s | 006 |
 | Checkout after `sale_end_time` | 15 min | 016 |
@@ -731,37 +793,65 @@ Every value below is a named property in `application.properties`.
 | Active holds per session per event | 1 | 017 |
 | Charge attempts per hold | 3 | 014 |
 | `payment:inflight` TTL | 90 s | 014 |
-| Promotion tick | 1 s | 008 |
-| Promotion batch size | **≤ `hikariMax × 1.5`** (45) | **028** |
-| Queue heartbeat | 90 s, advisory only | **026** |
+| Promotion tick | 1 s, singleton per event by Redis `SET NX PX` | 008 / **032** |
+| Promotion batch size | **≤ `hikariMax × 1.5`** (45) — **per sale; see ADR-049 for the global budget** | **028 / 049** |
 | SSE position push / heartbeat | 2 s / 15 s | 007 |
-| Sweeper interval | 30 s (Phase 2+); 10 s (Phase 1) | 019 |
-| Outbox poll / batch | 1 s / 100, `SKIP LOCKED` | 009 / 023 |
+| SSE stream timeout | 1 h, matched by nginx `proxy_read_timeout` | 007 |
+| Hold sweeper interval | 10 s | 019 |
+| Hold expiry timer | `hold:{token}`, fired by keyspace expiry — accelerator only | **048** |
+| Stale `PENDING` order | 90 s, then a retry resumes it | **034** |
+| Minimum time left to start a retry | 45 s | **030** |
+| Outbox poll / batch / confirm timeout | 1 s / 100 / 5 s, `SKIP LOCKED` | 009 / 023 / **048** |
+| Outbox stale claim recovery | 60 s | **048** |
+| Drift gauge interval | 60 s | **046** |
+| Redis epoch check | 5 s | **046** |
+| Rebuild settle window | 1 s between the two ledger reads | **046** |
 | Session bucket | 20 burst, 10/s | 011 |
 | IP bucket | 300 burst, 150/s | 011 |
-| HikariCP pool | 30 max, 10 idle | std §7 |
-| Availability buckets | `SOLD_OUT` 0 · `LIMITED` < 10 % · else `PLENTY` | **027** |
-| reCAPTCHA threshold / cache | 0.5 / 30 min | 011 |
+| Trusted proxies | **empty by default — trust nobody** | **039** |
+| HikariCP pool | 30 max, 10 idle, 3 s timeout | std §7 |
+| Availability buckets | `SOLD_OUT` 0 · `LIMITED` < 10 % · `PLENTY` · **`UNKNOWN` = no counter** | **027 / 040** |
+
+There is no reCAPTCHA and no bot-score threshold. Rate limiting is session-first with an IP backstop
+(ADR-011); a challenge provider is a Stage 2 item and no property for one exists.
 
 ---
 
 ## 7. Metrics and operational controls
 
-Nothing in the original design was observable. At minimum:
+**Built, and emitting today:**
 
-| Metric | Alarm |
+| Metric | Kind | Alarm |
+| :--- | :--- | :--- |
+| `flashseats.stock.drift` | gauge, **per replica** | **sustained** non-zero (ADR-046) |
+| `flashseats.stock.counters.missing` | gauge, **per replica** | any non-zero — each one answers holds with a `503` |
+| `hikaricp_connections_pending` | Boot built-in, per replica | sustained non-zero — the ADR-028 / ADR-049 alarm |
+
+`stock.drift` compares the live Redis counter against the §4.1 ledger formula every 60 s. It is the
+system's canary. **Alarm on sustained non-zero, not on one sample:** Redis and PostgreSQL are not
+read in one snapshot, so a hold created between the two reads shows as a momentary gap. The two SQL
+sums *are* one snapshot, which removes the only drift the measurement can manufacture by itself.
+
+Both gauges are scraped **per replica** — nginx routes only `/actuator/health`, and through a load
+balancer you would get one instance at random.
+
+**Specified, not built.** These were listed here as though they existed; they do not, and each is a
+genuine gap rather than a deleted idea:
+
+| Metric | Why it is wanted |
 | :--- | :--- |
-| `flashseats.queue.depth{event}` | — |
-| `flashseats.queue.promotion.rate{event}` | zero while queue depth > 0 |
-| `flashseats.hold.conversion.ratio{event}` | sustained < 0.3 |
-| `flashseats.stock.drift{event,tier}` | **any non-zero value** |
-| `flashseats.outbox.lag.seconds` | > 60 |
-| `flashseats.dlq.depth{queue}` | > 0 |
-| `flashseats.payment.decline.ratio` | > 0.2 |
-| `flashseats.sse.connections.active` | — |
+| `flashseats.queue.depth{event}` | the only direct read on whether a waiting room is draining |
+| `flashseats.queue.promotion.rate{event}` | zero while depth > 0 is a stuck promoter, which is invisible today |
+| `flashseats.hold.conversion.ratio{event}` | the number the 1.5× oversubscribe factor is a guess at |
+| `flashseats.outbox.lag.seconds` | a stalled relay currently shows up as buyers not receiving tickets |
+| `flashseats.dlq.depth{queue}` | the DLQ is listable by an operator but nothing alarms on it |
+| `flashseats.sse.connections.active` | the input to every capacity question about the broadcaster |
 
-`stock.drift` compares the live Redis counter against the §4.1 formula every 60 s. It is the
-system's canary: a non-zero value means inventory accounting has diverged, and it should page.
+Controls: `POST /api/v1/admin/events/{id}/pause` and `/resume` (stop promotions and new holds, honour
+existing ones), `POST /api/v1/admin/events/{id}/rebuild-stock`,
+`GET /api/v1/admin/notifications/dlq`, `POST /api/v1/admin/notifications/resend/{orderNumber}`, and
+`GET /api/v1/admin/orders/{orderNumber}`. All are HTTP Basic, `ROLE_ADMIN`, and **curl-only — there
+is no operator UI.**
 
 Controls: `POST /api/v1/admin/events/{id}/pause` (stop promotions and new holds, honour existing
 ones) and `POST /api/v1/admin/events/{id}/rebuild-stock`. There was previously no way to stop a
