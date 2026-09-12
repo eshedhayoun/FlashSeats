@@ -74,6 +74,15 @@ public final class QueueKeys {
     }
 
     /**
+     * Cluster-wide admission budget spent by every promotion worker in the same wall-clock bucket
+     * (ADR-049). Event-scoped locks prevent duplicate promotion for one sale; this key prevents five
+     * healthy sales from each admitting a full per-event batch into the same database pool.
+     */
+    public static String globalPromotionBudget(long tickBucket) {
+        return "queue:promote:budget:" + tickBucket;
+    }
+
+    /**
      * Marker that this event's stock is gone and nobody holds a claim on it.
      *
      * <p>Set by the promotion worker and <strong>deleted again the moment stock returns</strong>, so
