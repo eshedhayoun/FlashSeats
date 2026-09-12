@@ -531,10 +531,30 @@ dependency order. Everything in the first two groups is cheap; the third is the 
 4. A per-event index in the emitter registry.
 5. Make the drift gauge a singleton under the promotion tick's Redis-lock pattern.
 
-**The drill this needs and does not have:** every existing instrument runs one event. Seed five
-(9001–9005), run `flash-sale.js` against all of them at once with `VUS` split across them, and watch
-`hikaricp_connections_pending` and `flashseats_stock_drift` **per replica**. Without it, item 2 is
-arithmetic; with it, it is evidence — which is the standard the rest of this project has held to.
+**The drill — built in Pass 7, and NOT YET RUN.** Every other instrument here runs one event, and so
+did every measurement the capacity numbers rest on.
+
+```bash
+docker/seed/seed-concurrent.sh                 # 9001..9005, all opening at once
+docker/scripts/pool-pressure.sh 300 &          # THE instrument
+docker compose --profile loadtest run --rm -e VUS=2000 k6-concurrent
+```
+
+`k6-concurrent` asserts no-oversell **per event** — a global cap would pass while one sale oversold
+and another undersold by the same amount. `pool-pressure.sh` samples
+`hikaricp_connections_pending`, `hikaricp_connections_active` and `flashseats_stock_drift` **per
+replica** (nginx routes only `/actuator/health`, so a load balancer would hand you one at random)
+and exits non-zero on sustained pool pressure.
+
+**The pair is the drill, and running k6 alone is worse than not running it.** At `E` sales the
+expected failure is requests queuing on HikariCP while p99 collapses — under virtual threads that
+produces no error, no 500 and no drift, so the harness reports a green run over the exact condition
+it was built to find.
+
+**Status: the harness is verified, the run is not.** Syntax, compose wiring and the k6 script all
+parse; `seed-concurrent.sh` needs `FLASHSEATS_ADMIN_PLAINTEXT` exported (pre-warm is `ROLE_ADMIN`,
+and `.env` holds only the bcrypt digest). Until someone runs it, **ADR-049 is arithmetic, not
+evidence** — which is not the standard the rest of this project has held to.
 
 ### Stage 5 — Buyer accounts, as an overlay (ADR-044)
 

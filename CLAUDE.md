@@ -278,6 +278,14 @@ docker/scripts/hold-expiry-check.sh              # PROVE the expiry listener res
 docker compose --profile loadtest run --rm k6    # the load run; VUS=n to scale it down
 docker/scripts/sse-cadence.sh 60                 # run DURING a load run: is QueueBroadcaster's
                                                  # sweep finishing inside its 2s interval?
+
+# The ADR-049 drill: E sales at once. Every OTHER instrument here runs one
+# event, and so did every measurement the capacity numbers rest on.
+docker/seed/seed-concurrent.sh                   # seeds 9001..9005, pre-warms all five
+docker/scripts/pool-pressure.sh 300 &            # THE instrument. Without it the drill
+                                                 # proves nothing: the failure is latency,
+                                                 # not an error, so k6 sees a green run
+docker compose --profile loadtest run --rm -e VUS=2000 k6-concurrent
 ```
 
 Changing the compose network's `ipam` recreates the network, and containers created against the
