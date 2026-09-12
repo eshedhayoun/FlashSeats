@@ -5,40 +5,57 @@
 --
 --     confirmed_sold + active_holds + remaining == total_capacity
 --
--- It filters `tier_id = ? AND status = 'ACTIVE'`, and until now NO index could
--- serve it. V2 gives us two, and neither fits:
+-- It filters `tier_id = ? AND status = 'ACTIVE'` and sums `quantity`, and it is
+-- run by `measureDrift` per tier, per event, on EVERY replica, every 60 s.
 --
---   idx_holds_event_tier (event_id, tier_id)   -- needs a leading event_id,
---                                                 which this query does not have
---   idx_holds_sweeper (expires_at) WHERE ...   -- right partial clause,
---                                                 wrong leading column
+-- WHAT IT WAS ACTUALLY DOING, measured rather than assumed. The obvious reading
+-- is that no index fits — idx_holds_event_tier needs a leading event_id, and
+-- idx_holds_sweeper leads on expires_at — so it must seq-scan a table that
+-- accumulates every hold ever created. That reading is WRONG, and worth writing
+-- down because it is the one a reader will arrive at:
 --
--- So PostgreSQL fell back to scanning `ticket_holds`. That table is an append-
--- only ledger: every hold ever created stays in it as CONSUMED, RELEASED or
--- EXPIRED forever. The scan therefore grows with the lifetime sales history and
--- never shrinks.
+--     idx_holds_sweeper (expires_at) WHERE status = 'ACTIVE'
 --
--- What makes that expensive rather than merely untidy is WHO runs it.
--- `measureDrift` is @Scheduled every 60 s, it is read-only and therefore runs on
--- EVERY replica, and it loops every managed event and every tier within it. At
--- E events x T tiers x R replicas that is E*T*R scans a minute, permanently,
--- against the hottest table in the system during a sale.
+-- is itself PARTIAL on exactly this predicate. PostgreSQL therefore walked that
+-- index, which contains only live holds, and filtered out the tiers it did not
+-- want. Never a full table scan, and the settled-hold history was never the
+-- problem.
 --
--- A PARTIAL index, for the same reason as V8 and more strongly. ACTIVE is a
--- transient state -- a few hundred rows during a sale, zero between them --
--- while the table it lives in accumulates without bound. Indexing only ACTIVE
--- rows keeps this small enough to stay in cache, and it means the index is
--- maintained only while a hold is live rather than on every settled row for the
--- rest of time.
+-- The problem is what IS live. Measured on 25,400 ACTIVE holds spread across
+-- five tiers — the shape of the ADR-049 envelope, several sales at peak:
 --
--- `quantity` is INCLUDEd so the sum is answered from the index alone: the query
--- needs no other column, and without it every matching row still costs a heap
--- fetch to read one integer.
+--     idx_holds_sweeper       cost 1109   903 buffers   5,000 rows kept,
+--                                                       20,400 discarded
+--     idx_holds_active_tier   cost  184    23 buffers   Index Only Scan,
+--                                                       Heap Fetches: 0
+--
+-- A 39x reduction in buffers, and the gap widens with E: the old plan reads
+-- every live hold in the CLUSTER to answer a question about one tier, so its
+-- cost scales with concurrent sales while this one does not. Multiply by tiers,
+-- by events, by three replicas, every minute, for the length of a sale.
+--
+-- `INCLUDE (quantity)` is what makes it an Index Only Scan rather than a bitmap
+-- heap scan: the query needs no other column, and without it every matching row
+-- still costs a heap fetch to read one integer. That earns most of the win —
+-- forced onto this index before the INCLUDE could be used, the plan was 504
+-- buffers, better than 903 but nowhere near 23.
+--
+-- CAVEAT, since an Index Only Scan depends on it: `Heap Fetches: 0` requires the
+-- visibility map, which autovacuum maintains. On a table being written this hard
+-- during a sale the map lags, and the plan degrades toward the bitmap heap scan
+-- above — still an improvement, not the full one. That is a reason to watch
+-- autovacuum on `ticket_holds`, not a reason to skip the index.
+--
+-- PARTIAL, for the same reason as V8 and more strongly: ACTIVE is transient — a
+-- few thousand rows at peak, zero between sales — while the table it lives in
+-- grows without bound. So the index stays small enough to sit in cache, and it
+-- is maintained only while a hold is live rather than on every settled row for
+-- the rest of time.
 --
 -- Note this deliberately indexes holds that are ACTIVE but already past their
 -- expiry. Those still own their seats until the sweeper reaches them, and
--- `sumActiveQuantityForTier` counts them on purpose -- excluding them would let
--- a rebuild and the sweeper both account for the same seats (ADR-046).
+-- `sumActiveQuantityForTier` counts them on purpose — excluding them would let a
+-- rebuild and the sweeper both account for the same seats (ADR-046).
 -- ============================================================================
 
 CREATE INDEX idx_holds_active_tier
