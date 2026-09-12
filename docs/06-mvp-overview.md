@@ -257,9 +257,9 @@ Honest list. None of these is hidden behind a passing test.
   in the run that sold 76 % of capacity. **The 300-VU five-sale number is the real open one**: 682 ms →
   9.3 s for the same VU count spread over five sales is a 13× cost that the pool does not explain, and
   finding what does is the next latency question. It needs a host where k6 is not competing for cores.
-- **A pool timeout surfaces to a buyer as `500 INTERNAL_ERROR` mid-checkout.** With
-  `connection-timeout=3000`, CPU starvation produced 1,218 of them across three replicas in one Pass 8
-  run; one order was left `FAILED`. The compensation held — that tier's `sold + held + redis` was still
+- **A pool timeout surfaces to a buyer as `500 INTERNAL_ERROR` mid-checkout.** Not seen in the runs that
+  sell out — `pending` stays at zero there — but with `connection-timeout=3000`, CPU starvation produced
+  1,218 of them across three replicas in the 2,000-VU run; one order was left `FAILED`. The compensation held — that tier's `sold + held + redis` was still
   exactly 500, so no seats were stranded — and a buyer's documented recovery (re-POST the same body)
   works because checkout is find-or-create. But `INTERNAL_ERROR` is the least actionable code in the
   registry for what is really back-pressure, and `503` with a `Retry-After` would be the honest answer.
@@ -571,9 +571,9 @@ dependency order. Everything in the first two groups is cheap; the third is the 
    that instance, leaving a live connection in a set nothing iterates.
 5. Make the drift gauge a singleton under the promotion tick's Redis-lock pattern. **Still open** —
    all three replicas compute the same global number every 60 s.
-6. **New, from the Pass 8 runs:** tune the allowance on the 300-VU rig. Run E denied 13,349 admissions
-   while `pending` peaked at 10 of 90 — the cluster could serve more than 11 per tick, and the crossing
-   point where `pending` starts to lift is the number ADR-049 asks for.
+6. ~~Tune the allowance.~~ **Done:** 45 per tick, measured. Five sales now sell out with `pending` at
+   zero; `denied` fell from 13,349 to 1,044, so the allowance shapes the opening burst rather than
+   capping the sale.
 
 **The drill — built in Pass 7, and NOT YET RUN.** Every other instrument here runs one event, and so
 did every measurement the capacity numbers rest on.
@@ -665,27 +665,61 @@ them. 5 sales × 500 seats, 2,000 VUs, three replicas.
 | **B** | 2,000 | cache **on**, allowance unlimited | **330** | 246 | not measurable | — |
 | **C** | 2,000 | cache **on**, allowance 11/tick | sampled 0, logged **217** | 352 | 162 | 34.6 s |
 | **D** | 2,000 | + promoter off the pool | **54** | 308 | 203 | 45.0 s |
-| **E** | **300** | same as D | **10** | **1,414** | **1,904 / 2,500 — 76 %** | 9.3 s |
+| **E** | **300** | same as D | **10** | 1,414 | 1,904 / 2,500 — 76 % | 9.3 s |
+| **F** | **300** | **allowance 45/tick** | **0** | **2,002** | **2,496 / 2,500 — 99.8 %** | 10.0 s |
 
-**Run E is the one that answers "can it sell a lot without overbooking?", and the answer is yes.**
-Five simultaneous sales, **1,904 of 2,500 seats sold, no oversell and no drift** — `sold + held + redis`
-exactly 500 on every tier. The only thing that changed between D and E is the number of virtual users
-the *load generator* ran on the same ten cores as the system under test.
+**Run F is the answer: five sales open at once sell out, and nothing oversells.**
 
 ```
 event  tier  cap  sold  held  redis   sum
-9001   9001  500   363     0    137   500
-9002   9002  500   387     5    108   500
-9003   9003  500   392     0    108   500
-9004   9004  500   336     0    164   500
-9005   9005  500   426    21     53   500
+9001   9001  500   499     0      1    500
+9002   9002  500   500     0      0    500      <- sold out, exactly
+9003   9003  500   497     0      3    500
+9004   9004  500   500     0      0    500      <- sold out, exactly
+9005   9005  500   500     0      0    500      <- sold out, exactly
 ```
+
+Three tiers at **exactly 500 of 500** — the case where oversell would show, and the counter reached zero
+and stopped. `sold + held + redis == 500` on all five. Zero inventory `503`s. And
+`hikaricp_connections_pending` peaked at **0**: the cluster sold 2,496 seats across five simultaneous
+sales without the pool ever making a caller wait.
+
+**The four unsold seats are worth explaining, because the reason is a real edge and not the clock.** At
+the end of the run they were *available* — no active holds — and **48 to 60 buyers were still queued for
+every sale**. They were not promoted because admission accounting counted them as already claimed:
+
+```
+admittable = floor(remaining × oversubscribeFactor) − pendingPasses − liveAdmissions
+
+9001:  floor(1 × 1.5) − 0 − 2  =  -1      1 seat, 2 live admission sessions
+9003:  floor(3 × 1.5) − 4 − 0  =   0      3 seats, 4 outstanding passes
+```
+
+Those passes and sessions belong to buyers who had not bought. So the seats were reserved *notionally*
+for people who never took them, and the next buyer in line could not be let through until a pass expired
+(120 s) or an admission lapsed (600 s) — not one more tick, and **not a seat that could never sell.** In
+a real sale they sell within ten minutes.
+
+**It does expose where the oversubscribe factor stops working: the tail.** 1.5 exists because
+conversion is below 100 %, but `floor(1 × 1.5) = 1`, so at one seat remaining the factor grants no slack
+at all — exactly where a single unused pass can idle the last seat for its full TTL. A small floor at
+the tail would close it, at the cost of admitting buyers who may arrive to find it gone, which ADR-008
+exists to prevent. **Left as is, deliberately**, and now written down: at 99.8 % the trade is sound, and
+the alternative trades a measurable last seat for an unmeasurable number of wasted journeys.
+
+**What changed between E and F was one number**, and the way it was wrong is the more useful finding.
+ADR-049 said to derive the allowance from the per-buyer connection cost, which became
+`90 connections ÷ 8 transactions = 11`. **Those units do not compose:** 90 is a concurrency, 8 is a
+count over a session lasting minutes, their quotient is neither — and it was then spent as a per-second
+rate. Run E's instruments said so plainly: `pending` at 10 of 90 while `denied` refused ten admissions
+for every one granted. The fix is a single property that *is* a rate,
+`global-admission-budget-per-tick`, at ADR-028's own 45 — re-scoped from one sale to the cluster, which
+is the only thing ADR-049 ever needed to change. In run F, `denied` fell from 13,349 to 1,044: the
+allowance now shapes the burst instead of capping the sale.
 
 **So the 6–8 % figures in runs A–D are not results about this system.** They are what happens when k6
 with 2,000 VUs and three JVMs contend for ten cores: every request takes tens of seconds, holds expire
-before their buyer can pay, and the funnel never fills. At 300 VUs the same build sells 76 % of five
-sales in three and a half minutes, and would approach capacity given a longer window — 26 seats were
-still held when the run ended.
+before their buyer can pay, and the funnel never fills. At 300 VUs the same build sells out.
 
 **Run E also confirms the harness defect from the other direction.** Its client count (1,898) and the
 ledger (1,904) agree to within six seats, because almost nothing timed out. The 8× gap in run C was
@@ -747,13 +781,15 @@ run and the real p99 are blocked on **CPU**, not memory, so a bigger machine is 
 machine where the load generator is not competing for the same ten cores is the right one. Freeing host
 RAM changes nothing; Docker's allocation is a fixed VM size either way.
 
-**What the runs do and do not license.** They license the two fixes: pool saturation under concurrent
-sales is gone, the cache is what makes that affordable, **no tier oversold or drifted**, and the system
-sells 76 % of five concurrent sales in three and a half minutes. They do not license the allowance of
-**11 per tick** as a *tuned* number: run E denied **13,349** admissions against 1,414 granted while
-`pending` peaked at 10 of 90, which says plainly that the cluster could have served more. Raising
-`global-admission-connection-budget` until `pending` starts to lift is the next measurement, and run E
-at 300 VUs is now the rig to do it on — the 2,000-VU runs cannot answer it on this host.
+**What the runs license.** Five concurrent sales **sell out** — 2,496 of 2,500 — with no oversell, no
+drift, no inventory `503`s and `hikaricp_connections_pending` at zero throughout. That is the exit
+criterion this stage existed for, and ADR-049 and ADR-051 are the two changes that get there.
+
+**What they still do not license is the latency number.** Checkout p99 is 10 s against a 200 ms
+criterion, and `pending` at zero says it is not the pool. The single-sale run at the same 300 VUs was
+682 ms, so the 15× is the cost of five concurrent sales somewhere other than the database — and finding
+it needs a host where the load generator is not sharing ten cores with three JVMs. That is the one
+open number, and it is stated as open rather than implied by a sellout.
 
 **Nothing in the sale path ever failed, in any run.** In run C's 2,000-VU conditions, 145 holds were
 created and **every one was a `201`** — no `409`, no `503` — and 109 of them became orders. The funnel
@@ -1285,15 +1321,24 @@ things came out:
 2. **The residual latency is scheduling, not the pool** — 25 idle connections with 75 waiters and a 3 s
    timeout firing at 9.8 s — and the claim that `pending` stayed at `0.0` was an artefact of a sampler
    that rotates replicas every ~15 s. It reached 217.
-3. **At 300 VUs the same build sells 1,904 of 2,500 seats across five concurrent sales, with no oversell
-   and no drift.** That is run E, and it is the number that answers what the drill was for. Everything
-   below ~10 % in runs A–D was the load generator competing with the system for ten cores.
+3. **At 300 VUs, with the allowance corrected, five concurrent sales sell out: 2,496 of 2,500, three
+   tiers at exactly 500/500, no oversell, no drift, no inventory `503`s, and
+   `hikaricp_connections_pending` at zero throughout.** That is run F, and it is what the drill existed
+   to establish. Everything below ~10 % in runs A–D was the load generator competing with the system for
+   ten cores.
 
 The lesson is not about k6. Three of this pass's nine findings and all four of its wrong turns came from
 trusting a summary line over a ledger — and the drill was *built* in Pass 7 specifically because a green
 harness had hidden the failure it was written to find.
 
-- **Result:** the two highest-leverage concurrent-sales fixes are built, tested and measured;
-  `hikaricp_connections_pending` stops being sustained where it reached 1,004 without them, and no tier
-  oversold or drifted. The allowance itself is not yet tuned, and the host cannot answer the latency
-  question — both are stated as open in §9 and §11 rather than implied by a green run.
+**The allowance's formula was the last thing wrong, and it was wrong in its units.** ADR-049 asked for a
+budget "derived from the true per-buyer connection cost"; that became 90 connections ÷ 8 transactions =
+11, a concurrency divided by a count, spent as a rate. It capped the sale at 76 % while leaving the pool
+89 % idle. Replaced by one honest rate at ADR-028's own 45, re-scoped to the cluster — the only scope
+change ADR-049 ever needed — and the sale sells out.
+
+- **Result:** **five concurrent sales sell out — 2,496 of 2,500 — with no oversell, no drift and
+  `hikaricp_connections_pending` at zero.** Where the same drill measured 202 pending and 370 sold in
+  Pass 7, it now measures 0 and 2,496. 108 tests green. The one number still open is checkout p99: 10 s
+  against a 200 ms criterion, which `pending` at zero says is not the database, and which needs a host
+  where the load generator is not sharing ten cores with three JVMs.

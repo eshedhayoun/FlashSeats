@@ -39,25 +39,20 @@ class GlobalPromotionBudgetIT extends IntegrationTest {
     private int port;
 
     private long originalPromotionIntervalMs;
-    private int originalGlobalAdmissionConnectionBudget;
-    private int originalDatabaseConnectionsPerBuyer;
+    private long originalBudgetPerTick;
 
     @BeforeEach
     void reset() {
         fixture.reset();
         originalPromotionIntervalMs = properties.getPromotionIntervalMs();
-        originalGlobalAdmissionConnectionBudget = properties.getGlobalAdmissionConnectionBudget();
-        originalDatabaseConnectionsPerBuyer = properties.getDatabaseConnectionsPerBuyer();
-
-        properties.setGlobalAdmissionConnectionBudget(10);
-        properties.setDatabaseConnectionsPerBuyer(2);
+        originalBudgetPerTick = properties.getGlobalAdmissionBudgetPerTick();
+        properties.setGlobalAdmissionBudgetPerTick(5);
     }
 
     @AfterEach
     void restoreProperties() {
         properties.setPromotionIntervalMs(originalPromotionIntervalMs);
-        properties.setGlobalAdmissionConnectionBudget(originalGlobalAdmissionConnectionBudget);
-        properties.setDatabaseConnectionsPerBuyer(originalDatabaseConnectionsPerBuyer);
+        properties.setGlobalAdmissionBudgetPerTick((int) originalBudgetPerTick);
         redis.delete("queue:budget");
     }
 

@@ -1727,8 +1727,29 @@ is a number somebody has to be able to tune.
 **A correction this ADR's own arithmetic depends on.** A checkout is **nine** sequential
 transactions, not eight: every listing collapses `PaymentTransactionStore`'s two `REQUIRES_NEW`
 transactions — the pair that brackets the gateway call, and which its javadoc describes as two — into
-"the payment store". `database-connections-per-buyer` is 8 because it prices the *connection* cost of
-an admitted buyer rather than counting statements; the nine is what the narrative should say.
+"the payment store".
+
+**And decision 3 was wrong, which the measurement found.** "Derive the budget from the true per-buyer
+connection cost" became `globalAdmissionConnectionBudget / databaseConnectionsPerBuyer` = 90 ÷ 8 = 11 —
+and **those units do not compose.** 90 is a *concurrency* (connections the cluster holds at one instant);
+8 is a *count* (transactions one buyer issues over a session lasting minutes). Their quotient is neither,
+and it was then spent as a **rate**, per tick, per second.
+
+The error is invisible in the algebra and obvious in the instruments. At 11 per tick:
+`hikaricp_connections_pending` peaked at **10 of 90** while
+`flashseats.queue.admission.budget.denied` logged **ten refusals for every admission granted**, and five
+500-seat sales sold **76 %** rather than selling out. The budget meant to stop the pool being the
+bottleneck had made itself the bottleneck, at a tenth of the pool's capacity.
+
+**So the two properties are replaced by one — `global-admission-budget-per-tick`, a rate, default 45.**
+That is ADR-028's `hikariMax × 1.5` re-scoped from one sale to the whole cluster, which keeps the
+lineage this ADR set out to correct without inventing a second derivation.
+
+**The general point is worth more than the number.** A capacity limit expressed as a formula over
+quantities that do not share units will look derived and be arbitrary. The honest form is a rate with a
+measured ceiling, and the ceiling is observable: raise it until
+`hikaricp_connections_pending` stops returning to zero. `denied` staying high while the pool sits idle
+means there is room; `pending` refusing to drain means there is not.
 
 ---
 
