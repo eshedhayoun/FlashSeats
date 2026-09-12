@@ -36,6 +36,7 @@ This module owns **no Redis key at all.**
 | :--- | :--- | :--- |
 | `POST` | `/api/v1/orders/checkout` | `fsid` + a live hold |
 | `GET` | `/api/v1/orders/{orderNumber}` | `fsid` **or** `receiptToken` |
+| `GET` | `/api/v1/orders/{orderNumber}/ticket.pdf` | `fsid` **or** `receiptToken` |
 | `POST` | `/api/v1/admin/events/{eventId}/rebuild-stock` | `ROLE_ADMIN` |
 | `GET` | `/api/v1/admin/orders/{orderNumber}` | `ROLE_ADMIN` |
 | `POST` | `/api/v1/admin/notifications/resend/{orderNumber}` | `ROLE_ADMIN` |
@@ -46,6 +47,13 @@ terminal history and any log that records bodies (ADR-048).
 
 The resend is served here, not by `notification`, because the payload lives in `outbox_events`. One
 new outbox row drives the whole existing pipeline.
+
+**The ticket download is the recovery path for an unverified email** (ADR-050). It renders through
+`shared`'s `TicketPdfRenderer`, so a downloaded ticket is byte-identical to the emailed one by
+construction. Two guards: authorisation is *identical* to the receipt read, and **only a
+`CONFIRMED` order has a ticket** — anything else answers `TICKET_NOT_AVAILABLE`, because rendering
+for a `REFUNDED` order would mint a document that still admits someone at a door for money that has
+already gone back. An unauthorised caller gets `404`, never `403`.
 
 **Facade:** `findLatestOrder` (rehydration for `saleflow`) — and nothing else. A `getOrderSummary`
 existed with zero callers anywhere and was deleted in Pass 7.
@@ -142,7 +150,6 @@ exactly what ADR-023 forbids.
 
 | Gap | Detail |
 | :--- | :--- |
-| **No ticket retrieval endpoint** | The PDF exists only as an email attachment. A typo'd address means the buyer can never obtain what they paid for, and the operator resend replays the same payload to the same wrong address. **ADR-050. Specified, not built** |
 | **Checkout costs eight sequential transactions** | Steps 0, 1, 2, 4, 5, the payment store, 7 and the closing read are each their own connection acquisition. ADR-049 budgets admission against this figure |
 | **No outbox lag metric** | `flashseats.outbox.lag.seconds` is specified in `03` §7 and not built; a stalled relay currently surfaces as buyers not receiving tickets |
 

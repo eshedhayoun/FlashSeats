@@ -83,6 +83,11 @@ acknowledged (ADR-042).
 
 ## 5. Rendering
 
+**The renderer lives in `shared`, not here** (ADR-050). It is a pure function from a payload to
+bytes, and `order` needs the same bytes to serve a download — which it could not do without either
+the first synchronous edge into this module or a second implementation that would drift. This module
+maps its wire payload onto the renderer's own narrower input.
+
 The ticket is a PDF. **Operator-supplied text must not reach a standard-14 font**: `showText` throws
 on anything outside WinAnsi, deterministically, so a Hebrew event title would cost a paid buyer their
 ticket with no retry that could help (ADR-042).
@@ -93,9 +98,8 @@ ticket with no retry that could help (ADR-042).
 
 | Gap | Detail |
 | :--- | :--- |
-| **The renderer is not reachable outside the consumer** | ADR-050 moves it to `shared` so `order` can serve a ticket download. **Specified, not built** |
 | **No DLQ depth alarm** | The DLQ is listable by an operator; nothing alarms on it |
-| **Email is never verified** | The address is taken from the checkout body. A typo is currently unrecoverable |
+| **Email is never verified** | The address is taken from the checkout body. A typo is no longer *unrecoverable* — `order` serves the same PDF as a download (ADR-050) — but nothing validates the address or lets a buyer correct it |
 
 ---
 

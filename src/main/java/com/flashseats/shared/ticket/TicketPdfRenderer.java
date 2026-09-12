@@ -1,6 +1,5 @@
-package com.flashseats.notification.service;
+package com.flashseats.shared.ticket;
 
-import com.flashseats.notification.dto.OrderConfirmedPayload;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.nio.charset.Charset;
@@ -23,6 +22,14 @@ import org.springframework.stereotype.Component;
  * <p><strong>One page per line item</strong>, because a ticket is a thing a person holds at a door.
  * An earlier payload design carried a single flat tier and quantity, which would have produced one
  * wrong page for any multi-tier order (ADR-015).
+ *
+ * <p><strong>It lives in the kernel because it is a pure function</strong> — bytes in, bytes out, no
+ * repository, no facade, no state (ADR-050). It was in {@code notification}, which made the ticket
+ * reachable only as an email attachment: a buyer who mistyped their address could never obtain what
+ * they had paid for, and the operator resend replayed to the same wrong address. Serving a download
+ * from {@code order} would otherwise have meant the first synchronous edge into {@code notification},
+ * for a page render. Here both modules render from one implementation, so a downloaded ticket is
+ * byte-identical to the emailed one by construction rather than by coincidence.
  *
  * <p>Uses the standard-14 fonts only — no font loading, no glyph lookups, nothing that can fail
  * differently on a different machine. A render failure here is deterministic and must not be
@@ -53,20 +60,19 @@ public class TicketPdfRenderer {
     private static final float TITLE_SIZE = 22f;
     private static final float BODY_SIZE = 12f;
 
-    public byte[] render(OrderConfirmedPayload payload) throws IOException {
+    public byte[] render(TicketDocument ticket) throws IOException {
         try (PDDocument document = new PDDocument();
                 ByteArrayOutputStream out = new ByteArrayOutputStream()) {
 
-            for (OrderConfirmedPayload.Item item : payload.items()) {
-                document.addPage(renderTicket(document, payload, item));
+            for (TicketDocument.Seat seat : ticket.seats()) {
+                document.addPage(renderTicket(document, ticket, seat));
             }
             document.save(out);
             return out.toByteArray();
         }
     }
 
-    private PDPage renderTicket(
-            PDDocument document, OrderConfirmedPayload payload, OrderConfirmedPayload.Item item)
+    private PDPage renderTicket(PDDocument document, TicketDocument ticket, TicketDocument.Seat seat)
             throws IOException {
 
         PDPage page = new PDPage(PDRectangle.A4);
@@ -75,17 +81,17 @@ public class TicketPdfRenderer {
         try (PDPageContentStream content = new PDPageContentStream(document, page)) {
             float y = top;
 
-            y = write(content, payload.event().title(), TITLE_SIZE, true, MARGIN, y);
+            y = write(content, ticket.eventTitle(), TITLE_SIZE, true, MARGIN, y);
             y -= 10;
-            y = write(content, payload.event().venueName(), BODY_SIZE + 2, false, MARGIN, y);
-            y = write(content, DATE.format(payload.event().startTime()), BODY_SIZE, false, MARGIN, y);
+            y = write(content, ticket.venueName(), BODY_SIZE + 2, false, MARGIN, y);
+            y = write(content, DATE.format(ticket.eventStartTime()), BODY_SIZE, false, MARGIN, y);
 
             y -= 28;
-            y = write(content, item.tierName(), TITLE_SIZE - 4, true, MARGIN, y);
-            y = write(content, "Admits " + item.quantity(), BODY_SIZE, false, MARGIN, y);
+            y = write(content, seat.tierName(), TITLE_SIZE - 4, true, MARGIN, y);
+            y = write(content, "Admits " + seat.quantity(), BODY_SIZE, false, MARGIN, y);
 
             y -= 28;
-            y = write(content, "Order " + payload.orderNumber(), BODY_SIZE + 4, true, MARGIN, y);
+            y = write(content, "Order " + ticket.orderNumber(), BODY_SIZE + 4, true, MARGIN, y);
             write(content, "Present this page at the door.", BODY_SIZE, false, MARGIN, y - 4);
         }
         return page;
@@ -121,7 +127,7 @@ public class TicketPdfRenderer {
      * ticket outright, with no automated path back. A degraded glyph is a cosmetic loss; an
      * undelivered ticket is not.
      */
-    static String drawable(String text) {
+    public static String drawable(String text) {
         if (text == null || text.isEmpty()) {
             return "";
         }

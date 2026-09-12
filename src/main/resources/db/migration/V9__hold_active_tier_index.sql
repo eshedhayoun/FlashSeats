@@ -1,0 +1,46 @@
+-- ============================================================================
+-- hold — make the stock invariant cheap to check
+--
+-- `sumActiveQuantityForTier` is the `active_holds` term of invariant 1:
+--
+--     confirmed_sold + active_holds + remaining == total_capacity
+--
+-- It filters `tier_id = ? AND status = 'ACTIVE'`, and until now NO index could
+-- serve it. V2 gives us two, and neither fits:
+--
+--   idx_holds_event_tier (event_id, tier_id)   -- needs a leading event_id,
+--                                                 which this query does not have
+--   idx_holds_sweeper (expires_at) WHERE ...   -- right partial clause,
+--                                                 wrong leading column
+--
+-- So PostgreSQL fell back to scanning `ticket_holds`. That table is an append-
+-- only ledger: every hold ever created stays in it as CONSUMED, RELEASED or
+-- EXPIRED forever. The scan therefore grows with the lifetime sales history and
+-- never shrinks.
+--
+-- What makes that expensive rather than merely untidy is WHO runs it.
+-- `measureDrift` is @Scheduled every 60 s, it is read-only and therefore runs on
+-- EVERY replica, and it loops every managed event and every tier within it. At
+-- E events x T tiers x R replicas that is E*T*R scans a minute, permanently,
+-- against the hottest table in the system during a sale.
+--
+-- A PARTIAL index, for the same reason as V8 and more strongly. ACTIVE is a
+-- transient state -- a few hundred rows during a sale, zero between them --
+-- while the table it lives in accumulates without bound. Indexing only ACTIVE
+-- rows keeps this small enough to stay in cache, and it means the index is
+-- maintained only while a hold is live rather than on every settled row for the
+-- rest of time.
+--
+-- `quantity` is INCLUDEd so the sum is answered from the index alone: the query
+-- needs no other column, and without it every matching row still costs a heap
+-- fetch to read one integer.
+--
+-- Note this deliberately indexes holds that are ACTIVE but already past their
+-- expiry. Those still own their seats until the sweeper reaches them, and
+-- `sumActiveQuantityForTier` counts them on purpose -- excluding them would let
+-- a rebuild and the sweeper both account for the same seats (ADR-046).
+-- ============================================================================
+
+CREATE INDEX idx_holds_active_tier
+    ON ticket_holds (tier_id) INCLUDE (quantity)
+    WHERE status = 'ACTIVE';

@@ -16,7 +16,7 @@
 > 1. **The system now targets 3–10 concurrent sales** ([`03`](docs/03-end-to-end-flow.md) §2). Every
 >    piece of client state must therefore be **scoped by `eventId`** — see rule 5. The current demo
 >    client is single-sale and would corrupt itself with two tabs on two sales.
-> 2. **A ticket will be retrievable, not only emailed** (ADR-050). V5 gains a download.
+> 2. **A ticket is retrievable, not only emailed** (ADR-050) — built. V5 gains a download.
 
 ---
 
@@ -330,14 +330,20 @@ Email delivery is **asynchronous** — the PDF may take a few seconds. Do not pr
 > "We're sending your tickets to **buyer@example.com**. They usually arrive within a minute."
 
 **The download is not a convenience — it is the recovery path.** The address is collected once at
-checkout and never verified, so a typo currently means the buyer can never obtain what they paid
-for: the ticket goes to a stranger or bounces, and even an operator resend replays to the same wrong
-address. `GET /orders/{orderNumber}/ticket.pdf` closes that (**ADR-050 — specified, not built**), and
-it is authorised exactly like this page: session cookie **or** `receiptToken`.
+checkout and never verified, so a typo means the ticket goes to a stranger or bounces, and even an
+operator resend replays to the same wrong address. `GET /orders/{orderNumber}/ticket.pdf` closes
+that (ADR-050), authorised exactly like this page: session cookie **or** `receiptToken`.
 
-Until it ships, V5 must at minimum **show the email address it sent to, prominently enough to
-proofread**, and offer a route to support. A buyer who spots the typo on this screen can still be
-helped; one who discovers it two days later cannot.
+**Send `Accept: application/pdf, application/problem+json`.** Asking only for the PDF makes every
+failure on this endpoint unnegotiable, and the client gets a `406` it cannot read instead of the
+`ProblemDetail` explaining why.
+
+`409 TICKET_NOT_AVAILABLE` means the order is yours but has no ticket. Branch on `retryable`: true
+means `PENDING` and still in flight, so poll; false is terminal and polling will never help.
+
+V5 must **still show the email address it sent to, prominently enough to proofread**. The download
+makes a typo survivable, not invisible — a buyer who never opens this page and never receives the
+email is still stuck, and spotting it here is the cheapest fix available to them.
 
 Clear `fs.{eventId}.holdToken` and `fs.{eventId}.idem`. **Keep** `orderNumber` and `receiptToken` —
 they are how a buyer returns here — and append the order to `fs.recentOrders`, which is what lets
@@ -379,7 +385,7 @@ Base `/api/v1`. `fsid` is an `HttpOnly` cookie — **JavaScript never reads or s
 | V4 | `DELETE` | `/holds/{holdToken}` | — | — | `204` | `HOLD_NOT_FOUND` |
 | V4 | `POST` | `/orders/checkout` | — | `{holdToken, userEmail, paymentMethodId, idempotencyKey}` | `201`/`200` | `PAYMENT_DECLINED`, `PAYMENT_ATTEMPTS_EXHAUSTED`, `HOLD_EXPIRED`, `DUPLICATE_PAYMENT`, `PAYMENT_GATEWAY_UNAVAILABLE`, `CHECKOUT_WINDOW_CLOSED`, `INSUFFICIENT_TIME_REMAINING`, `ORDER_REFUNDED` |
 | V5 | `GET` | `/orders/{orderNumber}?receiptToken=` | — | — | `200` | `ORDER_NOT_FOUND` |
-| V5 | `GET` | `/orders/{orderNumber}/ticket.pdf?receiptToken=` | — | — | `200` | `ORDER_NOT_FOUND` — **specified, not built (ADR-050)** |
+| V5 | `GET` | `/orders/{orderNumber}/ticket.pdf?receiptToken=` | `Accept: application/pdf, application/problem+json` | — | `200` | `ORDER_NOT_FOUND`, `TICKET_NOT_AVAILABLE` |
 
 > **`userSessionId` is never sent** — not in a body, not in a header, not in a query string. Identity
 > comes from the signed cookie alone (ADR-010). A request that carries it will be rejected.

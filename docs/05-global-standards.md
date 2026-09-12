@@ -126,6 +126,7 @@ breaking change.
 | `CHECKOUT_WINDOW_CLOSED` | 409 | order | Past the 15-minute grace |
 | `INSUFFICIENT_TIME_REMAINING` | 409 | order | Too little of the hold left to start a charge that could finish (ADR-030). Nothing charged; the order is left resumable |
 | `ORDER_REFUNDED` | 409 | order | A settled charge was refunded because the seats could not be delivered (ADR-012). Distinct from `HOLD_EXPIRED`, whose promise that nothing was charged would be false |
+| `TICKET_NOT_AVAILABLE` | 409 | order | The order is the caller's and has no ticket (ADR-050). Only a `CONFIRMED` order does; rendering for any other status would mint a document indistinguishable from a real ticket. Returned **only** to a caller who has already proved ownership, so it can afford to say why — an unauthorised one still gets `ORDER_NOT_FOUND`. `retryable` is true for `PENDING` and false for everything else |
 | `NOTIFICATION_LOG_NOT_FOUND` | 404 | notification | Admin only |
 | `SALE_PAUSED` | 409 | catalog | Pause or resume asked for on an event that is `DRAFT` or `CANCELLED`, where neither means anything (ADR-048) |
 | `NOTIFICATION_PAYLOAD_UNAVAILABLE` | 410 | order | A resend was asked for past `flashseats.outbox.purge-after-days`, so the stored message is gone. `410`, not `404`: the order existed and so did its message — they aged out, and a `404` would send an operator hunting a typo |
