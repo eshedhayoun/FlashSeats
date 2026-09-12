@@ -7,7 +7,6 @@ import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
-import java.util.stream.Collectors;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Component;
 import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
@@ -31,6 +30,7 @@ import tools.jackson.databind.ObjectMapper;
 public class SseEmitterRegistry {
 
     private final Map<String, Connection> connections = new ConcurrentHashMap<>();
+    private final Map<Long, Set<String>> sessionsByEvent = new ConcurrentHashMap<>();
     private final ObjectMapper json;
 
     public SseEmitterRegistry(ObjectMapper json) {
@@ -45,21 +45,20 @@ public class SseEmitterRegistry {
         // holding a socket that will never be written to again.
         Connection previous = connections.put(sessionId, connection);
         if (previous != null) {
+            unindex(sessionId, previous.eventId());
             previous.emitter().complete();
         }
+        sessionsByEvent.computeIfAbsent(eventId, ignored -> ConcurrentHashMap.newKeySet()).add(sessionId);
 
-        emitter.onCompletion(() -> connections.remove(sessionId, connection));
-        emitter.onTimeout(() -> connections.remove(sessionId, connection));
-        emitter.onError(error -> connections.remove(sessionId, connection));
+        emitter.onCompletion(() -> remove(sessionId, connection));
+        emitter.onTimeout(() -> remove(sessionId, connection));
+        emitter.onError(error -> remove(sessionId, connection));
 
         return emitter;
     }
 
     public Set<String> sessionsWatching(long eventId) {
-        return connections.entrySet().stream()
-                .filter(entry -> entry.getValue().eventId() == eventId)
-                .map(Map.Entry::getKey)
-                .collect(Collectors.toSet());
+        return Set.copyOf(sessionsByEvent.getOrDefault(eventId, Set.of()));
     }
 
     /**
@@ -70,7 +69,7 @@ public class SseEmitterRegistry {
      * (ADR-036).
      */
     public Set<Long> watchedEventIds() {
-        return connections.values().stream().map(Connection::eventId).collect(Collectors.toSet());
+        return Set.copyOf(sessionsByEvent.keySet());
     }
 
     /**
@@ -84,13 +83,14 @@ public class SseEmitterRegistry {
      * closing their old one, leaving them holding a socket nothing will ever write to.
      */
     public void closeAll(long eventId, String eventName, Object data) {
-        for (Map.Entry<String, Connection> entry : Map.copyOf(connections).entrySet()) {
-            if (entry.getValue().eventId() != eventId) {
+        for (String sessionId : sessionsWatching(eventId)) {
+            Connection connection = connections.get(sessionId);
+            if (connection == null || connection.eventId() != eventId) {
                 continue;
             }
-            send(entry.getKey(), eventName, data);
-            if (connections.remove(entry.getKey(), entry.getValue())) {
-                entry.getValue().emitter().complete();
+            send(sessionId, eventName, data);
+            if (remove(sessionId, connection)) {
+                connection.emitter().complete();
             }
         }
     }
@@ -133,7 +133,7 @@ public class SseEmitterRegistry {
         } catch (IOException | IllegalStateException disconnected) {
             // Routine: browsers close streams constantly. Not worth a stack trace.
             log.debug("Dropping dead SSE connection for {}", sessionId);
-            connections.remove(sessionId, connection);
+            remove(sessionId, connection);
             connection.emitter().complete();
             return false;
         }
@@ -157,9 +157,28 @@ public class SseEmitterRegistry {
             try {
                 connection.emitter().send(SseEmitter.event().comment("hb"));
             } catch (IOException | IllegalStateException disconnected) {
-                connections.remove(sessionId, connection);
+                remove(sessionId, connection);
                 connection.emitter().complete();
             }
+        }
+    }
+
+    private boolean remove(String sessionId, Connection connection) {
+        if (!connections.remove(sessionId, connection)) {
+            return false;
+        }
+        unindex(sessionId, connection.eventId());
+        return true;
+    }
+
+    private void unindex(String sessionId, long eventId) {
+        Set<String> sessions = sessionsByEvent.get(eventId);
+        if (sessions == null) {
+            return;
+        }
+        sessions.remove(sessionId);
+        if (sessions.isEmpty()) {
+            sessionsByEvent.remove(eventId, sessions);
         }
     }
 
