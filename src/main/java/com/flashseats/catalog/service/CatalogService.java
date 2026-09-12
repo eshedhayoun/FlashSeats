@@ -67,11 +67,10 @@ public class CatalogService {
 
     // ---------------------------------------------------------------- browse
 
-    @Transactional(readOnly = true)
     public List<EventListItemResponse> listEvents() {
         Instant now = clock.instant();
-        return events.findByStatusOrderBySaleStartTimeAsc(EventStatus.PUBLISHED).stream()
-                .map(EventRow::of)
+        return metadata.selectableEvents().stream()
+                .filter(event -> event.status() == EventStatus.PUBLISHED)
                 .map(event -> new EventListItemResponse(
                         event.id(),
                         event.title(),
@@ -157,15 +156,42 @@ public class CatalogService {
         return SaleWindows.statusOf(metadata.event(eventId), clock.instant());
     }
 
-    @Transactional(readOnly = true)
+    /**
+     * Ids of events inside their sale window right now — what the promotion worker ticks over.
+     *
+     * <p><strong>Served from the metadata cache, and that is a correctness choice rather than a
+     * performance one.</strong> This was a query per tick per replica — trivial in cost and fatal in
+     * dependency: under pool pressure the promoter queued for a connection behind the very buyers it
+     * existed to admit, one wait measured at 16 seconds inside a one-second tick. Nobody promoted means
+     * the waiting room does not drain, which means the buyers keep polling (ADR-051).
+     *
+     * <p>The window is still compared against the live clock; only the rows are remembered.
+     */
     public List<Long> findOpenEventIds() {
-        return events.findOpenEventIds(clock.instant());
+        Instant now = clock.instant();
+        return metadata.selectableEvents().stream()
+                .filter(event -> event.status() == EventStatus.PUBLISHED)
+                .filter(event -> isInsideWindow(event, now))
+                .map(EventRow::id)
+                .toList();
     }
 
     /** Open <em>or paused</em> — what an operator is still answerable for. See the repository. */
-    @Transactional(readOnly = true)
     public List<Long> findManagedEventIds() {
-        return events.findManagedEventIds(clock.instant());
+        Instant now = clock.instant();
+        return metadata.selectableEvents().stream()
+                .filter(event -> isInsideWindow(event, now))
+                .map(EventRow::id)
+                .toList();
+    }
+
+    /**
+     * The window predicate both id lists share, matching the repository's to the boundary: sale start
+     * inclusive, sale end exclusive. Two implementations that rounded an edge differently would put an
+     * event in the drift gauge's set and not the promoter's.
+     */
+    private static boolean isInsideWindow(EventRow event, Instant now) {
+        return !now.isBefore(event.saleStartTime()) && now.isBefore(event.saleEndTime());
     }
 
     /**

@@ -138,6 +138,14 @@ concurrent sales the cluster was admitting `R × E × batchSize` per second into
 measured at 31.3 s checkout p99 and 202 connections pending. `queue:budget` is claimed first and the
 batch size is now the secondary cap (ADR-049).
 
+**The tick needs no database connection**, and that is load-bearing rather than tidy (ADR-051). It
+reads the open-event set, the event row and the tier list from `catalog`'s metadata cache and moves
+everything else in Redis. Before that, `findOpenEventIds()` was a pooled query once a second — so under
+pressure the promoter waited in the same queue as the buyers it existed to admit, one wait measured at
+**16 s inside a 1 s tick**. A tick that does not run promotes nobody, a waiting room that does not drain
+keeps polling, and the polling is what saturated the pool: the component bounding admission was inside
+the loop it was bounding.
+
 Three properties of the claim matter: it is **atomic** (one Lua script, so two replicas promoting two
 sales in the same second cannot both read the allowance as untouched), it is **against demand** (the
 worker asks for the number of sessions actually at the front, so a quiet sale leaves the rest of the

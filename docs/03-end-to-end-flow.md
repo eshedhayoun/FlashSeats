@@ -156,6 +156,12 @@ the gateway call), `confirm`, `receiptFor` — and a buyer's full session costs 
 including `POST /holds` and `GET /sale/state`. Every earlier listing said eight, collapsing the
 payment pair into one. ADR-049 budgets against that order of magnitude rather than against one.
 
+**The promoter itself needed a connection, which made the failure self-sustaining.**
+`findOpenEventIds()` ran once per tick against PostgreSQL, so at peak the promotion worker queued behind
+the buyers it existed to admit — a logged wait of **16 s inside a 1 s tick**. Nobody promoted means the
+waiting room does not drain, which means everyone keeps polling, which is what saturated the pool. The
+open-event set is now served from the metadata cache and the tick touches only Redis (ADR-051).
+
 **And polling, not admission, was the larger half.** Every window check, event summary and tier
 summary was its own transaction, on paths that scale with *waiting* buyers rather than admitted ones.
 Those are now served from an in-process cache with a 1 s TTL (ADR-051), which is also the bound on

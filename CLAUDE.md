@@ -214,6 +214,7 @@ Do not reintroduce these — each cost a real defect in the first pass:
 | **Returning `OrderReceiptResponse` from an admin endpoint** | `receiptToken` is a 90-day bearer capability. An operator view would mint a durable impersonation link into terminal history and any log that records bodies (ADR-048) |
 | **Guarding a password with `equals("admin")`** | It refuses one known string. `{noop}hunter2` passes and is stored in plaintext. Refuse the *encoding*, not the value (ADR-048) |
 | **Editing a migration that has already been applied — even only its comments** | Flyway checksums the whole file. `V9`'s comment block was rewritten after the measurement that motivated it, and **every container then refused to start**: `Validate failed … checksum mismatch for version 9`, with identical DDL. A migration is immutable the moment any database has run it; new understanding goes in a new migration, an ADR, or the code that issues the query. Recovery is `UPDATE flyway_schema_history SET checksum = <resolved> WHERE version = …` (what `flyway repair` does) on every database that applied the old one |
+| **A scheduled job that protects a resource by reading that resource** | `PromotionWorker` bounds admission to protect the connection pool — and called `findOpenEventIds()`, a pooled read, every tick. Under pressure it queued behind the buyers it existed to admit: **16 s inside a 1 s tick**, so nobody was promoted, the queue did not drain, and the polling that saturated the pool continued. Ask not what a read costs but what stops working when it is slow (ADR-051) |
 | **A cache with no TTL** | Eviction reaches one replica. A paused sale then answers `OPEN` on the other two *for the life of the process*, and the window status gates join, holds and checkout — so pause stops nothing. The TTL **is** the cross-replica invalidation (ADR-051) |
 | **Loading a cache entry inside `computeIfAbsent`** | The loader runs inside `ConcurrentHashMap`'s per-bin `synchronized`, so a blocking JDBC read there **pins carrier threads** — the Redisson failure (ADR-022), reached through a cache. Load outside the map: `get`, load, `put` (ADR-051) |
 | **A recovery path that reads a cache** | `prewarm` and the rebuild write inventory counters *derived from the tier list*. A stale list leaves a tier with no counter — a `503` for the rest of the sale — or rebuilds the wrong set. Probably-right input, definitely-wrong counter (ADR-051) |
@@ -294,7 +295,14 @@ docker/seed/seed-concurrent.sh                   # seeds 9001..9005, pre-warms a
 docker/scripts/pool-pressure.sh 300 &            # THE instrument. Without it the drill
                                                  # proves nothing: the failure is latency,
                                                  # not an error, so k6 sees a green run
-docker compose --profile loadtest run --rm -e VUS=2000 k6-concurrent
+docker compose --profile loadtest run --rm -e VUS=300 k6-concurrent
+docker/scripts/sold-count.sh                     # what was ACTUALLY sold, and the invariant per tier.
+                                                 # k6's count is what the CLIENT saw: it abandons
+                                                 # in-flight requests at 60s and at ramp-down, and
+                                                 # under-reported by 8x in the worst Pass 8 run.
+                                                 # VUS=300, not 2000, on a ten-core host -- at 2000 the
+                                                 # load generator competes with the three JVMs and the
+                                                 # same build sells 6% instead of 76%
 ```
 
 Changing the compose network's `ipam` recreates the network, and containers created against the

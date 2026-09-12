@@ -1848,6 +1848,37 @@ and it does not care that the caller is a test.
 - `flashseats.catalog.metadata.cache{result=hit|miss}` is how the effect is read, and
   `metadata-cache-enabled` is the switch that makes the concurrent-sales drill a comparison rather
   than an assertion.
-- `findOpenEventIds`, `findManagedEventIds` and `listEvents` are deliberately **not** cached. They
+- ~~`findOpenEventIds`, `findManagedEventIds` and `listEvents` are deliberately **not** cached. They
   are clock-parameterised, and their cost is `O(replicas × ticks)` — about four queries per second
-  cluster-wide — not `O(requests)`.
+  cluster-wide — not `O(requests)`.~~ **Reversed the same day; see below.**
+
+**Amendment — the three list reads are cached after all, for availability rather than cost.**
+
+The reasoning above is arithmetically right and asks the wrong question. Cost was never the issue: it
+really is about four queries a second cluster-wide. **Dependency** was the issue.
+
+`PromotionWorker.tick()` called `findOpenEventIds()` every second, which needed a pooled connection.
+So under pool pressure the promoter queued *behind the buyers it existed to admit*. The Pass 8 drill
+caught it: `Unable to acquire JDBC Connection … timed out after 16068ms (total=30, active=30, idle=0,
+waiting=63)` — **a sixteen-second wait inside a one-second tick.** A tick that does not run promotes
+nobody; a waiting room that does not drain keeps polling; polling is what saturated the pool. That is a
+feedback loop, and the component whose whole job is to bound admission was inside it.
+
+It explains the measurement that made no sense otherwise: the allowance permitted ~2,300 admissions
+over the run and only **352** happened. The allowance was never the binding limit — the tick was
+running roughly once every six to thirteen seconds instead of once a second.
+
+**So one query — every `PUBLISHED` or `PAUSED` event, any window — is cached under the event TTL, and
+all three list reads filter it in memory.** The promotion tick now needs **no** pooled connection on its
+hot path: the event row, the tier list and the open-event set are all cache reads, and the only thing
+left is Redis. Two details keep it honest:
+
+- **The window is still derived.** Only the rows are remembered; `saleStartTime <= now < saleEndTime`
+  is evaluated against the live clock, exactly as rule 1 requires of the status.
+- **`StockEpoch` keeps querying PostgreSQL directly.** It is the Redis-restart guard, it runs every
+  five seconds, and a fault detector should not read a cache. Its query is now also the surviving SQL
+  definition of the window that the in-memory filter must match.
+
+**The general rule this is an instance of:** a cache is usually an optimisation, but in front of a
+control-plane read it is an *availability* decision. Ask not only what the read costs, but what else
+stops working when it is slow.
