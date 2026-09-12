@@ -32,6 +32,7 @@ correctness-neutral: delete the whole module and the sale is still correct, just
 | `queue:passes:{e}` | ZSET, score = expiry | sale end + retention | live passes, so a count is one `ZCOUNT` |
 | `queue:admit:{e}:{sid}` | String, signed | 600 s | proof of admission into the sale (ADR-020) |
 | `queue:admissions:{e}` | ZSET, score = expiry | sale end + retention | live admissions, same trick |
+| `queue:admission-budget` | ZSET, member = `{eventId}:{sessionId}`, score = expiry | rolling | cluster-wide pending-pass and active-admission budget (ADR-049) |
 | `queue:exhausted:{e}` | String | sale end + retention | derived sold-out marker; deleted the moment stock returns (ADR-035) |
 | `queue:promote:{e}` | String | 900 ms | makes the promotion tick a singleton across replicas (ADR-032) |
 | `queue:events:{e}` | Pub/Sub | — | promotion fan-out to whichever replica holds the SSE connection (ADR-007) |
@@ -118,10 +119,11 @@ for sid in ZRANGE queue:waiting:{e} 0 admittable-1:
   lives in another's heap. Without fan-out, roughly two-thirds of promotions vanish on three
   replicas — and the bug is invisible on one (ADR-007).
 
-**The batch size is per sale, and that is now a known limit rather than the whole story.**
+**The batch size is per sale, and the global budget is the first limit.**
 ADR-028 derives `batchSize ≤ hikariMax × 1.5` for a single sale. This worker loops every open event
-and applies the cap per event, so at `E` concurrent sales the cluster admits `R × E × batchSize` per
-second into one shared pool. **ADR-049 adds a global budget. Specified, not built.**
+and applies the cap per event. ADR-049 additionally reserves from `queue:admission-budget` before
+issuing a pass, so concurrent sales draw from one cluster-wide occupancy limit. Expired reservations
+are removed atomically by the reserve script; completed admissions release their member explicitly.
 
 ---
 

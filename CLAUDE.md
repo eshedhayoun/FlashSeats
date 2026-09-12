@@ -235,6 +235,7 @@ rather than one module's corner:
 | `queue:passes:{e}` | `queue` | ZSET | sale end | live passes, scored by expiry, so a count is one `ZCOUNT` |
 | `queue:admit:{e}:{sid}` | `queue` | String | 600 s | proof of admission into the sale (ADR-020) |
 | `queue:admissions:{e}` | `queue` | ZSET | sale end | live admissions, same trick as `passes` |
+| `queue:admission-budget` | `queue` | ZSET | rolling | cluster-wide pending-pass and active-admission budget (ADR-049) |
 | `queue:events:{e}` | `queue` | Pub/Sub | — | promotion fan-out to whichever replica holds the SSE connection (ADR-007) |
 | `queue:promote:{e}` | `queue` | String | 900 ms | makes the promotion tick a singleton across replicas (ADR-032) |
 | `queue:exhausted:{e}` | `queue` | String | sale end | derived sold-out marker; deleted the moment stock returns (ADR-035) |

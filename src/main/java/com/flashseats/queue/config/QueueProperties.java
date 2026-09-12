@@ -28,6 +28,11 @@ public class QueueProperties {
     private int promotionBatchSize = 45;
 
     /**
+     * Maximum pending passes and active admissions across every open sale and replica (ADR-049).
+     */
+    private int globalAdmissionBudget = 90;
+
+    /**
      * Hold-to-order conversion is well under 100%, so admitting exactly {@code remainingStock}
      * buyers leaves the sale under-filled. Every real waiting room tunes this (ADR-020).
      */
@@ -86,6 +91,16 @@ public class QueueProperties {
 
     public void setPromotionBatchSize(int promotionBatchSize) {
         this.promotionBatchSize = promotionBatchSize;
+    }
+
+    /** Returns the cluster-wide admission budget. */
+    public int getGlobalAdmissionBudget() {
+        return globalAdmissionBudget;
+    }
+
+    /** Sets the cluster-wide admission budget. */
+    public void setGlobalAdmissionBudget(int globalAdmissionBudget) {
+        this.globalAdmissionBudget = globalAdmissionBudget;
     }
 
     public double getOversubscribeFactor() {
