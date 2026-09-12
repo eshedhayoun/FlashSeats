@@ -34,10 +34,13 @@ correctness-neutral: delete the whole module and the sale is still correct, just
 | `queue:admissions:{e}` | ZSET, score = expiry | sale end + retention | live admissions, same trick |
 | `queue:exhausted:{e}` | String | sale end + retention | derived sold-out marker; deleted the moment stock returns (ADR-035) |
 | `queue:promote:{e}` | String | 900 ms | makes the promotion tick a singleton across replicas (ADR-032) |
+| `queue:budget` | String | one promotion interval | **the cluster-wide admission allowance** (ADR-049) |
 | `queue:events:{e}` | Pub/Sub | — | promotion fan-out to whichever replica holds the SSE connection (ADR-007) |
 
 Every per-buyer key is **scoped by event**. One visitor in two concurrent sales would otherwise have
-one promotion overwrite the other (ADR-036).
+one promotion overwrite the other (ADR-036). **`queue:budget` is the deliberate exception**, and it is
+the opposite kind of thing: one counter every sale and every replica is meant to share, so scoping it
+by event would reproduce the per-sale accounting ADR-049 exists to replace.
 
 Nothing here is authoritative. Lose the lot and the sale is still correct — buyers lose their place
 in line, which is a fairness failure, not a correctness one.
@@ -63,6 +66,7 @@ in line, which is a fairness failure, not a correctness one.
 | :--- | :--- | :--- |
 | `position-update` | `{position, aheadOfYou, estWaitSeconds}` | 2 s, **clamped monotonic non-increasing** |
 | `queue-promoted` | `{passToken, expiresInSeconds}` | on promotion |
+| `tier-availability` | `{tiers:[{tierId, level}]}` | on change — each replica diffs the buckets it last sent (ADR-027) |
 | `sale-exhausted` | `{soldOutAt}` | when derived — **not terminal**, it un-derives if stock returns |
 | `sale-closed` | `{closedAt}` | terminal; the stream is completed |
 | *(comment)* | `:hb` | 15 s |
@@ -84,7 +88,8 @@ The pass is never exposed. It is minted, published and spent entirely inside thi
 
 ## 4. The promotion tick
 
-Once per second, per open event, on whichever replica wins `queue:promote:{e}`:
+Once per second, over the open events **in shuffled order**, on whichever replica wins
+`queue:promote:{e}`:
 
 ```
 remaining = CatalogFacade.getRemainingForEvent(e)
@@ -98,14 +103,23 @@ elif no live passes and no live admissions: SETNX queue:exhausted:{e}; publish o
 admittable = min(promotionBatchSize,
                  floor(remaining × oversubscribeFactor) − pendingPasses − liveAdmissions)
 
-for sid in ZRANGE queue:waiting:{e} 0 admittable-1:
+front    = ZRANGE queue:waiting:{e} 0 admittable-1
+granted  = claim(queue:budget, want = |front|)       ← cluster-wide, atomic, fails closed
+if granted == 0: promote nobody
+
+for sid in first `granted` of front:
     mint pass → SET queue:pass:{e}:{sid} EX 120
     ZADD queue:passes:{e} <expiry> <sid>
     ZREM queue:waiting:{e} <sid>
     PUBLISH queue:events:{e}
 ```
 
-**Four things here are load-bearing:**
+**Five things here are load-bearing:**
+
+- **The shuffle.** Every replica reads the open events in the same ascending order and claims the
+  shared allowance as it reaches each sale, so a fixed order lets the lowest event id take the whole
+  allowance every tick while the others stand still. The per-event batch size cannot save it: once the
+  cluster allowance is smaller than `promotionBatchSize`, that cap never binds (ADR-049).
 
 - **`ZADD NX` on join.** A plain `ZADD` *updates* the score, so a refresh or a double-click sends the
   buyer to the back of the line (ADR-008).
@@ -118,11 +132,17 @@ for sid in ZRANGE queue:waiting:{e} 0 admittable-1:
   lives in another's heap. Without fan-out, roughly two-thirds of promotions vanish on three
   replicas — and the bug is invisible on one (ADR-007).
 
-**The batch size is per sale, and that is now a known limit rather than the whole story.**
-ADR-028 derives `batchSize ≤ hikariMax × 1.5` for a single sale. This worker loops every open event
-and applies the cap per event, so at `E` concurrent sales the cluster admits `R × E × batchSize` per
-second into one shared pool. ADR-049 adds a Redis-backed global budget before each promotion tick,
-with the per-sale batch size kept as a secondary cap.
+**The batch size is per sale; the allowance is per cluster.** ADR-028 derives
+`batchSize ≤ hikariMax × 1.5` for a single sale, and this worker loops every open event, so at `E`
+concurrent sales the cluster was admitting `R × E × batchSize` per second into one shared pool —
+measured at 31.3 s checkout p99 and 202 connections pending. `queue:budget` is claimed first and the
+batch size is now the secondary cap (ADR-049).
+
+Three properties of the claim matter: it is **atomic** (one Lua script, so two replicas promoting two
+sales in the same second cannot both read the allowance as untouched), it is **against demand** (the
+worker asks for the number of sessions actually at the front, so a quiet sale leaves the rest of the
+allowance for sales that can use it), and it **fails closed** (no allowance, no promotion this tick —
+a late promotion costs patience, an unbudgeted one costs the pool).
 
 ---
 
@@ -130,9 +150,20 @@ with the per-sale batch size kept as a secondary cap.
 
 `flashseats.queue.ordering` supports two ZSET score strategies:
 
-- **`FIFO`** — default; score is the join timestamp in epoch milliseconds.
-- **`RANDOM`** — score is a deterministic per-event draw from `eventId:sessionId`, so refreshes keep
-  the same position while the sale avoids pure latency ordering.
+- **`FIFO`** — default; score is the join timestamp in epoch milliseconds. Explicable, and decided by
+  whoever has the lowest RTT.
+- **`RANDOM`** — score is a **fresh uniform draw taken at join**, bounded at 2^53 so it stays exactly
+  representable as the double a ZSET score is.
+
+**The draw must not be derived from the session id.** Deriving it — `SHA-256(eventId:sessionId)` was
+the first implementation — is idempotent *and precomputable*: ids cost nothing to mint, so a bot
+generates candidates offline until it holds a low draw and walks to the front deterministically, which
+is the automation advantage ADR-024 exists to remove. `ZADD NX` already makes a fresh draw idempotent,
+because a rejoin's draw is discarded and the place the first join won is the place that stands.
+
+Open under `RANDOM`, and the reason it is not the default: a later joiner can draw lower, so a waiting
+buyer's true position can worsen while `position-update` is clamped monotonic non-increasing (ADR-007).
+Closing the draw at a fixed moment is the answer and is not built.
 
 ---
 
@@ -140,9 +171,8 @@ with the per-sale batch size kept as a secondary cap.
 
 | Gap | Detail |
 | :--- | :--- |
-| **The broadcaster does 4 Redis round trips per connection per tick** | Admission `GET`, pass `GET`, exhausted `EXISTS`, waiting `ZRANK`. The `EXISTS` is per *event* and is being re-read per *session*. Measured fine at 2,000 VUs on **one** sale; the cost is linear in connections × events, so that evidence does not carry to `E = 5` |
-| **The emitter registry is a flat map** | Keyed on session id alone, so "sessions watching event X" streams the whole map. `O(connections × events)` per tick |
-| **No queue metrics** | Depth, promotion rate and active SSE connections are all specified in `03` §7 and none is built |
+| **The broadcaster does 3 Redis round trips per connection per tick** | Admission `GET`, pass `GET`, waiting `ZRANK`. The exhausted `EXISTS` is now hoisted to once per event per sweep; the remaining three are per session and not yet pipelined. Measured fine at 2,000 VUs on **one** sale; the cost is linear in connections × events, so `docker/scripts/sse-cadence.sh` at `E = 5` is what decides whether it needs the pipeline |
+| **No per-event queue metrics** | `flashseats.queue.admissions` and `flashseats.queue.admission.budget.denied` are built and **untagged**, so they answer "is the cluster promoting?" and not "is *this* sale promoting?". Depth and active SSE connections are still unbuilt (`03` §7) |
 | **No `Last-Event-ID` replay** | The stream sends live state and heartbeats, but does not replay missed frames after a disconnect |
 
 ---

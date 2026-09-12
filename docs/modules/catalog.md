@@ -27,6 +27,14 @@ bottom of the graph and everything above it reads through `CatalogFacade`.
 | `catalog:stock:{e}:{t}` | String | **none** | **the live inventory count** |
 | `catalog:vouch:{e}` | String | none | which Redis incarnation last derived this event's counters (ADR-046) |
 
+**It also holds an in-process cache of both tables** (ADR-051) — event rows for 1 s, tier lists for
+60 s. That is derived state, not owned state: dropping all of it costs a re-read and nothing else. Two
+rules make it safe to have at all. The **TTL is the cross-replica invalidation**, because eviction
+reaches only the replica that served the operator's call — so the event TTL is the bound on how long a
+paused sale can still answer `OPEN` elsewhere, and it is a correctness setting rather than a
+performance one. And the **window status is never cached**: it is derived from the row and the clock on
+every call, since it flips with no write to evict on.
+
 **There is no copy of the count in PostgreSQL.** `tier_inventory` was dropped in `V7` — it had
 become a write-only copy of a number that had moved to Redis, with a stale column named `remaining`
 that read exactly like the truth (ADR-046). The database holds the **ledger** the count can be
@@ -121,7 +129,7 @@ conclusion independently, and a rebuild performed on one releases the event on a
 
 | Gap | Detail |
 | :--- | :--- |
-| **No cross-replica cache invalidation event** | `events` and `ticket_tiers` are cached inside each `CatalogService` instance and evicted locally on pause/resume. A later `TierAvailabilityChangedEvent` or metadata-change event is still needed before richer operator edits exist across replicas |
+| **No cross-replica cache invalidation** | Pause takes effect on the replica that served it immediately and on the others when their cached row expires — 1 s (ADR-051). A Redis invalidation channel would buy a fraction of a second on a control measured in seconds, and adds a failure mode a TTL does not have. It becomes worth building when an operator can *edit* an event, which is the gap below |
 | **No create-event endpoint** | Events are seeded by a `dev`-profile seeder or by `docker/seed/seed.sql`. An operator cannot create a sale through the API |
 
 ---
@@ -134,3 +142,10 @@ conclusion independently, and a rebuild performed on one releases the event on a
 - Let a Lua return code escape the repository.
 - Publish a count, or clamp `COUNTER_UNAVAILABLE` into a number.
 - Move stock inside a SQL transaction.
+- **Cache a window status, or anything else derived from the clock.** Cache the row; derive on read.
+- **Cache a miss.** Rows are inserted out of band by the seed scripts, so a remembered "no such event"
+  outlives the insert that created it.
+- **Serve pre-warm or a rebuild from the cache.** Both write counters derived from the tier list: a
+  probably-right list produces a definitely-wrong counter (ADR-004, ADR-046).
+- **Load a cache entry inside `computeIfAbsent`.** Blocking JDBC inside `ConcurrentHashMap`'s per-bin
+  monitor pins carrier threads (ADR-022, ADR-051).

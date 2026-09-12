@@ -6,7 +6,7 @@
 > A **Review passes** log at the bottom records every pass over this MVP. Append to it; do not
 > rewrite history.
 
-**Status:** built and running, two review passes, one cleanup pass and **Stage 1** deep. 68 tests
+**Status:** built and running, two review passes, one cleanup pass and **Stage 1** deep. 108 tests
 green, including the concurrency, journey, checkout-recovery, queue-lifecycle, availability,
 problem-response, pre-warm, rebuild and Redis-restart suites.
 
@@ -206,8 +206,9 @@ Findings that cost real time and would cost it again.
 ## 8. Verification
 
 ```bash
-./mvnw test        # 68 tests: unit, modularity, concurrency, journey, recovery, queue lifecycle,
-                   #            pre-warm, stock rebuild, drift, Redis-restart guard
+./mvnw test        # 108 tests: unit, modularity, concurrency, journey, recovery, queue lifecycle,
+                   #             pre-warm, stock rebuild, drift, Redis-restart guard, the metadata
+                   #             cache's five rules, and the cluster admission allowance
 ```
 
 | Test | What it proves |
@@ -223,6 +224,8 @@ Findings that cost real time and would cost it again.
 | `NotificationClaimIT` | The claim blocks a duplicate, is terminal once sent, and releases a dead letter for replay. |
 | `CatalogAvailabilityIT` | A tier with no counter reads `UNKNOWN`, a drained tier still reads `SOLD_OUT`, and the two are never the same answer (ADR-040). |
 | `ProblemResponseIT` | Spring's own binding failures are `400` with a registry `code`, not `500` (ADR-041). |
+| `CatalogMetadataCacheTest` | Every rule that makes a cache in front of `events` safe: an entry stops being served when its TTL passes, a miss is never remembered, a committed change evicts, and the recovery path reads PostgreSQL (ADR-051). |
+| `GlobalPromotionBudgetIT` | One allowance is shared by every caller whichever sale it is promoting, a single claim cannot exceed a window, the window refills, and **no open sale is starved by another** (ADR-049). |
 | `ModularityTests` | The boundary graph is acyclic and unbroken. |
 | `SignedTokenTest`, `AvailabilityBucketsTest`, `TicketPdfRendererTest` | The signing primitive — including domain separation — the availability rule including its fault value, and a ticket that renders whatever alphabet the title is in. |
 
@@ -242,13 +245,18 @@ Honest list. None of these is hidden behind a passing test.
 - ~~**No load test run.**~~ **Run** (Stage 3), at 300 and 2,000 VUs: exactly 500 sold, zero
   overbooking, zero inventory 503s, zero rate-limited requests, `stock.drift` `0.0` on every
   replica. The harness needed four fixes first, all in ADR-047.
-- **The 10,000-VU run has not happened**, and the limit is the host, not the system. Three JVMs take
-  ~6 GB of the 7.65 GB this machine gives Docker, and k6 costs ~0.33 MB per VU. 2,000 VUs is the
-  ceiling here; at that load Redis sat at 10.5k ops/s and 29 % CPU, so the system was not the thing
-  running out. Needs a host with ~32 GB.
-- **Checkout p99 is 682 ms at 300 VUs and 4.7 s at 2,000**, against a 200 ms exit criterion. Also a
-  host artefact — the load generator and three JVMs were competing for ten cores — but it is
-  unmeasured on real hardware, so it stays an open number rather than a passing one.
+- **The 10,000-VU run has not happened, and the limit is the host's CPU — not its memory.** This was
+  recorded as a memory ceiling ("three JVMs take ~6 GB of the 7.65 GB this machine gives Docker"); the
+  Pass 8 runs measured it and that is **wrong**. Each replica uses **~350 MiB**, about 1 GB between
+  them, while each sits at **114–142 % of one core** with a 2,000-VU k6 competing for the same ten.
+  2,000 VUs is still the ceiling here, but a 32 GB machine would not move it — a machine where the
+  load generator is not sharing cores with the system under test would.
+- **Checkout p99 is 682 ms at 300 VUs and 4.7 s at 2,000 on one sale**, against a 200 ms exit
+  criterion, and **~30 s at five sales in every Pass 8 configuration — including the one whose pool sat
+  idle.** That last detail is what identifies it: with `connections_pending` at `0.0` throughout, p99 of
+  34 s is not the pool and not admission, it is ten cores shared between three JVMs and 2,000 VUs. It
+  stays an open number rather than a passing one, and it is the measurement that most needs a second
+  machine.
 - **`stock.drift` will read non-zero transiently under live traffic.** Redis and PostgreSQL are not
   read in one snapshot, so a hold created between the two reads shows as a momentary gap. The two
   SQL sums *are* one snapshot, which removes the only drift the measurement can manufacture by
@@ -310,22 +318,29 @@ Honest list. None of these is hidden behind a passing test.
 
 **Found in Pass 7 (the plan-correctness pass), with current status:**
 
-- **Admission was budgeted per sale against a shared pool.** The promotion worker loops every open
-  event and applies `promotion-batch-size` per event; the tick lock is per event too. At the newly
-  adopted `E = 3..10` envelope the cluster admits up to `R × E × 45` per second into `R × 30`
-  connections. ADR-049 is now built as a global Redis budget, with the per-event batch kept as a
-  secondary cap; the next concurrent-sales run must verify the new pool-saturation numbers.
-- **A checkout costs eight sequential database transactions**, and a full buyer session about
-  fifteen — not the ~1 that ADR-028's "capacity to serve" model implicitly prices. Both limits were
-  therefore generous even at `E = 1`.
-- **Catalog metadata is cached.** `events` and `ticket_tiers` now sit behind `CatalogService`, with
-  eviction on pause/resume and live stock still read from Redis on every availability path. The next
-  concurrent-sales run should show whether this removed the expected PostgreSQL pressure.
-- **The write-only `queue:hb:{sid}` key is gone.** Pass 7 found that it was written by every join and
-  every status poll and read by nobody; the current queue code drains by promotion, never by evicting
-  abandoned sessions. The remaining work is to keep the docs and key map aligned with that reality.
-- **`sumActiveQuantityForTier` now has a supporting index.** `V9__hold_active_tier_index.sql` adds
-  `idx_holds_active_tier` on active holds, with `quantity` included for the drift gauge's aggregate.
+- ~~**Admission was budgeted per sale against a shared pool.**~~ **Fixed** (ADR-049): `queue:budget`
+  is one cluster-wide allowance, claimed atomically before anyone is promoted, with the per-event
+  batch kept as the secondary cap. The open-event order is shuffled every tick — the first
+  implementation iterated ascending on every replica, so the lowest event id took the whole allowance
+  and the other four sales stood still.
+- **A checkout costs *nine* sequential database transactions** — `PaymentTransactionStore`'s two
+  `REQUIRES_NEW` transactions bracket the gateway call, and every listing collapsed them into "the
+  payment store" — and a full buyer session about fifteen, not the ~1 that ADR-028's "capacity to
+  serve" model implicitly prices. Both limits were therefore generous even at `E = 1`.
+- ~~**Nothing is cached.**~~ **Fixed** (ADR-051): event rows for 1 s, tier lists for 60 s, behind
+  `CatalogService`, with live stock still read from Redis on every availability path. The first
+  implementation had **no TTL**, which made an operator's pause a no-op on every replica but the one
+  that served it; loaded inside `computeIfAbsent`, which pins carrier threads; and was read by
+  pre-warm and the rebuild, which must read the authority. All four rules are now tests.
+- ~~**The write-only `queue:hb:{sid}` key.**~~ **Gone**, along with the `touchHeartbeat` call on the
+  hottest polling path. The queue drains by promotion and never by evicting abandoned sessions.
+- ~~**`sumActiveQuantityForTier` has no supporting index.**~~ **Fixed:** `V9` adds
+  `idx_holds_active_tier` on active holds, `INCLUDE (quantity)` so the gauge's sum is an Index Only
+  Scan. **But `V9`'s comment block was then rewritten in place**, and Flyway checksums the whole file:
+  every replica refused to start with `Validate failed: checksum mismatch for version 9` against DDL
+  that had not changed by one character. It cost the first two attempts at the Pass 8 drill and a
+  hand-repair of `flyway_schema_history`. A migration is immutable once any database has run it;
+  `CLAUDE.md` now carries the rule.
 - **The drift gauge is computed three times to produce one global answer.** Read-only and therefore
   "safe on every replica", but all three replicas compute the same number.
 - ~~**There is no way to retrieve a ticket.**~~ **Fixed:** `GET /orders/{orderNumber}/ticket.pdf`
@@ -367,6 +382,7 @@ below is a real exposure someone should close before real money moves through it
 | :-- | :--- | :--- |
 | S5 | **Session identity is free to mint** | The rate limiter's primary bucket is per-`fsid`, and anyone can discard a cookie to get a fresh one. The IP bucket is therefore the only real backstop — and it is deliberately loose (300 burst) so NAT populations are not blocked. This is the ADR-011 trade working as designed, but it means **the session bucket does not constrain a determined attacker at all.** Pass 1 made the IP bucket real (S11); it is now genuinely the backstop ADR-011 assumed it was. reCAPTCHA on join is still the missing compensating control, and it is still deferred. |
 | S6 | **CSRF is disabled while a cookie authorises actions** | Justified for a stateless JSON API, and the checkout path is safe because it needs a `holdToken` an attacker cannot guess. But a cross-site `POST /queue/join` or `POST /holds` *would* succeed against a logged-in visitor and could be used to consume their one-hold-per-event allowance. Low impact, non-zero. Require a custom header, or re-enable CSRF for the mutating endpoints. |
+| S13 | **`POST /api/v1/session/reset` discards the caller's identity, unauthenticated** | A demo affordance: it expires the `fsid` cookie so the bundled page can start over as a new visitor. Under S6 a cross-site `POST` therefore throws a visitor out of a queue they were waiting in and cuts them off from their own live hold — no disclosure, but during a flash sale it is the most damaging thing on the CSRF list, because the session *is* the queue position. Scope it to the demo profile, or make it a `DELETE` that requires a header a form post cannot send. |
 | S7 | **Order numbers are sequential** | `TK-00001`, `TK-00002`. Access is properly controlled, so this is not an IDOR — but it publishes exact sales volume to anyone who buys one ticket. It was worse in combination with S4: a deterministic receipt token over a countable order number meant one leaked secret enumerated every buyer's email. The nonce closes that; the volume leak remains. Prefer a non-sequential public reference. |
 | S8 | **SSE connections are uncapped per session** | The stream is exempt from per-request rate accounting (correctly — it is one connection, not a request stream), and nothing limits how many a single session opens. A few thousand connections would exhaust the container. Cap concurrent streams per session and per IP. |
 | S9 | **PII is stored and logged in clear** | `orders.user_email` and `notification_logs.recipient_email` are plaintext, with no retention policy and no deletion path. Whatever regime applies, decide it explicitly. |
@@ -537,13 +553,18 @@ dependency order. Everything in the first two groups is cheap; the third is the 
 
 **Then concurrent sales** (**ADR-049**), in leverage order, each measurable on its own:
 
-1. Cache `events` + `ticket_tiers` behind `CatalogService`, evicted on pause/resume. Built; verify
-   its effect in the next concurrent-sales run.
-2. The global admission budget, with the per-event batch as a secondary cap. Built; the next
-   concurrent-sales run should verify the pool-saturation numbers.
-3. Hoist the exhausted `EXISTS` out of the per-session loop. Built; pipeline the rest of the sweep.
-4. A per-event index in the emitter registry. Built.
-5. Make the drift gauge a singleton under the promotion tick's Redis-lock pattern.
+1. ~~Cache `events` + `ticket_tiers` behind `CatalogService`.~~ **Built and measured** (ADR-051) —
+   TTL-bounded, rows not entities, misses not cached, recovery paths uncached, evicted after commit.
+2. ~~The global admission budget, with the per-event batch as a secondary cap.~~ **Built and
+   measured** (ADR-049) — one atomic claim on `queue:budget`, shuffled event order, fails closed.
+3. Hoist the exhausted `EXISTS` out of the per-session loop. **Built.** Pipelining the remaining three
+   per-session reads is still open, and `sse-cadence.sh` at `E = 5` is what decides whether it is
+   needed.
+4. ~~A per-event index in the emitter registry.~~ **Built**, with one race fixed afterwards: the index
+   removed an event's session set once empty while a concurrent connect had already added itself to
+   that instance, leaving a live connection in a set nothing iterates.
+5. Make the drift gauge a singleton under the promotion tick's Redis-lock pattern. **Still open** —
+   all three replicas compute the same global number every 60 s.
 
 **The drill — built in Pass 7, and NOT YET RUN.** Every other instrument here runs one event, and so
 did every measurement the capacity numbers rest on.
@@ -613,6 +634,57 @@ No oversell at any point, on any tier.
 a much stronger reason to bound admission globally than p99 was.
 
 **Two bugs the drill found on its way to the answer**, both in §9.
+
+### Stage 4c, measured — the Pass 8 runs (12 Sept 2026, evening)
+
+Both fixes are property-driven, so the drill was run three times on one host, back to back, to separate
+them. 5 sales × 500 seats, 2,000 VUs, three replicas.
+
+| Run | Configuration | peak `connections_pending` | tickets sold | checkout p99 |
+| :--- | :--- | :--- | :--- | :--- |
+| *(Pass 7)* | no cache, per-event cap only | **202** | 370 / 2,500 | 31.3 s |
+| **A** | cache **off**, allowance unlimited | **1,004** | 0 / 2,500 | 30.5 s |
+| **B** | cache **on**, allowance unlimited | **330** | 0 / 2,500 | — (no checkout completed) |
+| **C** | cache **on**, allowance 11/tick | **0.0 at every sample** | 21 / 2,500 | 34.6 s |
+
+**The pool stopped being the bottleneck, which is exactly what ADR-049 claimed.** `pool-pressure.sh`
+exits 2 on sustained pressure: it did for A and B and **not** for C, where `pending` read `0.0` on all
+three replicas at every five-second sample while `active` moved between 2 and 24 of 30. The allowance
+was doing the work the numbers say it was — `flashseats.queue.admissions` totalled **352** across the
+cluster against **3,358** on `admission.budget.denied`.
+
+**Caching alone is worth about 3×** on pool pressure (1,004 → 330) and nothing else on its own: B still
+saturated, just later. That is the ordering the plan assumed, confirmed rather than argued.
+
+**And the throughput number is not a result.** Nought, nought and 21 tickets sold, with p99 around 30 s
+in every configuration including the one with an idle pool, is not a statement about the system — it is
+a statement about the host. `docker stats` during the runs: each replica **114–142 % of one core** and
+**~350 MiB of 7.65 GiB**. Ten cores, shared between three JVMs and a 2,000-VU k6 inside the same Docker
+VM.
+
+**That corrects a claim this section has carried since Stage 3.** "Three JVMs take ~6 GB of the 7.65 GB
+this machine gives Docker" is wrong — measured, they take about **1 GB between them**. The 10,000-VU
+run and the real p99 are blocked on **CPU**, not memory, so a bigger machine is the wrong fix and a
+machine where the load generator is not competing for the same ten cores is the right one. Freeing host
+RAM changes nothing; Docker's allocation is a fixed VM size either way.
+
+**What the runs do and do not license.** They license the two fixes: pool saturation under concurrent
+sales is gone, and the cache is what makes that affordable. They do not license the committed allowance
+of **11 per tick** as a *tuned* number — at 11/s a 2,500-seat sale needs over three minutes of admission
+alone, and the run holds for three and a half. On a host that can actually serve checkout, C is the run
+to repeat with the allowance raised until `pending` starts to lift; that crossing point is the number
+ADR-049 wants, and it has not been found yet.
+
+**One transient drift sample of 1.0** appeared in run C and read `0.0` on all three replicas afterwards
+with no rebuild — the documented behaviour for a gauge that does not read Redis and PostgreSQL in one
+snapshot. `pool-pressure.sh` exits 1 on any drift by design, which is the right default for an
+instrument and means run C's exit code reports the transient rather than the pool.
+
+**A second-order observation worth keeping.** With admissions living 600 s (ADR-020), a cluster too slow
+to convert them starves its own queue: the inventory bound is
+`floor(remaining × 1.5) − pendingPasses − liveAdmissions`, so buyers admitted and then unable to finish
+hold the allowance down for ten minutes. It is correct behaviour and it is why C admitted 352 rather
+than the ~2,300 its allowance permitted.
 
 ### Stage 5 — Buyer accounts, as an overlay (ADR-044)
 
@@ -1054,3 +1126,55 @@ drift is what produced most of the defects in passes 1 and 2; it is now a checkl
 habit.
 
 - **Result:** 88 `@Test` methods, untouched — nothing in this pass changes `src/`.
+
+### Pass 8 — concurrent sales, built and measured
+
+- **Scope:** review the `preview-next-stage` merge, fix what it got wrong, and run the ADR-049 drill.
+  **108 `@Test` methods, green** — and green with the metadata cache *enabled*, which the merge had
+  switched off for the whole suite.
+
+**The merge built the right two things and shipped both with defects.** It landed the catalog cache
+(Stage 4c item 1), the global admission budget (item 2), the exhausted-`EXISTS` hoist (item 3), the
+per-event emitter index (item 4), plus `RANDOM` ordering (ADR-024) and `tier-availability`
+(ADR-027) from Stage 4b. Nine findings, in severity order:
+
+| Found | Fix |
+| :--- | :--- |
+| **The cache had no TTL.** Eviction reaches only the replica that served the operator's call, so a paused sale answered `OPEN` on the other two **for the life of the process** — and the window status gates queue join, hold creation and checkout. ADR-043 calls the operator surface a correctness dependency; this made pause a cluster-wide no-op | TTL-bounded, and the TTL is *documented as* the cross-replica invalidation (**ADR-051**) |
+| **It loaded inside `computeIfAbsent`** — blocking JDBC inside `ConcurrentHashMap`'s per-bin monitor, which **pins carrier threads** on JDK 21. On a cold key at sale open, thousands of virtual threads converge on one bin. A cache added to stop a stall introduced a worse one | `get` → load outside the map → `put`. Invariant 11, reached through a cache rather than a lock library |
+| **Pre-warm and the rebuild read it.** Both write inventory counters derived from the tier list: a stale list leaves a tier with no counter (`503` for the rest of the sale, ADR-004) or rebuilds the wrong set (ADR-046) | `tiersUncached` for both. Recovery paths read the authority |
+| **Eviction ran inside the transaction**, so a concurrent reader could re-cache the row the commit was about to change | Published as an event, evicted `AFTER_COMMIT` |
+| **It cached mutable JPA entities** and handed one instance to every request thread | Immutable `EventRow` / `TierRow` records; the window status stays derived on every call |
+| **It was disabled in `application-test.properties`**, so all 102 tests ran with the feature off and the configuration production uses had no coverage at all | Enabled; `SaleFixture.reset()` clears every `DerivedStateCache`, a one-method interface in `shared` — because a fixture importing `catalog.service` is the boundary violation `ApplicationModules.verify()` catches, and it does not care that the caller is a test |
+| **The budget starved every sale but one.** 90 ÷ 8 = 11 per tick cluster-wide against a per-event cap of 45, so the cap never binds — and every replica iterates `findOpenEventIds()` ascending, so the lowest event id took the whole allowance every tick. At `E = 5`: one sale draining, four frozen | The open-event order is **shuffled** per tick. ADR-049's "secondary cap prevents starvation" is only true while the cap is smaller than the allowance |
+| **The claim was three non-atomic round trips** keyed on each replica's own clock (`epochMillis / interval`), so skew opened two adjacent windows each with a full allowance | One Lua script on `queue:budget`, window anchored by the key's own TTL. No clock agreement required |
+| **`RANDOM` ordering scored by `SHA-256(eventId:sessionId)`** — idempotent, and **precomputable**. Session ids cost nothing to mint, so a bot grinds candidates offline until it holds a low draw: the automation advantage ADR-024 exists to remove, restored by the mechanism meant to remove it | A fresh uniform draw; `ZADD NX` already makes a rejoin idempotent by discarding the second one |
+
+Also: a lost-registration race in the new emitter index (the per-event set was removed once empty while
+a concurrent connect had already joined that instance, leaving a live connection in a set nothing
+iterates), and a per-sweep `WARN` per unreadable counter — a log flood during the incident the message
+describes.
+
+**And the documents the merge did not touch.** It added a Redis key, three tunables, a resurrected
+tunable, an SSE frame and a public endpoint while changing `00-architecture-decisions.md`,
+`03-end-to-end-flow.md`, `FE_SPEC.md` and `CLAUDE.md` not at all. `03` §6 still said queue ordering was
+"not configurable" next to a live `flashseats.queue.ordering`; `CLAUDE.md`'s key table — the one rule
+that names itself explicitly — had no `queue:budget`. ADR-051 is new; 049, 024 and 027 are amended to
+*built*, each with the departures the build produced.
+
+**A correction that matters because a limit rests on it.** A checkout is **nine** sequential
+transactions, not eight. Every listing collapsed `PaymentTransactionStore`'s two `REQUIRES_NEW`
+transactions — the pair bracketing the gateway call, which its own javadoc describes as two — into "the
+payment store", and ADR-049's budget is derived from that count.
+
+**The drill cost two false starts, both worth recording.** `V9`'s comment block had been rewritten in
+place after it had already been applied, and Flyway checksums the whole file: every replica refused to
+start on `Validate failed: checksum mismatch for version 9` with DDL identical to the character. Then
+the drill script sourced `.env` — which expands the bcrypt digest's `$$` to the shell's PID and exports
+it over Compose's own value, re-creating ADR-048's corrupted-hash defect from the other side, and every
+admin call answered `401`. The repo's own scripts `grep | cut` a single value for exactly this reason.
+
+- **Result:** the two highest-leverage concurrent-sales fixes are built, tested and measured;
+  `hikaricp_connections_pending` reaches `0.0` where it reached 1,004 without them. The allowance
+  itself is not yet tuned, and the host cannot answer the latency question — both are stated as open in
+  §9 and §11 rather than implied by a green run.

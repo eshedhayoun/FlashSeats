@@ -1,8 +1,10 @@
 package com.flashseats.flashseats.support;
 
+import com.flashseats.shared.cache.DerivedStateCache;
 import java.sql.Timestamp;
 import java.time.Instant;
 import java.time.temporal.ChronoUnit;
+import java.util.List;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.stereotype.Component;
@@ -22,10 +24,13 @@ public class SaleFixture {
 
     private final JdbcTemplate jdbc;
     private final StringRedisTemplate redis;
+    private final List<DerivedStateCache> caches;
 
-    public SaleFixture(JdbcTemplate jdbc, StringRedisTemplate redis) {
+    public SaleFixture(
+            JdbcTemplate jdbc, StringRedisTemplate redis, List<DerivedStateCache> caches) {
         this.jdbc = jdbc;
         this.redis = redis;
+        this.caches = caches;
     }
 
     /**
@@ -36,6 +41,11 @@ public class SaleFixture {
      * flush, one class's {@code queue:waiting:1} is the next class's starting queue, and a
      * {@code payment:inflight:} key outlives the hold it belonged to. Nothing about that fails
      * immediately; it surfaces later as a test that passes alone and fails in a suite.
+     *
+     * <p>There is now a third half, for the same reason: in-process caches of rows this truncates
+     * (ADR-051). An id that comes back as {@code 1} finds a cached snapshot of the previous test's
+     * sale, so every {@link DerivedStateCache} is cleared here — which is what lets the suite run
+     * with the metadata cache <em>enabled</em>, exercising the configuration production uses.
      */
     public void reset() {
         jdbc.execute(
@@ -46,6 +56,7 @@ public class SaleFixture {
                 """);
 
         redis.getConnectionFactory().getConnection().serverCommands().flushDb();
+        caches.forEach(DerivedStateCache::invalidateAll);
     }
 
     /** An event whose sale is open right now. */
@@ -80,12 +91,13 @@ public class SaleFixture {
                 eventId, name, priceCents, capacity);
 
         setStockCounter(eventId, tierId, capacity);
+        caches.forEach(DerivedStateCache::invalidateAll);
         return tierId;
     }
 
     /** A tier deliberately left with no counter, to exercise the unreadable-inventory fault path. */
     public long tierWithoutCounter(long eventId, String name, long priceCents, int capacity) {
-        return jdbc.queryForObject(
+        Long tierId = jdbc.queryForObject(
                 """
                 INSERT INTO ticket_tiers
                        (event_id, tier_name, price_cents, currency, total_capacity, max_per_order,
@@ -95,6 +107,9 @@ public class SaleFixture {
                 """,
                 Long.class,
                 eventId, name, priceCents, capacity);
+
+        caches.forEach(DerivedStateCache::invalidateAll);
+        return tierId;
     }
 
     /**
@@ -106,12 +121,18 @@ public class SaleFixture {
         setStockCounter(eventIdOf(tierId), tierId, 0);
     }
 
-    /** Ends a sale's window now, as the clock would. */
+    /**
+     * Ends a sale's window now, as the clock would.
+     *
+     * <p>Written with SQL, so no application write evicts the cached snapshot of the row — the
+     * caches are cleared here explicitly rather than waiting out a TTL a test is faster than.
+     */
     public void closeSale(long eventId) {
         jdbc.update(
                 "UPDATE events SET sale_end_time = ? WHERE id = ?",
                 Timestamp.from(Instant.now().minusSeconds(1)),
                 eventId);
+        caches.forEach(DerivedStateCache::invalidateAll);
     }
 
     /**

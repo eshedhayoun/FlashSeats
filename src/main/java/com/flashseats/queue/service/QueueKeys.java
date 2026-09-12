@@ -74,12 +74,19 @@ public final class QueueKeys {
     }
 
     /**
-     * Cluster-wide admission budget spent by every promotion worker in the same wall-clock bucket
-     * (ADR-049). Event-scoped locks prevent duplicate promotion for one sale; this key prevents five
-     * healthy sales from each admitting a full per-event batch into the same database pool.
+     * The cluster-wide admission allowance for one promotion interval (ADR-049).
+     *
+     * <p><strong>The one key here that is deliberately not scoped by event.</strong> ADR-036's rule
+     * is about per-buyer keys — one visitor in two concurrent sales must not have one sale's state
+     * overwrite the other's — and this is the opposite kind of thing: a single counter that every
+     * sale and every replica is meant to share. Scoping it by event would reproduce exactly the
+     * per-sale accounting ADR-049 exists to replace.
+     *
+     * <p>It carries no window suffix either: its own TTL is the window, so the replicas need not
+     * agree about the time.
      */
-    public static String globalPromotionBudget(long tickBucket) {
-        return "queue:promote:budget:" + tickBucket;
+    public static String admissionBudget() {
+        return "queue:budget";
     }
 
     /**

@@ -132,21 +132,34 @@ every limit below is stated at the scale it actually has to hold at.
   N   waiting buyers per sale           up to 10,000
   R   application replicas              3
       DB connections                    30 per replica  ->  90 cluster-wide
-      admission budget                  GLOBAL across E, then capped per sale   (ADR-049)
+      admission budget                  GLOBAL across E, then capped per sale   (ADR-049, built)
+                                        90 / 8 = 11 per tick, cluster-wide
 ```
 
 **`E` is the number that was missing.** ADR-028 derives the promotion batch size from the connection
 pool — `batchSize <= hikariMax x 1.5` — and that derivation is sound for exactly one sale. The
 promotion worker loops every open event and applies the cap *per event*, and the tick lock
 `queue:promote:{e}` is per event too, so replicas promote different sales in the same second. At
-`E = 5` the cluster admits up to `3 x 5 x 45 = 675` buyers per second into 90 connections. Nothing
+`E = 5` the cluster admitted up to `3 x 5 x 45 = 675` buyers per second into 90 connections. Nothing
 errors — under virtual threads the requests simply queue on HikariCP while p99 collapses, which is
 the exact failure ADR-028 exists to prevent.
 
-**A checkout is not one connection, either.** It is eight sequential transactions
-(`findConfirmedReceiptFor`, `getActiveHold`, `getTierSummary`, `findOrCreate`, `grantGrace`, the
-payment store, `confirm`, `receiptFor`), and a buyer's full session costs roughly fifteen including
-`POST /holds` and `GET /sale/state`. ADR-049 budgets against that figure rather than against one.
+**That is now bounded by `queue:budget`**, one cluster-wide allowance claimed per event per tick
+before anyone is promoted, with the per-event batch left as a secondary cap. The open-event order is
+shuffled each tick, because every replica otherwise reads the same ascending list and the lowest
+event id takes the whole allowance.
+
+**A checkout is not one connection, either.** It is **nine** sequential transactions —
+`findConfirmedReceiptFor`, `getActiveHold`, `getTierSummary`, `findOrCreate`, `grantGrace`, **two**
+in the payment store (`recordInitiated` and `recordOutcome`, the `REQUIRES_NEW` pair that brackets
+the gateway call), `confirm`, `receiptFor` — and a buyer's full session costs roughly fifteen
+including `POST /holds` and `GET /sale/state`. Every earlier listing said eight, collapsing the
+payment pair into one. ADR-049 budgets against that order of magnitude rather than against one.
+
+**And polling, not admission, was the larger half.** Every window check, event summary and tier
+summary was its own transaction, on paths that scale with *waiting* buyers rather than admitted ones.
+Those are now served from an in-process cache with a 1 s TTL (ADR-051), which is also the bound on
+how long a paused sale can still answer `OPEN` on a replica that did not handle the pause.
 
 Alarm on `hikaricp_connections_pending`, per replica — it is scraped per instance, and through a
 load balancer you get one replica at random.
@@ -785,7 +798,7 @@ Every value below is a named property in `application.properties`.
 | Queue pass TTL | 120 s, single-use | 006 / 020 |
 | **Admission session TTL** | **600 s**, reusable | **020** |
 | **Admission oversubscribe factor** | **1.5** | **020** |
-| Queue ordering | FIFO by arrival millisecond — **not configurable** | 024 |
+| Queue ordering | `flashseats.queue.ordering` — **FIFO** (default) or **RANDOM**, a fresh draw at join | **024** |
 | Hold TTL | 300 s | 006 |
 | Payment grace | +120 s once, ceiling 420 s | 006 |
 | Checkout after `sale_end_time` | 15 min | 016 |
@@ -794,7 +807,10 @@ Every value below is a named property in `application.properties`.
 | Charge attempts per hold | 3 | 014 |
 | `payment:inflight` TTL | 90 s | 014 |
 | Promotion tick | 1 s, singleton per event by Redis `SET NX PX` | 008 / **032** |
-| Promotion batch size | **≤ `hikariMax × 1.5`** (45) — **per sale; see ADR-049 for the global budget** | **028 / 049** |
+| Promotion batch size | **≤ `hikariMax × 1.5`** (45) — **per sale**, the secondary cap | **028 / 049** |
+| **Cluster admission allowance** | **11 per tick** = `global-admission-connection-budget` 90 ÷ `database-connections-per-buyer` 8. Claimed from `queue:budget` before the cap above applies | **049** |
+| Open-event order per tick | **shuffled** — a fixed order starves every sale but the lowest id | **049** |
+| Catalog metadata cache | event **1 s** · tier **60 s** · 1,000 events, `metadata-cache-enabled` | **051** |
 | SSE position push / heartbeat | 2 s / 15 s | 007 |
 | SSE stream timeout | 1 h, matched by nginx `proxy_read_timeout` | 007 |
 | Hold sweeper interval | 10 s | 019 |
@@ -826,6 +842,9 @@ There is no reCAPTCHA and no bot-score threshold. Rate limiting is session-first
 | `flashseats.stock.drift` | gauge, **per replica** | **sustained** non-zero (ADR-046) |
 | `flashseats.stock.counters.missing` | gauge, **per replica** | any non-zero — each one answers holds with a `503` |
 | `hikaricp_connections_pending` | Boot built-in, per replica | sustained non-zero — the ADR-028 / ADR-049 alarm |
+| `flashseats.queue.admissions` | counter, per replica | zero while a waiting room has depth — a stuck promoter (ADR-049) |
+| `flashseats.queue.admission.budget.denied` | counter, per replica | **sustained** non-zero with `pending` at zero means the allowance is throttling a pool that could serve more (ADR-049) |
+| `flashseats.catalog.metadata.cache{result}` | counter, per replica | a miss rate near 1 means the cache is off or the TTL is below the poll interval (ADR-051) |
 
 `stock.drift` compares the live Redis counter against the §4.1 ledger formula every 60 s. It is the
 system's canary. **Alarm on sustained non-zero, not on one sample:** Redis and PostgreSQL are not
@@ -841,7 +860,7 @@ genuine gap rather than a deleted idea:
 | Metric | Why it is wanted |
 | :--- | :--- |
 | `flashseats.queue.depth{event}` | the only direct read on whether a waiting room is draining |
-| `flashseats.queue.promotion.rate{event}` | zero while depth > 0 is a stuck promoter, which is invisible today |
+| ~~`flashseats.queue.promotion.rate{event}`~~ | **built** as `flashseats.queue.admissions`, above — untagged, so it answers "is the cluster promoting?" and not "is *this* sale promoting?" |
 | `flashseats.hold.conversion.ratio{event}` | the number the 1.5× oversubscribe factor is a guess at |
 | `flashseats.outbox.lag.seconds` | a stalled relay currently shows up as buyers not receiving tickets |
 | `flashseats.dlq.depth{queue}` | the DLQ is listable by an operator but nothing alarms on it |
@@ -853,6 +872,6 @@ existing ones), `POST /api/v1/admin/events/{id}/rebuild-stock`,
 `GET /api/v1/admin/orders/{orderNumber}`. All are HTTP Basic, `ROLE_ADMIN`, and **curl-only — there
 is no operator UI.**
 
-Controls: `POST /api/v1/admin/events/{id}/pause` (stop promotions and new holds, honour existing
-ones) and `POST /api/v1/admin/events/{id}/rebuild-stock`. There was previously no way to stop a
-sale that was going wrong.
+**Pause takes effect cluster-wide within `metadata-event-ttl-ms`** (1 s), not instantly: the replica
+that handles the call evicts its cached event row immediately, and the others stop selling when their
+entry expires (ADR-051).
