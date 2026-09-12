@@ -75,7 +75,7 @@ stream.
 | :--- | :--- | :--- | :--- | :--- |
 | 1 | **`bot`** | Signed `fsid` cookie, Redis-backed rate limits, reCAPTCHA v3, IP reputation | `ip_rules`, `bot_audit_logs` | `bot:rate:session:*`, `bot:rate:ip:*`, `bot:block:*`, `bot:captcha:*` |
 | 2 | **`catalog`** | Event metadata, tiers, sale windows, **inventory ownership** | `events`, `ticket_tiers` | `catalog:stock:{e}:{t}` **(the live count)**, `catalog:vouch:{e}` |
-| 3 | **`queue`** | Virtual waiting room, SSE streaming, HMAC passes, **admission sessions**, admission control | *none* | `queue:waiting:*` (ZSET), `queue:pass:*`, `queue:passes:*`, `queue:admit:*`, `queue:admissions:*`, `queue:hb:*`, `queue:events:*` (pub/sub) |
+| 3 | **`queue`** | Virtual waiting room, SSE streaming, HMAC passes, **admission sessions**, admission control | *none* | `queue:waiting:*` (ZSET), `queue:pass:*`, `queue:passes:*`, `queue:admit:*`, `queue:admissions:*`, `queue:events:*` (pub/sub) |
 | 4 | **`hold`** | Time-bound reservations, atomic stock movement, settle-once restoration | `ticket_holds` **(authority)** | *none* — `hold:{token}` is deferred to Phase 4 (ADR-046) |
 | 5 | **`payment`** | Stripe integration, idempotency, webhook reconciliation, refunds | `payment_transactions` | `payment:inflight:{holdToken}` |
 | 6 | **`order`** | ACID ledger, checkout orchestration, transactional outbox, **stock rebuild + drift gauge** (ADR-046) | `orders`, `order_items`, `outbox_events` | *none* |
