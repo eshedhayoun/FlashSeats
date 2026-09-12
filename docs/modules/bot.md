@@ -1,213 +1,86 @@
 # Module: `bot`
 
-> **Status:** aligned to [`../00-architecture-decisions.md`](../00-architecture-decisions.md) and
-> [`../05-global-standards.md`](../05-global-standards.md). Structural rewrite to the §10 template
-> is pending.
+> **Describes what is built.** No class names — see [`../../CLAUDE.md`](../../CLAUDE.md), "Updating
+> the docs is part of the change".
 
-**Package:** `com.flashseats.bot` · **Phase:** 3 · **Storage:** PostgreSQL + Redis
+**Package:** `com.flashseats.bot` · **Storage:** Redis · **Depends on:** `shared`
 
 ---
 
 ## 1. Scope
 
-The first thing every request touches. Issues the signed session identity the rest of the system
-treats as authoritative, enforces rate limits, verifies reCAPTCHA v3, and blocks abusive sources
-before any business logic runs.
+Two servlet filters that run before everything else: one issues and verifies the signed `fsid`
+cookie, one enforces rate limits.
 
-**Forbidden:** reading inventory, issuing queue passes, handling payments, writing orders.
-
-**Design stance:** be aggressive against *sessions*, conservative against *IPs*. During a flash sale
-the whole point is that thousands of legitimate humans arrive at once — many of them behind the same
-carrier-grade NAT.
+`filter` is a **package inside this module**, not a module of its own.
 
 ---
 
-## 2. Package layout
+## 2. What it owns
 
-```
-com.flashseats.bot
-├── config       BotFilterConfig, Bucket4jRedisConfig, SessionCookieProperties
-├── controller   BotAdminController
-├── filter       SessionIdentityFilter, RateLimitFilter      ← ordered before everything
-├── service      RateLimitService, RecaptchaService, IpReputationService
-├── facade       BotFacade + impl
-├── repository   IpRuleRepository, BotAuditLogRepository
-├── model        IpRule, BotAuditLog, RuleType, ActionTaken
-├── dto          CaptchaVerdictDTO, IpRuleDTO, ThreatSummaryDTO
-└── event        BotAttackDetectedEvent
-```
-
----
-
-## 3. Session identity (ADR-010)
-
-```
-Cookie: fsid=<base64url(uuid)>.<base64url(HMAC-SHA256(uuid, serverSecret))>
-        HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=86400
-```
-
-`SessionIdentityFilter` issues one on first contact, verifies the HMAC in constant time on every
-subsequent request, and exposes the verified id as request attribute `fsid`. A tampered cookie is
-replaced with a fresh identity, not accepted.
-
-**Nothing anywhere in the system may read `userSessionId` from a request body, query parameter, or
-custom header.** v1 accepted it in `CreateHoldRequestDTO` and as `X-Session-ID` on hold cancellation
-— queue position, pass validity and hold ownership all key off that value, so it was trivially
-spoofable.
-
----
-
-## 4. Rate limiting (ADR-011)
-
-| Bucket | Key | Capacity | Refill | Role |
-| :--- | :--- | :--- | :--- | :--- |
-| Session | `bot:rate:session:{sid}` | 20 | 10/s | **primary** |
-| IP | `bot:rate:ip:{ip}` | 300 | 150/s | coarse flood backstop |
-| Join | `bot:join:{sid}:{eventId}` | 1 per event | — | one join per session |
-| Join/IP | `bot:join:ip:{ip}` | 5 | 5/min | scripted-join brake |
-
-Bucket4j is **Redis-backed in every phase** (`bucket4j_jdk17-lettuce`).
-
-> v1 contradicted itself: `01-system-architecture.md` described Bucket4j as in-memory while the bot
-> spec described Redis-backed counters. In-memory buckets across three replicas silently triple
-> every configured limit.
-
-**`GET /api/v1/queue/stream` is exempt from per-request accounting** — it is counted once at connect.
-It is one long-lived connection, not a request stream, and charging it per frame would evict exactly
-the users who are patiently waiting.
-
-**Why the IP bucket is loose.** v1 specified 20 requests/second per IP. A corporate office or a
-mobile carrier NAT presents thousands of legitimate buyers behind one address; that limit would have
-blocked them all during precisely the traffic spike this system exists to serve. The IP bucket now
-catches only genuine floods; the session bucket does the real work.
-
-Escalation: repeated breaches → `bot:block:{ip}` EX 3600 → `403`, and an `ip_rules` row plus
-`BotAttackDetectedEvent`.
-
----
-
-## 5. reCAPTCHA v3
-
-Applied to **`POST /api/v1/queue/join` only** — the one endpoint where a bot gains a durable
-advantage.
-
-```
-verdict = GET bot:captcha:{sid}
-if absent:
-    score = Google siteverify(token, action)      -- 3s timeout
-    SET bot:captcha:{sid} <score> EX 1800
-reject if score < 0.5   → 403 BOT_VERIFICATION_FAILED
-```
-
-Caching per session for 30 minutes matters: at 10,000 concurrent joins, verifying every request
-would mean 10,000 outbound HTTPS calls to Google on the hottest path in the system.
-
-**Fail-open on timeout or outage** — log, alarm, and rely on the rate limits. This is a deliberate
-availability-over-security trade: blocking every buyer because a third party is slow is a worse
-outcome than admitting some bots for the duration. Stated explicitly so it is a decision, not an
-accident.
-
----
-
-## 6. Schema
-
-```sql
-CREATE TABLE ip_rules (
-    id         BIGSERIAL PRIMARY KEY,
-    ip_address VARCHAR(45)  NOT NULL,
-    rule_type  VARCHAR(32)  NOT NULL,     -- BLACKLIST | WHITELIST
-    reason     VARCHAR(255) NOT NULL,
-    expires_at TIMESTAMPTZ,               -- null ⇒ permanent
-    created_by VARCHAR(64),
-    created_at TIMESTAMPTZ  NOT NULL DEFAULT now(),
-    UNIQUE (ip_address, rule_type)
-);
-
-CREATE TABLE bot_audit_logs (
-    id              BIGSERIAL PRIMARY KEY,
-    ip_address      VARCHAR(45)  NOT NULL,
-    user_session_id VARCHAR(255),
-    endpoint_path   VARCHAR(255) NOT NULL,
-    recaptcha_score REAL,
-    action_taken    VARCHAR(32)  NOT NULL,   -- ALLOWED | THROTTLED | BLOCKED
-    created_at      TIMESTAMPTZ  NOT NULL DEFAULT now()
-);
-CREATE INDEX idx_bot_audit_ip_time ON bot_audit_logs(ip_address, created_at DESC);
-```
-
-Audit rows are written **asynchronously** and only for `THROTTLED` / `BLOCKED` outcomes. Writing a
-row per allowed request would put a PostgreSQL insert on the hot path of every request in the
-system — v1 implied exactly that.
-
-Retention: 30 days.
-
----
-
-## 7. Interfaces
-
-| Method | Path | Access |
-| :--- | :--- | :--- |
-| `GET` | `/api/v1/admin/bot/audit-logs` | admin |
-| `POST` | `/api/v1/admin/bot/ip-rules` | admin |
-| `DELETE` | `/api/v1/admin/bot/ip-rules/{ipAddress}` | admin |
-
-`POST /api/v1/bot/verify-captcha` is **removed** — captcha verification happens inline during
-`queue/join`, not as a separate client-callable step that could be replayed.
-
-```java
-public interface BotFacade {
-    boolean          authorize(String ip, String sessionId, String endpointPath);
-    CaptchaVerdictDTO verifyCaptcha(String recaptchaToken, String action, String sessionId);
-    void             banIp(String ip, int durationSeconds, String reason);
-}
-
-public record CaptchaVerdictDTO(boolean passed, double score, boolean degraded) {}
-```
-
-`degraded = true` signals that Google was unreachable and the request was allowed through by the
-fail-open policy — it feeds the alarm, so the trade-off is visible rather than silent.
-
-**Event:** `BotAttackDetectedEvent(ip, sessionId, violationType, requestCount, at)`.
-
----
-
-## 8. Edge cases
-
-| Case | Handling |
+| Redis key | Purpose |
 | :--- | :--- |
-| Legitimate spike behind one NAT | Session buckets absorb it; the loose IP bucket does not fire |
-| Distributed bot across many IPs | Session buckets + captcha + join limits |
-| Bot rotating session cookies | Each new `fsid` needs a fresh captcha pass; IP join limit applies |
-| Forged `fsid` | HMAC fails → fresh identity issued, request continues |
-| Google reCAPTCHA down | Fail open, `degraded = true`, alarm |
-| Redis down | Fail open on rate limits, alarm. Availability over enforcement |
-| SSE connection held open | Counted once at connect |
-| Admin whitelist | Checked before every bucket (load tests, monitoring) |
+| `bot:rate:session:{sid}` | the primary rate-limit bucket |
+| `bot:rate:ip:{address}` | a coarse flood backstop |
 
-**Exceptions:** `RateLimitExceeded` 429 (with `Retry-After`) · `BotVerificationFailed` 403 ·
-`IpAddressBlacklisted` 403.
+**Redis-backed, not in-memory.** In-memory buckets across three replicas silently triple every
+configured limit — the kind of bug that only appears under the exact load the limits exist to control.
 
 ---
 
-## 9. Changes from v1
+## 3. The two asymmetries that matter
 
-1. Signed `fsid` cookie specified; body/header session ids banned system-wide (ADR-010).
-2. Session bucket promoted to primary; IP bucket loosened from 20/s to 300 burst (ADR-011).
-3. Bucket4j confirmed **Redis-backed**, resolving the in-memory contradiction (ADR-011).
-4. SSE exempt from per-request accounting.
-5. reCAPTCHA narrowed to `queue/join`, cached per session for 30 min.
-6. Fail-open documented as a deliberate, alarmed trade rather than an implicit fallback.
-7. Public `verify-captcha` endpoint removed.
-8. Audit logging made async and restricted to non-`ALLOWED` outcomes.
-9. `UNIQUE(ip_address, rule_type)` and a retention policy added.
+**Session-first, IP as a backstop** (ADR-011). This is the opposite of the obvious design, and
+deliberately so: a flash sale means thousands of legitimate humans arriving at once, many sharing one
+carrier-grade NAT or corporate gateway. A tight per-IP limit blocks all of them during precisely the
+spike this system exists to serve.
 
-### Added in the 2nd pass
+| Bucket | Capacity | Refill |
+| :--- | :--- | :--- |
+| session | 20 | 10/s |
+| IP | 300 | 150/s |
 
-10. Filters registered via `FilterRegistrationBean` ahead of the Spring Security chain, and stated
-    to live **outside** the Modulith module graph for HTTP concerns — they are servlet filters, not
-    facade callers.
-11. Admin endpoints now enforced by Spring Security (`ROLE_ADMIN`). "Admin Only" was previously an
-    assertion with no mechanism behind it.
-12. reCAPTCHA fail-open surfaced as `degraded=true` and wired to an alarm, so the trade is visible
-    rather than silent (std §6).
-13. Error codes aligned to the canonical registry (std §2).
+**`X-Forwarded-For` is believed only from a trusted peer** (ADR-039), and the trusted set is
+**empty by default — trust nobody**. Trusting the header unconditionally let any caller mint unlimited
+fresh IP buckets by rotating a fake address; combined with a session bucket that is free to mint by
+dropping a cookie, that left the backstop enforcing nothing at all.
+
+The set holds **exact addresses, not CIDR ranges**. It is the handful of load balancers in front of
+the app, and a range parser is a place for a subtle bug to hide in the one check that decides whether
+the rate limiter can be bypassed.
+
+The SSE stream is **counted once, not exempted**. An exempt endpoint is an unmetered one.
+
+---
+
+## 4. Identity
+
+The `fsid` cookie is `base64url(uuid).base64url(HMAC-SHA256(uuid, secret))`, `HttpOnly`, with the
+signed bytes length-prefixed by a `kind` so a token of one kind never verifies as another (ADR-039).
+
+**A tampered cookie is replaced, not rejected.** The visitor did nothing an error page would help
+with, and a hard failure on a corrupted cookie strands them with no way to recover.
+
+Identity reaches a handler **only** as a resolved `SessionId` parameter. There is no path by which a
+body field, query parameter or custom header can supply one (ADR-010).
+
+---
+
+## 5. Known gaps
+
+| Gap | Detail |
+| :--- | :--- |
+| **Identity lives in the wrong module** | The cookie filter, the `"fsid"` kind and the signing secret (`flashseats.bot.session-secret`) are here; the `SessionId` type and its argument resolver are in `shared`. The two are coupled by a request-attribute string constant. `bot` is abuse defence and identity is not abuse defence — **the filter should move to `shared/identity` and the property to `flashseats.session.*`**. Specified, not built |
+| **No challenge provider** | reCAPTCHA appears in older diagrams. **It does not exist**, no property for it exists, and no code references it. Stage 2 |
+| **No IP reputation, no audit log, no admin surface** | Earlier drafts specified all three. None is built, and none is required by anything |
+| **No rate-limit metrics** | Rejections are invisible except in logs |
+
+---
+
+## 6. What it must never do
+
+- Let identity arrive from a request body, query parameter or custom header.
+- Trust `X-Forwarded-For` from an untrusted peer.
+- Exempt an endpoint from counting.
+- Tighten the IP bucket into the primary control.
+- Hold in-memory buckets.
