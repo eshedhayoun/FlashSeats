@@ -620,10 +620,16 @@ scalpers a free feed.
 
 ## ADR-028 — Promotion batch size is derived from the connection pool
 
+> **Amended by [ADR-049](#adr-049--admission-is-budgeted-globally-not-per-sale--amends-adr-028).**
+> Everything below is correct **for a single sale**, which was the unstated assumption. The promotion
+> worker applies this cap *per event* while the pool is shared, so at `E` concurrent sales the
+> cluster admits `R × E × batchSize` per second. ADR-049 adds the global budget; this remains the
+> per-sale cap.
+
 **Decision.**
 
 ```
-promotionBatchSize ≤ hikariMaxPoolSize × 1.5
+promotionBatchSize ≤ hikariMaxPoolSize × 1.5        # per sale
 ```
 
 With the default pool of 30, batch size caps at **45 per tick** — not the previously documented 50.
@@ -1576,3 +1582,116 @@ live sale. `AdminProblemResponses` writes RFC 7807 at the entry point and keeps 
 - `flashseats.outbox.transport` is bound on `OutboxProperties` instead of being a loose string.
 - Still deferred: the refund-notice template and a consumer for
   `notification.order-refunded.queue`, which still grows without bound.
+
+---
+
+## ADR-049 — Admission is budgeted globally, not per sale — *amends ADR-028*
+
+**Context.** ADR-028 caps the promotion batch at `hikariMaxPoolSize × 1.5` — 45 with the default
+pool of 30 — and calls that "capacity to serve". The derivation is correct and the assumption it
+rests on was never written down: **one sale at a time.**
+
+`PromotionWorker.tick()` iterates `catalog.findOpenEventIds()` and calls `promote(eventId)` for each,
+applying the batch cap **per event**. The tick lock `queue:promote:{e}` is per event as well, so
+nothing stops three replicas from promoting three different sales in the same second. The connection
+pool they all admit into is shared.
+
+```
+admissions/second  =  R replicas × E events × batchSize
+                   =  3 × 5 × 45   =  675
+connections        =  R × 30       =   90
+```
+
+With the operating envelope now at **E = 3..10 concurrent sales** (03-end-to-end-flow §2), ADR-028's
+limit is exceeded by roughly the factor `E` — and exceeded silently, because under virtual threads
+nothing errors. Requests queue on HikariCP and p99 collapses, which is precisely the failure ADR-028
+was written to prevent, arriving through the door it left open.
+
+**A second error in the same arithmetic.** ADR-028 implicitly prices an admitted buyer at about one
+connection. A checkout is **eight sequential transactions** — `findConfirmedReceiptFor`,
+`getActiveHold`, `getTierSummary`, `findOrCreate`, `grantGrace`, the payment store, `confirm`,
+`receiptFor` — and a full session costs roughly fifteen including `POST /holds` and
+`GET /sale/{id}/state`. The per-event cap was already generous for E = 1.
+
+**Decision.**
+
+1. **A cluster-wide admission budget, spent per tick, shared across every open sale.** It lives in
+   Redis so all replicas draw on one pool, and it is the *first* limit applied.
+2. **The per-event batch size stays** as a secondary cap, so one hot sale cannot consume the whole
+   budget and starve the others.
+3. **The budget is derived from the true per-buyer connection cost**, not from one connection per
+   buyer. Both numbers are properties, and both carry the derivation in a comment — the same
+   discipline ADR-028 established.
+4. **ADR-028's formula is not deleted**; it is re-scoped. It remains the correct per-sale cap and is
+   now explicitly labelled as such.
+
+**Why a global budget rather than a smaller per-event one.** Dividing the batch by `E` would be
+simpler and is wrong in both directions: with one open sale it throttles the system to a tenth of
+what it can serve, and `E` changes whenever an operator publishes an event. A budget that is spent
+tracks actual demand — a quiet sale returns what it does not use, in the same tick.
+
+**Why not just enlarge the pool.** The pool is sized against PostgreSQL's `max_connections` (200 in
+compose) and against what one PostgreSQL instance actually serves well. Admitting more buyers than
+the database can serve moves the queue from the waiting room — where it is visible, ordered, fair and
+has a position indicator — into HikariCP, where it is none of those things. The waiting room is the
+correct place to hold people, and that is the whole thesis of the system.
+
+**Consequences.**
+
+- `flashseats.queue.promotion-batch-size` keeps its meaning and its ADR-028 comment, gaining a
+  pointer here.
+- One new Redis key, owned by `queue`, event-independent, and therefore the first key in the system
+  that is deliberately *not* scoped by event — the ADR-036 rule is about per-buyer keys, and this is
+  a cluster-wide counter.
+- `hikaricp_connections_pending` stays the alarm, and now has a drill: five sales at once
+  (`docs/06-mvp-overview.md` §8).
+- The existing single-sale load results remain valid for what they measured. They simply do not
+  generalise, and §9 says so.
+
+---
+
+## ADR-050 — A ticket is retrievable, not only deliverable
+
+**Context.** The PDF ticket is rendered inside `OrderConfirmedConsumer` and handed straight to the
+mail dispatcher. `GET /orders/{orderNumber}` returns `OrderReceiptResponse` — JSON. **There is no
+endpoint anywhere that returns the ticket.**
+
+The buyer's email address is collected once, in the checkout body, and never verified. A typo
+therefore means:
+
+- the ticket is delivered to a stranger, or bounces;
+- the buyer holds a valid receipt and a 90-day `receiptToken` and still has no way to obtain the
+  thing they paid for;
+- and the operator resend path (`POST /admin/notifications/resend/{orderNumber}`) replays the **same
+  outbox payload**, so it re-sends to the same wrong address.
+
+Every layer of this system is built so a failure has a recovery path. This one has none, and it ends
+with a paying buyer holding nothing.
+
+**Decision.** `GET /api/v1/orders/{orderNumber}/ticket.pdf`, authorised **exactly like the receipt
+read it sits beside**: a matching `fsid` session cookie **or** a valid `receiptToken`. The order
+number alone authorises nothing (ADR-010). No new authorisation concept is introduced.
+
+**Placement, which is the only hard part.** `TicketPdfRenderer` lives in `notification`, and
+`order → notification` is currently outbox-only with **no facade edge at all**. Adding one would
+make `notification` the first module reachable both synchronously and asynchronously, for a page
+render.
+
+**`TicketPdfRenderer` moves to `shared`.** It is a pure function from a payload to bytes — no
+repository, no facade, no state — which is precisely what the shared kernel is for (standards §8).
+Both `order` and `notification` then render from one implementation, no new edge appears, and the
+guarantee that a resent ticket is byte-identical to the original becomes structural rather than
+coincidental.
+
+The alternative — serving the endpoint from `notification`, keyed on the notification log row — was
+rejected: it gives a module with no buyer-facing surface its first public endpoint, and it makes the
+ticket unavailable exactly when fulfilment is broken, which is the case the endpoint exists for.
+
+**Consequences.**
+
+- Email verification is still not solved, and this does not pretend to solve it. It makes the failure
+  *recoverable* rather than terminal, which is the correct first move.
+- The renderer's ADR-042 property — that operator-supplied text outside WinAnsi must not reach a
+  standard-14 font — moves with it, and its test moves with it too.
+- A future "resend to a corrected address" operator action becomes a small change rather than a new
+  subsystem, because the buyer already has a path that does not depend on email at all.
