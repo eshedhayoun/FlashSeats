@@ -542,7 +542,7 @@ dependency order. Everything in the first two groups is cheap; the third is the 
 2. The global admission budget, with the per-event batch as a secondary cap. Built; the next
    concurrent-sales run should verify the pool-saturation numbers.
 3. Hoist the exhausted `EXISTS` out of the per-session loop. Built; pipeline the rest of the sweep.
-4. A per-event index in the emitter registry.
+4. A per-event index in the emitter registry. Built.
 5. Make the drift gauge a singleton under the promotion tick's Redis-lock pattern.
 
 **The drill — built in Pass 7, and NOT YET RUN.** Every other instrument here runs one event, and so
