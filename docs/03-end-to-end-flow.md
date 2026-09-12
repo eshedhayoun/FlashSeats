@@ -133,7 +133,7 @@ every limit below is stated at the scale it actually has to hold at.
   R   application replicas              3
       DB connections                    30 per replica  ->  90 cluster-wide
       admission budget                  GLOBAL across E, then capped per sale   (ADR-049, built)
-                                        90 / 8 = 11 per tick, cluster-wide
+                                        45 per tick, cluster-wide
 ```
 
 **`E` is the number that was missing.** ADR-028 derives the promotion batch size from the connection
@@ -814,7 +814,7 @@ Every value below is a named property in `application.properties`.
 | `payment:inflight` TTL | 90 s | 014 |
 | Promotion tick | 1 s, singleton per event by Redis `SET NX PX` | 008 / **032** |
 | Promotion batch size | **≤ `hikariMax × 1.5`** (45) — **per sale**, the secondary cap | **028 / 049** |
-| **Cluster admission allowance** | **11 per tick** = `global-admission-connection-budget` 90 ÷ `database-connections-per-buyer` 8. Claimed from `queue:budget` before the cap above applies | **049** |
+| **Cluster admission allowance** | **45 per tick**, `global-admission-budget-per-tick` — ADR-028's `hikariMax × 1.5` re-scoped from one sale to the cluster. Claimed from `queue:budget` before the per-sale cap applies | **049** |
 | Open-event order per tick | **shuffled** — a fixed order starves every sale but the lowest id | **049** |
 | Catalog metadata cache | event **1 s** · tier **60 s** · 1,000 events, `metadata-cache-enabled` | **051** |
 | SSE position push / heartbeat | 2 s / 15 s | 007 |

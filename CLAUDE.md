@@ -21,6 +21,8 @@ allowance and the metadata cache that had to come before it. **050 is ticket ret
 **The operating envelope is 3–10 concurrent sales**, not one
 ([`03-end-to-end-flow.md`](docs/03-end-to-end-flow.md) §2). Every capacity number written before
 ADR-049 silently assumed a single sale. Check which assumption a limit rests on before trusting it.
+**Five concurrent sales now sell out** — 2,496 of 2,500, no oversell, `hikaricp_connections_pending` at
+zero — measured in Pass 8 (`06-mvp-overview.md` §11). Checkout p99 is the one number still open.
 
 **For what is actually built**, read [`docs/06-mvp-overview.md`](docs/06-mvp-overview.md) — scope,
 security posture, next stages, and the review-pass log. It is the doc to update after every pass.
@@ -214,6 +216,7 @@ Do not reintroduce these — each cost a real defect in the first pass:
 | **Returning `OrderReceiptResponse` from an admin endpoint** | `receiptToken` is a 90-day bearer capability. An operator view would mint a durable impersonation link into terminal history and any log that records bodies (ADR-048) |
 | **Guarding a password with `equals("admin")`** | It refuses one known string. `{noop}hunter2` passes and is stored in plaintext. Refuse the *encoding*, not the value (ADR-048) |
 | **Editing a migration that has already been applied — even only its comments** | Flyway checksums the whole file. `V9`'s comment block was rewritten after the measurement that motivated it, and **every container then refused to start**: `Validate failed … checksum mismatch for version 9`, with identical DDL. A migration is immutable the moment any database has run it; new understanding goes in a new migration, an ADR, or the code that issues the query. Recovery is `UPDATE flyway_schema_history SET checksum = <resolved> WHERE version = …` (what `flyway repair` does) on every database that applied the old one |
+| **A capacity limit expressed as a formula over quantities that do not share units** | `90 connections / 8 transactions per buyer = 11` looks derived and is arbitrary: a concurrency over a count is neither, and it was then spent as a per-second rate. It capped a sale at 76 % while the pool sat 89 % idle. A limit is a rate with a **measured** ceiling — raise it until `hikaricp_connections_pending` stops returning to zero (ADR-049) |
 | **A scheduled job that protects a resource by reading that resource** | `PromotionWorker` bounds admission to protect the connection pool — and called `findOpenEventIds()`, a pooled read, every tick. Under pressure it queued behind the buyers it existed to admit: **16 s inside a 1 s tick**, so nobody was promoted, the queue did not drain, and the polling that saturated the pool continued. Ask not what a read costs but what stops working when it is slow (ADR-051) |
 | **A cache with no TTL** | Eviction reaches one replica. A paused sale then answers `OPEN` on the other two *for the life of the process*, and the window status gates join, holds and checkout — so pause stops nothing. The TTL **is** the cross-replica invalidation (ADR-051) |
 | **Loading a cache entry inside `computeIfAbsent`** | The loader runs inside `ConcurrentHashMap`'s per-bin `synchronized`, so a blocking JDBC read there **pins carrier threads** — the Redisson failure (ADR-022), reached through a cache. Load outside the map: `get`, load, `put` (ADR-051) |

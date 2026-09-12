@@ -132,6 +132,14 @@ for sid in first `granted` of front:
   lives in another's heap. Without fan-out, roughly two-thirds of promotions vanish on three
   replicas — and the bug is invisible on one (ADR-007).
 
+**The tail of a sale is where the oversubscribe factor stops working.** `admittable` subtracts live
+passes and admissions from `floor(remaining × oversubscribeFactor)`, and at one seat remaining that
+product is 1 — so a single outstanding pass whose owner never bought blocks the last seat until the pass
+expires (120 s) or the admission lapses (600 s). Measured in Pass 8: a five-sale run ended at
+2,496 / 2,500 with seats available and 48–60 buyers still queued for each sale. **Deliberately left**:
+the alternative admits buyers who may arrive to find the seat gone, which is the twenty-minute wait for
+a `409` that ADR-008 exists to prevent.
+
 **The batch size is per sale; the allowance is per cluster.** ADR-028 derives
 `batchSize ≤ hikariMax × 1.5` for a single sale, and this worker loops every open event, so at `E`
 concurrent sales the cluster was admitting `R × E × batchSize` per second into one shared pool —
