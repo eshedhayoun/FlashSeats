@@ -91,11 +91,16 @@ may read the whole ledger; ADR-046). Redis configured with
 `maxmemory-policy noeviction`, AOF `everysec`, and `notify-keyspace-events **Ex**` — all three
 already shipped in [`docker/redis/redis.conf`](../docker/redis/redis.conf).
 
-**`hold`** — `hold_reserve.lua` and `hold_restore.lua`. **The claim stays exactly where it was in
-Phase 1**: a conditional `UPDATE` on `ticket_holds` (ADR-019). Redis gains the TTL timer and the
-keyspace listener as a latency optimisation; the sweeper (now 30 s) remains the correctness
-guarantee. `extendHold()` — once, +120 s, ceiling 420 s, pushing `ticket_holds.expires_at`, and
-**failing the checkout rather than charging** if it cannot win the claim.
+**`catalog`** — `stock_reserve.lua` and `stock_restore.lua`. **As built, both scripts and the key
+live in `catalog`, not in `hold`** (ADR-046): `hold` moves stock through `CatalogFacade` like every
+other caller, and the boundary has no exception. Each script touches one key.
+
+**`hold`** — **The claim stays exactly where it was in Phase 1**: a conditional `UPDATE` on
+`ticket_holds` (ADR-019). Redis gains the `hold:{token}` TTL timer and the keyspace listener as a
+latency optimisation; the sweeper (**10 s**, not 30) remains the correctness guarantee, and the
+listener re-reads the row rather than trusting the event (ADR-048). `grantGrace()` — once **per
+hold**, +120 s, ceiling 420 s, pushing `ticket_holds.expires_at`, and **failing the checkout rather
+than charging** if it cannot win the claim.
 
 **`queue`** — ZSET with `ZADD NX` (`FIFO` or `RANDOM` score — ADR-024); `GET /api/v1/queue/stream`
 with a 15 s heartbeat and `Last-Event-ID`; `GET /api/v1/queue/status` returning the pass as a
