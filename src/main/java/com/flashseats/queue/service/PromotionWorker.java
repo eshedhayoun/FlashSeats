@@ -38,6 +38,7 @@ public class PromotionWorker {
     private final StringRedisTemplate redis;
     private final CatalogFacade catalog;
     private final QueueTokens tokens;
+    private final GlobalAdmissionBudget globalAdmissionBudget;
     private final QueueProperties properties;
     private final ObjectMapper json;
     private final Clock clock;
@@ -46,12 +47,14 @@ public class PromotionWorker {
             StringRedisTemplate redis,
             CatalogFacade catalog,
             QueueTokens tokens,
+            GlobalAdmissionBudget globalAdmissionBudget,
             QueueProperties properties,
             ObjectMapper json,
             Clock clock) {
         this.redis = redis;
         this.catalog = catalog;
         this.tokens = tokens;
+        this.globalAdmissionBudget = globalAdmissionBudget;
         this.properties = properties;
         this.json = json;
         this.clock = clock;
@@ -128,10 +131,25 @@ public class PromotionWorker {
             return;
         }
 
+        int promoted = 0;
         for (String sessionId : front) {
-            issuePass(eventId, sessionId, now);
+            String budgetMember = QueueKeys.budgetMember(eventId, sessionId);
+            boolean reserved = globalAdmissionBudget.tryReserve(
+                    budgetMember,
+                    now.plusSeconds(properties.getPassTtlSeconds()),
+                    properties.getGlobalAdmissionBudget());
+            if (!reserved) {
+                break;
+            }
+            try {
+                issuePass(eventId, sessionId, now);
+                promoted++;
+            } catch (RuntimeException failure) {
+                globalAdmissionBudget.release(budgetMember);
+                throw failure;
+            }
         }
-        log.debug("Promoted {} session(s) for event {}", front.size(), eventId);
+        log.debug("Promoted {} session(s) for event {}", promoted, eventId);
     }
 
     /**

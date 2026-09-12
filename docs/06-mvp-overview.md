@@ -309,11 +309,11 @@ Honest list. None of these is hidden behind a passing test.
 
 **Found in Pass 7 (the plan-correctness pass), all open:**
 
-- **Admission is budgeted per sale against a shared pool.** The promotion worker loops every open
-  event and applies `promotion-batch-size` per event; the tick lock is per event too. At the newly
-  adopted `E = 3..10` envelope the cluster admits up to `R × E × 45` per second into `R × 30`
-  connections. ADR-049 is the fix and is **specified, not built**. This is the largest open risk in
-  the system.
+- **Admission is budgeted globally against a shared pool.** The promotion worker keeps
+  `promotion-batch-size` as a per-event secondary cap, then reserves from the Redis
+  `queue:admission-budget` ZSET shared by all replicas and open sales. Expired reservations are
+  removed atomically, pass-to-admission exchange renews the expiry, and completed admissions release
+  their member. ADR-049 is now built and covered by a two-sale integration test.
 - **A checkout costs eight sequential database transactions**, and a full buyer session about
   fifteen — not the ~1 that ADR-028's "capacity to serve" model implicitly prices. Both limits were
   therefore generous even at `E = 1`.
@@ -540,7 +540,7 @@ dependency order. Everything in the first two groups is cheap; the third is the 
 
 1. Cache `events` + `ticket_tiers` behind `CatalogService`, evicted on pause/resume. The single
    highest-leverage change, and the smallest.
-2. The global admission budget, with the per-event batch as a secondary cap.
+2. The global admission budget, with the per-event batch as a secondary cap — **built (ADR-049)**.
 3. Hoist the exhausted `EXISTS` out of the per-session loop; pipeline the rest of the sweep.
 4. A per-event index in the emitter registry.
 5. Make the drift gauge a singleton under the promotion tick's Redis-lock pattern.

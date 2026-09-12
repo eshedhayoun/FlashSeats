@@ -26,6 +26,7 @@ public class QueueService {
     private final StringRedisTemplate redis;
     private final CatalogFacade catalog;
     private final QueueTokens tokens;
+    private final GlobalAdmissionBudget globalAdmissionBudget;
     private final QueueDrainRateTracker drainRate;
     private final QueueProperties properties;
     private final Clock clock;
@@ -34,12 +35,14 @@ public class QueueService {
             StringRedisTemplate redis,
             CatalogFacade catalog,
             QueueTokens tokens,
+            GlobalAdmissionBudget globalAdmissionBudget,
             QueueDrainRateTracker drainRate,
             QueueProperties properties,
             Clock clock) {
         this.redis = redis;
         this.catalog = catalog;
         this.tokens = tokens;
+        this.globalAdmissionBudget = globalAdmissionBudget;
         this.drainRate = drainRate;
         this.properties = properties;
         this.clock = clock;
@@ -175,6 +178,10 @@ public class QueueService {
 
         String admissionToken = tokens.mintAdmission(eventId, sessionId);
         Instant expiresAt = clock.instant().plusSeconds(properties.getAdmissionTtlSeconds());
+        String budgetMember = QueueKeys.budgetMember(eventId, sessionId);
+        if (!globalAdmissionBudget.renew(budgetMember, expiresAt)) {
+            throw new QueuePassInvalidException();
+        }
 
         redis.opsForValue()
                 .set(
@@ -209,5 +216,6 @@ public class QueueService {
     public void revokeAdmission(String sessionId, long eventId) {
         redis.delete(QueueKeys.admission(eventId, sessionId));
         redis.opsForZSet().remove(QueueKeys.admissions(eventId), sessionId);
+        globalAdmissionBudget.release(QueueKeys.budgetMember(eventId, sessionId));
     }
 }

@@ -134,6 +134,11 @@ position clamping.
 oversell it (`StockEpochIT`), because AOF `everysec` brings counters back high and no ordering of
 operations can prevent that.
 
+**ADR-049 follow-up:** the promotion worker now applies a Redis-backed, cluster-wide admission
+budget before the existing per-event batch cap. Reservations cover pending passes and active
+admissions across concurrent sales, expire by score, renew on pass exchange, and release when an
+admission is completed. `GlobalAdmissionBudgetIT` verifies the limit across two sales.
+
 ---
 
 ## Phase 3 — Defence and real payments

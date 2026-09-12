@@ -57,6 +57,16 @@ public final class QueueKeys {
         return "queue:admissions:" + eventId;
     }
 
+    /** The cluster-wide ZSET of pending passes and active admissions (ADR-049). */
+    public static String globalAdmissionBudget() {
+        return "queue:admission-budget";
+    }
+
+    /** Builds the globally unique reservation member for one session in one sale. */
+    public static String budgetMember(long eventId, String sessionId) {
+        return eventId + ":" + sessionId;
+    }
+
     /**
      * Pub/Sub channel carrying promotions to whichever replica holds the buyer's SSE connection.
      *
