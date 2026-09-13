@@ -123,14 +123,21 @@ public class StripePaymentGateway implements PaymentGateway {
     /**
      * Maps an intent's status onto the three answers this system understands.
      *
-     * <p>{@code processing} and {@code requires_capture} are deliberately <em>not</em> successes:
-     * confirming an order against either would hand over seats for money that has not moved. They
-     * fall to the transport branch, which retains the hold and lets the buyer retry.
+     * <p>Only {@code requires_action} is a challenge. {@code requires_confirmation} means the
+     * <em>server</em> has yet to confirm, which with {@code setConfirm(true)} should not occur —
+     * and answering it with {@code PAYMENT_ACTION_REQUIRED} would be worse than useless: the client
+     * would receive a {@code clientSecret} whose {@code handleNextAction} does nothing, re-POST,
+     * retrieve the same state, and be told to authenticate again for the life of the hold.
+     *
+     * <p>{@code processing} and {@code requires_capture} are deliberately <em>not</em> successes
+     * either: confirming an order against either would hand over seats for money that has not moved.
+     * All of them fall to the transport branch, which is the honest "this is a state we do not
+     * model" — a retryable {@code 503} with the seats retained and no attempt consumed.
      */
-    private GatewayResult classify(PaymentIntent intent) {
+    GatewayResult classify(PaymentIntent intent) {
         return switch (intent.getStatus()) {
             case "succeeded" -> GatewayResult.succeeded(intent.getId());
-            case "requires_action", "requires_confirmation" -> GatewayResult.requiresAction(
+            case "requires_action" -> GatewayResult.requiresAction(
                     intent.getId(), intent.getClientSecret());
             case "requires_payment_method", "canceled" -> GatewayResult.declined(
                     errorCodeOf(intent), errorMessageOf(intent));

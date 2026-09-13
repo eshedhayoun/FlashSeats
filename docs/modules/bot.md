@@ -46,6 +46,12 @@ pool it exists to protect, queued behind the buyers it is shielding (ADR-051, AD
 the cross-replica invalidation** — an operator's call evicts one replica, the others follow within
 `ip-rule-cache-ttl-ms` (10 s).
 
+Three further rules govern what the snapshot does when it is **not** working (ADR-056), and all three
+are non-blocking, because a lock on this path pins carrier threads: a failed reload **stamps the
+attempt like a success**, so an unreachable database is asked once per window rather than once per
+request; **one reload is in flight at a time**, so a TTL boundary is not a pool spike; and an **empty
+result is cached** like any other, because "no rules" is this table's normal state.
+
 **`bot_audit_logs` has no `ALLOWED` outcome, and must not gain one.** A row per allowed request is a
 write per request during exactly the traffic this system is built for, and it would make the table
 unreadable for the purpose it exists to serve. Writes are asynchronous on a bounded queue that

@@ -2,6 +2,9 @@ package com.flashseats.order.service;
 
 import com.flashseats.catalog.facade.CatalogFacade;
 import com.flashseats.catalog.facade.TierSummary;
+import com.flashseats.hold.exception.HoldAlreadySettledException;
+import com.flashseats.hold.exception.HoldExpiredException;
+import com.flashseats.hold.exception.HoldNotFoundException;
 import com.flashseats.hold.facade.HoldFacade;
 import com.flashseats.hold.facade.HoldSummary;
 import com.flashseats.order.model.Order;
@@ -92,6 +95,22 @@ public class PaymentSettlementService {
         settle(order, event);
     }
 
+    /**
+     * <strong>Only a definite failure is compensated.</strong>
+     *
+     * <p>The three exceptions caught here are the hold module's way of saying the seats are
+     * provably not ours: not found, expired, already settled. Those are facts, and a refund is the
+     * right answer to a fact.
+     *
+     * <p>Everything else — a pool timeout, an {@code InventoryUnavailableException}, a commit that
+     * failed for reasons nobody has established — is <em>ambiguous</em>, and propagates. That
+     * releases the webhook claim and earns a redelivery, which is the only outcome that can still
+     * come out right. Catching it would refund a buyer whose seats are perfectly fine and then
+     * answer the provider {@code 200}, so nothing would ever retry and the mistake would be final.
+     *
+     * <p>This is ADR-046's rule reaching money: a definite rollback is safe to compensate, an
+     * ambiguous failure is not.
+     */
     private void settle(Order order, PaymentSettledEvent event) {
         String orderNumber = order.getOrderNumber();
         try {
@@ -101,9 +120,9 @@ public class PaymentSettlementService {
             commit.confirm(orderNumber, hold, tier, resultOf(event));
             log.info("Order {} confirmed from a webhook settlement", orderNumber);
 
-        } catch (RuntimeException seatsGone) {
+        } catch (HoldNotFoundException | HoldExpiredException | HoldAlreadySettledException seatsGone) {
             log.warn(
-                    "Webhook settlement for order {} could not claim hold {} — refunding",
+                    "Webhook settlement for order {} found hold {} gone — refunding",
                     orderNumber,
                     event.holdToken(),
                     seatsGone);

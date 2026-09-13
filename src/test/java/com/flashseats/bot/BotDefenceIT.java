@@ -106,6 +106,21 @@ class BotDefenceIT extends IntegrationTest {
     }
 
     @Test
+    @DisplayName("The audit trail records the buyer's address, not the proxy's")
+    void auditRecordsTheResolvedClientAddress() {
+        // The test profile trusts nobody, so X-Forwarded-For is ignored and the peer address wins.
+        // That is the assertion worth making either way: the audit row must carry whatever the RATE
+        // LIMITER resolved, because resolving it a second way — getRemoteAddr() — is always the
+        // proxy behind nginx, and every row in the deployment that matters would say 172.28.0.10.
+        ipRules.upsert("127.0.0.1", IpRuleAction.DENY, "address check", null);
+
+        new BuyerSession(port).get("/events/" + eventId, Map.of("X-Forwarded-For", "203.0.113.9"));
+
+        await().atMost(PATIENCE)
+                .untilAsserted(() -> assertThat(fixture.botAuditAddresses()).containsOnly("127.0.0.1"));
+    }
+
+    @Test
     @DisplayName("A refusal is written to the audit trail, and a success is not")
     void onlyRefusalsAreAudited() {
         new BuyerSession(port).get("/events/" + eventId);

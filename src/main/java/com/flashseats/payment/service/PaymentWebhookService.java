@@ -99,6 +99,13 @@ public class PaymentWebhookService {
                     transactions.referenceForGateway(intent.getId()).orElse(null),
                     intent.getAmount() == null ? 0L : intent.getAmount(),
                     intent.getCurrency() == null ? null : intent.getCurrency().toUpperCase()));
+
+            // Inside the same guard. If stamping the claim fails, the settlement itself is still in
+            // doubt from this method's point of view, and the honest answer is to give the claim
+            // back and let the provider ask again — a second delivery finds the order already
+            // CONFIRMED and does nothing.
+            webhookEvents.markProcessed(event.getId());
+
         } catch (RuntimeException settlementFailed) {
             webhookEvents.release(event.getId());
             log.error(
@@ -107,8 +114,6 @@ public class PaymentWebhookService {
                     settlementFailed);
             throw settlementFailed;
         }
-
-        webhookEvents.markProcessed(event.getId());
     }
 
     private Event verify(String rawBody, String signature) {

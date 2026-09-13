@@ -8,6 +8,7 @@ import com.flashseats.bot.service.RateLimitService;
 import com.flashseats.shared.error.ErrorCode;
 import com.flashseats.shared.error.ProblemDetails;
 import com.flashseats.shared.identity.SessionId;
+import com.flashseats.shared.web.ClientAddress;
 import jakarta.servlet.FilterChain;
 import jakarta.servlet.ServletException;
 import jakarta.servlet.http.HttpServletRequest;
@@ -78,6 +79,10 @@ public class RateLimitFilter extends OncePerRequestFilter {
 
         Object sessionId = request.getAttribute(SessionId.REQUEST_ATTRIBUTE);
         String clientIp = clientIpOf(request);
+        // Published for the rest of the request. This filter is the ONLY place X-Forwarded-For is
+        // resolved against the trusted-proxy set (ADR-039), so anything downstream that wants the
+        // caller's address reads it from here rather than resolving it a second way.
+        request.setAttribute(ClientAddress.REQUEST_ATTRIBUTE, clientIp);
         IpRuleAction rule = ipRules.actionFor(clientIp);
 
         if (rule == IpRuleAction.DENY) {

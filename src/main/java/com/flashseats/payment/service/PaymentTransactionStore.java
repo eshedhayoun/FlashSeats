@@ -12,7 +12,7 @@ import org.springframework.transaction.annotation.Propagation;
 import org.springframework.transaction.annotation.Transactional;
 
 /**
- * The two <strong>short</strong> transactions that bracket a gateway call.
+ * The <strong>short</strong> transactions that bracket a gateway call.
  *
  * <p>They live on their own bean rather than as private methods on {@link PaymentService} because
  * Spring's transaction proxy does not intercept self-invocation: a {@code @Transactional} method
@@ -31,9 +31,30 @@ public class PaymentTransactionStore {
         this.transactions = transactions;
     }
 
-    /** Records the intent to charge, before any network call. Committed immediately. */
+    /**
+     * Opens one charge attempt: resume the intent this hold is already authenticating, or record a
+     * new one.
+     *
+     * <p><strong>One transaction, not two.</strong> Looking for a resumable row in its own
+     * {@code REQUIRES_NEW} read would add a tenth sequential transaction to <em>every</em> checkout
+     * in order to serve the 3-D Secure minority — and the admission allowance is derived from that
+     * count (ADR-049), while ADR-051 exists because pooled reads on hot paths are what binds at
+     * {@code E = 3..10} sales. Doing both here keeps the cost exactly where it was.
+     *
+     * <p>It also closes a race the two-call version had: two requests could each find nothing and
+     * each insert. The in-flight guard makes that unlikely rather than impossible.
+     */
     @Transactional(propagation = Propagation.REQUIRES_NEW)
-    public PaymentTransaction recordInitiated(AuthorizeCommand command) {
+    public ChargeAttempt beginAttempt(AuthorizeCommand command) {
+        Optional<PaymentTransaction> resumable = transactions
+                .findFirstByHoldTokenAndStatusOrderByIdDesc(command.holdToken(), PaymentStatus.PROCESSING)
+                .filter(transaction -> transaction.getGatewayReference() != null);
+
+        if (resumable.isPresent()) {
+            PaymentTransaction pending = resumable.get();
+            return new ChargeAttempt(pending.getTransactionReference(), pending.getGatewayReference());
+        }
+
         PaymentTransaction transaction = new PaymentTransaction(
                 "pt_" + UUID.randomUUID().toString().replace("-", ""),
                 command.orderNumber(),
@@ -43,7 +64,7 @@ public class PaymentTransactionStore {
                 command.currency(),
                 command.clientIdempotencyKey(),
                 command.attemptNumber());
-        return transactions.save(transaction);
+        return new ChargeAttempt(transactions.save(transaction).getTransactionReference(), null);
     }
 
     /**
@@ -51,7 +72,7 @@ public class PaymentTransactionStore {
      *
      * <p>{@code REQUIRES_ACTION} lands as {@link PaymentStatus#PROCESSING} — the state that was
      * declared on day one and never written, because the stub had no way to reach it. It is what
-     * {@link #findResumable} looks for, so recording it correctly is what makes the 3-D Secure
+     * {@link #beginAttempt} looks for, so recording it correctly is what makes the 3-D Secure
      * resume find its intent rather than open a second one.
      *
      * <p>The gateway reference is only ever <em>overwritten</em>, never cleared: a decline arriving
@@ -76,22 +97,6 @@ public class PaymentTransactionStore {
             case REQUIRES_ACTION -> PaymentStatus.PROCESSING;
             case DECLINED, ERROR -> PaymentStatus.FAILED;
         };
-    }
-
-    /**
-     * The intent this hold was already sent away to authenticate, if there is one.
-     *
-     * <p>Anchored on the hold token rather than the order number because that is the key the whole
-     * idempotency scheme anchors on (ADR-014), and a resumed order keeps its number across retries
-     * anyway.
-     */
-    @Transactional(propagation = Propagation.REQUIRES_NEW, readOnly = true)
-    public Optional<ResumableCharge> findResumable(String holdToken) {
-        return transactions
-                .findFirstByHoldTokenAndStatusOrderByIdDesc(holdToken, PaymentStatus.PROCESSING)
-                .filter(transaction -> transaction.getGatewayReference() != null)
-                .map(transaction -> new ResumableCharge(
-                        transaction.getTransactionReference(), transaction.getGatewayReference()));
     }
 
     @Transactional(propagation = Propagation.REQUIRES_NEW)
