@@ -252,7 +252,8 @@ Honest list. None of these is hidden behind a passing test.
   them, while each sits at **114–142 % of one core** with a 2,000-VU k6 competing for the same ten.
   2,000 VUs is still the ceiling here, but a 32 GB machine would not move it — a machine where the
   load generator is not sharing cores with the system under test would.
-- **Checkout p99 is 682 ms at 300 VUs on one sale, 9.3 s at 300 VUs across five, and ~30–45 s at
+- **Checkout p99 is 682 ms at 300 VUs on one sale, 6.4 s at 300 VUs across five — 9.3 s before
+  Pass 9's review removed a checkout transaction — and ~30–45 s at
   2,000 VUs across five** — against a 200 ms exit criterion. The 2,000-VU figures are the host: ten
   cores shared between three JVMs and the load generator, with `connections_pending` peaking at 10 of 90
   in the run that sold 76 % of capacity. **The 300-VU five-sale number is the real open one**: 682 ms →
@@ -1526,6 +1527,40 @@ client a `clientSecret` whose `handleNextAction` does nothing — a `402` loop f
 and the audit trail recorded `getRemoteAddr()`, which behind nginx is nginx, so every row in the only
 deployment that matters said `172.28.0.10`. `X-Forwarded-For` is now resolved in exactly one place and
 published as `shared`'s `ClientAddress` attribute.
+
+**Measured, on the ADR-049 drill plus a bot dimension the drill had never had** (13 Sept 2026,
+three replicas, five sales, 300 VUs):
+
+| | Pass 8 | Pass 9 |
+| :--- | :--- | :--- |
+| seats sold of 2,500 | 2,496 | **2,497** — `sold + held + redis == 500` on every tier |
+| `hikaricp_connections_pending` | 0 | 0 throughout the sale, peaking at 2 (the 6–7 later in the trace is the deliberate database outage below, not sale load) |
+| **checkout p99** | **9.3 s** | **6.4 s** |
+| inventory `503`s · rate-limited | 0 · 0 | 0 · 0 |
+| `flashseats.stock.drift` | transient | **one** `1.0` sample out of sixty, zero on that replica's next read — the documented transient, not sustained (ADR-046) |
+
+The p99 is the number Pass 8 left open, and a third of it went away by *removing* a transaction
+rather than adding capacity. It is still far above the 200 ms exit criterion, and still measured on a
+ten-core host shared with three JVMs and the load generator.
+
+**And the bot half, measured for the first time.** During the same run: a `DENY` rule added mid-run
+reached all three replicas; `bot_audit_logs` held **13 rows against 1,678 orders** — refusals only,
+never a row per request; and every row recorded the *forwarded* client address rather than nginx's,
+which is the fix above proving itself in the only deployment shape where it matters.
+
+Then PostgreSQL was stopped for twelve seconds under sixty requests. One replica attempted **two**
+reloads — one per TTL window. Before the backoff it would have attempted sixty, one per request,
+against a database that was already down. That measurement is the whole point of the fix, and it is
+invisible in every other instrument, because nothing about it is an error.
+
+**And the instrument contradicted the ADR it cites.** `pool-pressure.sh` failed the whole run on that
+single drift sample, printing "this is a correctness failure" — while `sold-count.sh`, which reads the
+ledger and is the authority, reported `sold + held + redis == 500` on every one of the five tiers.
+ADR-046 says to alarm on *sustained* non-zero precisely because Redis and PostgreSQL are not read in
+one snapshot. The script now requires drift on **consecutive samples for the same replica** before
+failing, and names an isolated one as the measurement's own artefact. Same family as ADR-047's four
+harness defects: an instrument that measures the wrong thing is worse than no instrument, because its
+answer is specific.
 
 **A note on the test that could not be written the obvious way.** Forcing an ambiguous settlement
 failure with `@MockitoSpyBean` **broke nineteen unrelated tests**: a bean override forks the
