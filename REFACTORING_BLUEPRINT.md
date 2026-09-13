@@ -15,9 +15,9 @@ This blueprint fixes that. **It does not weaken a single invariant.**
 | :--- | ---: | ---: |
 | Java files | 215 | ~130 |
 | Files ≤ 25 lines | 91 | ~25 |
-| Classes traversed on `checkout → charge` | 6 | 3 |
+| Classes traversed on `checkout → charge` | 6 | 4 |
 | Representations of one domain object | 5 | 2 |
-| Files to read for a module's failure surface | up to 12 | 1 |
+| Files to read for a module's failure surface | up to 12 | 1–5 |
 | Entry-point document | none | this one |
 
 ---
@@ -31,7 +31,7 @@ Nine steps, all real HTTP. The demo client at `/` is one consumer of it.
 | # | Call | Lands in | Gated by |
 | :-- | :--- | :--- | :--- |
 | 1 | `GET /api/v1/events/{id}` | `EventController` → `CatalogService` | mints the signed `fsid` cookie |
-| 2 | `POST /api/v1/queue/join` | `QueueController` → `QueueService` | sale window `OPEN`; `ZADD NX` so a refresh keeps your place |
+| 2 | `POST /api/v1/queue/join` | `QueueController` → `BotFacade`, then `QueueService` | the challenge check, which **fails open** (ADR-055); sale window `OPEN`; `ZADD NX` so a refresh keeps your place |
 | 3 | `GET /api/v1/queue/stream` | `QueueController` → `SseEmitterRegistry` | SSE. `GET /queue/status` is the polling equivalent |
 | 4 | *(worker, 1 s)* | `PromotionWorker` | cluster-wide `queue:budget`, then the per-event batch |
 | 5 | `POST /api/v1/queue/admit` | `QueueService.admit` | pass is single-use — revoked here |
@@ -52,17 +52,24 @@ Nine modules. The graph is **acyclic and build-enforced** — `ApplicationModule
                          shared          ← open module; everyone may depend on it
                                             (ErrorCode, SessionId, SignedToken, Clock, TicketPdfRenderer)
 
-  bot      ──► shared only          servlet filters; rate limiting only
+  bot      ──► shared only          filters, rate limits, IP rules, the challenge check
   catalog  ──► shared               events, tiers, sale windows, AND the Redis inventory counter
-  queue    ──► catalog              waiting room, promotion, admission
+  queue    ──► catalog, bot         waiting room, promotion, admission. `bot` only on join
   hold     ──► queue, catalog       ticket_holds is the authority for a reservation's lifecycle
   order    ──► hold, catalog,       checkout, the outbox, the stock rebuild
                payment, queue
   payment  ──► (nothing)            calls NO facade — an edge here would make the graph cyclic
-  notification ◄── order            reached only by RabbitMQ, never by a call
   saleflow ──► queue, hold,         read-only leaf; nothing depends on it
                order, catalog
+
+  payment  ──( PaymentSettledEvent )──►  order          the only inbound edge, webhook path only
+  order    ──( outbox → RabbitMQ )──►    notification   reached by the broker, never by a call
 ```
+
+**Read the bottom two arrows differently from the top block.** Those are not facade calls. `payment`
+publishes a Spring event that `order` listens for, and `order` writes an outbox row that RabbitMQ
+delivers to `notification`. Both directions would be cycles as facade edges — which is exactly why
+neither is one (ADR-005, ADR-009).
 
 **Why nine modules for 8,400 lines** — the question everyone asks once:
 
@@ -90,6 +97,9 @@ The sequence *is* the design. Read `CheckoutService.checkout()` alongside this.
 4  find-or-create on UNIQUE(hold_token)
 5  grantGrace()                       → once per hold. FAILS ⇒ abort 410, DO NOT CHARGE
 6  authorize()                        → OUTSIDE every transaction
+6b 3-D Secure?                        → 402 + clientSecret; order left FAILED, no attempt consumed.
+                                        The client authenticates and re-POSTs THIS SAME body —
+                                        find-or-create resumes it (ADR-054). No resume endpoint.
 7  @Transactional                     → consumeHold · CONFIRMED · order_items · outbox_events
 8  AFTER_COMMIT                       → discardTimer, revokeAdmission — best-effort, safe to lose
 9  commit failed after a charge?      → refund · REFUNDED · ORDER_REFUNDED outbox row
@@ -114,6 +124,7 @@ it, so if anything fails the hold returns to `ACTIVE` and expires normally.
 | Admission is bounded | `queue:budget`, one cluster-wide allowance per tick | the pool, not inventory, is the real ceiling |
 | Event/tier metadata | `CatalogMetadata`, TTL-bounded, rows not entities | the TTL **is** the cross-replica invalidation |
 | Session identity | the signed `fsid` cookie, `shared/identity` | never a body field, query param or header |
+| A charge that settled after the buyer left | `PaymentWebhookService` → `PaymentSettledEvent` → `PaymentSettlementService` | a delivery is a claim, released when its work did not happen (ADR-053) |
 
 **Two rules over the whole Redis surface:** a module touches only its own prefix, and **no key is the
 authority for anything**. Lose all of Redis and `ticket_holds` plus the rebuild reconstruct the state.
@@ -130,7 +141,7 @@ That is what makes `noeviction` a correctness setting rather than a tuning one.
 | **Checkout step 0**, apparently redundant with step 4 | It must precede step 1 — see §1.3. |
 | **Three split class pairs**: `CheckoutService`/`OrderCommitService`, `OutboxRelay`/`OutboxStore`, `TicketDownloadService`/`OrderQueryService` | Spring's proxy does not intercept self-invocation: a `@Transactional` method called from its own class runs with **no transaction at all**, silently. The split *is* the boundary. |
 | **`LoggingOutboxPublisher`** and the `OutboxPublisher` interface | The whole test suite runs on `transport=log`. It is what tests the three-transaction relay without a broker. |
-| **`PaymentGateway` interface** over one stub | One `@Bean` swap is the Stripe seam. |
+| **`PaymentGateway` interface** over one stub | One `@Bean` swap was the Stripe seam — and it was taken: `StripePaymentGateway` and a circuit-breaking decorator now sit behind it (ADR-052). |
 | **The drift gauge computed on all three replicas** | Under a lock only the winner updates its gauge and the other two report `0.0` for ever — on the system's correctness canary. |
 | **`EventRow`/`TierRow`** next to the `Event`/`TicketTier` entities | The row records are the cache contract. Collapsing them re-introduces detached-entity caching. |
 | **`OutboxPayload` ≡ `OrderConfirmedPayload`**, field for field | A wire contract between two modules. One shared class makes `notification` depend on `order`'s internals. |
@@ -268,52 +279,69 @@ Each is a file you must open to discover it does almost nothing.
 | `PaymentTransactionRepository`, `OrderItemRepository`, `TicketTierRepository` | their single callers | one method each |
 | The authorisation block at `OrderQueryService.java:88-98` ≡ `:167-177` | `requireAuthorised(orderNumber, sessionId, receiptToken)` | six lines, duplicated; the javadoc at `:149-151` already admits it |
 
-**And `payment`** — 22 files and ~700 lines around one switch statement. After Stage B removes the
-facade impl, collapse `GatewayCharge`/`GatewayResult` into `AuthorizeCommand`/`PaymentResult`: they
-differ by field *name*, not content, and that mapping is the only thing `PaymentService` does between
-them. **Keep the `PaymentGateway` interface** — it is the documented Stripe seam. 22 files → ~12, and
-`checkout → charge` reaches three classes.
+**`payment` is WITHDRAWN from this stage.** The blueprint originally called it "22 files and ~700
+lines around one switch statement" and proposed collapsing `GatewayCharge`/`GatewayResult` into
+`AuthorizeCommand`/`PaymentResult`. That description was accurate when written and is now false:
+the module has a real Stripe gateway, a circuit-breaking decorator, a webhook receiver, 3-D Secure
+and a settlement path (ADR-052–056). The two record pairs no longer differ by name alone —
+`GatewayResult` carries `clientSecret` and a `requiresAction` the facade record deliberately
+reshapes. **Do not collapse them.** Stage B already removed this module's `*FacadeImpl`, which was
+the part that was genuinely free.
 
-`payment_transactions` is write-only but for one `findByTransactionReference`. Rather than drop the
-ledger, **make it reachable**: surface `paymentTransactionRef` on `AdminOrderResponse`, which is the
-operator view that should have had it. And `RefundResult` is currently constructed and **discarded**
-at `CheckoutService.java:203`, so a failed refund on the money-moved-seats-lost path is a log line.
-Act on it.
+One item from the original proposal survives and is worth doing: `RefundResult` is constructed and
+**discarded** at `CheckoutService`'s compensation path, so a failed refund — money we hold and
+should not — is a log line and nothing more. Act on it.
 
 ## Stage F — delete what nothing reads
 
 All verified by grep against `src/main` **and** `src/test`.
 
+> **This stage ran, and the payment work landing in parallel reverted about half of it.** What
+> follows is what actually holds; the reverted items and the lesson are in `06` §13 Pass 10 and
+> ADR-057. Short version: *"nothing references this"* is a sound reason to delete **code**, and a
+> much weaker one to delete **contract and schema**.
+
 **Java**
 
-- `OrderQueryService.findByOrderNumber` (`:112-115`) — public, `@Transactional`, **zero callers**.
-- **Ten unused `ErrorCode` constants**: `NOT_IN_QUEUE`, `QUEUE_PASS_EXPIRED`, `QUEUE_UNAVAILABLE`,
-  `SALE_EXHAUSTED`, `BOT_VERIFICATION_FAILED`, `IP_BLOCKED`, `PAYMENT_ACTION_REQUIRED`,
-  `WEBHOOK_SIGNATURE_INVALID`, `ORDER_ALREADY_CONFIRMED`, `NOTIFICATION_LOG_NOT_FOUND`. An
-  unreachable code is dead contract. **Removing one changes the client contract** — `05` §2 and
-  `FE_SPEC.md` §2 move in the same commit.
-- Dead enum values and unread fields: `PaymentStatus.PROCESSING`, `NotificationStatus.FAILED`,
-  `GatewayResult.Outcome.REQUIRES_ACTION`, `PaymentResult.{failureCode, retryable, requiresAction}`.
-- `DuplicatePaymentException`'s unused parameter.
-- `QueueService.queueScore(sessionId, eventId)` — **both parameters unused**; leftovers from the
-  precomputable-draw design ADR-024 itself rejected.
+- `OrderQueryService.findByOrderNumber` — public, `@Transactional`, **zero callers**. Gone.
+- **Six unreachable `ErrorCode` constants**: `NOT_IN_QUEUE`, `QUEUE_PASS_EXPIRED`,
+  `QUEUE_UNAVAILABLE`, `SALE_EXHAUSTED`, `ORDER_ALREADY_CONFIRMED`, `NOTIFICATION_LOG_NOT_FOUND`.
+  **Removing one changes the client contract** — `05` §2 and `FE_SPEC.md` §2 move in the same commit.
+  Four more were removed and came straight back when the gateway, the webhook and the IP-rule
+  surface landed.
+- `NotificationStatus.FAILED` — declared, never assigned, and dangerous: `DLQ` is re-claimable by
+  design, so a second terminal-looking state a replay does not recognise is how a buyer gets two
+  tickets or none (ADR-042). `PaymentStatus.PROCESSING` and `GatewayResult.Outcome.REQUIRES_ACTION`
+  went the same way and both came back — they are 3-D Secure's parking state and its outcome.
+- `DuplicatePaymentException`'s unused parameter, and `QueueService.queueScore`'s two unused
+  parameters — leftovers from the precomputable-draw design ADR-024 itself rejected.
 
-**Schema — one new migration `V10`.** V1–V9 are immutable: Flyway checksums the whole file, and
-editing `V9`'s *comments* once made every container refuse to start.
+**Schema — one new migration, `V12`.** Earlier migrations are immutable: Flyway checksums the whole
+file, and editing `V9`'s *comments* once made every container refuse to start. It was written as
+`V10` and renumbered when the payment work took `V10` and `V11` — a version is first-come.
 
 - `outbox_events.last_error` — a column nothing writes and nothing reads.
-- **Six indexes no query uses**: `idx_holds_session`, `idx_holds_event_tier` (both maintained on
-  *every* hold insert, i.e. every reserve), `idx_orders_email`, `idx_orders_intent`, `idx_pay_order`,
-  `idx_pay_hold`. The last three exist for the unbuilt Stripe webhook and return with it.
+- **Three indexes no query uses**: `idx_holds_session`, `idx_holds_event_tier` (both maintained on
+  *every* hold insert, i.e. every reserve) and `idx_orders_email`.
+- **`idx_pay_hold` is NOT dropped** — it now backs the 3-D Secure resume lookup. The first draft
+  dropped it on the reasoning that the webhook did not exist; the webhook arrived that week, and
+  dropping it would have put a sequential scan on the authentication path.
+- **`idx_pay_order` and `idx_orders_intent` are still queried by nothing and are left alone anyway.**
+  Shaving writes off a table someone is actively extending, on a path that is not hot, is not worth
+  the coordination cost.
 - **Keep** `ticket_holds.settled_at` and `settle_reason`. Unread by code, but they are the incident
   forensics for a settle-once claim.
 
 **Infra — four dangling references.** Each is the "class names that never existed" failure mode this
 repo has a rule about.
 
-- `nginx.conf:123-129` routes `/api/v1/payments/webhook` to an endpoint that does not exist.
-- `compose.yaml:49-51` passes `STRIPE_API_KEY`, `STRIPE_WEBHOOK_SECRET`, `RECAPTCHA_SECRET` — none
-  reaches Java.
+- `nginx.conf` routed `/api/v1/payments/webhook` to an endpoint that did not exist. The endpoint
+  exists now and the block still stays deleted: it only set `proxy_next_upstream off`, a weaker
+  version of the guarantee ADR-053 already makes — a replayed delivery finds the claim taken and
+  acks. The generic `/api/` block routes it.
+- ~~`compose.yaml` passes `STRIPE_API_KEY`, `STRIPE_WEBHOOK_SECRET`, `RECAPTCHA_SECRET` — none
+  reaches Java.~~ **Reverted.** All three are read now, and `SecretsGuard` refuses to boot the
+  `docker` profile without the webhook secret.
 - `redis.conf:71` names `hold_reserve.lua`; the scripts are `stock_reserve`, `stock_restore`,
   `promotion_budget`.
 - `AdminNotificationController.java:24` javadoc names `AdminResendController`, which does not exist.
@@ -396,13 +424,19 @@ removing a transaction from checkout is the claim being made.
 - [x] **Stage B** — five `*FacadeImpl` deleted; services implement their facades (**ADR-057**)
 - [x] **Stage C** — 25 exception files → 9 classes + four `<Module>Errors`; javadoc moved verbatim
 - [ ] **Stage D** — one shape per concept; add the `OutboxPayload` ≡ `OrderConfirmedPayload` test
-- [ ] **Stage E** — absorb the non-concept files; collapse `payment` to ~12 files; act on `RefundResult`
-- [x] **Stage F** — dead surface, migration `V10`, four pom dependencies, four dangling infra references
+- [ ] **Stage E** — absorb the non-concept files, and act on the discarded `RefundResult`. The
+      `payment` collapse is **withdrawn**: that module is a real gateway now, not 22 files around a
+      switch statement
+- [x] **Stage F** — dead surface, migration `V12`, four pom dependencies, three dangling infra
+      references. **About half of the deletions were reverted** when the payment work landed in
+      parallel; `06` §13 Pass 10 has the full accounting and the lesson
 - [ ] **Stage F (remainder)** — admin namespaces, `QueueOrdering.RANDOM` + the ADR superseding 024,
       and `EventRepository.findManagedEventIds`' duplicated predicate. These three change behaviour
       or a URL, so they were held back from the behaviour-preserving stages
 - [x] **Stage G1** — the redundant receipt re-read is gone. **Not yet measured**: the
       `connections_pending` before/after still needs the concurrent-sales drill
+- [x] **Merge review** — `getActiveHold` lost its transaction to self-invocation when its
+      `*FacadeImpl` collapsed into the service. Restored, and it was the only instance
 - [x] Updated `05` §2 and §5, `FE_SPEC.md` §2, `CLAUDE.md`, `README.md`, and `06` §6 and §13
 
 ## 3.2 The coverage gap this review found
