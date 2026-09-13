@@ -48,7 +48,7 @@ public class SseEmitterRegistry {
             unindex(sessionId, previous.eventId());
             previous.emitter().complete();
         }
-        sessionsByEvent.computeIfAbsent(eventId, ignored -> ConcurrentHashMap.newKeySet()).add(sessionId);
+        index(sessionId, eventId);
 
         emitter.onCompletion(() -> remove(sessionId, connection));
         emitter.onTimeout(() -> remove(sessionId, connection));
@@ -177,15 +177,32 @@ public class SseEmitterRegistry {
         return true;
     }
 
+    /**
+     * Both halves of the per-event index go through {@code compute}, so they hold the same per-key
+     * lock.
+     *
+     * <p>Read and written separately, they raced: the last session of an event unindexing would see
+     * the set empty and remove it, while a connect arriving in between had already added itself to
+     * that same instance. The two-argument {@code remove} matches on identity and dropped it anyway,
+     * leaving a live connection indexed in a map nothing iterates — no position frames and no
+     * {@code sale-closed} until its one-hour timeout.
+     */
+    private void index(String sessionId, long eventId) {
+        sessionsByEvent.compute(eventId, (ignored, sessions) -> {
+            Set<String> live = sessions == null ? ConcurrentHashMap.newKeySet() : sessions;
+            live.add(sessionId);
+            return live;
+        });
+    }
+
     private void unindex(String sessionId, long eventId) {
-        Set<String> sessions = sessionsByEvent.get(eventId);
-        if (sessions == null) {
-            return;
-        }
-        sessions.remove(sessionId);
-        if (sessions.isEmpty()) {
-            sessionsByEvent.remove(eventId, sessions);
-        }
+        sessionsByEvent.compute(eventId, (ignored, sessions) -> {
+            if (sessions == null) {
+                return null;
+            }
+            sessions.remove(sessionId);
+            return sessions.isEmpty() ? null : sessions;
+        });
     }
 
     /**

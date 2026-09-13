@@ -3,6 +3,7 @@ package com.flashseats.catalog.repository;
 import com.flashseats.catalog.model.Event;
 import com.flashseats.catalog.model.EventStatus;
 import java.time.Instant;
+import java.util.Collection;
 import java.util.List;
 import org.springframework.data.jpa.repository.JpaRepository;
 import org.springframework.data.jpa.repository.Query;
@@ -10,20 +11,21 @@ import org.springframework.data.repository.query.Param;
 
 public interface EventRepository extends JpaRepository<Event, Long> {
 
-    List<Event> findByStatusOrderBySaleStartTimeAsc(EventStatus status);
-
     /**
-     * Ids of events whose sale window is open right now. The promotion worker ticks over exactly
-     * this set, so a closed sale costs nothing — and a <strong>paused</strong> one drops out of it,
-     * which is what pausing means.
+     * Every event an operator is still answerable for — {@code PUBLISHED} or {@code PAUSED}, any
+     * window.
+     *
+     * <p>One query behind all three list reads below, so that <strong>the promotion tick needs no
+     * database connection at all</strong> (ADR-051). The tick existed to protect the connection pool
+     * and could not run when the pool was under pressure: {@code findOpenEventIds} waited on the same
+     * queue as the buyers it was meant to admit, and a 16-second wait inside a one-second tick means
+     * nobody is promoted, the waiting room does not drain, and the buyers keep polling. That is a
+     * feedback loop, not a slow query.
+     *
+     * <p>Unlike the three derived reads this is <em>not</em> parameterised by the clock, which is what
+     * makes it cacheable: the window comparison happens in memory against a snapshot.
      */
-    @Query("""
-            SELECT e.id FROM Event e
-             WHERE e.status = com.flashseats.catalog.model.EventStatus.PUBLISHED
-               AND e.saleStartTime <= :now
-               AND e.saleEndTime   >  :now
-            """)
-    List<Long> findOpenEventIds(@Param("now") Instant now);
+    List<Event> findByStatusInOrderBySaleStartTimeAsc(Collection<EventStatus> statuses);
 
     /**
      * Ids of events inside their sale window that an operator is still <strong>responsible
@@ -41,8 +43,17 @@ public interface EventRepository extends JpaRepository<Event, Long> {
      *       once someone resumes the sale, which is to say once it has started selling from them.
      * </ul>
      *
-     * <p>Reusing {@code findOpenEventIds} for those two is the easy version of this change and the
-     * wrong one.
+     * <p>Reusing "is it open?" for those two is the easy version of this change and the wrong one.
+     *
+     * <p><strong>This is the surviving SQL definition of the window</strong>, and the one
+     * {@code CatalogService}'s in-memory filter is written against: sale start inclusive, sale end
+     * exclusive. The open-events query that used to sit above it is gone — it ran once per promotion
+     * tick, which made the promoter wait on the pool it was protecting (ADR-051) — so if this
+     * predicate ever changes, the in-memory one changes with it or the drift gauge and the promoter
+     * disagree about which sales exist.
+     *
+     * <p>{@code StockEpoch} keeps calling this rather than the cached path deliberately: it is the
+     * Redis-restart guard, and a fault detector should not read a cache.
      */
     @Query("""
             SELECT e.id FROM Event e

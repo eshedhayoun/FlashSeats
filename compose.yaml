@@ -49,6 +49,14 @@ x-app: &app
     STRIPE_API_KEY: ${STRIPE_API_KEY:-}
     STRIPE_WEBHOOK_SECRET: ${STRIPE_WEBHOOK_SECRET:-}
     RECAPTCHA_SECRET: ${RECAPTCHA_SECRET:-}
+    # The two halves of the concurrent-sales fix, overridable per run, because the
+    # drill is a comparison and not a pass/fail (ADR-049, ADR-051). Defaults match
+    # application.properties; a baseline run is
+    #   FLASHSEATS_CATALOG_METADATA_CACHE_ENABLED=false \
+    #   FLASHSEATS_QUEUE_GLOBAL_ADMISSION_BUDGET_PER_TICK=999999 \
+    #   docker compose --profile cluster up -d
+    FLASHSEATS_CATALOG_METADATA_CACHE_ENABLED: ${FLASHSEATS_CATALOG_METADATA_CACHE_ENABLED:-true}
+    FLASHSEATS_QUEUE_GLOBAL_ADMISSION_BUDGET_PER_TICK: ${FLASHSEATS_QUEUE_GLOBAL_ADMISSION_BUDGET_PER_TICK:-45}
     JAVA_TOOL_OPTIONS: "-XX:MaxRAMPercentage=75"
   depends_on:
     postgres: { condition: service_healthy }

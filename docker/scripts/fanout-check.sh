@@ -55,6 +55,23 @@ if [[ "$WINDOW" != "OPEN" ]]; then
     exit 1
 fi
 
+# ...and it must still have SEATS. An OPEN sale with a drained counter promotes
+# nobody -- correctly, by admission control -- so every session here would report
+# "did not receive a promotion" and blame pub/sub fan-out for a sold-out sale.
+# That is exactly what happened running this straight after a load run.
+AVAILABILITY="$(curl -fsS "${BASE_URL}/api/v1/events/${EVENT_ID}" \
+    | tr ',' '\n' | grep '"availability"' | cut -d'"' -f4 | head -1 || true)"
+if [[ "$AVAILABILITY" == "SOLD_OUT" ]]; then
+    echo "error: event ${EVENT_ID} is OPEN but SOLD OUT, so nothing can be promoted." >&2
+    echo "       Re-seed before checking fan-out: docker/seed/seed-concurrent.sh" >&2
+    exit 1
+fi
+if [[ "$AVAILABILITY" == "UNKNOWN" ]]; then
+    echo "error: event ${EVENT_ID} has no readable inventory counter (ADR-004)." >&2
+    echo "       Pre-warm or rebuild it; a fan-out result would mean nothing." >&2
+    exit 1
+fi
+
 # --- 1. mint a session, join the queue, open a stream ------------------------
 for i in $(seq 1 "$SESSIONS"); do
     JAR="${WORK}/cookies-${i}"
