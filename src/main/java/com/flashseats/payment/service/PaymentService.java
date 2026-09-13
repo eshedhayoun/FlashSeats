@@ -72,16 +72,24 @@ public class PaymentService {
         }
 
         try {
-            PaymentTransaction transaction = store.recordInitiated(command); // tx1, committed
+            // Resume before charging. If this hold was already sent away for 3-D Secure, the only
+            // correct move is to re-read THAT intent: the client reuses one idempotency key for the
+            // life of the hold (FE_SPEC §1), so a second charge would replay the provider's cached
+            // "requires_action" answer for ever — and varying the key per attempt instead would
+            // open a second intent and risk billing twice for one authentication.
+            ChargeAttempt attempt = store.beginAttempt(command); // tx1
 
-            GatewayResult result = gateway.charge(new GatewayCharge( // no transaction open
-                    command.orderNumber(),
-                    command.amountCents(),
-                    command.currency(),
-                    command.paymentMethodId(),
-                    command.clientIdempotencyKey()));
+            GatewayResult result = attempt.isResume() // no transaction open
+                    ? gateway.retrieve(attempt.resumableGatewayReference())
+                    : gateway.charge(new GatewayCharge(
+                            command.orderNumber(),
+                            command.holdToken(),
+                            command.amountCents(),
+                            command.currency(),
+                            command.paymentMethodId(),
+                            command.clientIdempotencyKey()));
 
-            store.recordOutcome(transaction.getTransactionReference(), result); // tx2
+            store.recordOutcome(attempt.transactionReference(), result); // tx2
 
             if (result.outcome() == GatewayResult.Outcome.ERROR) {
                 log.warn("Gateway error for order {}: {}", command.orderNumber(), result.failureReason());
@@ -89,17 +97,32 @@ public class PaymentService {
             }
 
             return new PaymentResult(
-                    transaction.getTransactionReference(),
+                    attempt.transactionReference(),
                     result.isSuccess(),
                     result.gatewayReference(),
+                    result.clientSecret(),
                     result.failureCode(),
                     result.failureReason(),
                     result.outcome() == GatewayResult.Outcome.DECLINED,
-                    result.outcome() == GatewayResult.Outcome.REQUIRES_ACTION);
+                    result.requiresAction());
         } finally {
             // Released whatever happened. The order row remains the durable guard, so letting go
             // early costs nothing and avoids stranding a buyer behind their own failed attempt.
-            redis.delete(inflightKey);
+            //
+            // Guarded, because a throw from a `finally` REPLACES whatever the block was returning.
+            // An unguarded delete meant that Redis dropping between the charge and this line
+            // discarded a successful result and sent the caller down its catch-all to mark the
+            // order FAILED — money moved, and the order says it did not. The key expires on its own
+            // in `inflight-ttl-seconds`, so failing to release it costs nothing at all.
+            try {
+                redis.delete(inflightKey);
+            } catch (RuntimeException releaseFailed) {
+                log.warn(
+                        "Could not release {}; it expires in {}s",
+                        inflightKey,
+                        properties.getInflightTtlSeconds(),
+                        releaseFailed);
+            }
         }
     }
 

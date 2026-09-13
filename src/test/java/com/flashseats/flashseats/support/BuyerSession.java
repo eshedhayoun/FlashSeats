@@ -64,6 +64,18 @@ public class BuyerSession {
         return send(request(path).POST(publisher(body)), headers);
     }
 
+    /**
+     * Posts a body <strong>exactly</strong> as given, with no serialisation in between.
+     *
+     * <p>For the webhook endpoint, where the signature is computed over the bytes rather than over
+     * the meaning: re-serialising an equivalent object changes key order and whitespace, and the
+     * signature then fails on a payload that is, as JSON, identical. Signing one string and sending
+     * another is the exact mistake this method exists to make impossible.
+     */
+    public Response postRaw(String path, String rawBody, Map<String, String> headers) {
+        return send(request(path).POST(HttpRequest.BodyPublishers.ofString(rawBody)), headers);
+    }
+
     public Response delete(String path) {
         return send(request(path).DELETE(), Map.of());
     }
