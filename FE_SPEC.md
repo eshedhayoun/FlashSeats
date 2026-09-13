@@ -303,18 +303,30 @@ the gateway-level guard (ADR-014).
 | `503 PAYMENT_GATEWAY_UNAVAILABLE` | "Payment provider is having trouble. **Your seats are held.**" Retry after `retryAfterSeconds` |
 | `409 DUPLICATE_PAYMENT` | Ignore — a charge is in flight. Poll `/sale/state` every 2 s |
 | `409 ORDER_REFUNDED` | Terminal. The charge succeeded and could not be completed, so it was **refunded**. Say that plainly and name the order number |
-| `402 PAYMENT_ACTION_REQUIRED` | **Unreachable today.** Reserved for 3-DS in Stage 2 — see below |
+| `402 PAYMENT_ACTION_REQUIRED` | 3-D Secure. Keep `paymentInFlight` **true**, run `stripe.handleNextAction(problem.clientSecret)`, then **re-POST this same body**. Hold retained, **no attempt consumed** — see below |
 
 **A retry is the same request.** Re-POST `/orders/checkout` with the same body and the same
 `idempotencyKey`. Find-or-create on `UNIQUE(hold_token)` retries on the same order number, so three
 declines produce one reference rather than three (ADR-002, ADR-034). Regenerating the key per attempt
 defeats the gateway-level guard (ADR-014).
 
-**3-D Secure — specified, not built.** The gateway is a stub; there is no `clientSecret`, no
-`handleNextAction`, and no redirect. When Stage 2 brings a real provider, `paymentInFlight` must stay
-`true` for the entire challenge, per-event storage must carry whatever survives a redirect, and the
-return path is `/sale/{eventId}/state` — **not** a bespoke resume endpoint. The +120 s grace is
-granted before the charge, so the challenge window is already covered (ADR-006, ADR-030).
+**3-D Secure — built (ADR-054).** The `402` carries a `clientSecret` on the problem document. Four
+rules, and each of them is a way this goes wrong:
+
+1. **`paymentInFlight` stays `true` for the whole challenge.** It is what freezes the expiry branch;
+   letting it drop mid-challenge routes the buyer off the payment screen while their bank is still
+   asking them a question.
+2. **The retry is the same request.** Re-POST `/orders/checkout` with the same body and the **same
+   `idempotencyKey`** — the server retrieves the existing PaymentIntent rather than charging again.
+   There is no resume endpoint. A fresh key per attempt would open a second intent and bill twice
+   for one authentication.
+3. **No attempt was consumed and the seats are still held.** Do not decrement anything you show the
+   buyer, and do not re-route.
+4. **If the page is reloaded mid-challenge**, rehydrate through `/sale/{eventId}/state` like every
+   other recovery — the order is `FAILED` and resumable, so V4 is still the right screen.
+
+The +120 s grace is granted *before* the charge, so the challenge window is already covered
+(ADR-006, ADR-030). No further extension is granted, and none is needed.
 
 **Email:** validated client-side for shape only — shape validation catches `foo@@bar`, never
 `jhon@gmial.com`. Show it back on V5 prominently. Today a typo means the tickets go nowhere with no
@@ -409,10 +421,10 @@ not needed. **Re-POST the same `/orders/checkout` body** — the endpoint is fin
 resubmission after success replays the receipt with `200` instead of `201` (ADR-002, ADR-034). That
 is the whole retry mechanism; do not build a second one.
 
-**Three registry codes are currently unreachable** and a client must not branch on them yet:
-`BOT_VERIFICATION_FAILED` (no challenge provider — §5), `PAYMENT_ACTION_REQUIRED` (no 3-DS; the
-gateway is a stub) and `WEBHOOK_SIGNATURE_INVALID` (no webhook). Handle them defensively as generic
-failures; they arrive with Stage 2.
+**`PAYMENT_ACTION_REQUIRED` is now reachable** and a client must branch on it — see V4 above.
+`WEBHOOK_SIGNATURE_INVALID` is reachable too, but only on the provider's own callback; no browser
+will ever see it. **`BOT_VERIFICATION_FAILED` remains unreachable** (no challenge provider — §5);
+handle it defensively as a generic failure.
 
 ### Error envelope — RFC 7807
 
@@ -466,8 +478,10 @@ not context the tab happens to remember.
 `fs.clockOffsetMs` is the **one** deliberately global key: there is a single server clock, and every
 `serverTime` in every response refreshes the same offset.
 
-There is no `fs.pi`. Stripe PaymentIntents and the 3-DS redirect they exist for are Stage 2; the
-gateway is a stub today and no redirect occurs.
+There is still no `fs.pi`, and 3-D Secure does not need one. The `clientSecret` arrives on the
+`402` and is used immediately by `handleNextAction`; the retry is a re-POST of the same body, so
+nothing about the challenge has to survive a reload. The intent id lives on the server, keyed by the
+hold (ADR-054). Persisting a client secret would be storing a bearer value for no reason.
 
 **`localStorage`:** only `fs.recentOrders` — a list of `{orderNumber, receiptToken, eventTitle}` so a
 returning buyer can find their tickets across sales. It is keyed by nothing because it spans
@@ -550,6 +564,7 @@ seats*. Getting either wrong leaves a buyer mashing a button that cannot succeed
 | :--- | :--- | :--- | :--- |
 | `PAYMENT_DECLINED` | **enabled**, "Try again" | held | "Your seats are still held — N attempt(s) left" |
 | `PAYMENT_GATEWAY_UNAVAILABLE` | **enabled**, "Try again" | held | Our problem, not theirs, and **no attempt was used** (ADR-034) |
+| `PAYMENT_ACTION_REQUIRED` | **disabled during the challenge**, then "Try again" | held | Their bank is verifying. **No attempt was used**, and re-POSTing the same body is what completes it (ADR-054) |
 | `PAYMENT_ATTEMPTS_EXHAUSTED` | **disabled** | held | Offer *Release seats* — a further attempt cannot be accepted |
 | `DUPLICATE_PAYMENT` | **disabled** | held | "Finishing a payment already in progress", then poll `/sale/state` |
 | `INVENTORY_UNAVAILABLE` | **enabled**, "Try again" | untouched | "Having trouble reading availability." **Never "sold out"** (ADR-004) |

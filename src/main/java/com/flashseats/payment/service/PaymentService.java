@@ -11,6 +11,7 @@ import com.flashseats.payment.gateway.GatewayResult;
 import com.flashseats.payment.gateway.PaymentGateway;
 import com.flashseats.payment.model.PaymentTransaction;
 import java.time.Duration;
+import java.util.Optional;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.stereotype.Service;
@@ -72,16 +73,28 @@ public class PaymentService {
         }
 
         try {
-            PaymentTransaction transaction = store.recordInitiated(command); // tx1, committed
+            // Resume before charging. If this hold was already sent away for 3-D Secure, the only
+            // correct move is to re-read THAT intent: the client reuses one idempotency key for the
+            // life of the hold (FE_SPEC §1), so a second charge would replay the provider's cached
+            // "requires_action" answer for ever — and varying the key per attempt instead would
+            // open a second intent and risk billing twice for one authentication.
+            Optional<ResumableCharge> resumable = store.findResumable(command.holdToken());
 
-            GatewayResult result = gateway.charge(new GatewayCharge( // no transaction open
-                    command.orderNumber(),
-                    command.amountCents(),
-                    command.currency(),
-                    command.paymentMethodId(),
-                    command.clientIdempotencyKey()));
+            String transactionReference = resumable
+                    .map(ResumableCharge::transactionReference)
+                    .orElseGet(() -> store.recordInitiated(command).getTransactionReference()); // tx1
 
-            store.recordOutcome(transaction.getTransactionReference(), result); // tx2
+            GatewayResult result = resumable // no transaction open
+                    .map(charge -> gateway.retrieve(charge.gatewayReference()))
+                    .orElseGet(() -> gateway.charge(new GatewayCharge(
+                            command.orderNumber(),
+                            command.holdToken(),
+                            command.amountCents(),
+                            command.currency(),
+                            command.paymentMethodId(),
+                            command.clientIdempotencyKey())));
+
+            store.recordOutcome(transactionReference, result); // tx2
 
             if (result.outcome() == GatewayResult.Outcome.ERROR) {
                 log.warn("Gateway error for order {}: {}", command.orderNumber(), result.failureReason());
@@ -89,13 +102,14 @@ public class PaymentService {
             }
 
             return new PaymentResult(
-                    transaction.getTransactionReference(),
+                    transactionReference,
                     result.isSuccess(),
                     result.gatewayReference(),
+                    result.clientSecret(),
                     result.failureCode(),
                     result.failureReason(),
                     result.outcome() == GatewayResult.Outcome.DECLINED,
-                    result.outcome() == GatewayResult.Outcome.REQUIRES_ACTION);
+                    result.requiresAction());
         } finally {
             // Released whatever happened. The order row remains the durable guard, so letting go
             // early costs nothing and avoids stranding a buyer behind their own failed attempt.

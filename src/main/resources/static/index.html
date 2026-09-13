@@ -160,6 +160,7 @@
       <option value="pm_card_visa">Visa ending 4242 — succeeds</option>
       <option value="pm_card_declined">Test card — declines</option>
       <option value="pm_card_error">Test card — provider error</option>
+      <option value="pm_card_authenticationRequired">Test card — 3-D Secure challenge</option>
     </select>
     <div style="height:18px"></div>
     <button id="btn-pay" class="full">Pay now</button>
@@ -614,6 +615,17 @@ function handleCheckoutFailure(p) {
       // Ours, not theirs: the hold is intact and no attempt was spent (ADR-034).
       notify(`${p.detail} No attempt was used.`);
       return retry("Try again");
+
+    case "PAYMENT_ACTION_REQUIRED":
+      // 3-D Secure. A real client runs stripe.handleNextAction(p.clientSecret) and then
+      // RE-POSTS THIS SAME BODY — there is no resume endpoint, and the server resumes the
+      // existing intent rather than charging again (ADR-054). No attempt was spent, and the
+      // grace extension granted before the charge is what pays for the challenge window.
+      //
+      // This demo page has no Stripe.js, so it can only describe the step. The button stays
+      // live because the resubmission is genuinely the next action.
+      notify(`${p.detail} Complete the check with your bank, then press Pay again.`);
+      return retry("I've verified — pay now");
 
     case "PAYMENT_ATTEMPTS_EXHAUSTED":
       // No further card attempt will be accepted for this reservation. Offering

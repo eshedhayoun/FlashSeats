@@ -274,7 +274,13 @@ Honest list. None of these is hidden behind a passing test.
 - **The Redis-restart guard halts selling for every affected event** until each is rebuilt. That is
   what `catalog.md` has always demanded after a restart; it is now enforced rather than remembered,
   and an unattended restart therefore stops a sale.
-- **Payment is a stub.** Every idempotency layer is real; the gateway is not.
+- ~~**Payment is a stub.**~~ **Fixed (Pass 9):** Stripe is behind the same seam, with a circuit
+  breaker, the webhook receiver and 3-D Secure (ADR-052-054). The stub survives as the **default**,
+  so `dev`, `test`, the load harness and every drill still drive the whole journey with no keys — and
+  it is now the only deterministic coverage of decline, outage and challenge. What that means is that
+  **the suite proves this system's behaviour, not the provider's**: `docker/scripts/stripe-check.sh`
+  is the only thing that checks the real account, the real status mapping and the real webhook secret
+  agree, and it is a script someone has to run rather than a test that fails on its own.
 - ~~**No admin surface** beyond pre-warm.~~ **Built** (Stage 4, ADR-048): pause/resume, the DLQ
   listing, a ticket resend, and an operator order view. `rebuild-stock` shipped in Stage 1. Still
   a single in-memory operator account — now stored bcrypt-hashed rather than in plaintext, with a
@@ -435,15 +441,21 @@ restored exactly once, in 339 ms, across three replicas.
 removed". `git log -S` across every commit finds no keyspace listener and no `hold:` key literal
 ever committed, so that work lived only in an uncommitted tree and none of it was recoverable.
 
-### Stage 2 — Real money and real defence (Phase 3)
+### Stage 2 — Real money and real defence (Phase 3) — payment half DONE (Pass 9)
 
-- `StripeGateway` implementing the existing `PaymentGateway`; the webhook receiver with signature
-  verification and `webhook_events` replay protection; `PaymentSettledEvent` → `order`.
-- The auto-refund path when a webhook arrives against a hold that is gone (ADR-012) — the code exists
-  and is currently only reachable via a commit failure.
-- 3-D Secure: `PAYMENT_ACTION_REQUIRED` plus `POST /orders/checkout/resume`.
-- Resilience4j around every gateway call — declared as plain beans, since the Boot-3 starter does not
-  apply here.
+- ~~`StripeGateway` implementing the existing `PaymentGateway`~~ — **built** (ADR-052). Server-confirmed
+  PaymentIntents, so `FE_SPEC` §2's checkout body and ADR-001's ordering are unchanged.
+- ~~the webhook receiver with signature verification and `webhook_events` replay protection;
+  `PaymentSettledEvent` → `order`~~ — **built** (ADR-053). The claim is released when settlement
+  fails, so a redelivery retries rather than being dismissed as a duplicate.
+- ~~The auto-refund path when a webhook arrives against a hold that is gone (ADR-012)~~ — **built and
+  now reachable**, with its first test. A refund the provider *refuses* is also no longer recorded as
+  a refund: it is counted on `flashseats.payment.refund.failed` and written into `failure_reason`.
+- ~~3-D Secure: `PAYMENT_ACTION_REQUIRED` plus `POST /orders/checkout/resume`.~~ — **built, without
+  the resume endpoint** (ADR-054). `FE_SPEC` §2 was right and this line was wrong: re-POSTing the
+  same body is the retry, and the server retrieves the pending intent rather than charging again.
+- ~~Resilience4j around every gateway call — declared as plain beans~~ — **built** as a decorator that
+  counts transport failures only.
 - reCAPTCHA v3 on join, cached per session, **failing open** (ADR-011) — this is S5's compensating
   control, so it belongs with the security fixes above.
 - `ip_rules`, `bot_audit_logs` (async, non-`ALLOWED` outcomes only), and `V6__bot.sql`.
@@ -1389,3 +1401,74 @@ change ADR-049 ever needed — and the sale sells out.
   Pass 7, it now measures 0 pending and a **complete sellout — 2,500 of 2,500**. 112 tests green. The one number still open is checkout p99: 10 s
   against a 200 ms criterion, which `pending` at zero says is not the database, and which needs a host
   where the load generator is not sharing ten cores with three JVMs.
+
+---
+
+### Pass 9 — Stage 2, the payment half: real money behind the seam that was already there
+
+- **Scope:** replace the stub gateway, build the webhook receiver, make ADR-012's refund reachable,
+  and ship 3-D Secure. **124 tests green** (112 before; `payment` had none of its own).
+- **Method:** build against the existing seam without changing anything above it, then give the
+  module its first tests — and keep every one of them runnable with no Stripe account.
+
+**The seam held.** `PaymentGateway`, `payment:inflight`, the two `REQUIRES_NEW` transactions
+bracketing the network call, find-or-create, the attempt ceiling and the compensating refund were all
+built for a provider that did not exist yet, and none of them needed changing. What the provider
+actually cost was: two fields on `GatewayResult` (`clientSecret`, and a `requiresAction` factory that
+*must* carry the intent id), one method on the interface (`retrieve`), one field on `GatewayCharge`
+(`holdToken`, which travels as provider metadata and is how the webhook finds its order), and **three
+lines in `CheckoutService`**.
+
+| Built | Shape |
+| :--- | :--- |
+| `StripePaymentGateway` | Server-confirmed PaymentIntents (ADR-052). Payment Element would have inverted ADR-001 and made the synchronous `402`/`409` contract dead code |
+| `CircuitBreakingGateway` | A decorator, not an aspect. Counts `GatewayTransportException` and **nothing else** — a decline is a returned value, and a breaker that counted declines opens on a healthy provider during an ordinary burst of expired cards |
+| `webhook_events` + the receiver | A claim, not a log (ADR-053). `ON CONFLICT DO NOTHING`, rowcount as the answer, **released when settlement throws** so the redelivery retries |
+| `PaymentSettledEvent` → `order` | ADR-005's one cross-module edge, traversed for the first time since it was drawn |
+| 3-D Secure | `402` + `clientSecret`, resumed by re-POSTing the same body (ADR-054) |
+
+**Three things this pass got right only because a document was wrong out loud.**
+
+| Found | Resolution |
+| :--- | :--- |
+| **`03` §5 and `06` §11 both specified `POST /orders/checkout/resume`; `FE_SPEC` §2 said flatly that it does not exist and must not be built.** Three documents, two answers, and the contract one is the one clients are written against | FE_SPEC wins. Both others corrected, and **ADR-054** records why: a second retry path needs its own idempotency story, and this system's whole guarantee is that there is one |
+| **`05-global-standards.md` §2 told clients to "follow `resumeUrl`"** — a field that existed in no code, no DTO and no other document | Replaced with the real contract: `clientSecret`, then re-POST |
+| **The compensating refund discarded `RefundResult`.** A provider that *refused* the refund still produced an order marked `REFUNDED` and an email telling the buyer their money was coming — money this business holds and should not, described to the only person who would notice as already returned | One `OrderRefundService` for both call sites; a failure is counted on `flashseats.payment.refund.failed` and written into `failure_reason`. **Alarm on any non-zero value** |
+
+**The resume had to retrieve, and finding out why was the real design work.** The obvious
+implementation — charge again on the re-POST — fails in two different directions depending on the
+idempotency key. Reuse it, as `FE_SPEC` §1 requires, and the provider replays its cached
+`requires_action` response **for ever**, so the buyer can never finish. Vary it per attempt and a
+*second* intent opens, so they authenticate one payment and are billed for two. Only retrieving the
+pending intent works — and `PaymentStatus.PROCESSING`, declared on day one and never written because
+the stub could not reach it, turned out to be exactly the marker needed.
+
+**Accepted, and written down rather than discovered later:** while a challenge is outstanding, a
+different card in the body is ignored, because the resume re-reads that intent. The bound is the hold,
+which expires in minutes, and the alternative is a second charge against a hold that already has one
+in flight. A *failed* challenge resolves itself — the provider moves the intent to
+`requires_payment_method`, the retrieve returns `DECLINED`, and the next attempt charges fresh.
+
+**The stub was kept, and made the default.** It would have been natural to delete it on the day the
+real thing arrived, and that would have taken the only deterministic coverage of decline, outage and
+challenge with it — along with the ability to run the load harness, every drill and the whole suite
+with no account. Its vocabulary is now the provider's own (`pm_card_authenticationRequired`), so one
+script drives either gateway. Two consequences worth stating plainly:
+
+- **The suite proves this system's behaviour, not Stripe's.** `docker/scripts/stripe-check.sh` is the
+  only thing that checks the real account, the real status mapping and the real webhook secret agree,
+  and it is a script someone has to run rather than a test that fails on its own.
+- **The webhook secret is read on every profile**, independently of `stripe.enabled`, because that is
+  how the tests sign their own payloads. Gating it on the flag would have left the endpoint untested
+  on exactly the configuration the tests run.
+
+**Two traps avoided that the repository had already written down once.** The webhook claim is on its
+own bean, because a `@Transactional` method called from the same object runs with no transaction at
+all — and a claim that is not committed before the work it guards lets all three replicas settle the
+same charge. And the claim is released on failure, which is ADR-038's rule (Pass 6, the DLQ replay)
+appearing in a second place for the same reason.
+
+- **Result:** 124 tests green. `payment`'s first suite: webhook signature, replay, settlement,
+  ADR-012's refund, the 3-D Secure round trip asserting **one** charge and **zero** attempts consumed,
+  and a breaker unit test asserting a hundred declines leave it closed. Still open: the bot half of
+  Stage 2, and checkout p99.
