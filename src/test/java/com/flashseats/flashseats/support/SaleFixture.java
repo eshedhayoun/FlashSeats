@@ -262,6 +262,42 @@ public class SaleFixture {
     }
 
     /**
+     * Runs {@code body} with a tier's row temporarily gone, then puts it back exactly as it was.
+     *
+     * <p>Nothing references {@code ticket_tiers} from {@code ticket_holds}, so this leaves a live
+     * hold pointing at a tier the catalog cannot describe — which is how a settlement can be made to
+     * fail for a reason that is <strong>not</strong> one of the three definite hold outcomes. Every
+     * other failure reachable on that path is definite, which is the point: the branch that must not
+     * refund cannot be reached any other way.
+     *
+     * <p>The caches are cleared on both edges. A raw delete evicts nothing by itself (ADR-051).
+     */
+    public void withTierRemoved(long tierId, Runnable body) {
+        var row = jdbc.queryForMap("SELECT * FROM ticket_tiers WHERE id = ?", tierId);
+        jdbc.update("DELETE FROM ticket_tiers WHERE id = ?", tierId);
+        caches.forEach(DerivedStateCache::invalidateAll);
+        try {
+            body.run();
+        } finally {
+            jdbc.update(
+                    """
+                    INSERT INTO ticket_tiers
+                           (id, event_id, tier_name, price_cents, currency, total_capacity,
+                            max_per_order, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, now(), now())
+                    """,
+                    row.get("id"), row.get("event_id"), row.get("tier_name"), row.get("price_cents"),
+                    row.get("currency"), row.get("total_capacity"), row.get("max_per_order"));
+            caches.forEach(DerivedStateCache::invalidateAll);
+        }
+    }
+
+    /** Every address in the bot audit trail — the RESOLVED one, not the socket peer. */
+    public java.util.List<String> botAuditAddresses() {
+        return jdbc.queryForList("SELECT ip_address FROM bot_audit_logs", String.class);
+    }
+
+    /**
      * Every outcome in the bot audit trail.
      *
      * <p>Deliberately returns them all rather than a count: the assertion worth making is that no

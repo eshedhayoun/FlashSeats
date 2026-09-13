@@ -161,7 +161,7 @@ exactly what ADR-023 forbids.
 
 | Gap | Detail |
 | :--- | :--- |
-| **Checkout costs eight sequential transactions** | Steps 0, 1, 2, 4, 5, the payment store, 7 and the closing read are each their own connection acquisition. ADR-049 budgets admission against this figure |
+| **Checkout costs nine sequential transactions** | Steps 0, 1, 2, 4, 5, **both** of the payment store's `REQUIRES_NEW` transactions bracketing the gateway call, 7, and the closing read are each their own connection acquisition. ADR-049 budgets admission against this figure, so the count is load-bearing rather than trivia — it was listed as eight here and nine in `06` §9 until Pass 9 |
 | **No outbox lag metric** | `flashseats.outbox.lag.seconds` is specified in `03` §7 and not built; a stalled relay currently surfaces as buyers not receiving tickets |
 
 ---

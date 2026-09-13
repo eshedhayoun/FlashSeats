@@ -47,7 +47,8 @@ hold a session — so the signature over the **raw request bytes** is the only g
 Both are called only by `order`.
 
 **Event:** `PaymentSettledEvent` — the one cross-module event in the system (ADR-005). Published
-synchronously so a failed settlement can become a non-2xx and earn a redelivery. The *type*
+synchronously so a failed settlement can become a non-2xx and earn a redelivery. **Only a definite
+failure refunds**; anything unresolved propagates and is retried (ADR-056). The *type*
 dependency runs `order → payment`, which already exists; the event is what keeps the runtime
 direction from closing the loop.
 
@@ -80,6 +81,7 @@ else.
 | **Checkout does not survive a Redis outage** | It opens with `SETNX payment:inflight:{holdToken}`, which fails closed. For a payment that is the right direction, but it is a written-down limitation rather than a resilience feature |
 | **No decline-ratio metric** | `flashseats.payment.decline.ratio` is specified in `03` §7 and not built. `flashseats.payment.refund.failed` **is** built, and any non-zero value is money owed to a named buyer |
 | **A failed refund still needs a human** | It is counted and written into `failure_reason` rather than silently reported as refunded, but nothing retries it — and nothing should, automatically |
+| **A webhook that keeps failing keeps being redelivered** | Correct, and unbounded: the claim is released every time, so a permanently broken settlement is retried on the provider's schedule until it gives up. Visible in the logs, not in a metric |
 | **Live-provider coverage is a script, not a test** | The suite runs the stub. `docker/scripts/stripe-check.sh` is the only thing that proves the real account, the real status mapping and the real webhook secret agree |
 
 ---
@@ -93,3 +95,4 @@ else.
 - Parse a webhook body before verifying its signature, or bind it to anything but a raw string.
 - Keep a webhook claim whose settlement failed (ADR-038).
 - Start a second charge for a hold whose intent is awaiting authentication (ADR-054).
+- Refund on anything but a **definite** failure to obtain the seats (ADR-056).

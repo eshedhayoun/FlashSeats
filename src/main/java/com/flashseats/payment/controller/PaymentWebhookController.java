@@ -1,7 +1,6 @@
 package com.flashseats.payment.controller;
 
 import com.flashseats.payment.service.PaymentWebhookService;
-import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
@@ -42,7 +41,10 @@ public class PaymentWebhookController {
      * an event type we ignore, as well as to a settlement that worked. Anything that throws becomes
      * a non-2xx and asks for a redelivery — which the released claim makes safe.
      */
-    @PostMapping(value = "/webhook", consumes = MediaType.APPLICATION_JSON_VALUE)
+    // No `consumes`: a content type we did not predict would answer 415, and the provider retries
+    // every non-2xx — for ever, against a request that will never be accepted. The signature is the
+    // gate here, not the header.
+    @PostMapping("/webhook")
     public ResponseEntity<Void> receive(
             @RequestBody String rawBody, @RequestHeader("Stripe-Signature") String signature) {
 

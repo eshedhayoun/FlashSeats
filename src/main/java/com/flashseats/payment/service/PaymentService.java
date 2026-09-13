@@ -11,7 +11,6 @@ import com.flashseats.payment.gateway.GatewayResult;
 import com.flashseats.payment.gateway.PaymentGateway;
 import com.flashseats.payment.model.PaymentTransaction;
 import java.time.Duration;
-import java.util.Optional;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.stereotype.Service;
@@ -78,23 +77,19 @@ public class PaymentService {
             // life of the hold (FE_SPEC §1), so a second charge would replay the provider's cached
             // "requires_action" answer for ever — and varying the key per attempt instead would
             // open a second intent and risk billing twice for one authentication.
-            Optional<ResumableCharge> resumable = store.findResumable(command.holdToken());
+            ChargeAttempt attempt = store.beginAttempt(command); // tx1
 
-            String transactionReference = resumable
-                    .map(ResumableCharge::transactionReference)
-                    .orElseGet(() -> store.recordInitiated(command).getTransactionReference()); // tx1
-
-            GatewayResult result = resumable // no transaction open
-                    .map(charge -> gateway.retrieve(charge.gatewayReference()))
-                    .orElseGet(() -> gateway.charge(new GatewayCharge(
+            GatewayResult result = attempt.isResume() // no transaction open
+                    ? gateway.retrieve(attempt.resumableGatewayReference())
+                    : gateway.charge(new GatewayCharge(
                             command.orderNumber(),
                             command.holdToken(),
                             command.amountCents(),
                             command.currency(),
                             command.paymentMethodId(),
-                            command.clientIdempotencyKey())));
+                            command.clientIdempotencyKey()));
 
-            store.recordOutcome(transactionReference, result); // tx2
+            store.recordOutcome(attempt.transactionReference(), result); // tx2
 
             if (result.outcome() == GatewayResult.Outcome.ERROR) {
                 log.warn("Gateway error for order {}: {}", command.orderNumber(), result.failureReason());
@@ -102,7 +97,7 @@ public class PaymentService {
             }
 
             return new PaymentResult(
-                    transactionReference,
+                    attempt.transactionReference(),
                     result.isSuccess(),
                     result.gatewayReference(),
                     result.clientSecret(),
@@ -113,7 +108,21 @@ public class PaymentService {
         } finally {
             // Released whatever happened. The order row remains the durable guard, so letting go
             // early costs nothing and avoids stranding a buyer behind their own failed attempt.
-            redis.delete(inflightKey);
+            //
+            // Guarded, because a throw from a `finally` REPLACES whatever the block was returning.
+            // An unguarded delete meant that Redis dropping between the charge and this line
+            // discarded a successful result and sent the caller down its catch-all to mark the
+            // order FAILED — money moved, and the order says it did not. The key expires on its own
+            // in `inflight-ttl-seconds`, so failing to release it costs nothing at all.
+            try {
+                redis.delete(inflightKey);
+            } catch (RuntimeException releaseFailed) {
+                log.warn(
+                        "Could not release {}; it expires in {}s",
+                        inflightKey,
+                        properties.getInflightTtlSeconds(),
+                        releaseFailed);
+            }
         }
     }
 

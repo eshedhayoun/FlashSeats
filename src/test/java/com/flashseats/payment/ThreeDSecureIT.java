@@ -127,6 +127,9 @@ class ThreeDSecureIT extends IntegrationTest {
         assertThat(fixture.gatewayReferenceFor(holdToken)).isEqualTo(intentBeforeChallenge);
 
         assertThat(fixture.countOrders()).isEqualTo(1);
+        // Exactly one attempt against the buyer's three, for one purchase. The challenge itself
+        // spent none, and the resume spent the one the confirmation earned.
+        assertThat(fixture.paymentAttemptsFor(holdToken)).isEqualTo(1);
         assertThat(fixture.holdStatus(holdToken)).isEqualTo("CONSUMED");
         assertThat(fixture.stockInvariantHolds(tierId)).isTrue();
         await().atMost(PATIENCE)

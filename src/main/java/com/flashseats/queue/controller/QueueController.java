@@ -8,6 +8,7 @@ import com.flashseats.queue.dto.QueueStatusResponse;
 import com.flashseats.queue.service.QueueService;
 import com.flashseats.queue.service.SseEmitterRegistry;
 import com.flashseats.shared.identity.SessionId;
+import com.flashseats.shared.web.ClientAddress;
 import jakarta.servlet.http.HttpServletRequest;
 import jakarta.validation.Valid;
 import java.time.Duration;
@@ -64,7 +65,13 @@ public class QueueController {
             SessionId session,
             HttpServletRequest http) {
 
-        bots.verifyHuman(session.value(), request.recaptchaToken(), http.getRemoteAddr());
+        // The address the rate limiter already resolved, not getRemoteAddr(): behind nginx the
+        // latter is always the proxy, so every audit row in the deployment that matters would
+        // record the same meaningless value (ADR-039 resolves X-Forwarded-For in one place).
+        bots.verifyHuman(
+                session.value(),
+                request.recaptchaToken(),
+                ClientAddress.of(http));
         return queue.join(session.value(), request.eventId());
     }
 

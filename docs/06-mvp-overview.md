@@ -1409,8 +1409,9 @@ change ADR-049 ever needed — and the sale sells out.
 ### Pass 9 — Stage 2: real money behind the seam that was already there, and defence that fails open
 
 - **Scope:** replace the stub gateway, build the webhook receiver, make ADR-012's refund reachable,
-  ship 3-D Secure, and build §10 S5's compensating control. **129 tests green** (112 before;
-  `payment` and `bot` each had none of their own).
+  ship 3-D Secure, build §10 S5's compensating control — **and then review all of it** against
+  rollbacks, connection loss, repeated attempts and load. **142 tests green** (112 before; `payment`
+  and `bot` each had none of their own).
 - **Method:** build against the existing seam without changing anything above it, then give the
   module its first tests — and keep every one of them runnable with no Stripe account.
 
@@ -1508,10 +1509,38 @@ the stack must run from a clean checkout, and therefore the honest statement is 
 *exists* rather than that it is *on*. ADR-044's verified accounts remain the other route to the same
 problem.
 
-- **Result:** **129 tests green.** `payment`'s first suite (12): webhook signature, replay,
+**The same pass then reviewed its own work**, against the conditions this code will actually meet
+rather than the ones a green suite exercises: a rolled-back transaction, a dropped connection, one
+actor retrying hard, a sale with many buyers at once. Four defects, and **none of them is an error** —
+which is exactly why 129 passing tests could not see them (ADR-056).
+
+| Found | Condition that reveals it | Rule |
+| :--- | :--- | :--- |
+| The settlement caught `RuntimeException` and refunded, so a pool timeout or an unreadable counter refunded a buyer whose seats were **fine** — then answered the provider `200`, so nothing ever retried and the mistake was permanent | any transient database trouble during a webhook | **Only a definite failure moves money.** The three hold exceptions refund; everything else propagates, releases the claim and earns a redelivery — ADR-046's inventory rule, reaching money |
+| `payment:inflight` was released in an **unguarded** `finally`, so Redis dropping after a successful charge discarded the result and marked the order `FAILED` — money moved, order says it did not | Redis blip mid-checkout | A throw from `finally` **replaces** the returned value. Guard cleanup; the key expires anyway |
+| The 3-D Secure resume lookup was its own `REQUIRES_NEW` read, so **every** checkout paid a tenth sequential transaction to serve the challenge minority — against the count ADR-049's allowance is derived from | many buyers at once | Merged into the insert as one `beginAttempt`. Back to nine, and one class shorter |
+| `ip_rules` retried a down database **per request** and had no single-flight guard, so a TTL boundary was a pool spike and an outage was a connection storm | PostgreSQL unreachable; high request rate | A failed attempt stamps the clock like a success; one reload in flight; an empty result is cached too. All non-blocking — a lock here pins carrier threads |
+
+Plus `requires_confirmation` was mapped to `PAYMENT_ACTION_REQUIRED`, which would have handed the
+client a `clientSecret` whose `handleNextAction` does nothing — a `402` loop for the life of the hold;
+and the audit trail recorded `getRemoteAddr()`, which behind nginx is nginx, so every row in the only
+deployment that matters said `172.28.0.10`. `X-Forwarded-For` is now resolved in exactly one place and
+published as `shared`'s `ClientAddress` attribute.
+
+**A note on the test that could not be written the obvious way.** Forcing an ambiguous settlement
+failure with `@MockitoSpyBean` **broke nineteen unrelated tests**: a bean override forks the
+application context, so two applications ran their schedulers against the same containers while the
+fixture truncated underneath both. The natural trigger turned out to be sitting in the schema —
+`ticket_holds` has no foreign key to `ticket_tiers`, so removing a tier row leaves a live hold the
+catalog cannot describe. Worth recording, because the next person to reach for a bean override in
+this suite will hit the same wall.
+
+- **Result:** **142 tests green.** `payment`'s first suite (12): webhook signature, replay,
   settlement, ADR-012's refund, the 3-D Secure round trip asserting **one** charge and **zero**
   attempts consumed, and a breaker unit test asserting a hundred declines leave it closed. `bot`'s
   first suite (5): join succeeds with no provider configured, a denied address is refused with
   `IP_BLOCKED`, removing a rule takes effect with no restart, an expired rule stops applying at *its*
-  expiry rather than the cache's, and only refusals reach the audit trail. Still open: rate-limit
-  metrics, and checkout p99.
+  expiry rather than the cache's, and only refusals reach the audit trail. Then the review's own
+  thirteen: the ambiguous-failure branch and its redelivery, provider status mapping including the
+  `requires_confirmation` loop, the snapshot's backoff and single flight, and the resolved audit
+  address. Still open: rate-limit metrics, and checkout p99.

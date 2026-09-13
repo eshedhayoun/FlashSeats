@@ -12,7 +12,7 @@ but `flashseats.payment.stripe.enabled` is **false by default**, so `dev`, `test
 and every drill still run the in-process stub through the complete journey, 3-D Secure included.
 
 **Read [`docs/00-architecture-decisions.md`](docs/00-architecture-decisions.md) before changing
-anything.** It contains 55 ADRs. Most record a defect and its fix — 034-039 come from the first
+anything.** It contains 56 ADRs. Most record a defect and its fix — 034-039 come from the first
 review pass over the built code, 040-042 from the second — and several look like over-engineering
 until you read the failure they prevent. 043-045 are the exception: forward-looking decisions about
 the operator surface, buyer accounts and what health should report, with nothing built against them
@@ -20,7 +20,8 @@ yet. **046 is Stage 1** — Redis as the counter, and the five places it departs
 **049 and 051 are the concurrent-sales work**, both built in Pass 8: the cluster-wide admission
 allowance and the metadata cache that had to come before it. **050 is ticket retrieval**, built. **052-055 are Stage 2**, all built: Stripe behind the
 existing seam with a circuit breaker, the webhook as a released-on-failure claim, 3-D Secure with no
-resume endpoint, and bot defence that fails open.
+resume endpoint, and bot defence that fails open. **056 is Stage 2's own review** — the four defects
+that only appear under a rollback, a dropped connection or real load.
 
 **The operating envelope is 3–10 concurrent sales**, not one
 ([`03-end-to-end-flow.md`](docs/03-end-to-end-flow.md) §2). Every capacity number written before
@@ -240,6 +241,9 @@ Do not reintroduce these — each cost a real defect in the first pass:
 | **Caching a value derived from the clock** | A window status flips with no write to evict on, so the one thing nothing can detect goes stale. Cache the row; derive the status every call (ADR-051) |
 | **Disabling a feature in the test profile so the suite passes** | The configuration production runs then has no coverage at all. Give the fixture a seam instead — `SaleFixture.reset()` clears every `DerivedStateCache` (ADR-051) |
 | **Iterating open events in a fixed order while spending a shared budget** | Every replica reads the same ascending list, so the lowest event id takes the whole allowance every tick and the other sales stand still. Shuffle the order (ADR-049) |
+| **Compensating on an exception rather than on a fact** | `catch (RuntimeException)` around a settlement refunded a buyer whose seats were fine whenever the database blipped — and answered the provider `200`, so nothing ever retried. Only a *definite* failure may move money; ambiguity falls to the redelivery (ADR-056, ADR-046) |
+| **Cleanup in an unguarded `finally`** | A throw from `finally` **replaces** the value the block was returning. An unguarded `redis.delete` discarded a *successful* charge and marked the order `FAILED` — money moved, order says it did not. Guard it; the key expires anyway (ADR-056) |
+| **A cache that retries a failing dependency per request** | While PostgreSQL was down, `ip_rules` opened a connection per request: the load-shedder becoming the load, at the worst moment. Stamp the failed attempt exactly like a success, single-flight the reload, and cache an empty result too (ADR-056) |
 | **Reading an operator's rule table on every request** | `ip_rules` gates every API call. A query there puts the rate limiter *inside* the connection pool it exists to protect, queued behind the buyers it is shielding — ADR-051's trap with the filter as the job. Snapshot it, TTL it, and let the TTL be the cross-replica invalidation (ADR-055) |
 | **Writing an audit row synchronously on a refusal path** | Every row is written on a path an attacker controls the rate of, so a synchronous insert lets them convert their own `429`s into database load during the sale. Bounded queue, **discard** policy: evidence is not worth an outage (ADR-055) |
 | **Refusing a request because the challenge provider was unreachable** | It fails at peak load, because that is when the provider is busiest too — so the failure mode is "the sale closes at exactly the wrong moment". Fail open and audit the degradation (ADR-011, ADR-055) |

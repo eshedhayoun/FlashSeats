@@ -3,6 +3,7 @@ package com.flashseats.bot.service;
 import com.flashseats.bot.model.BotAuditLog;
 import com.flashseats.bot.model.BotOutcome;
 import com.flashseats.bot.repository.BotAuditLogRepository;
+import jakarta.annotation.PreDestroy;
 import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
@@ -63,6 +64,18 @@ public class BotAuditService {
                 log.warn("Could not write a bot audit row ({})", outcome, failed);
             }
         });
+    }
+
+    /**
+     * Stops the writer on shutdown, without waiting on it.
+     *
+     * <p>{@code shutdownNow} rather than a drain: the queued rows describe requests that have
+     * already been refused, and holding a shutdown open for them would delay a rolling deploy to
+     * preserve evidence about traffic that was turned away. Same trade as the discard policy.
+     */
+    @PreDestroy
+    void stop() {
+        writer.shutdownNow();
     }
 
     @Transactional(readOnly = true)

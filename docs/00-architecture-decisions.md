@@ -2123,3 +2123,78 @@ verification is **off** by default. That is deliberate — the stack must run fr
 no configuration — and it means the control is only real where someone sets the secret. ADR-044's
 verified buyer accounts remain the other route to the same problem: an account is a rate-limit bucket
 that costs something to mint, where a discarded cookie costs nothing.
+
+---
+
+## ADR-056 — Compensation requires a definite failure; a cache in front of a failing dependency must back off
+
+**Context.** Reviewing Stage 2 against the conditions it will actually meet — a rolled-back
+transaction, a dropped connection, one actor retrying hard, a sale with many buyers at once — turned
+up four defects that a green suite could not see, because **none of them is an error**. Two of them
+are instances of rules this repository had already written down for other components, reappearing in
+new ones. That is what makes them worth an ADR rather than a commit message.
+
+**Decision 1 — money moves on facts, not on exceptions.**
+
+`PaymentSettlementService` caught `RuntimeException` around the whole settlement and refunded. So a
+pool timeout, an `InventoryUnavailableException` (a 503 *fault*, ADR-004) or any commit blip refunded
+a buyer whose seats were perfectly fine — and then answered the provider `200`, so nothing ever
+redelivered and the mistake was permanent.
+
+Only the three **definite** outcomes may compensate: `HoldNotFoundException`, `HoldExpiredException`,
+`HoldAlreadySettledException`. Each is the hold module stating a fact. Everything else propagates,
+which releases the webhook claim and earns a redelivery — the only outcome that can still come out
+right.
+
+This is ADR-046's rule reaching money. There it was inventory: *a constraint rejection is a definite
+rollback and safe to compensate; a failure at commit is ambiguous, and returning seats that may still
+be held is an oversell.* The same sentence with "seats" replaced by "money" is this decision, and the
+asymmetry is the same — an unnecessary refund is not recoverable by retrying, so ambiguity must fall
+to the retry rather than to the compensation.
+
+**Corollary, stated because it was got wrong once already:** a `finally` that can throw will
+**replace** the value its block was returning. `PaymentService` released `payment:inflight` in an
+unguarded `finally`, so Redis dropping between the charge and the release discarded a *successful*
+result and sent the caller down its catch-all to mark the order `FAILED` — money moved, and the order
+said it did not. Cleanup in a `finally` is guarded, always. The key expires on its own.
+
+**Decision 2 — a cache in front of a dependency must back off when that dependency fails, or it
+becomes the load.**
+
+`IpRuleService` is read on every API request. Its first version reloaded on any failure without
+stamping the attempt, so while PostgreSQL was unreachable **every request opened a connection**
+against it. It also had no single-flight guard, so every thread arriving at a TTL boundary issued its
+own query — a pool spike on a timer.
+
+Both are the same failure wearing different clothes: *the component whose job is shedding load became
+the thing generating it, at exactly the moment that was most expensive.* ADR-051 said "ask not what a
+read costs but what stops working when it is slow"; this adds the other half — **ask what the cache
+does when the read fails.** Three rules, all non-blocking, because this runs on the hottest path and
+a lock there pins carrier threads (invariant 11):
+
+1. A failed attempt stamps the clock exactly like a successful one. One query per window, whatever
+   the outcome.
+2. One reload in flight at a time; everyone else serves the stale snapshot, which is what a TTL means
+   anyway.
+3. An empty result is as cacheable as a full one — "no rules" is the normal state of that table, and
+   the common case must not be the expensive one.
+
+**Decision 3 — the resume lookup rides the insert it was about to duplicate.**
+
+Finding a resumable 3-D Secure intent had its own `REQUIRES_NEW` read, so **every** checkout paid a
+tenth sequential transaction to serve the challenge minority — against a count ADR-049's admission
+allowance is derived from. It is now one `beginAttempt` that either finds the `PROCESSING` row or
+inserts a new one, in one transaction. Back to nine, and a class shorter.
+
+**Decision 4 — only `requires_action` is a challenge.**
+
+`requires_confirmation` was mapped to `PAYMENT_ACTION_REQUIRED` alongside it. That state means the
+*server* has yet to confirm, so the client would receive a `clientSecret` whose `handleNextAction`
+does nothing, re-POST, retrieve the same state, and be told to authenticate again for the life of the
+hold. It now falls to the transport branch — a retryable `503` with the seats intact, which is the
+honest answer to a state this system does not model.
+
+**And one boundary tidy.** `X-Forwarded-For` is resolved against the trusted-proxy set in exactly one
+place (ADR-039), so everything downstream reads the answer from `shared`'s `ClientAddress` request
+attribute rather than calling `getRemoteAddr()` again — which behind nginx is nginx, so every audit
+row in the deployment that matters recorded the same meaningless value.
