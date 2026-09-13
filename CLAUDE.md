@@ -12,15 +12,15 @@ but `flashseats.payment.stripe.enabled` is **false by default**, so `dev`, `test
 and every drill still run the in-process stub through the complete journey, 3-D Secure included.
 
 **Read [`docs/00-architecture-decisions.md`](docs/00-architecture-decisions.md) before changing
-anything.** It contains 54 ADRs. Most record a defect and its fix — 034-039 come from the first
+anything.** It contains 55 ADRs. Most record a defect and its fix — 034-039 come from the first
 review pass over the built code, 040-042 from the second — and several look like over-engineering
 until you read the failure they prevent. 043-045 are the exception: forward-looking decisions about
 the operator surface, buyer accounts and what health should report, with nothing built against them
 yet. **046 is Stage 1** — Redis as the counter, and the five places it departs from the module specs.
 **049 and 051 are the concurrent-sales work**, both built in Pass 8: the cluster-wide admission
-allowance and the metadata cache that had to come before it. **050 is ticket retrieval**, built. **052-054 are Stage 2's payment work**, all built: Stripe behind
-the existing seam with a circuit breaker, the webhook as a released-on-failure claim, and 3-D Secure
-with no resume endpoint.
+allowance and the metadata cache that had to come before it. **050 is ticket retrieval**, built. **052-055 are Stage 2**, all built: Stripe behind the
+existing seam with a circuit breaker, the webhook as a released-on-failure claim, 3-D Secure with no
+resume endpoint, and bot defence that fails open.
 
 **The operating envelope is 3–10 concurrent sales**, not one
 ([`03-end-to-end-flow.md`](docs/03-end-to-end-flow.md) §2). Every capacity number written before
@@ -118,7 +118,7 @@ describing superseded designs. That is the failure mode this rule exists to stop
                     shared        ← open module; everyone may depend on it
 
 bot      ──► shared only          ← servlet filters; `filter` is a PACKAGE in `bot`, not a module
-queue    ──► catalog
+queue    ──► catalog, bot         ← `bot` only on join (reCAPTCHA); acyclic, `bot` needs nothing
 hold     ──► queue, catalog
 order    ──► hold, catalog, payment, queue
 saleflow ──► queue, hold, order, catalog     ← read-only leaf; nothing depends on it
@@ -240,6 +240,9 @@ Do not reintroduce these — each cost a real defect in the first pass:
 | **Caching a value derived from the clock** | A window status flips with no write to evict on, so the one thing nothing can detect goes stale. Cache the row; derive the status every call (ADR-051) |
 | **Disabling a feature in the test profile so the suite passes** | The configuration production runs then has no coverage at all. Give the fixture a seam instead — `SaleFixture.reset()` clears every `DerivedStateCache` (ADR-051) |
 | **Iterating open events in a fixed order while spending a shared budget** | Every replica reads the same ascending list, so the lowest event id takes the whole allowance every tick and the other sales stand still. Shuffle the order (ADR-049) |
+| **Reading an operator's rule table on every request** | `ip_rules` gates every API call. A query there puts the rate limiter *inside* the connection pool it exists to protect, queued behind the buyers it is shielding — ADR-051's trap with the filter as the job. Snapshot it, TTL it, and let the TTL be the cross-replica invalidation (ADR-055) |
+| **Writing an audit row synchronously on a refusal path** | Every row is written on a path an attacker controls the rate of, so a synchronous insert lets them convert their own `429`s into database load during the sale. Bounded queue, **discard** policy: evidence is not worth an outage (ADR-055) |
+| **Refusing a request because the challenge provider was unreachable** | It fails at peak load, because that is when the provider is busiest too — so the failure mode is "the sale closes at exactly the wrong moment". Fail open and audit the degradation (ADR-011, ADR-055) |
 | **Deriving a "random" queue draw from the session id** | Idempotent and *precomputable*: ids are free to mint, so a bot grinds candidates offline until it holds a low draw. `ZADD NX` already makes a fresh draw idempotent (ADR-024) |
 | **Reusing one provider idempotency key across a 3-D Secure resume** | The client mints ONE key per hold and reuses it on every retry, so a second `charge` replays the cached `requires_action` response **for ever** and the buyer can never finish. Varying the key per attempt is worse: it opens a *second* intent, so they authenticate one payment and are billed for two. Retrieve the existing intent (ADR-054) |
 | **Letting a webhook claim survive a failed settlement** | The provider redelivers, the claim says "already handled", and the buyer's settled charge never reaches an order. ADR-038's rule in a new place: `processed_at IS NULL` must mean *in flight*, and a failure must leave **no row at all** (ADR-053) |
@@ -274,6 +277,7 @@ rather than one module's corner:
 | `queue:exhausted:{e}` | `queue` | String | sale end | derived sold-out marker; deleted the moment stock returns (ADR-035) |
 | `payment:inflight:{holdToken}` | `payment` | String | 90 s | duplicate-charge guard, anchored to the hold (ADR-014) |
 | `bot:rate:*` | `bot` | Bucket4j | rolling | session-first rate limiting, IP as a coarse backstop (ADR-011) |
+| `bot:verified:{sid}` | `bot` | String | 900 s | one challenge verification, remembered per session (ADR-055) |
 | `hold:{token}` | `hold` | String | hold TTL | expiry timer. A **hint, never an authority** — the listener re-reads the row and the settle-once claim is what makes three replicas restore once (ADR-048) |
 
 Two rules over that table: a module touches only its own prefix, and **no key here is ever the

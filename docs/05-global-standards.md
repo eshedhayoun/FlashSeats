@@ -93,8 +93,8 @@ breaking change.
 | `VALIDATION_FAILED` | 400 | shared | Fix `violations` and resubmit |
 | `INTERNAL_ERROR` | 500 | shared | Show `traceId`, offer retry |
 | `RATE_LIMITED` | 429 | bot | Back off `retryAfterSeconds` |
-| `BOT_VERIFICATION_FAILED` | 403 | bot | Re-run reCAPTCHA |
-| `IP_BLOCKED` | 403 | bot | Terminal; contact support |
+| `BOT_VERIFICATION_FAILED` | 403 | bot | The challenge scored below the threshold. Reload for a fresh token and retry — **never** returned for a provider timeout or outage, which fail open (ADR-011, ADR-055) |
+| `IP_BLOCKED` | 403 | bot | A standing operator decision on this address. Terminal for the client — `retryable` is false; contact support (ADR-055) |
 | `SESSION_INVALID` | 401 | bot | Reload to obtain a fresh `fsid` |
 | `EVENT_NOT_FOUND` | 404 | catalog | — |
 | `TIER_NOT_FOUND` | 404 | catalog | — |

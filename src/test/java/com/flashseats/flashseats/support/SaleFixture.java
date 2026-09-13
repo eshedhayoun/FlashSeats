@@ -50,8 +50,9 @@ public class SaleFixture {
     public void reset() {
         jdbc.execute(
                 """
-                TRUNCATE notification_logs, webhook_events, payment_transactions, outbox_events,
-                         order_items, orders, ticket_holds, ticket_tiers, events
+                TRUNCATE bot_audit_logs, ip_rules, notification_logs, webhook_events,
+                         payment_transactions, outbox_events, order_items, orders, ticket_holds,
+                         ticket_tiers, events
                 RESTART IDENTITY CASCADE
                 """);
 
@@ -258,6 +259,17 @@ public class SaleFixture {
                 "UPDATE ticket_holds SET expires_at = ? WHERE hold_token = ?",
                 Timestamp.from(Instant.now().minusSeconds(30)),
                 holdToken);
+    }
+
+    /**
+     * Every outcome in the bot audit trail.
+     *
+     * <p>Deliberately returns them all rather than a count: the assertion worth making is that no
+     * row describes an <em>allowed</em> request. A count cannot say that, and a write per request
+     * during a flash sale is the failure this table's shape exists to avoid.
+     */
+    public java.util.List<String> botAuditOutcomes() {
+        return jdbc.queryForList("SELECT outcome FROM bot_audit_logs", String.class);
     }
 
     /** The order's own status, read straight from the row rather than through an API that filters. */

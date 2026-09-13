@@ -111,7 +111,7 @@ it, so if anything fails the hold returns to `ACTIVE` and expires normally.
 | Module | Ships now | Deferred |
 | :--- | :--- | :--- |
 | `shared` | `ErrorCode` (42 codes), `ProblemDetails`, one global advice, `SessionId`, `Money`, `Clock`, `SignedToken`, `TraceIdFilter` | — |
-| `bot` | Signed `fsid` cookie; Redis-backed Bucket4j session + IP buckets; SSE exempt from per-request accounting | reCAPTCHA, `ip_rules`, audit logs. **Writes no tables.** |
+| `bot` | Redis-backed Bucket4j session + IP buckets (SSE **counted once**, not exempt); reCAPTCHA v3 on join, failing open; cached `ip_rules`; async `bot_audit_logs`; operator surface | Rate-limit **metrics**; CIDR ranges; audit retention. The `fsid` cookie moved to `shared` in Pass 7 |
 | `catalog` | Events, tiers, window derivation, metadata cache, `serverTime`, bucketed availability, **Redis counters + Lua, the `-2` fault path, pre-warm, pause/resume, the Redis-restart guard** | create-event endpoint, `TierAvailabilityChangedEvent` |
 | `queue` | `ZADD NX` join, `FIFO`/`RANDOM` ordering, SSE with heartbeats, HMAC passes, admission sessions, promotion worker, **pub/sub fan-out**, measured drain-rate estimates, `tier-availability` frame | `Last-Event-ID` replay |
 | `hold` | `ticket_holds` authority, the settle-once claim, atomic reserve **with compensation**, **after-commit restore**, bounded grace, sweeper, all three endpoints, `hold:{token}` Redis timers and the keyspace listener | — |
@@ -395,7 +395,7 @@ below is a real exposure someone should close before real money moves through it
 
 | # | Weakness | Assessment |
 | :-- | :--- | :--- |
-| S5 | **Session identity is free to mint** | The rate limiter's primary bucket is per-`fsid`, and anyone can discard a cookie to get a fresh one. The IP bucket is therefore the only real backstop — and it is deliberately loose (300 burst) so NAT populations are not blocked. This is the ADR-011 trade working as designed, but it means **the session bucket does not constrain a determined attacker at all.** Pass 1 made the IP bucket real (S11); it is now genuinely the backstop ADR-011 assumed it was. reCAPTCHA on join is still the missing compensating control, and it is still deferred. |
+| S5 | **Session identity is free to mint** | The rate limiter's primary bucket is per-`fsid`, and anyone can discard a cookie to get a fresh one. The IP bucket is therefore the only real backstop — and it is deliberately loose (300 burst) so NAT populations are not blocked. This is the ADR-011 trade working as designed, but it means **the session bucket does not constrain a determined attacker at all.** Pass 1 made the IP bucket real (S11). **Pass 9 built the compensating control** — reCAPTCHA v3 on join, failing open, plus `ip_rules` for the manual case (ADR-055). **It is off by default**, because `flashseats.bot.recaptcha.secret` is blank in a clean checkout, so this closes only where someone sets the secret. ADR-044's verified accounts remain the other route: an account costs something to mint, a discarded cookie costs nothing. |
 | S6 | **CSRF is disabled while a cookie authorises actions** | Justified for a stateless JSON API, and the checkout path is safe because it needs a `holdToken` an attacker cannot guess. But a cross-site `POST /queue/join` or `POST /holds` *would* succeed against a logged-in visitor and could be used to consume their one-hold-per-event allowance. Low impact, non-zero. Require a custom header, or re-enable CSRF for the mutating endpoints. |
 | S13 | **`POST /api/v1/session/reset` discards the caller's identity, unauthenticated** | A demo affordance: it expires the `fsid` cookie so the bundled page can start over as a new visitor. Under S6 a cross-site `POST` therefore throws a visitor out of a queue they were waiting in and cuts them off from their own live hold — no disclosure, but during a flash sale it is the most damaging thing on the CSRF list, because the session *is* the queue position. Scope it to the demo profile, or make it a `DELETE` that requires a header a form post cannot send. |
 | S7 | **Order numbers are sequential** | `TK-00001`, `TK-00002`. Access is properly controlled, so this is not an IDOR — but it publishes exact sales volume to anyone who buys one ticket. It was worse in combination with S4: a deterministic receipt token over a countable order number meant one leaked secret enumerated every buyer's email. The nonce closes that; the volume leak remains. Prefer a non-sequential public reference. |
@@ -441,7 +441,7 @@ restored exactly once, in 339 ms, across three replicas.
 removed". `git log -S` across every commit finds no keyspace listener and no `hold:` key literal
 ever committed, so that work lived only in an uncommitted tree and none of it was recoverable.
 
-### Stage 2 — Real money and real defence (Phase 3) — payment half DONE (Pass 9)
+### Stage 2 — Real money and real defence (Phase 3) — DONE (Pass 9)
 
 - ~~`StripeGateway` implementing the existing `PaymentGateway`~~ — **built** (ADR-052). Server-confirmed
   PaymentIntents, so `FE_SPEC` §2's checkout body and ADR-001's ordering are unchanged.
@@ -456,9 +456,11 @@ ever committed, so that work lived only in an uncommitted tree and none of it wa
   same body is the retry, and the server retrieves the pending intent rather than charging again.
 - ~~Resilience4j around every gateway call — declared as plain beans~~ — **built** as a decorator that
   counts transport failures only.
-- reCAPTCHA v3 on join, cached per session, **failing open** (ADR-011) — this is S5's compensating
-  control, so it belongs with the security fixes above.
-- `ip_rules`, `bot_audit_logs` (async, non-`ALLOWED` outcomes only), and `V6__bot.sql`.
+- ~~reCAPTCHA v3 on join, cached per session, **failing open** (ADR-011)~~ — **built** (ADR-055).
+  Off unless a secret is configured, which is deliberate and is also the limit of what it closes.
+- ~~`ip_rules`, `bot_audit_logs` (async, non-`ALLOWED` outcomes only), and `V6__bot.sql`.~~ —
+  **built**, as `V11__bot.sql`: `V6` has been `V6__pass1_corrections.sql` in every database that has
+  run this schema, and a migration is immutable once applied.
 - The remaining §10 "must fix" item. (Pass 1 closed S1–S4 and S11; Stage 4 hashed the admin
   credential, so what is left of S12 is a real identity provider, wanted only once a second
   operator does.)
@@ -1404,10 +1406,11 @@ change ADR-049 ever needed — and the sale sells out.
 
 ---
 
-### Pass 9 — Stage 2, the payment half: real money behind the seam that was already there
+### Pass 9 — Stage 2: real money behind the seam that was already there, and defence that fails open
 
 - **Scope:** replace the stub gateway, build the webhook receiver, make ADR-012's refund reachable,
-  and ship 3-D Secure. **124 tests green** (112 before; `payment` had none of its own).
+  ship 3-D Secure, and build §10 S5's compensating control. **129 tests green** (112 before;
+  `payment` and `bot` each had none of their own).
 - **Method:** build against the existing seam without changing anything above it, then give the
   module its first tests — and keep every one of them runnable with no Stripe account.
 
@@ -1466,9 +1469,49 @@ script drives either gateway. Two consequences worth stating plainly:
 own bean, because a `@Transactional` method called from the same object runs with no transaction at
 all — and a claim that is not committed before the work it guards lets all three replicas settle the
 same charge. And the claim is released on failure, which is ADR-038's rule (Pass 6, the DLQ replay)
-appearing in a second place for the same reason.
+appearing in a second place for the same reason. The same self-invocation trap was then avoided a
+third time in `bot`'s audit writer, where the lambda would have called its own `@Transactional`
+method through `this`.
 
-- **Result:** 124 tests green. `payment`'s first suite: webhook signature, replay, settlement,
-  ADR-012's refund, the 3-D Secure round trip asserting **one** charge and **zero** attempts consumed,
-  and a breaker unit test asserting a hundred declines leave it closed. Still open: the bot half of
-  Stage 2, and checkout p99.
+**And the bot half** (ADR-055) — §10 S5's compensating control, deferred four times. reCAPTCHA v3 on
+join with a new `queue ──► bot` edge, `ip_rules` as a TTL-bounded snapshot rather than a per-request
+query, and `bot_audit_logs` written asynchronously on a queue that discards. Verification **fails
+open**: only a score the provider actively returns below the threshold refuses anything. It is `V11`,
+not the `V6__bot.sql` four documents asked for, because `V6` has been applied everywhere. And it is
+**off by default** — a blank secret means no verification — so the honest claim is that the control
+exists, not that it is on.
+
+**The bot half, in the same pass** (ADR-055). §10 S5 has said the same sentence since Pass 1 —
+session identity is free to mint, so the primary rate-limit bucket constrains nobody determined — and
+the named compensating control had been deferred four times. It is now built: reCAPTCHA v3 on join,
+`ip_rules` as the manual override, and `bot_audit_logs` for what was refused. The module wrote no
+tables before this and had no operator surface at all, so an address flooding a sale could be
+answered only by changing a property and restarting three replicas *during the sale*.
+
+Three decisions carry the weight, and each is the same shape as one this repository already made:
+
+| Decision | The failure it avoids |
+| :--- | :--- |
+| **Verification fails open.** Only a score the provider actively returns below the threshold refuses anything; an unconfigured secret, a missing token, a timeout and a non-2xx all allow | A challenge provider's outage closing a sale ten thousand people are waiting for — **at peak load**, because that is when the provider is busiest too. Every degraded verification is audited, since failing open is otherwise invisible |
+| **`ip_rules` is a TTL-bounded snapshot, never a per-request query** | ADR-051's trap with the pool as the resource: a filter that queries to decide whether to shed load sits *inside* the connection pool it exists to protect, queued behind the buyers it is shielding |
+| **Audit writes are asynchronous on a bounded queue that discards** | Every row is written on a path an attacker controls the rate of, so a synchronous insert lets them convert their own `429`s into database load during the sale. Evidence is not worth an outage |
+
+Two smaller things worth recording. The provider timeouts (1 s / 2 s) are **correctness settings**:
+a default-timeout client on the join path turns a provider slowdown into a sale-length outage,
+reintroducing the exact failure that failing open exists to prevent. And the migration is `V11`, not
+the `V6__bot.sql` four documents asked for — `V6` has been `V6__pass1_corrections.sql` in every
+database that has run this schema, and Flyway checksums the whole file.
+
+**What S5 actually closes to.** Not "closed". `flashseats.bot.recaptcha.secret` is blank in `dev`,
+`test` and a clean checkout, so verification is **off** unless someone sets it — deliberate, because
+the stack must run from a clean checkout, and therefore the honest statement is that the control now
+*exists* rather than that it is *on*. ADR-044's verified accounts remain the other route to the same
+problem.
+
+- **Result:** **129 tests green.** `payment`'s first suite (12): webhook signature, replay,
+  settlement, ADR-012's refund, the 3-D Secure round trip asserting **one** charge and **zero**
+  attempts consumed, and a breaker unit test asserting a hundred declines leave it closed. `bot`'s
+  first suite (5): join succeeds with no provider configured, a denied address is refused with
+  `IP_BLOCKED`, removing a rule takes effect with no restart, an expired rule stops applying at *its*
+  expiry rather than the cache's, and only refusals reach the audit trail. Still open: rate-limit
+  metrics, and checkout p99.

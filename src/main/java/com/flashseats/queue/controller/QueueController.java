@@ -1,5 +1,6 @@
 package com.flashseats.queue.controller;
 
+import com.flashseats.bot.facade.BotFacade;
 import com.flashseats.queue.dto.AdmitRequest;
 import com.flashseats.queue.dto.AdmitResponse;
 import com.flashseats.queue.dto.JoinQueueRequest;
@@ -7,6 +8,7 @@ import com.flashseats.queue.dto.QueueStatusResponse;
 import com.flashseats.queue.service.QueueService;
 import com.flashseats.queue.service.SseEmitterRegistry;
 import com.flashseats.shared.identity.SessionId;
+import jakarta.servlet.http.HttpServletRequest;
 import jakarta.validation.Valid;
 import java.time.Duration;
 import org.springframework.http.HttpStatus;
@@ -35,16 +37,34 @@ public class QueueController {
 
     private final QueueService queue;
     private final SseEmitterRegistry emitters;
+    private final BotFacade bots;
 
-    public QueueController(QueueService queue, SseEmitterRegistry emitters) {
+    public QueueController(QueueService queue, SseEmitterRegistry emitters, BotFacade bots) {
         this.queue = queue;
         this.emitters = emitters;
+        this.bots = bots;
     }
 
-    /** Joins the line. Idempotent — rejoining preserves the original position. */
+    /**
+     * Joins the line. Idempotent — rejoining preserves the original position.
+     *
+     * <p><strong>The one place a challenge is worth its cost.</strong> Join is where an automated
+     * buyer gains its advantage: it is the front of the line, it is cheap to repeat, and a session
+     * id costs nothing to mint — so ADR-011's per-session bucket does not constrain a determined
+     * attacker at all. Everything after this point is already gated by a queue pass and an admission
+     * the server issued.
+     *
+     * <p>Verification <strong>fails open</strong>: a provider that is unconfigured, slow or broken
+     * lets the visitor through and is audited as degraded (ADR-011, ADR-055).
+     */
     @PostMapping("/join")
     @ResponseStatus(HttpStatus.ACCEPTED)
-    public QueueStatusResponse join(@Valid @RequestBody JoinQueueRequest request, SessionId session) {
+    public QueueStatusResponse join(
+            @Valid @RequestBody JoinQueueRequest request,
+            SessionId session,
+            HttpServletRequest http) {
+
+        bots.verifyHuman(session.value(), request.recaptchaToken(), http.getRemoteAddr());
         return queue.join(session.value(), request.eventId());
     }
 
