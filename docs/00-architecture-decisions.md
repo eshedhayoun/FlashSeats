@@ -1906,9 +1906,308 @@ stops working when it is slow.
 
 ---
 
-## ADR-052 — The contract is a type, not a layer: facades are implemented by their services, and most exceptions are factories
+## ADR-052 — Stripe goes behind the seam that was already there; the breaker is a decorator
+
+**Context.** The MVP shipped `PaymentGateway` with one implementation, a stub, in the final position
+in the checkout sequence. Every idempotency layer around it was real from day one — `UNIQUE(hold_token)`,
+`SETNX payment:inflight:{holdToken}`, the two `REQUIRES_NEW` transactions bracketing the network call,
+find-or-create, the three-attempt ceiling, the compensating refund. **Only the gateway was fiction.**
+
+**Decision.** `StripePaymentGateway` implements the same interface, server-confirming PaymentIntents:
+the client keeps sending a `pm_...` and the server charges it. `PaymentGatewayConfig` builds exactly
+one `PaymentGateway` bean — Stripe when `flashseats.payment.stripe.enabled`, the stub otherwise —
+wrapped in `CircuitBreakingGateway`.
+
+**Why server-confirm rather than Payment Element.** Payment Element has the browser confirm and makes
+the webhook the *primary* settlement path. That inverts ADR-001's charge-then-consume ordering, and the
+synchronous `402`/`409` contract that `FE_SPEC` §2, the client's error table and half this document
+describe would become mostly dead code. The flow the whole system was built around is the one kept.
+
+**Why one assembled bean rather than `@ConditionalOnMissingBean`.** That condition was a good seam
+while there was one real implementation and one stub. With a provider, a stub *and* a decorator all
+implementing the interface, "whichever bean exists" stops being a seam and becomes an ambiguity.
+
+**Why the stub survives, and is the default.** `enabled` is false unless a deployment says otherwise,
+so a clean checkout, the whole test suite, the load harness and every drill run the complete buyer
+journey — decline, provider outage, 3-D Secure — with no keys and no network. A stub that were deleted
+on the day the real thing arrived would take the only deterministic coverage of those branches with it.
+Its token vocabulary is deliberately the provider's own (`pm_card_authenticationRequired`,
+`pm_card_chargeDeclined` alongside the older `pm_card_declined`), so one script drives either gateway.
+
+**Why the breaker is a decorator and counts only `GatewayTransportException`.** Resilience4j's Spring
+Boot starter targets Boot 3, so the plain artifacts are declared and one `CircuitBreaker` bean is built
+by hand. More importantly, the breaker must distinguish two things that an AOP-driven one cannot:
+
+| Provider says | Shape | Counted? |
+| :--- | :--- | :--- |
+| card refused | returned `GatewayResult.DECLINED` | **no** |
+| unreachable, 5xx, rate-limited | thrown `GatewayTransportException` | **yes** |
+
+A decline is a *correct answer*. A breaker that counted declines would open during an ordinary burst
+of expired cards — which during a flash sale is the normal state of the world, not a signal — and take
+a perfectly healthy sale's payments down with it. What the breaker exists to stop is ten thousand
+queued buyers each waiting out a 20-second read timeout against a provider that is already down,
+holding a pooled connection apiece, which under virtual threads is the system's real concurrency limit.
+
+An open breaker and a transport failure leave by the same door, `GatewayResult.error`, which the
+existing `ERROR → PAYMENT_GATEWAY_UNAVAILABLE → 503` path already handles: seats retained, **no payment
+attempt consumed**, exactly what `05-global-standards.md` §2 already promised for that code. Nothing
+above `CircuitBreakingGateway` changed to accommodate the breaker.
+
+`maxNetworkRetries(0)`: the provider's own client-side retry would be a second retry mechanism, and
+this system already has one — re-POSTing the same checkout body.
+
+---
+
+## ADR-053 — A webhook delivery is a claim, and a claim is released when its work did not happen
+
+**Context.** The charge settles and the buyer never sees the response — a dropped connection, a killed
+replica, a closed laptop. The money moved and nothing in this system knows it. The provider's webhook
+is the only remaining witness, and ADR-005 reserved `payment → order` as the one cross-module event
+precisely for it. Until now nothing traversed that edge.
+
+**Decision.** `POST /api/v1/payments/webhook` verifies, claims, settles, and reports:
+
+1. **Verify the signature over the raw bytes.** The endpoint is unauthenticated by necessity — the
+   provider cannot hold a session — so this is the only gate. The body is bound as a `String`, never a
+   DTO: the signature is over the bytes, not the meaning, and letting Jackson re-serialise an
+   equivalent object changes key order and whitespace and fails every legitimate delivery.
+   `WEBHOOK_SIGNATURE_INVALID` finally has a thrower.
+2. **Acknowledge every other event type with `200`.** A non-2xx asks for a redelivery of something we
+   will go on ignoring for ever.
+3. **Claim it.** `INSERT … ON CONFLICT (stripe_event_id) DO NOTHING`, rowcount as the answer — the same
+   shape as `notification_logs`, and never an insert whose exception is caught, which marks the
+   transaction rollback-only so the `catch` block's `return` throws at commit (ADR-038).
+4. **Publish `PaymentSettledEvent` synchronously.** The contract of the endpoint is that a failed
+   settlement becomes a non-2xx; an asynchronous listener's failure cannot be reported to the provider.
+   A plain `@EventListener`, not `@ApplicationModuleListener` — that needs the Modulith event-publication
+   registry, removed in ADR-009.
+5. **Release the claim if settlement throws**, then rethrow. Otherwise the redelivery is dismissed as a
+   duplicate and the buyer's charge never reaches an order. `processed_at IS NULL` therefore means *in
+   flight*, never *failed*: a failure leaves no row at all.
+
+**`order` settles it, and may refuse** (ADR-012, now reachable for the first time). The listener finds
+the order by `hold_token` — carried to the provider as metadata and back — and:
+
+| Order state | Action |
+| :--- | :--- |
+| `CONFIRMED` / `REFUNDED` | nothing; the synchronous path or an earlier delivery already resolved it |
+| `PENDING` / `FAILED`, hold still claimable | `OrderCommitService.confirm` — the same transaction the synchronous path uses, so the `ORDER_CONFIRMED` outbox row and the ticket follow identically |
+| hold gone | refund, `REFUNDED`, `ORDER_REFUNDED` outbox row |
+
+The hold can easily have expired during exactly the disconnect that made the webhook necessary, and
+another buyer may own those seats by now. Confirming anyway would charge one customer for inventory
+another already holds.
+
+**The endpoint is not exempt from rate limiting.** An exempt endpoint is an unmetered one
+(`docs/modules/bot.md` §6), and the IP bucket sits orders of magnitude above any delivery rate.
+
+**A refund that fails is no longer recorded as a refund.** The pre-existing compensation discarded
+`RefundResult`, so a provider that refused still produced an order marked `REFUNDED` and an email
+telling the buyer their money was on its way — money this business holds and should not, described to
+the only person who would notice as already returned. Both call sites now share `OrderRefundService`,
+which writes the failure into `failure_reason` and increments `flashseats.payment.refund.failed`.
+**Alarm on any non-zero value:** each one is money owed to a named buyer.
+
+---
+
+## ADR-054 — 3-D Secure resumes the existing intent; there is no resume endpoint
+
+**Context.** Three documents disagreed. `03-end-to-end-flow.md` §5 and `06-mvp-overview.md` §11 both
+specified `POST /api/v1/orders/checkout/resume`; `FE_SPEC.md` §2 said flatly that it does not exist,
+is not needed, and that **re-POSTing the same body is the retry**. FE_SPEC is the client contract and
+it is right: a second retry path would need its own idempotency story, and this system's whole
+guarantee is that there is exactly one.
+
+**Decision.** A challenge is a *pause in one checkout*, not a second checkout.
+
+- The gateway returns `REQUIRES_ACTION` with the intent id **and** a `clientSecret`.
+- `CheckoutService` throws `PaymentActionRequiredException` → `402 PAYMENT_ACTION_REQUIRED` carrying
+  `clientSecret` and `expiresAt`. (`05-global-standards.md` §2 said "follow `resumeUrl`" — a field that
+  existed nowhere; it now names the real contract.)
+- The client runs `stripe.handleNextAction(clientSecret)` and **re-POSTs the same body**.
+- `PaymentService` then looks for a `PROCESSING` ledger row for that hold and, finding one,
+  **retrieves that intent instead of charging**.
+
+**Three things already in place do the work**, which is why the server-side change is three lines:
+
+1. The throw lands in `CheckoutService`'s existing catch-all → `markAbandoned` → order `FAILED`,
+   resumable by find-or-create on the same order number, **no payment attempt consumed** (ADR-034).
+   A bank challenge is not one of the buyer's three cards.
+2. `payment:inflight` is released in a `finally` regardless, so the buyer is not locked out of their
+   own challenge.
+3. The `+120 s` grace was granted *before* the charge, so the challenge window is already paid for
+   (ADR-006, ADR-030). No new extension is granted, and none is needed.
+
+**Why retrieving is mandatory, not an optimisation.** The client mints one `idempotencyKey` per hold
+and reuses it on every retry (`FE_SPEC` §1). A second `charge` would therefore replay the provider's
+cached `requires_action` response **for ever**, and the buyer could never complete. Varying the key per
+attempt instead would create a *second* intent — so the buyer authenticates one payment and is billed
+for two. Retrieving the existing intent is the only correct shape, and `PaymentStatus.PROCESSING`,
+declared on day one and never written because the stub could not reach it, is what marks the row.
+
+**Accepted consequence.** While a challenge is outstanding, a *different* card in the body changes
+nothing: the resume re-reads the pending intent. A buyer who abandons the challenge cannot switch cards
+until the hold expires, which is minutes. The alternative is opening a second charge against a hold that
+already has one in flight, and that trade is not close. A *failed* challenge is different and resolves
+itself: the provider moves the intent to `requires_payment_method`, the retrieve returns `DECLINED`, the
+row goes `FAILED`, and the next attempt charges fresh.
+
+---
+
+## ADR-055 — Bot defence fails open, and its rules are never read from the database on the request path
+
+**Context.** `06-mvp-overview.md` §10 S5 has said the same thing since Pass 1: **session identity is
+free to mint.** ADR-011 makes the per-session bucket the primary rate-limit control, and anyone can
+discard a cookie to get a fresh one; the IP bucket is deliberately loose (300 burst) so that
+carrier-grade NAT populations are not blocked during exactly the spike this system exists to serve.
+ADR-039 made that backstop real by refusing `X-Forwarded-For` from untrusted peers, but the
+conclusion stood: **the session bucket does not constrain a determined attacker at all.** The named
+compensating control was a challenge on join, and it was deferred for four passes.
+
+Until now this module wrote no tables, had no operator surface, and read a `recaptchaToken` field
+that `queue` had accepted and ignored since day one.
+
+**Decision.** Three things, and a rule that governs all of them.
+
+**1. reCAPTCHA v3 on `POST /queue/join`, failing open.** Join is the one place a challenge is worth
+its cost: it is the front of the line, it is cheap to repeat, and everything after it is already
+gated by a queue pass and an admission the server issued. `queue ──► bot` is a new facade edge and
+cannot make the graph cyclic — `bot` depends on nothing but `shared`.
+
+Only a score the provider *actively returns* below `min-score` refuses a request. An unconfigured
+secret, a missing token, a timeout, a non-2xx and a malformed body all allow it. **Failing open is
+the decision, not a fallback**: a challenge provider's outage must not close a sale that ten thousand
+people are waiting for, and it would arrive at peak load, because that is when the provider is
+busiest too. Every degraded verification is audited — failing open is invisible from the outside, and
+"our bot defence was off for three hours" must not be learned afterwards from an absence.
+
+The provider timeouts (1 s connect, 2 s read) are therefore **correctness settings**. This call sits
+on the join path, and a default-timeout client there turns a provider slowdown into a sale-length
+outage — reintroducing the exact failure that failing open exists to prevent, through the client that
+implements it.
+
+**2. `ip_rules`, held in memory and re-read on a timer.** This is consulted on *every* API request.
+A per-request query would put the rate limiter — whose entire job is keeping load off the system —
+inside the connection pool it is protecting, queued behind the buyers it is shielding. That is
+ADR-051's trap ("a job that protects a resource by reading that resource") with the pool as the
+resource and the filter as the job, and it is the second time this repository has walked toward it.
+
+ADR-051's three rules apply unchanged: **the TTL is the cross-replica invalidation** (an operator's
+call evicts one replica; the others follow within 10 s), **the load happens outside every monitor**
+(one `AtomicReference` swapped after the read — blocking JDBC inside a `ConcurrentHashMap` bin pins
+carrier threads on JDK 21), and **expiry is derived from the clock on read, never baked into the
+snapshot** — a rule that lapses between reloads has to stop applying at its expiry, not at the
+cache's. A fourth is specific to this table: a failed reload **keeps the previous snapshot**, because
+the database being briefly unreachable must neither unblock every address nor block every address.
+
+An `ALLOW` rule exempts **the IP bucket only**, never the session bucket. It is for a known shared
+egress where hundreds of real buyers share one address; it is not a statement that the traffic is
+trusted.
+
+**3. `bot_audit_logs`, asynchronous and non-`ALLOWED` only.** There is no `ALLOWED` outcome and there
+must not be one — a row per allowed request is a write per request during precisely the traffic this
+system is built for, and it would make the table unreadable for the purpose it exists to serve.
+Writes go to a bounded queue with a **discard** policy: every row here is written on a path that has
+just refused someone, and the caller is very often an attacker, so a synchronous insert would let
+them convert their own `429`s into database load at whatever rate they can generate requests. If the
+audit trail cannot keep up, the right outcome is to lose audit rows. Evidence is not worth an outage.
+
+**The migration is `V11`, not `V6`.** Earlier documents called for `V6__bot.sql`. `V6` has been
+`V6__pass1_corrections.sql` in every database that has ever run this schema, and Flyway checksums the
+whole file — renumbering would refuse to start every container with a checksum mismatch.
+
+**What this does and does not close.** S5's compensating control now exists, but
+`flashseats.bot.recaptcha.secret` is blank in `dev`, `test` and a clean checkout, which means
+verification is **off** by default. That is deliberate — the stack must run from a clean checkout with
+no configuration — and it means the control is only real where someone sets the secret. ADR-044's
+verified buyer accounts remain the other route to the same problem: an account is a rate-limit bucket
+that costs something to mint, where a discarded cookie costs nothing.
+
+---
+
+## ADR-056 — Compensation requires a definite failure; a cache in front of a failing dependency must back off
+
+**Context.** Reviewing Stage 2 against the conditions it will actually meet — a rolled-back
+transaction, a dropped connection, one actor retrying hard, a sale with many buyers at once — turned
+up four defects that a green suite could not see, because **none of them is an error**. Two of them
+are instances of rules this repository had already written down for other components, reappearing in
+new ones. That is what makes them worth an ADR rather than a commit message.
+
+**Decision 1 — money moves on facts, not on exceptions.**
+
+`PaymentSettlementService` caught `RuntimeException` around the whole settlement and refunded. So a
+pool timeout, an `InventoryUnavailableException` (a 503 *fault*, ADR-004) or any commit blip refunded
+a buyer whose seats were perfectly fine — and then answered the provider `200`, so nothing ever
+redelivered and the mistake was permanent.
+
+Only the three **definite** outcomes may compensate: `HoldNotFoundException`, `HoldExpiredException`,
+`HoldAlreadySettledException`. Each is the hold module stating a fact. Everything else propagates,
+which releases the webhook claim and earns a redelivery — the only outcome that can still come out
+right.
+
+This is ADR-046's rule reaching money. There it was inventory: *a constraint rejection is a definite
+rollback and safe to compensate; a failure at commit is ambiguous, and returning seats that may still
+be held is an oversell.* The same sentence with "seats" replaced by "money" is this decision, and the
+asymmetry is the same — an unnecessary refund is not recoverable by retrying, so ambiguity must fall
+to the retry rather than to the compensation.
+
+**Corollary, stated because it was got wrong once already:** a `finally` that can throw will
+**replace** the value its block was returning. `PaymentService` released `payment:inflight` in an
+unguarded `finally`, so Redis dropping between the charge and the release discarded a *successful*
+result and sent the caller down its catch-all to mark the order `FAILED` — money moved, and the order
+said it did not. Cleanup in a `finally` is guarded, always. The key expires on its own.
+
+**Decision 2 — a cache in front of a dependency must back off when that dependency fails, or it
+becomes the load.**
+
+`IpRuleService` is read on every API request. Its first version reloaded on any failure without
+stamping the attempt, so while PostgreSQL was unreachable **every request opened a connection**
+against it. It also had no single-flight guard, so every thread arriving at a TTL boundary issued its
+own query — a pool spike on a timer.
+
+Both are the same failure wearing different clothes: *the component whose job is shedding load became
+the thing generating it, at exactly the moment that was most expensive.* ADR-051 said "ask not what a
+read costs but what stops working when it is slow"; this adds the other half — **ask what the cache
+does when the read fails.** Three rules, all non-blocking, because this runs on the hottest path and
+a lock there pins carrier threads (invariant 11):
+
+1. A failed attempt stamps the clock exactly like a successful one. One query per window, whatever
+   the outcome.
+2. One reload in flight at a time; everyone else serves the stale snapshot, which is what a TTL means
+   anyway.
+3. An empty result is as cacheable as a full one — "no rules" is the normal state of that table, and
+   the common case must not be the expensive one.
+
+**Decision 3 — the resume lookup rides the insert it was about to duplicate.**
+
+Finding a resumable 3-D Secure intent had its own `REQUIRES_NEW` read, so **every** checkout paid a
+tenth sequential transaction to serve the challenge minority — against a count ADR-049's admission
+allowance is derived from. It is now one `beginAttempt` that either finds the `PROCESSING` row or
+inserts a new one, in one transaction. Back to nine, and a class shorter.
+
+**Decision 4 — only `requires_action` is a challenge.**
+
+`requires_confirmation` was mapped to `PAYMENT_ACTION_REQUIRED` alongside it. That state means the
+*server* has yet to confirm, so the client would receive a `clientSecret` whose `handleNextAction`
+does nothing, re-POST, retrieve the same state, and be told to authenticate again for the life of the
+hold. It now falls to the transport branch — a retryable `503` with the seats intact, which is the
+honest answer to a state this system does not model.
+
+**And one boundary tidy.** `X-Forwarded-For` is resolved against the trusted-proxy set in exactly one
+place (ADR-039), so everything downstream reads the answer from `shared`'s `ClientAddress` request
+attribute rather than calling `getRemoteAddr()` again — which behind nginx is nginx, so every audit
+row in the deployment that matters recorded the same meaningless value.
+
+---
+
+## ADR-057 — The contract is a type, not a layer: facades are implemented by their services, and most exceptions are factories
 
 **Status:** accepted, Pass 9 (13 Sept 2026). Built.
+
+> Numbered 052 when written; renumbered to 057 on the merge with the payment work, which had taken
+> 052–056 in parallel. Two branches appending to the same log is exactly how a duplicate number
+> happens — check the tip before claiming one.
 
 **Context.** Eight passes of adding correctness left the logic sound and the *packaging* unreadable:
 215 Java files for ~8,360 lines of real code, 91 of them 25 lines or fewer. Two patterns produced
@@ -1935,11 +2234,17 @@ reader could not learn what a module could refuse without opening a directory.
 
 2. **A failure gets a class only when something catches it by type, or when two sibling types keep a
    distinction visible.** Everything else is a static factory on one `<Module>Errors` class in the
-   same `@NamedInterface` package. Twenty-five classes became nine plus four `Errors` files. Each
+   same `@NamedInterface` package. Twenty-five classes became ten plus four `Errors` files. Each
    deleted class's javadoc moved onto its factory verbatim — those paragraphs are the record of why
    a distinction exists, and this is a re-shelving, not a deletion.
 
-   Nine survive. `DuplicatePaymentException` is genuinely caught by type at `CheckoutService`.
+   Ten survive. `DuplicatePaymentException` is genuinely caught by type at `CheckoutService`.
+   `HoldNotFoundException` is caught by type at `PaymentSettlementService`, together with
+   `HoldExpiredException` and `HoldAlreadySettledException` — the three ways a webhook settlement
+   finds the seats gone, caught as a set so the buyer is refunded (ADR-053). **It was a factory for
+   about a week**: nothing caught it when this ADR was written, and the webhook receiver landed on a
+   parallel branch days later. The rule produced the right answer both times; what it cannot do is
+   see another branch's tip.
    `HoldAlreadySettledException` and `OrderRefundedException` steer control flow.
    `PaymentDeclinedException` and `TicketNotAvailableException` each choose between two answers.
    `HoldExpiredException` carries `expiresAt`. `PaymentGatewayUnavailableException` stayed rather
@@ -1964,9 +2269,17 @@ forwards is not an abstraction — it is a second name for the same thing, and t
 on every trace. Prefer making the contract a *type* the compiler enforces over a *layer* a
 convention enforces.
 
+**Applied to `bot` on the merge.** Pass 9 added a tenth module facade, `BotFacadeImpl`, in the shape
+the other five used — written before this ADR existed. It was never pure delegation: it decides what
+a challenge verdict means and orchestrates two services to act on it, which global standards §5 rule
+6 already placed in a service. It is now `bot/service/BotVerificationService implements BotFacade`.
+Nothing about its behaviour changed. **That it appeared at all is the consequence worth noting**: a
+convention removed in one branch is re-added by any branch that forked before it, so rule 7 exists in
+§5 precisely because the ADR alone will not be read in time.
+
 **Consequences.**
 
-- Cross-module tracing is one hop shorter everywhere, three shorter into `payment`.
+- Cross-module tracing is one hop shorter everywhere.
 - A module's whole failure surface is one file, readable top to bottom.
 - `FlashSeatsException`'s constructors are public, which is the point rather than a concession: a
   refusal that needs no type should not have to invent one.

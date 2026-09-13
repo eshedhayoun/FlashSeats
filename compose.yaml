@@ -46,10 +46,16 @@ x-app: &app
     FLASHSEATS_ADMIN_USERNAME: ${FLASHSEATS_ADMIN_USERNAME:-admin}
     FLASHSEATS_ADMIN_PASSWORD: ${FLASHSEATS_ADMIN_PASSWORD:-admin}
     FLASHSEATS_COOKIE_SECURE: ${FLASHSEATS_COOKIE_SECURE:-false}
-    # STRIPE_API_KEY, STRIPE_WEBHOOK_SECRET and RECAPTCHA_SECRET were passed here
-    # and read by nothing — no Java code references any of them. An env var the
-    # container receives and ignores reads exactly like one it uses. They come
-    # back with the integrations that need them.
+    # STRIPE_ENABLED is what chooses the real provider over the stub. Left false,
+    # the cluster runs StubPaymentGateway and the whole journey works with no
+    # account at all — which is what the load harness and every drill rely on.
+    STRIPE_ENABLED: ${STRIPE_ENABLED:-false}
+    STRIPE_API_KEY: ${STRIPE_API_KEY:-}
+    # Minted per `stripe listen` session, not per account. See the `stripe`
+    # service below; SecretsGuard refuses to start on the docker profile with
+    # STRIPE_ENABLED=true and this still at its default.
+    STRIPE_WEBHOOK_SECRET: ${STRIPE_WEBHOOK_SECRET:-whsec_dev_only_change_me}
+    RECAPTCHA_SECRET: ${RECAPTCHA_SECRET:-}
     # The two halves of the concurrent-sales fix, overridable per run, because the
     # drill is a comparison and not a pass/fail (ADR-049, ADR-051). Defaults match
     # application.properties; a baseline run is
@@ -252,6 +258,42 @@ services:
     volumes:
       - ./docker/k6:/scripts
     entrypoint: ["k6", "run", "/scripts/concurrent-sales.js"]
+    networks: [flashseats]
+
+  # ===================================================================
+  # Live provider webhooks (profile: stripe)
+  # ===================================================================
+  #
+  # The Stripe CLI's tunnel: it receives real test-mode deliveries for your
+  # account and forwards them to nginx. Its own profile, because it is the one
+  # service that cannot run without credentials — a plain `up -d` must not start
+  # needing an account.
+  #
+  #   export STRIPE_API_KEY=sk_test_... STRIPE_ENABLED=true
+  #   docker compose --profile cluster --profile stripe up -d
+  #   docker compose logs stripe        # prints the whsec_... to put in .env
+  #   docker/scripts/stripe-check.sh
+  #
+  # NOTE the ordering trap: `stripe listen` MINTS a webhook secret per session,
+  # and the app must already have that value. So the first run is two steps —
+  # start this, read the secret from its logs into STRIPE_WEBHOOK_SECRET, then
+  # recreate the app. A signature check against a stale secret rejects every
+  # delivery, and the symptom is silence that looks exactly like a quiet day.
+  stripe:
+    image: stripe/stripe-cli:latest
+    profiles: ["stripe"]
+    restart: unless-stopped
+    environment:
+      STRIPE_API_KEY: ${STRIPE_API_KEY:?set STRIPE_API_KEY to a sk_test_... key}
+    command:
+      - listen
+      - --forward-to
+      - http://nginx:80/api/v1/payments/webhook
+      # Only what this system acts on. Forwarding everything makes the log
+      # unreadable and every ignored delivery a round trip.
+      - --events
+      - payment_intent.succeeded
+    depends_on: [nginx]
     networks: [flashseats]
 
 volumes:

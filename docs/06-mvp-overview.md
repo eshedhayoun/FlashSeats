@@ -111,7 +111,7 @@ it, so if anything fails the hold returns to `ACTIVE` and expires normally.
 | Module | Ships now | Deferred |
 | :--- | :--- | :--- |
 | `shared` | `ErrorCode` (42 codes), `ProblemDetails`, one global advice, `SessionId`, `Money`, `Clock`, `SignedToken`, `TraceIdFilter` | — |
-| `bot` | Signed `fsid` cookie; Redis-backed Bucket4j session + IP buckets; SSE exempt from per-request accounting | reCAPTCHA, `ip_rules`, audit logs. **Writes no tables.** |
+| `bot` | Redis-backed Bucket4j session + IP buckets (SSE **counted once**, not exempt); reCAPTCHA v3 on join, failing open; cached `ip_rules`; async `bot_audit_logs`; operator surface | Rate-limit **metrics**; CIDR ranges; audit retention. The `fsid` cookie moved to `shared` in Pass 7 |
 | `catalog` | Events, tiers, window derivation, metadata cache, `serverTime`, bucketed availability, **Redis counters + Lua, the `-2` fault path, pre-warm, pause/resume, the Redis-restart guard** | create-event endpoint, `TierAvailabilityChangedEvent` |
 | `queue` | `ZADD NX` join, `FIFO`/`RANDOM` ordering, SSE with heartbeats, HMAC passes, admission sessions, promotion worker, **pub/sub fan-out**, measured drain-rate estimates, `tier-availability` frame | `Last-Event-ID` replay |
 | `hold` | `ticket_holds` authority, the settle-once claim, atomic reserve **with compensation**, **after-commit restore**, bounded grace, sweeper, all three endpoints, `hold:{token}` Redis timers and the keyspace listener | — |
@@ -258,7 +258,8 @@ Honest list. None of these is hidden behind a passing test.
   them, while each sits at **114–142 % of one core** with a 2,000-VU k6 competing for the same ten.
   2,000 VUs is still the ceiling here, but a 32 GB machine would not move it — a machine where the
   load generator is not sharing cores with the system under test would.
-- **Checkout p99 is 682 ms at 300 VUs on one sale, 9.3 s at 300 VUs across five, and ~30–45 s at
+- **Checkout p99 is 682 ms at 300 VUs on one sale, 6.4 s at 300 VUs across five — 9.3 s before
+  Pass 9's review removed a checkout transaction — and ~30–45 s at
   2,000 VUs across five** — against a 200 ms exit criterion. The 2,000-VU figures are the host: ten
   cores shared between three JVMs and the load generator, with `connections_pending` peaking at 10 of 90
   in the run that sold 76 % of capacity. **The 300-VU five-sale number is the real open one**: 682 ms →
@@ -280,7 +281,13 @@ Honest list. None of these is hidden behind a passing test.
 - **The Redis-restart guard halts selling for every affected event** until each is rebuilt. That is
   what `catalog.md` has always demanded after a restart; it is now enforced rather than remembered,
   and an unattended restart therefore stops a sale.
-- **Payment is a stub.** Every idempotency layer is real; the gateway is not.
+- ~~**Payment is a stub.**~~ **Fixed (Pass 9):** Stripe is behind the same seam, with a circuit
+  breaker, the webhook receiver and 3-D Secure (ADR-052-054). The stub survives as the **default**,
+  so `dev`, `test`, the load harness and every drill still drive the whole journey with no keys — and
+  it is now the only deterministic coverage of decline, outage and challenge. What that means is that
+  **the suite proves this system's behaviour, not the provider's**: `docker/scripts/stripe-check.sh`
+  is the only thing that checks the real account, the real status mapping and the real webhook secret
+  agree, and it is a script someone has to run rather than a test that fails on its own.
 - ~~**No admin surface** beyond pre-warm.~~ **Built** (Stage 4, ADR-048): pause/resume, the DLQ
   listing, a ticket resend, and an operator order view. `rebuild-stock` shipped in Stage 1. Still
   a single in-memory operator account — now stored bcrypt-hashed rather than in plaintext, with a
@@ -395,7 +402,7 @@ below is a real exposure someone should close before real money moves through it
 
 | # | Weakness | Assessment |
 | :-- | :--- | :--- |
-| S5 | **Session identity is free to mint** | The rate limiter's primary bucket is per-`fsid`, and anyone can discard a cookie to get a fresh one. The IP bucket is therefore the only real backstop — and it is deliberately loose (300 burst) so NAT populations are not blocked. This is the ADR-011 trade working as designed, but it means **the session bucket does not constrain a determined attacker at all.** Pass 1 made the IP bucket real (S11); it is now genuinely the backstop ADR-011 assumed it was. reCAPTCHA on join is still the missing compensating control, and it is still deferred. |
+| S5 | **Session identity is free to mint** | The rate limiter's primary bucket is per-`fsid`, and anyone can discard a cookie to get a fresh one. The IP bucket is therefore the only real backstop — and it is deliberately loose (300 burst) so NAT populations are not blocked. This is the ADR-011 trade working as designed, but it means **the session bucket does not constrain a determined attacker at all.** Pass 1 made the IP bucket real (S11). **Pass 9 built the compensating control** — reCAPTCHA v3 on join, failing open, plus `ip_rules` for the manual case (ADR-055). **It is off by default**, because `flashseats.bot.recaptcha.secret` is blank in a clean checkout, so this closes only where someone sets the secret. ADR-044's verified accounts remain the other route: an account costs something to mint, a discarded cookie costs nothing. |
 | S6 | **CSRF is disabled while a cookie authorises actions** | Justified for a stateless JSON API, and the checkout path is safe because it needs a `holdToken` an attacker cannot guess. But a cross-site `POST /queue/join` or `POST /holds` *would* succeed against a logged-in visitor and could be used to consume their one-hold-per-event allowance. Low impact, non-zero. Require a custom header, or re-enable CSRF for the mutating endpoints. |
 | S13 | **`POST /api/v1/session/reset` discards the caller's identity, unauthenticated** | A demo affordance: it expires the `fsid` cookie so the bundled page can start over as a new visitor. Under S6 a cross-site `POST` therefore throws a visitor out of a queue they were waiting in and cuts them off from their own live hold — no disclosure, but during a flash sale it is the most damaging thing on the CSRF list, because the session *is* the queue position. Scope it to the demo profile, or make it a `DELETE` that requires a header a form post cannot send. |
 | S7 | **Order numbers are sequential** | `TK-00001`, `TK-00002`. Access is properly controlled, so this is not an IDOR — but it publishes exact sales volume to anyone who buys one ticket. It was worse in combination with S4: a deterministic receipt token over a countable order number meant one leaked secret enumerated every buyer's email. The nonce closes that; the volume leak remains. Prefer a non-sequential public reference. |
@@ -441,18 +448,26 @@ restored exactly once, in 339 ms, across three replicas.
 removed". `git log -S` across every commit finds no keyspace listener and no `hold:` key literal
 ever committed, so that work lived only in an uncommitted tree and none of it was recoverable.
 
-### Stage 2 — Real money and real defence (Phase 3)
+### Stage 2 — Real money and real defence (Phase 3) — DONE (Pass 9)
 
-- `StripeGateway` implementing the existing `PaymentGateway`; the webhook receiver with signature
-  verification and `webhook_events` replay protection; `PaymentSettledEvent` → `order`.
-- The auto-refund path when a webhook arrives against a hold that is gone (ADR-012) — the code exists
-  and is currently only reachable via a commit failure.
-- 3-D Secure: `PAYMENT_ACTION_REQUIRED` plus `POST /orders/checkout/resume`.
-- Resilience4j around every gateway call — declared as plain beans, since the Boot-3 starter does not
-  apply here.
-- reCAPTCHA v3 on join, cached per session, **failing open** (ADR-011) — this is S5's compensating
-  control, so it belongs with the security fixes above.
-- `ip_rules`, `bot_audit_logs` (async, non-`ALLOWED` outcomes only), and `V6__bot.sql`.
+- ~~`StripeGateway` implementing the existing `PaymentGateway`~~ — **built** (ADR-052). Server-confirmed
+  PaymentIntents, so `FE_SPEC` §2's checkout body and ADR-001's ordering are unchanged.
+- ~~the webhook receiver with signature verification and `webhook_events` replay protection;
+  `PaymentSettledEvent` → `order`~~ — **built** (ADR-053). The claim is released when settlement
+  fails, so a redelivery retries rather than being dismissed as a duplicate.
+- ~~The auto-refund path when a webhook arrives against a hold that is gone (ADR-012)~~ — **built and
+  now reachable**, with its first test. A refund the provider *refuses* is also no longer recorded as
+  a refund: it is counted on `flashseats.payment.refund.failed` and written into `failure_reason`.
+- ~~3-D Secure: `PAYMENT_ACTION_REQUIRED` plus `POST /orders/checkout/resume`.~~ — **built, without
+  the resume endpoint** (ADR-054). `FE_SPEC` §2 was right and this line was wrong: re-POSTing the
+  same body is the retry, and the server retrieves the pending intent rather than charging again.
+- ~~Resilience4j around every gateway call — declared as plain beans~~ — **built** as a decorator that
+  counts transport failures only.
+- ~~reCAPTCHA v3 on join, cached per session, **failing open** (ADR-011)~~ — **built** (ADR-055).
+  Off unless a secret is configured, which is deliberate and is also the limit of what it closes.
+- ~~`ip_rules`, `bot_audit_logs` (async, non-`ALLOWED` outcomes only), and `V6__bot.sql`.~~ —
+  **built**, as `V11__bot.sql`: `V6` has been `V6__pass1_corrections.sql` in every database that has
+  run this schema, and a migration is immutable once applied.
 - The remaining §10 "must fix" item. (Pass 1 closed S1–S4 and S11; Stage 4 hashed the admin
   credential, so what is left of S12 is a real identity provider, wanted only once a second
   operator does.)
@@ -1396,7 +1411,183 @@ change ADR-049 ever needed — and the sale sells out.
   against a 200 ms criterion, which `pending` at zero says is not the database, and which needs a host
   where the load generator is not sharing ten cores with three JVMs.
 
-### Pass 9 — the simplification pass
+---
+
+### Pass 9 — Stage 2: real money behind the seam that was already there, and defence that fails open
+
+- **Scope:** replace the stub gateway, build the webhook receiver, make ADR-012's refund reachable,
+  ship 3-D Secure, build §10 S5's compensating control — **and then review all of it** against
+  rollbacks, connection loss, repeated attempts and load. **142 tests green** (112 before; `payment`
+  and `bot` each had none of their own).
+- **Method:** build against the existing seam without changing anything above it, then give the
+  module its first tests — and keep every one of them runnable with no Stripe account.
+
+**The seam held.** `PaymentGateway`, `payment:inflight`, the two `REQUIRES_NEW` transactions
+bracketing the network call, find-or-create, the attempt ceiling and the compensating refund were all
+built for a provider that did not exist yet, and none of them needed changing. What the provider
+actually cost was: two fields on `GatewayResult` (`clientSecret`, and a `requiresAction` factory that
+*must* carry the intent id), one method on the interface (`retrieve`), one field on `GatewayCharge`
+(`holdToken`, which travels as provider metadata and is how the webhook finds its order), and **three
+lines in `CheckoutService`**.
+
+| Built | Shape |
+| :--- | :--- |
+| `StripePaymentGateway` | Server-confirmed PaymentIntents (ADR-052). Payment Element would have inverted ADR-001 and made the synchronous `402`/`409` contract dead code |
+| `CircuitBreakingGateway` | A decorator, not an aspect. Counts `GatewayTransportException` and **nothing else** — a decline is a returned value, and a breaker that counted declines opens on a healthy provider during an ordinary burst of expired cards |
+| `webhook_events` + the receiver | A claim, not a log (ADR-053). `ON CONFLICT DO NOTHING`, rowcount as the answer, **released when settlement throws** so the redelivery retries |
+| `PaymentSettledEvent` → `order` | ADR-005's one cross-module edge, traversed for the first time since it was drawn |
+| 3-D Secure | `402` + `clientSecret`, resumed by re-POSTing the same body (ADR-054) |
+
+**Three things this pass got right only because a document was wrong out loud.**
+
+| Found | Resolution |
+| :--- | :--- |
+| **`03` §5 and `06` §11 both specified `POST /orders/checkout/resume`; `FE_SPEC` §2 said flatly that it does not exist and must not be built.** Three documents, two answers, and the contract one is the one clients are written against | FE_SPEC wins. Both others corrected, and **ADR-054** records why: a second retry path needs its own idempotency story, and this system's whole guarantee is that there is one |
+| **`05-global-standards.md` §2 told clients to "follow `resumeUrl`"** — a field that existed in no code, no DTO and no other document | Replaced with the real contract: `clientSecret`, then re-POST |
+| **The compensating refund discarded `RefundResult`.** A provider that *refused* the refund still produced an order marked `REFUNDED` and an email telling the buyer their money was coming — money this business holds and should not, described to the only person who would notice as already returned | One `OrderRefundService` for both call sites; a failure is counted on `flashseats.payment.refund.failed` and written into `failure_reason`. **Alarm on any non-zero value** |
+
+**The resume had to retrieve, and finding out why was the real design work.** The obvious
+implementation — charge again on the re-POST — fails in two different directions depending on the
+idempotency key. Reuse it, as `FE_SPEC` §1 requires, and the provider replays its cached
+`requires_action` response **for ever**, so the buyer can never finish. Vary it per attempt and a
+*second* intent opens, so they authenticate one payment and are billed for two. Only retrieving the
+pending intent works — and `PaymentStatus.PROCESSING`, declared on day one and never written because
+the stub could not reach it, turned out to be exactly the marker needed.
+
+**Accepted, and written down rather than discovered later:** while a challenge is outstanding, a
+different card in the body is ignored, because the resume re-reads that intent. The bound is the hold,
+which expires in minutes, and the alternative is a second charge against a hold that already has one
+in flight. A *failed* challenge resolves itself — the provider moves the intent to
+`requires_payment_method`, the retrieve returns `DECLINED`, and the next attempt charges fresh.
+
+**The stub was kept, and made the default.** It would have been natural to delete it on the day the
+real thing arrived, and that would have taken the only deterministic coverage of decline, outage and
+challenge with it — along with the ability to run the load harness, every drill and the whole suite
+with no account. Its vocabulary is now the provider's own (`pm_card_authenticationRequired`), so one
+script drives either gateway. Two consequences worth stating plainly:
+
+- **The suite proves this system's behaviour, not Stripe's.** `docker/scripts/stripe-check.sh` is the
+  only thing that checks the real account, the real status mapping and the real webhook secret agree,
+  and it is a script someone has to run rather than a test that fails on its own.
+- **The webhook secret is read on every profile**, independently of `stripe.enabled`, because that is
+  how the tests sign their own payloads. Gating it on the flag would have left the endpoint untested
+  on exactly the configuration the tests run.
+
+**Two traps avoided that the repository had already written down once.** The webhook claim is on its
+own bean, because a `@Transactional` method called from the same object runs with no transaction at
+all — and a claim that is not committed before the work it guards lets all three replicas settle the
+same charge. And the claim is released on failure, which is ADR-038's rule (Pass 6, the DLQ replay)
+appearing in a second place for the same reason. The same self-invocation trap was then avoided a
+third time in `bot`'s audit writer, where the lambda would have called its own `@Transactional`
+method through `this`.
+
+**And the bot half** (ADR-055) — §10 S5's compensating control, deferred four times. reCAPTCHA v3 on
+join with a new `queue ──► bot` edge, `ip_rules` as a TTL-bounded snapshot rather than a per-request
+query, and `bot_audit_logs` written asynchronously on a queue that discards. Verification **fails
+open**: only a score the provider actively returns below the threshold refuses anything. It is `V11`,
+not the `V6__bot.sql` four documents asked for, because `V6` has been applied everywhere. And it is
+**off by default** — a blank secret means no verification — so the honest claim is that the control
+exists, not that it is on.
+
+**The bot half, in the same pass** (ADR-055). §10 S5 has said the same sentence since Pass 1 —
+session identity is free to mint, so the primary rate-limit bucket constrains nobody determined — and
+the named compensating control had been deferred four times. It is now built: reCAPTCHA v3 on join,
+`ip_rules` as the manual override, and `bot_audit_logs` for what was refused. The module wrote no
+tables before this and had no operator surface at all, so an address flooding a sale could be
+answered only by changing a property and restarting three replicas *during the sale*.
+
+Three decisions carry the weight, and each is the same shape as one this repository already made:
+
+| Decision | The failure it avoids |
+| :--- | :--- |
+| **Verification fails open.** Only a score the provider actively returns below the threshold refuses anything; an unconfigured secret, a missing token, a timeout and a non-2xx all allow | A challenge provider's outage closing a sale ten thousand people are waiting for — **at peak load**, because that is when the provider is busiest too. Every degraded verification is audited, since failing open is otherwise invisible |
+| **`ip_rules` is a TTL-bounded snapshot, never a per-request query** | ADR-051's trap with the pool as the resource: a filter that queries to decide whether to shed load sits *inside* the connection pool it exists to protect, queued behind the buyers it is shielding |
+| **Audit writes are asynchronous on a bounded queue that discards** | Every row is written on a path an attacker controls the rate of, so a synchronous insert lets them convert their own `429`s into database load during the sale. Evidence is not worth an outage |
+
+Two smaller things worth recording. The provider timeouts (1 s / 2 s) are **correctness settings**:
+a default-timeout client on the join path turns a provider slowdown into a sale-length outage,
+reintroducing the exact failure that failing open exists to prevent. And the migration is `V11`, not
+the `V6__bot.sql` four documents asked for — `V6` has been `V6__pass1_corrections.sql` in every
+database that has run this schema, and Flyway checksums the whole file.
+
+**What S5 actually closes to.** Not "closed". `flashseats.bot.recaptcha.secret` is blank in `dev`,
+`test` and a clean checkout, so verification is **off** unless someone sets it — deliberate, because
+the stack must run from a clean checkout, and therefore the honest statement is that the control now
+*exists* rather than that it is *on*. ADR-044's verified accounts remain the other route to the same
+problem.
+
+**The same pass then reviewed its own work**, against the conditions this code will actually meet
+rather than the ones a green suite exercises: a rolled-back transaction, a dropped connection, one
+actor retrying hard, a sale with many buyers at once. Four defects, and **none of them is an error** —
+which is exactly why 129 passing tests could not see them (ADR-056).
+
+| Found | Condition that reveals it | Rule |
+| :--- | :--- | :--- |
+| The settlement caught `RuntimeException` and refunded, so a pool timeout or an unreadable counter refunded a buyer whose seats were **fine** — then answered the provider `200`, so nothing ever retried and the mistake was permanent | any transient database trouble during a webhook | **Only a definite failure moves money.** The three hold exceptions refund; everything else propagates, releases the claim and earns a redelivery — ADR-046's inventory rule, reaching money |
+| `payment:inflight` was released in an **unguarded** `finally`, so Redis dropping after a successful charge discarded the result and marked the order `FAILED` — money moved, order says it did not | Redis blip mid-checkout | A throw from `finally` **replaces** the returned value. Guard cleanup; the key expires anyway |
+| The 3-D Secure resume lookup was its own `REQUIRES_NEW` read, so **every** checkout paid a tenth sequential transaction to serve the challenge minority — against the count ADR-049's allowance is derived from | many buyers at once | Merged into the insert as one `beginAttempt`. Back to nine, and one class shorter |
+| `ip_rules` retried a down database **per request** and had no single-flight guard, so a TTL boundary was a pool spike and an outage was a connection storm | PostgreSQL unreachable; high request rate | A failed attempt stamps the clock like a success; one reload in flight; an empty result is cached too. All non-blocking — a lock here pins carrier threads |
+
+Plus `requires_confirmation` was mapped to `PAYMENT_ACTION_REQUIRED`, which would have handed the
+client a `clientSecret` whose `handleNextAction` does nothing — a `402` loop for the life of the hold;
+and the audit trail recorded `getRemoteAddr()`, which behind nginx is nginx, so every row in the only
+deployment that matters said `172.28.0.10`. `X-Forwarded-For` is now resolved in exactly one place and
+published as `shared`'s `ClientAddress` attribute.
+
+**Measured, on the ADR-049 drill plus a bot dimension the drill had never had** (13 Sept 2026,
+three replicas, five sales, 300 VUs):
+
+| | Pass 8 | Pass 9 |
+| :--- | :--- | :--- |
+| seats sold of 2,500 | 2,496 | **2,497** — `sold + held + redis == 500` on every tier |
+| `hikaricp_connections_pending` | 0 | 0 throughout the sale, peaking at 2 (the 6–7 later in the trace is the deliberate database outage below, not sale load) |
+| **checkout p99** | **9.3 s** | **6.4 s** |
+| inventory `503`s · rate-limited | 0 · 0 | 0 · 0 |
+| `flashseats.stock.drift` | transient | **one** `1.0` sample out of sixty, zero on that replica's next read — the documented transient, not sustained (ADR-046) |
+
+The p99 is the number Pass 8 left open, and a third of it went away by *removing* a transaction
+rather than adding capacity. It is still far above the 200 ms exit criterion, and still measured on a
+ten-core host shared with three JVMs and the load generator.
+
+**And the bot half, measured for the first time.** During the same run: a `DENY` rule added mid-run
+reached all three replicas; `bot_audit_logs` held **13 rows against 1,678 orders** — refusals only,
+never a row per request; and every row recorded the *forwarded* client address rather than nginx's,
+which is the fix above proving itself in the only deployment shape where it matters.
+
+Then PostgreSQL was stopped for twelve seconds under sixty requests. One replica attempted **two**
+reloads — one per TTL window. Before the backoff it would have attempted sixty, one per request,
+against a database that was already down. That measurement is the whole point of the fix, and it is
+invisible in every other instrument, because nothing about it is an error.
+
+**And the instrument contradicted the ADR it cites.** `pool-pressure.sh` failed the whole run on that
+single drift sample, printing "this is a correctness failure" — while `sold-count.sh`, which reads the
+ledger and is the authority, reported `sold + held + redis == 500` on every one of the five tiers.
+ADR-046 says to alarm on *sustained* non-zero precisely because Redis and PostgreSQL are not read in
+one snapshot. The script now requires drift on **consecutive samples for the same replica** before
+failing, and names an isolated one as the measurement's own artefact. Same family as ADR-047's four
+harness defects: an instrument that measures the wrong thing is worse than no instrument, because its
+answer is specific.
+
+**A note on the test that could not be written the obvious way.** Forcing an ambiguous settlement
+failure with `@MockitoSpyBean` **broke nineteen unrelated tests**: a bean override forks the
+application context, so two applications ran their schedulers against the same containers while the
+fixture truncated underneath both. The natural trigger turned out to be sitting in the schema —
+`ticket_holds` has no foreign key to `ticket_tiers`, so removing a tier row leaves a live hold the
+catalog cannot describe. Worth recording, because the next person to reach for a bean override in
+this suite will hit the same wall.
+
+- **Result:** **142 tests green.** `payment`'s first suite (12): webhook signature, replay,
+  settlement, ADR-012's refund, the 3-D Secure round trip asserting **one** charge and **zero**
+  attempts consumed, and a breaker unit test asserting a hundred declines leave it closed. `bot`'s
+  first suite (5): join succeeds with no provider configured, a denied address is refused with
+  `IP_BLOCKED`, removing a rule takes effect with no restart, an expired rule stops applying at *its*
+  expiry rather than the cache's, and only refusals reach the audit trail. Then the review's own
+  thirteen: the ambiguous-failure branch and its redelivery, provider status mapping including the
+  `requires_confirmation` loop, the snapshot's backoff and single flight, and the resolved audit
+  address. Still open: rate-limit metrics, and checkout p99.
+---
+
+### Pass 10 — the simplification pass
 
 - **Scope:** the whole codebase and every document, read for *legibility* rather than correctness.
   The trigger was not a defect: eight passes of adding correctness had left 215 Java files holding
@@ -1404,6 +1595,10 @@ change ADR-049 ever needed — and the sale sells out.
   classes on the path from `checkout` to `charge` and five representations of an event. The
   guarantees were sound; nobody could find them. `REFACTORING_BLUEPRINT.md` is the pass's main
   artefact and is now the repo's entry point.
+
+- **Written in parallel with Pass 9 and merged after it**, which turned out to be the most useful
+  thing about it — see "what the merge taught" below. Numbered 10 and carrying **ADR-057** because
+  Pass 9 had taken 052–056 while this was in flight.
 
 - **The finding that shaped it:** most of what looks removable here is load-bearing, and recording
   *that* is worth more than the deletions. SSE looks like a duplicate of `/queue/status` polling and
@@ -1418,21 +1613,58 @@ change ADR-049 ever needed — and the sale sells out.
 
 | Change | Effect |
 | :--- | :--- |
-| **Five `*FacadeImpl` deleted; services implement their own facades** (ADR-052) | One hop shorter on every cross-module call, three shorter into `payment`. `CatalogFacadeImpl` was twelve one-line delegations |
-| **25 exception classes → 9 + four `<Module>Errors`** (ADR-052) | A module's whole failure surface is one readable file. 17 of the 25 were never caught by type; the javadoc moved verbatim |
-| **10 unreachable `ErrorCode` constants removed** | §12 item 7, in the direction nobody had checked. `FE_SPEC.md` had already begun warning clients off three of them — dead contract documenting its own uselessness |
-| **`V10__drop_unread_schema.sql`** | `outbox_events.last_error` (written by nothing, read by nothing) and **six indexes no query uses** — two of them on `ticket_holds`, i.e. maintained on every reserve |
-| **`PaymentResult` 7 fields → 4** | `retryable`, `requiresAction` and `failureCode` had no readers, while `retryable`'s own javadoc called it "the field that matters". It is not: the decision is made from the order's attempt budget |
-| **Dead enum values removed** | `PaymentStatus.PROCESSING`, `NotificationStatus.FAILED`, `GatewayResult.Outcome.REQUIRES_ACTION` — all declared, none ever assigned |
-| **Checkout lost one transaction** | `confirm` returned the `Order`, the caller discarded it and re-read the same row plus its items to build the receipt. It now returns the receipt, built from what it already holds |
-| **Four dangling infra references** | An nginx route to a nonexistent webhook, three Stripe/reCAPTCHA env vars reaching no Java code, `redis.conf` naming `hold_reserve.lua`, and a javadoc naming `AdminResendController` — the "class names that never existed" failure mode, alive in four places |
-| **Four pom dependencies removed** | `springdoc` (zero annotations behind it — `/docs` described shapes and no meaning), `devtools` (fights the static Testcontainers), `mail-test` and `security-test` (nothing uses either) |
+| **Five `*FacadeImpl` deleted; services implement their own facades** (ADR-057) | One hop shorter on every cross-module call. `CatalogFacadeImpl` was twelve one-line delegations and said so in its own javadoc |
+| **25 exception classes → 10 + four `<Module>Errors`** (ADR-057) | A module's whole failure surface is one readable file. 16 of the 25 were never caught by type; every deleted class's javadoc moved verbatim onto its factory |
+| **Six unreachable `ErrorCode` constants removed** | §12 item 7, in the direction nobody had checked. Ten went; four came back — see below |
+| **`V12__drop_unread_schema.sql`** | `outbox_events.last_error` (written by nothing, read by nothing) and **three indexes no query uses**, two of them on `ticket_holds` and therefore maintained on every reserve |
+| **`NotificationStatus.FAILED` removed** | Declared, never assigned — and dangerous: `DLQ` is re-claimable by design, so a second terminal-looking state a replay does not recognise is how a buyer gets two tickets or none (ADR-042) |
+| **Checkout lost one transaction** | `confirm` returned the `Order`, the caller discarded it and re-read the same row plus its items to build the receipt. It now returns the receipt built from what it already holds. **Not yet measured** — the `connections_pending` before/after needs the concurrent-sales drill |
+| **Three dangling references** | `redis.conf` naming `hold_reserve.lua`, a javadoc naming `AdminResendController`, and an nginx block routing to an endpoint that did not exist — the "class names that never existed" failure mode, alive in three places |
+| **Four pom dependencies removed** | `springdoc` (zero annotations behind it — `/docs` described every shape and no meaning), `devtools` (fights the static Testcontainers), `mail-test` and `security-test` (nothing uses either; re-verified after the merge) |
+
+**What the merge with Pass 9 taught, and it is the most transferable thing here.** This pass deleted
+ten `ErrorCode` constants, three enum values, seven schema objects and three env vars on one rule:
+*nothing references it.* Pass 9 landed a real Stripe gateway, a webhook receiver, 3-D Secure and an
+IP-rule surface in the same week — and **roughly half of those deletions had to be reverted on the
+merge**:
+
+| Deleted as unreachable | What Pass 9 did |
+| :--- | :--- |
+| `PAYMENT_ACTION_REQUIRED`, `WEBHOOK_SIGNATURE_INVALID`, `BOT_VERIFICATION_FAILED`, `IP_BLOCKED` | All four raised by real code paths |
+| `PaymentStatus.PROCESSING` | Became the 3-D Secure parking state — a resumed checkout finds the parked intent by it rather than opening a second one |
+| `GatewayResult.Outcome.REQUIRES_ACTION`, and three `PaymentResult` fields | All load-bearing for 3-D Secure; `PaymentResult` gained a fourth, `clientSecret` |
+| `idx_pay_hold` | Now the index behind the 3-D Secure resume lookup. Dropping it would have put a sequential scan on the authentication path |
+| `HoldNotFoundException`, made a factory | Caught **by type** by the webhook settlement path, with `HoldExpiredException` and `HoldAlreadySettledException`, to refund a settlement whose seats are gone. Restored as a class — the same rule, new evidence |
+| `STRIPE_API_KEY`, `STRIPE_WEBHOOK_SECRET`, `RECAPTCHA_SECRET` | All three read by real configuration; `SecretsGuard` now refuses to boot without the webhook secret |
+
+**The rule was not wrong — its time horizon was.** "Nothing references this" is a sound reason to
+delete *code*, which is cheap to restore from git and whose absence the compiler enforces. It is a
+much weaker reason to delete *contract and schema*, where the cost of being early is a revert, a
+renumbered migration and a merge conflict in someone else's branch. **Delete a thing when its feature
+is not being built — not merely when it is not built yet**, and check the tip of the other branches
+before deciding which of those you are looking at. Six of the ten codes did stay deleted, so the
+check is still worth running; it is the confidence that needed calibrating, not the question.
+
+Two smaller lessons from the same merge, both now in `CLAUDE.md`: a migration version is
+first-come, so `V10` had to become `V12` when Pass 9 took `V10` and `V11`; and an ADR number is the
+same, so `ADR-052` became `ADR-057`. Two branches appending to one log is exactly how a duplicate
+happens.
+
+**One deletion re-examined and kept.** The dedicated nginx `location` for the webhook stayed
+deleted even though the endpoint now exists. It only set `proxy_next_upstream off`, which is a
+weaker version of a guarantee the application already makes: a webhook delivery is a claim, and a
+claim is released when its work did not happen (ADR-053), so a delivery replayed against a second
+replica finds the claim taken and acks. The honest argument for the block is cost, not correctness,
+and one duplicate delivery per slow payment is not a cost.
 
 **Not done, and deliberately listed rather than quietly dropped:** the representation merges
 (blueprint Stage D — queue state still has four shapes, order line items four) and the absorption of
 the single-method wrappers (Stage E — `OrderNumbers`, `HoldKeys`, `SaleWindows`, the three
-one-method repositories, and `payment`'s gateway-record collapse). Both are behaviour-preserving and
-fully specified in the blueprint.
+one-method repositories). Stage E's `payment` collapse is **withdrawn**: that module was 22 files
+around one switch statement when the blueprint was written and is now a real gateway with a breaker,
+a webhook and 3-D Secure. `idx_pay_order` and `idx_orders_intent` are still queried by nothing and
+were left alone for the same reason — shaving writes off a table someone is actively extending is
+not worth the coordination cost.
 
 **The gap this pass found and did not close.** `application-test.properties` sets
 `flashseats.notification.enabled=false`, which `@ConditionalOnProperty`-disables the Rabbit topology,
@@ -1441,10 +1673,9 @@ test that drives a message through a listener** — no ack/nack, no DLX routing,
 claim → render → send → mark, no `EmailComposer` (133 lines, zero tests), and no end-to-end refund
 path. This is the trap `CLAUDE.md` names as *"disabling a feature in the test profile so the suite
 passes"*, and its own prescribed fix applies: give the fixture a seam.
-`RabbitOutboxPublisherTest` already shows the pattern with its own Testcontainers broker. It is
-item 3.2 of the blueprint's checklist.
+`RabbitOutboxPublisherTest` already shows the pattern with its own Testcontainers broker, and Pass 9's
+`PaymentWebhookIT` shows it again. It is item 3.2 of the blueprint's checklist.
 
 **Also noticed, not fixed:** `README.md` §"Architecture at a glance" is materially stale — it
-describes `tier_inventory` (dropped in `V7`), a `filter ──► bot` module edge, a
-`PaymentSettledEvent` that exists in no Java file, and Thymeleaf. It predates ADR-046 and was not in
-this pass's scope.
+describes `tier_inventory`, dropped in `V7`, and a `filter ──► bot` module edge that does not exist.
+It predates ADR-046 and was not in this pass's scope.

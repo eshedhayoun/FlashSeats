@@ -7,22 +7,28 @@ Guidance for Claude Code when working in this repository.
 FlashSeats — a high-concurrency ticket flash-sale engine. Modular monolith, Java 21, Spring Boot
 4.1.1. The **MVP is built and running**: all nine modules, the full journey from landing page to emailed
 PDF ticket, 112 tests green. **Inventory lives in Redis** (Stage 1, ADR-046): `catalog:stock:{e}:{t}`
-is the live count and PostgreSQL keeps no copy of it.
+is the live count and PostgreSQL keeps no copy of it. **Payment is real** (Stage 2, ADR-052-054) —
+but `flashseats.payment.stripe.enabled` is **false by default**, so `dev`, `test`, the load harness
+and every drill still run the in-process stub through the complete journey, 3-D Secure included.
 
 **Read [`docs/00-architecture-decisions.md`](docs/00-architecture-decisions.md) before changing
-anything.** It contains 52 ADRs. Most record a defect and its fix — 034-039 come from the first
+anything.** It contains 57 ADRs. Most record a defect and its fix — 034-039 come from the first
 review pass over the built code, 040-042 from the second — and several look like over-engineering
 until you read the failure they prevent. 043-045 are the exception: forward-looking decisions about
 the operator surface, buyer accounts and what health should report, with nothing built against them
 yet. **046 is Stage 1** — Redis as the counter, and the five places it departs from the module specs.
 **049 and 051 are the concurrent-sales work**, both built in Pass 8: the cluster-wide admission
-allowance and the metadata cache that had to come before it. **050 is ticket retrieval**, built.
+allowance and the metadata cache that had to come before it. **050 is ticket retrieval**, built. **052-055 are Stage 2**, all built: Stripe behind the
+existing seam with a circuit breaker, the webhook as a released-on-failure claim, 3-D Secure with no
+resume endpoint, and bot defence that fails open. **056 is Stage 2's own review** — the four defects
+that only appear under a rollback, a dropped connection or real load.
 
 **The operating envelope is 3–10 concurrent sales**, not one
 ([`03-end-to-end-flow.md`](docs/03-end-to-end-flow.md) §2). Every capacity number written before
 ADR-049 silently assumed a single sale. Check which assumption a limit rests on before trusting it.
-**Five concurrent sales now sell out** — 2,496 of 2,500, no oversell, `hikaricp_connections_pending` at
-zero — measured in Pass 8 (`06-mvp-overview.md` §11). Checkout p99 is the one number still open.
+**Five concurrent sales now sell out** — 2,497 of 2,500, no oversell, `hikaricp_connections_pending` at
+zero (`06-mvp-overview.md` §11). Checkout p99 is the one number still open: Pass 9's review took it
+from 9.3 s to **6.4 s** by removing a transaction, against a 200 ms criterion.
 
 **For what is actually built**, read [`docs/06-mvp-overview.md`](docs/06-mvp-overview.md) — scope,
 security posture, next stages, and the review-pass log. It is the doc to update after every pass.
@@ -30,7 +36,7 @@ security posture, next stages, and the review-pass log. It is the doc to update 
 ## Document precedence
 
 ```
-00-architecture-decisions.md      ← highest authority (52 ADRs)
+00-architecture-decisions.md      ← highest authority (57 ADRs)
 05-global-standards.md            ← cross-cutting contract; module docs conform to it
 FE_SPEC.md                        ← client contract (repo root)
 03-end-to-end-flow.md             ← the authoritative user journey AND the operating envelope
@@ -91,6 +97,13 @@ describing superseded designs. That is the failure mode this rule exists to stop
   starters were deliberately removed; only `spring-modulith-starter-core` and `-starter-test`
   remain, purely for `ApplicationModules.verify()` (ADR-009). Do not re-add them casually.
 - `spring.threads.virtual.enabled=true` is load-bearing, not decoration.
+- **Resilience4j is the plain artifacts, never the starter** — `resilience4j-spring-boot3` targets
+  Boot 3. One `CircuitBreaker` bean is declared by hand in `payment`'s gateway config (ADR-052).
+- **Stripe is on the classpath unconditionally but used conditionally.** Signature verification
+  (`com.stripe.net.Webhook`) is needed on every profile, because that is how the tests sign their own
+  payloads; the *gateway* is chosen by `flashseats.payment.stripe.enabled`.
+- **The webhook secret is minted per `stripe listen` session**, not per account. A stale one rejects
+  every delivery and the symptom is silence that looks exactly like a quiet day.
 - **Redisson is gone** (ADR-022). Distributed locks are `pg_try_advisory_xact_lock`.
 - There are **nine** modules: seven domain + `shared` (open) + `saleflow` (read-only leaf).
 - **`SecretsGuard` refuses to start** outside `dev`/`test` while any secret is still
@@ -107,11 +120,11 @@ describing superseded designs. That is the failure mode this rule exists to stop
                     shared        ← open module; everyone may depend on it
 
 bot      ──► shared only          ← servlet filters; `filter` is a PACKAGE in `bot`, not a module
-queue    ──► catalog
+queue    ──► catalog, bot         ← `bot` only on join (reCAPTCHA); acyclic, `bot` needs nothing
 hold     ──► queue, catalog
 order    ──► hold, catalog, payment, queue
 saleflow ──► queue, hold, order, catalog     ← read-only leaf; nothing depends on it
-payment  ──( PaymentSettledEvent · webhook path only )──► order
+payment  ──( PaymentSettledEvent · webhook path only )──► order   ← BUILT; the only inbound edge
 order    ──( outbox → RabbitMQ )──► notification
 ```
 
@@ -124,7 +137,9 @@ Rules:
 - **There is no exception.** `catalog:stock:{eventId}:{tierId}` is owned and mutated by `catalog`
   alone; `hold` moves stock through `CatalogFacade`. Earlier drafts had `hold` run the scripts
   against catalog's key and called it the one shared key in the system (ADR-046).
-- `payment` calls **no** facades. Adding one would make the graph cyclic (ADR-005).
+- `payment` calls **no** facades. Adding one would make the graph cyclic (ADR-005). It reports
+  settlement as an **event** for exactly that reason: the type dependency runs `order → payment`,
+  which already exists, so the runtime direction never closes the loop.
 - `order` owns no Redis keys at all.
 - The graph must stay acyclic — `ApplicationModules.verify()` fails the build otherwise.
 
@@ -226,8 +241,20 @@ Do not reintroduce these — each cost a real defect in the first pass:
 | **A recovery path that reads a cache** | `prewarm` and the rebuild write inventory counters *derived from the tier list*. A stale list leaves a tier with no counter — a `503` for the rest of the sale — or rebuilds the wrong set. Probably-right input, definitely-wrong counter (ADR-051) |
 | **Caching a value derived from the clock** | A window status flips with no write to evict on, so the one thing nothing can detect goes stale. Cache the row; derive the status every call (ADR-051) |
 | **Disabling a feature in the test profile so the suite passes** | The configuration production runs then has no coverage at all. Give the fixture a seam instead — `SaleFixture.reset()` clears every `DerivedStateCache` (ADR-051) |
+| **An instrument stricter than the ADR it cites** | `pool-pressure.sh` failed a whole run on ONE non-zero drift sample while `sold-count.sh` read the ledger and found the invariant exact on every tier. ADR-046 says *sustained*, because Redis and PostgreSQL are not read in one snapshot. A false correctness alarm during a load drill costs more than no alarm: it is specific, so it gets believed (ADR-047) |
 | **Iterating open events in a fixed order while spending a shared budget** | Every replica reads the same ascending list, so the lowest event id takes the whole allowance every tick and the other sales stand still. Shuffle the order (ADR-049) |
+| **Compensating on an exception rather than on a fact** | `catch (RuntimeException)` around a settlement refunded a buyer whose seats were fine whenever the database blipped — and answered the provider `200`, so nothing ever retried. Only a *definite* failure may move money; ambiguity falls to the redelivery (ADR-056, ADR-046) |
+| **Cleanup in an unguarded `finally`** | A throw from `finally` **replaces** the value the block was returning. An unguarded `redis.delete` discarded a *successful* charge and marked the order `FAILED` — money moved, order says it did not. Guard it; the key expires anyway (ADR-056) |
+| **A cache that retries a failing dependency per request** | While PostgreSQL was down, `ip_rules` opened a connection per request: the load-shedder becoming the load, at the worst moment. Stamp the failed attempt exactly like a success, single-flight the reload, and cache an empty result too (ADR-056) |
+| **Reading an operator's rule table on every request** | `ip_rules` gates every API call. A query there puts the rate limiter *inside* the connection pool it exists to protect, queued behind the buyers it is shielding — ADR-051's trap with the filter as the job. Snapshot it, TTL it, and let the TTL be the cross-replica invalidation (ADR-055) |
+| **Writing an audit row synchronously on a refusal path** | Every row is written on a path an attacker controls the rate of, so a synchronous insert lets them convert their own `429`s into database load during the sale. Bounded queue, **discard** policy: evidence is not worth an outage (ADR-055) |
+| **Refusing a request because the challenge provider was unreachable** | It fails at peak load, because that is when the provider is busiest too — so the failure mode is "the sale closes at exactly the wrong moment". Fail open and audit the degradation (ADR-011, ADR-055) |
 | **Deriving a "random" queue draw from the session id** | Idempotent and *precomputable*: ids are free to mint, so a bot grinds candidates offline until it holds a low draw. `ZADD NX` already makes a fresh draw idempotent (ADR-024) |
+| **Reusing one provider idempotency key across a 3-D Secure resume** | The client mints ONE key per hold and reuses it on every retry, so a second `charge` replays the cached `requires_action` response **for ever** and the buyer can never finish. Varying the key per attempt is worse: it opens a *second* intent, so they authenticate one payment and are billed for two. Retrieve the existing intent (ADR-054) |
+| **Letting a webhook claim survive a failed settlement** | The provider redelivers, the claim says "already handled", and the buyer's settled charge never reaches an order. ADR-038's rule in a new place: `processed_at IS NULL` must mean *in flight*, and a failure must leave **no row at all** (ADR-053) |
+| **Binding a webhook body to a DTO before verifying its signature** | The signature is over the *bytes*, not the meaning. Jackson round-tripping an equivalent object changes key order and whitespace, so every legitimate delivery fails verification — and the fix looks like a provider bug for as long as you believe the JSON is the same |
+| **Counting declines against a circuit breaker** | A refused card is a *correct answer*. During a flash sale a burst of expired cards is the normal state of the world, so a breaker that counted them opens on a healthy provider and takes the whole sale's payments down. Count only what a transport failure throws (ADR-052) |
+| **Making a `@Transactional` claim a private method on the class that calls it** | Spring's proxy does not intercept self-invocation, so it runs with **no transaction at all**, silently. For a webhook claim that is not style: the claim must be *committed* before the settlement it guards begins, or all three replicas settle the same charge |
 
 ## Implementation order
 
@@ -256,6 +283,7 @@ rather than one module's corner:
 | `queue:exhausted:{e}` | `queue` | String | sale end | derived sold-out marker; deleted the moment stock returns (ADR-035) |
 | `payment:inflight:{holdToken}` | `payment` | String | 90 s | duplicate-charge guard, anchored to the hold (ADR-014) |
 | `bot:rate:*` | `bot` | Bucket4j | rolling | session-first rate limiting, IP as a coarse backstop (ADR-011) |
+| `bot:verified:{sid}` | `bot` | String | 900 s | one challenge verification, remembered per session (ADR-055) |
 | `hold:{token}` | `hold` | String | hold TTL | expiry timer. A **hint, never an authority** — the listener re-reads the row and the settle-once claim is what makes three replicas restore once (ADR-048) |
 
 Two rules over that table: a module touches only its own prefix, and **no key here is ever the
@@ -294,6 +322,15 @@ docker/scripts/fanout-check.sh                   # PROVE promotion fan-out acros
                                                  # that a fan-out failure. Re-seed first
 docker/scripts/hold-expiry-check.sh              # PROVE the expiry listener restores seats exactly
                                                  # once, and faster than the sweeper (ADR-048)
+
+# Stage 2, the REAL provider. Everything else here runs the stub, deliberately
+# -- so none of it can tell you whether Stripe agrees (ADR-052).
+export STRIPE_API_KEY=sk_test_... STRIPE_ENABLED=true
+docker compose --profile cluster --profile stripe up -d --build
+docker compose logs stripe | grep whsec_         # PER SESSION, not per account. Put it in
+                                                 # STRIPE_WEBHOOK_SECRET and recreate the app, or
+                                                 # every delivery 400s and looks like no traffic
+docker/scripts/stripe-check.sh                   # real charge, real 3-DS, real redelivered webhook
 docker compose --profile loadtest run --rm k6    # the load run; VUS=n to scale it down
 docker/scripts/sse-cadence.sh 60                 # run DURING a load run: is QueueBroadcaster's
                                                  # sweep finishing inside its 2s interval?
@@ -303,7 +340,11 @@ docker/scripts/sse-cadence.sh 60                 # run DURING a load run: is Que
 docker/seed/seed-concurrent.sh                   # seeds 9001..9005, pre-warms all five
 docker/scripts/pool-pressure.sh 300 &            # THE instrument. Without it the drill
                                                  # proves nothing: the failure is latency,
-                                                 # not an error, so k6 sees a green run
+                                                 # not an error, so k6 sees a green run.
+                                                 # Needs FLASHSEATS_ADMIN_PLAINTEXT exported.
+                                                 # Drift fails only on CONSECUTIVE samples for
+                                                 # one replica -- ADR-046 says sustained, and a
+                                                 # single sample is the measurement's own gap
 docker compose --profile loadtest run --rm -e VUS=300 k6-concurrent
 docker/scripts/sold-count.sh                     # what was ACTUALLY sold, and the invariant per tier.
                                                  # k6's count is what the CLIENT saw: it abandons

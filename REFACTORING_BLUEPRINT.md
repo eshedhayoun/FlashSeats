@@ -393,7 +393,7 @@ removing a transaction from checkout is the claim being made.
 ## 3.1 This refactor
 
 - [x] **Stage A** — this document; linked from `README.md`
-- [x] **Stage B** — five `*FacadeImpl` deleted; services implement their facades (**ADR-052**)
+- [x] **Stage B** — five `*FacadeImpl` deleted; services implement their facades (**ADR-057**)
 - [x] **Stage C** — 25 exception files → 9 classes + four `<Module>Errors`; javadoc moved verbatim
 - [ ] **Stage D** — one shape per concept; add the `OutboxPayload` ≡ `OrderConfirmedPayload` test
 - [ ] **Stage E** — absorb the non-concept files; collapse `payment` to ~12 files; act on `RefundResult`

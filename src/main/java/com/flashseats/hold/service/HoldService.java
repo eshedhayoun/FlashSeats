@@ -10,6 +10,7 @@ import com.flashseats.hold.event.TicketHoldSettledEvent;
 import com.flashseats.hold.exception.HoldAlreadySettledException;
 import com.flashseats.hold.exception.HoldErrors;
 import com.flashseats.hold.exception.HoldExpiredException;
+import com.flashseats.hold.exception.HoldNotFoundException;
 import com.flashseats.hold.exception.InsufficientStockException;
 import com.flashseats.hold.exception.InventoryUnavailableException;
 import com.flashseats.hold.facade.HoldFacade;
@@ -165,8 +166,7 @@ public class HoldService implements HoldFacade {
     /**
      * The hold, if it is live and belongs to this session.
      *
-     * @throws com.flashseats.shared.error.FlashSeatsException {@code HOLD_NOT_FOUND} — see
-     *     {@link HoldErrors} — if it does not exist or is another session's; {@code 404} for
+     * @throws HoldNotFoundException if it does not exist or is another session's — {@code 404} for
      *     both, so hold tokens cannot be enumerated
      * @throws HoldExpiredException if it has been settled or its window has passed
      */
@@ -174,7 +174,7 @@ public class HoldService implements HoldFacade {
     public TicketHold requireActiveHold(String holdToken, String sessionId) {
         TicketHold hold = holds.findByHoldToken(holdToken)
                 .filter(h -> h.getUserSessionId().equals(sessionId))
-                .orElseThrow(() -> HoldErrors.holdNotFound(holdToken));
+                .orElseThrow(() -> new HoldNotFoundException(holdToken));
 
         if (!hold.isActive() || !clock.instant().isBefore(hold.getExpiresAt())) {
             throw new HoldExpiredException(holdToken, hold.getExpiresAt());
@@ -189,7 +189,7 @@ public class HoldService implements HoldFacade {
     public void release(String holdToken, String sessionId) {
         TicketHold hold = holds.findByHoldToken(holdToken)
                 .filter(h -> h.getUserSessionId().equals(sessionId))
-                .orElseThrow(() -> HoldErrors.holdNotFound(holdToken));
+                .orElseThrow(() -> new HoldNotFoundException(holdToken));
 
         settleAndRestore(hold, HoldStatus.RELEASED, SettleReason.USER_CANCEL);
     }
@@ -212,7 +212,7 @@ public class HoldService implements HoldFacade {
     @Transactional
     public Instant grantGrace(String holdToken) {
         TicketHold hold = holds.findByHoldToken(holdToken)
-                .orElseThrow(() -> HoldErrors.holdNotFound(holdToken));
+                .orElseThrow(() -> new HoldNotFoundException(holdToken));
 
         if (!hold.isActive()) {
             throw new HoldExpiredException(holdToken, hold.getExpiresAt());
@@ -358,7 +358,7 @@ public class HoldService implements HoldFacade {
     @Transactional(propagation = Propagation.MANDATORY)
     public HoldSummary consumeHold(String holdToken) {
         TicketHold hold = holds.findByHoldToken(holdToken)
-                .orElseThrow(() -> HoldErrors.holdNotFound(holdToken));
+                .orElseThrow(() -> new HoldNotFoundException(holdToken));
 
         if (holds.settle(holdToken, HoldStatus.CONSUMED, SettleReason.CONSUMED, clock.instant()) != 1) {
             throw new HoldAlreadySettledException(holdToken);

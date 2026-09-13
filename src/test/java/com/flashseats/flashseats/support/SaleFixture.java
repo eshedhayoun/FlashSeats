@@ -50,8 +50,9 @@ public class SaleFixture {
     public void reset() {
         jdbc.execute(
                 """
-                TRUNCATE notification_logs, payment_transactions, outbox_events, order_items,
-                         orders, ticket_holds, ticket_tiers, events
+                TRUNCATE bot_audit_logs, ip_rules, notification_logs, webhook_events,
+                         payment_transactions, outbox_events, order_items, orders, ticket_holds,
+                         ticket_tiers, events
                 RESTART IDENTITY CASCADE
                 """);
 
@@ -257,6 +258,110 @@ public class SaleFixture {
         jdbc.update(
                 "UPDATE ticket_holds SET expires_at = ? WHERE hold_token = ?",
                 Timestamp.from(Instant.now().minusSeconds(30)),
+                holdToken);
+    }
+
+    /**
+     * Runs {@code body} with a tier's row temporarily gone, then puts it back exactly as it was.
+     *
+     * <p>Nothing references {@code ticket_tiers} from {@code ticket_holds}, so this leaves a live
+     * hold pointing at a tier the catalog cannot describe — which is how a settlement can be made to
+     * fail for a reason that is <strong>not</strong> one of the three definite hold outcomes. Every
+     * other failure reachable on that path is definite, which is the point: the branch that must not
+     * refund cannot be reached any other way.
+     *
+     * <p>The caches are cleared on both edges. A raw delete evicts nothing by itself (ADR-051).
+     */
+    public void withTierRemoved(long tierId, Runnable body) {
+        var row = jdbc.queryForMap("SELECT * FROM ticket_tiers WHERE id = ?", tierId);
+        jdbc.update("DELETE FROM ticket_tiers WHERE id = ?", tierId);
+        caches.forEach(DerivedStateCache::invalidateAll);
+        try {
+            body.run();
+        } finally {
+            jdbc.update(
+                    """
+                    INSERT INTO ticket_tiers
+                           (id, event_id, tier_name, price_cents, currency, total_capacity,
+                            max_per_order, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, now(), now())
+                    """,
+                    row.get("id"), row.get("event_id"), row.get("tier_name"), row.get("price_cents"),
+                    row.get("currency"), row.get("total_capacity"), row.get("max_per_order"));
+            caches.forEach(DerivedStateCache::invalidateAll);
+        }
+    }
+
+    /** Every address in the bot audit trail — the RESOLVED one, not the socket peer. */
+    public java.util.List<String> botAuditAddresses() {
+        return jdbc.queryForList("SELECT ip_address FROM bot_audit_logs", String.class);
+    }
+
+    /**
+     * Every outcome in the bot audit trail.
+     *
+     * <p>Deliberately returns them all rather than a count: the assertion worth making is that no
+     * row describes an <em>allowed</em> request. A count cannot say that, and a write per request
+     * during a flash sale is the failure this table's shape exists to avoid.
+     */
+    public java.util.List<String> botAuditOutcomes() {
+        return jdbc.queryForList("SELECT outcome FROM bot_audit_logs", String.class);
+    }
+
+    /** The order's own status, read straight from the row rather than through an API that filters. */
+    public String orderStatus(String holdToken) {
+        return jdbc.queryForObject(
+                "SELECT status FROM orders WHERE hold_token = ?", String.class, holdToken);
+    }
+
+    /**
+     * How many times <em>this</em> delivery was claimed. A replay must not add one.
+     *
+     * <p>Scoped to the event id rather than counting the table, deliberately: a global count makes an
+     * assertion about every other test that has ever run, so it reports someone else's leftover row
+     * as this test's failure. The claim is per delivery, and so is the question worth asking.
+     */
+    public int countWebhookEvents(String stripeEventId) {
+        return jdbc.queryForObject(
+                "SELECT count(*) FROM webhook_events WHERE stripe_event_id = ?",
+                Integer.class,
+                stripeEventId);
+    }
+
+    /**
+     * Whether a claimed delivery was seen through to the end.
+     *
+     * <p>{@code processed_at IS NULL} means in flight, never failed — a failed settlement deletes
+     * its row so the provider's redelivery finds a clean claim (ADR-038).
+     */
+    public boolean webhookProcessed(String eventId) {
+        Integer processed = jdbc.queryForObject(
+                "SELECT count(*) FROM webhook_events WHERE stripe_event_id = ? AND processed_at IS NOT NULL",
+                Integer.class,
+                eventId);
+        return processed != null && processed == 1;
+    }
+
+    /** The provider intent recorded against a hold's charge, or null if nothing was recorded. */
+    public String gatewayReferenceFor(String holdToken) {
+        return jdbc.query(
+                "SELECT stripe_payment_intent_id FROM payment_transactions WHERE hold_token = ?"
+                        + " ORDER BY id DESC LIMIT 1",
+                rs -> rs.next() ? rs.getString(1) : null,
+                holdToken);
+    }
+
+    /** How many of the buyer's three card attempts an order has spent. */
+    public int paymentAttemptsFor(String holdToken) {
+        return jdbc.queryForObject(
+                "SELECT payment_attempts FROM orders WHERE hold_token = ?", Integer.class, holdToken);
+    }
+
+    /** The ledger status of a hold's most recent charge attempt. */
+    public String paymentStatusFor(String holdToken) {
+        return jdbc.query(
+                "SELECT status FROM payment_transactions WHERE hold_token = ? ORDER BY id DESC LIMIT 1",
+                rs -> rs.next() ? rs.getString(1) : null,
                 holdToken);
     }
 

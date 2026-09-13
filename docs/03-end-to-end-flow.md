@@ -486,10 +486,10 @@ hold. This abort was missing from the first pass and is the phantom-hold race cl
 | **Crash between commit and charge** | The order is stranded `PENDING` with no handler having run. Within `stale-pending-seconds` a retry gets `409` — a charge really may be in flight. Past it, the row is resumed on the same `order_number` (ADR-034). |
 | **Too little time left to finish** | `409 INSUFFICIENT_TIME_REMAINING`, **nothing charged**, order → `FAILED`. The grace extension is already spent, so this hold cannot be stretched further; the buyer releases and re-reserves. |
 | **Double-click / double submit** | Layer 1: `SETNX payment:inflight:{holdToken}` (90 s). Layer 2: `UNIQUE(hold_token)` — the second request sees a *fresh* `PENDING` and gets `409`. Layer 3: the client `idempotencyKey` reaches Stripe as its `Idempotency-Key` (ADR-014). |
-| **3-D Secure required** | `402 PAYMENT_ACTION_REQUIRED` + `resumeUrl`. Client runs `stripe.handleNextAction()`, then calls `POST /api/v1/orders/checkout/resume` with the same `holdToken`. The order stays `PENDING` throughout; the grace extension from step 4 covers the challenge. |
+| **3-D Secure required** | `402 PAYMENT_ACTION_REQUIRED` + `clientSecret`. Client runs `stripe.handleNextAction()`, then **re-POSTs the same `/orders/checkout` body** — there is no resume endpoint, and building one would be a second retry mechanism (ADR-054). The order is left `FAILED`, which find-or-create resumes on the same `order_number`, and **no attempt is consumed**. The server retrieves the existing intent rather than charging again. The grace extension from step 5 covers the challenge. |
 | **Extension fails at step 4** | `410 HOLD_EXPIRED`, **nothing charged**. |
 | **Timer expires before submit** | `410 HOLD_EXPIRED`. UI offers re-entry — and the admission session may still be live, so the buyer often does not have to re-queue at all. |
-| **Network drops after charge** | Stripe still settles. `payment_intent.succeeded` → webhook (signature-verified) → `PaymentSettledEvent` → `order` finalises the still-`PENDING` order by `hold_token`. |
+| **Network drops after charge** | Stripe still settles. `payment_intent.succeeded` → webhook (signature-verified over the raw bytes, claimed once on `stripe_event_id`) → `PaymentSettledEvent` → `order` finalises the order by `hold_token`, which travelled to the provider as metadata. A settlement that throws **releases the claim** so the redelivery retries (ADR-053). |
 | **Webhook arrives, hold already gone** | `order` refunds automatically, sets `REFUNDED`, writes a `REFUND_NOTICE` outbox event. The original design would have confirmed an order for seats another buyer already owned (ADR-012). |
 | **Charge succeeds, commit fails** | Compensating refund, order → `REFUNDED`, `REFUND_NOTICE` queued. |
 | **User cancels** | `DELETE /api/v1/holds/{holdToken}` → claim → stock restored. **Admission session survives**, so they can pick another tier (ADR-020). |
@@ -501,11 +501,13 @@ Note what is *absent*: `payment` never calls `HoldFacade`. Grace extension is re
 a decline deliberately retains the hold; abandonment is handled by the TTL. Removing that edge is
 what makes the facade graph acyclic (ADR-005).
 
-> **Phase 1 (MVP):** `PaymentFacade` is a stub returning `SUCCEEDED`, but behind the *real*
-> interface, in the *real* position in the sequence. No webhook, no refunds. The orchestration —
-> including `UNIQUE(hold_token)`, find-or-create, and consume-inside-the-transaction — is built
-> correctly from day one, because retrofitting transaction boundaries later is exactly how
-> overbooking bugs are born.
+> **The stub is still here, and still the default.** Stage 2 put Stripe behind the same interface,
+> in the same position, selected by `flashseats.payment.stripe.enabled` (ADR-052). With it false —
+> `dev`, `test`, the load harness and every drill — the in-process stub drives *every* branch above,
+> including the 3-D Secure one, with no keys and no network. Building the orchestration first and
+> the provider second is what let `UNIQUE(hold_token)`, find-or-create and
+> consume-inside-the-transaction be right from day one; retrofitting transaction boundaries later is
+> exactly how overbooking bugs are born.
 
 ---
 
@@ -812,6 +814,9 @@ Every value below is a named property in `application.properties`.
 | Active holds per session per event | 1 | 017 |
 | Charge attempts per hold | 3 | 014 |
 | `payment:inflight` TTL | 90 s | 014 |
+| **Payment provider** | `flashseats.payment.stripe.enabled` — **false by default**, which runs the in-process stub | **052** |
+| **Gateway breaker** | 20-call window, 10 minimum, 50 % threshold, 10 s open, 3 half-open probes. Counts **transport failures only** | **052** |
+| **Gateway timeouts** | 5 s connect / 20 s read, `maxNetworkRetries=0` | **052** |
 | Promotion tick | 1 s, singleton per event by Redis `SET NX PX` | 008 / **032** |
 | Promotion batch size | **≤ `hikariMax × 1.5`** (45) — **per sale**, the secondary cap | **028 / 049** |
 | **Cluster admission allowance** | **45 per tick**, `global-admission-budget-per-tick` — ADR-028's `hikariMax × 1.5` re-scoped from one sale to the cluster. Claimed from `queue:budget` before the per-sale cap applies | **049** |
@@ -834,8 +839,14 @@ Every value below is a named property in `application.properties`.
 | HikariCP pool | 30 max, 10 idle, 3 s timeout | std §7 |
 | Availability buckets | `SOLD_OUT` 0 · `LIMITED` < 10 % · `PLENTY` · **`UNKNOWN` = no counter** | **027 / 040** |
 
-There is no reCAPTCHA and no bot-score threshold. Rate limiting is session-first with an IP backstop
-(ADR-011); a challenge provider is a Stage 2 item and no property for one exists.
+| reCAPTCHA on join | `flashseats.bot.recaptcha.*` — **blank secret means OFF**, and off allows | **011 / 055** |
+| Challenge score threshold | 0.5; provider timeouts 1 s connect / 2 s read, both **correctness** | **055** |
+| Verification remembered per session | 900 s, `bot:verified:{sid}` | **055** |
+| `ip_rules` snapshot TTL | 10 s — **the TTL is the cross-replica invalidation** | **051 / 055** |
+
+Verification **fails open**: an unconfigured secret, a missing token, a timeout or a non-2xx all
+allow the join and are audited as degraded. Only a score the provider actively returns below the
+threshold refuses one (ADR-011, ADR-055).
 
 ---
 
@@ -851,6 +862,9 @@ There is no reCAPTCHA and no bot-score threshold. Rate limiting is session-first
 | `flashseats.queue.admissions` | counter, per replica | zero while a waiting room has depth — a stuck promoter (ADR-049) |
 | `flashseats.queue.admission.budget.denied` | counter, per replica | **sustained** non-zero with `pending` at zero means the allowance is throttling a pool that could serve more (ADR-049) |
 | `flashseats.catalog.metadata.cache{result}` | counter, per replica | a miss rate near 1 means the cache is off or the TTL is below the poll interval (ADR-051) |
+| `flashseats.payment.refund.failed` | counter, per replica | **any non-zero value.** Each one is money owed to a named buyer that automation could not return (ADR-053) |
+| `resilience4j_circuitbreaker_state` | gauge, per replica | `open` — every checkout is answering `503` without reaching the provider (ADR-052) |
+| `resilience4j_circuitbreaker_calls{kind}` | counter, per replica | a rising `failed` count is transport trouble; declines are **not** counted here by design |
 
 `stock.drift` compares the live Redis counter against the §4.1 ledger formula every 60 s. It is the
 system's canary. **Alarm on sustained non-zero, not on one sample:** Redis and PostgreSQL are not
@@ -871,11 +885,18 @@ genuine gap rather than a deleted idea:
 | `flashseats.outbox.lag.seconds` | a stalled relay currently shows up as buyers not receiving tickets |
 | `flashseats.dlq.depth{queue}` | the DLQ is listable by an operator but nothing alarms on it |
 | `flashseats.sse.connections.active` | the input to every capacity question about the broadcaster |
+| `flashseats.payment.decline.ratio` | a spike is either a provider incident or a fraud rule mis-firing, and today both look like silence |
+| `flashseats.payment.webhook.received{type}` | a webhook secret mismatch rejects **every** delivery, and the symptom is indistinguishable from a quiet day |
+| `flashseats.bot.refusals{outcome}` | refusals are now durable in `bot_audit_logs`, but a dashboard still cannot answer "are we shedding load right now?" without a query |
 
 Controls: `POST /api/v1/admin/events/{id}/pause` and `/resume` (stop promotions and new holds, honour
 existing ones), `POST /api/v1/admin/events/{id}/rebuild-stock`,
-`GET /api/v1/admin/notifications/dlq`, `POST /api/v1/admin/notifications/resend/{orderNumber}`, and
-`GET /api/v1/admin/orders/{orderNumber}`. All are HTTP Basic, `ROLE_ADMIN`, and **curl-only — there
+`GET /api/v1/admin/notifications/dlq`, `POST /api/v1/admin/notifications/resend/{orderNumber}`,
+`GET /api/v1/admin/orders/{orderNumber}`, and the bot surface —
+`GET`/`POST` `/api/v1/admin/bot/ip-rules`, `DELETE /api/v1/admin/bot/ip-rules/{ip}` and
+`GET /api/v1/admin/bot/audit`. An address flooding a sale used to be answerable only by changing a
+property and restarting three replicas, during the sale; a rule now reaches every replica within
+`ip-rule-cache-ttl-ms` (ADR-055). All are HTTP Basic, `ROLE_ADMIN`, and **curl-only — there
 is no operator UI.**
 
 **Pause takes effect cluster-wide within `metadata-event-ttl-ms`** (1 s), not instantly: the replica

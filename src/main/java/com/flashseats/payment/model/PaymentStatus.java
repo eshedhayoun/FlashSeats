@@ -4,13 +4,14 @@ package com.flashseats.payment.model;
  * Gateway transaction lifecycle.
  *
  * <pre>
- *   INITIATED ──► SUCCEEDED ──► REFUNDED
- *        └──────► FAILED
+ *   INITIATED ──► PROCESSING ──► SUCCEEDED ──► REFUNDED
+ *                      └───────► FAILED
  * </pre>
  *
- * <p>There is no {@code PROCESSING}. One was declared and never assigned: the gateway call sits
- * between two short transactions, so a row is {@code INITIATED} for exactly as long as the provider
- * takes to answer and there is no third moment to name.
+ * <p>{@code PROCESSING} is the 3-D Secure parking spot: the buyer has been sent away to
+ * authenticate, and the row must stay findable so a resumed checkout re-reads <em>that</em> intent
+ * rather than opening a second one
+ * ({@code findFirstByHoldTokenAndStatusOrderByIdDesc}).
  *
  * <p>Internal to this module. {@code order} reads outcomes from
  * {@link com.flashseats.payment.facade.PaymentResult} instead, so no caller has to reason about the
@@ -18,6 +19,7 @@ package com.flashseats.payment.model;
  */
 public enum PaymentStatus {
     INITIATED,
+    PROCESSING,
     SUCCEEDED,
     FAILED,
     REFUNDED
