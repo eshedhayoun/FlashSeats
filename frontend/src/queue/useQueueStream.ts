@@ -32,6 +32,15 @@ const initialState: QueueStreamState = {
   terminal: null
 };
 
+function parseEvent<T>(event: Event): T | null {
+  try {
+    const data = JSON.parse((event as MessageEvent).data) as unknown;
+    return data as T;
+  } catch {
+    return null;
+  }
+}
+
 export function useQueueStream(eventId: number, onRefresh: () => void) {
   const [state, setState] = useState<QueueStreamState>(initialState);
   const attempt = useRef(0);
@@ -104,7 +113,11 @@ export function useQueueStream(eventId: number, onRefresh: () => void) {
       stream.addEventListener("position-update", (event) => {
         const lastEventId = (event as MessageEvent).lastEventId;
         if (lastEventId) setLastEventId(eventId, lastEventId);
-        const update = JSON.parse((event as MessageEvent).data) as PositionUpdateEvent;
+        const update = parseEvent<PositionUpdateEvent>(event);
+        if (!update) {
+          onRefresh();
+          return;
+        }
         setState((current) => ({
           ...current,
           position:
@@ -118,7 +131,11 @@ export function useQueueStream(eventId: number, onRefresh: () => void) {
       stream.addEventListener("queue-promoted", (event) => {
         const lastEventId = (event as MessageEvent).lastEventId;
         if (lastEventId) setLastEventId(eventId, lastEventId);
-        const promoted = JSON.parse((event as MessageEvent).data) as QueuePromotedEvent;
+        const promoted = parseEvent<QueuePromotedEvent>(event);
+        if (!promoted) {
+          onRefresh();
+          return;
+        }
         setState((current) => ({ ...current, promoted }));
         stream?.close();
         onRefresh();
@@ -126,13 +143,21 @@ export function useQueueStream(eventId: number, onRefresh: () => void) {
       stream.addEventListener("tier-availability", (event) => {
         const lastEventId = (event as MessageEvent).lastEventId;
         if (lastEventId) setLastEventId(eventId, lastEventId);
-        const availability = JSON.parse((event as MessageEvent).data) as TierAvailabilityEvent;
+        const availability = parseEvent<TierAvailabilityEvent>(event);
+        if (!availability) {
+          onRefresh();
+          return;
+        }
         setState((current) => ({ ...current, availability }));
       });
       stream.addEventListener("sale-exhausted", (event) => {
         const lastEventId = (event as MessageEvent).lastEventId;
         if (lastEventId) setLastEventId(eventId, lastEventId);
-        const terminal = JSON.parse((event as MessageEvent).data) as SaleExhaustedEvent;
+        const terminal = parseEvent<SaleExhaustedEvent>(event);
+        if (!terminal) {
+          onRefresh();
+          return;
+        }
         setState((current) => ({ ...current, terminal }));
         stream?.close();
         onRefresh();
@@ -140,7 +165,11 @@ export function useQueueStream(eventId: number, onRefresh: () => void) {
       stream.addEventListener("sale-closed", (event) => {
         const lastEventId = (event as MessageEvent).lastEventId;
         if (lastEventId) setLastEventId(eventId, lastEventId);
-        const terminal = JSON.parse((event as MessageEvent).data) as SaleClosedEvent;
+        const terminal = parseEvent<SaleClosedEvent>(event);
+        if (!terminal) {
+          onRefresh();
+          return;
+        }
         setState((current) => ({ ...current, terminal }));
         stream?.close();
         onRefresh();

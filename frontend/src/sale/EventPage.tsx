@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState } from "react";
-import { useNavigate, useParams } from "react-router-dom";
+import { useNavigate, useParams, useSearchParams } from "react-router-dom";
 import CircularProgress from "@mui/material/CircularProgress";
 import Container from "@mui/material/Container";
 import Stack from "@mui/material/Stack";
@@ -15,18 +15,28 @@ import { useEvent } from "../landing/useEvent";
 import { CheckoutPage } from "../checkout/CheckoutPage";
 import { DegradedState } from "../shared/DegradedState";
 import { TerminalPage } from "../terminal/TerminalPage";
+import type { ActiveHold } from "../api/types";
 
 export function EventPage() {
   const eventId = Number(useParams().eventId);
+  const [searchParams] = useSearchParams();
+  const buyMore = searchParams.get("buyMore") === "1";
   const navigate = useNavigate();
   const eventResult = useEvent(eventId);
-  const sale = useSaleState(eventId);
+  const sale = useSaleState(eventId, { buyMore });
   const [admitting, setAdmitting] = useState(false);
   const [admitError, setAdmitError] = useState<ApiError | null>(null);
+  const [pendingHold, setPendingHold] = useState<ActiveHold | null>(null);
 
-  const refreshSale = useCallback(() => {
-    void sale.refresh();
+  const refreshSale = useCallback(async () => {
+    await sale.refresh();
   }, [sale.refresh]);
+
+  useEffect(() => {
+    if (sale.data?.route.view === "checkout") {
+      setPendingHold(null);
+    }
+  }, [sale.data?.route.view]);
 
   useEffect(() => {
     const route = sale.data?.route;
@@ -85,7 +95,15 @@ export function EventPage() {
     return <Typography>Sale state is unavailable.</Typography>;
   }
 
-  if (route.view === "landing") return <LandingPage />;
+  if (route.view === "landing") {
+    return (
+      <LandingPage
+        onJoined={async () => {
+          await sale.refresh();
+        }}
+      />
+    );
+  }
   if (route.view === "queue") {
     return (
       <QueuePage
@@ -107,11 +125,26 @@ export function EventPage() {
     );
   }
   if (route.view === "select") {
+    if (pendingHold) {
+      return (
+        <CheckoutPage
+          event={eventResult.event}
+          eventId={eventId}
+          hold={pendingHold}
+          onRefresh={refreshSale}
+          onCompleted={(orderNumber) => {
+            navigate(`/orders/${orderNumber}`);
+          }}
+        />
+      );
+    }
+
     return <SeatSelectionPage
       event={eventResult.event}
       eventId={eventId}
       admissionExpiresAt={route.admissionExpiresAt}
       onRefresh={refreshSale}
+      onHoldCreated={setPendingHold}
     />;
   }
   if (route.view === "checkout") {

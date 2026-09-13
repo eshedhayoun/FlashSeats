@@ -13,13 +13,16 @@ export type BootstrappedSale = {
   route: SaleRoute;
 };
 
-export async function bootstrapSale(eventId: number): Promise<BootstrappedSale> {
+export async function bootstrapSale(
+  eventId: number,
+  options: { buyMore?: boolean } = {}
+): Promise<BootstrappedSale> {
   const state = await getSaleState(eventId);
   synchronizeStorage(eventId, state);
 
   return {
     state,
-    route: routeFor(state)
+    route: routeFor(state, options)
   };
 }
 

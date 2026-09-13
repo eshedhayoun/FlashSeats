@@ -35,5 +35,5 @@ function getSnapshot() {
 }
 
 export function useClockTick() {
-  useSyncExternalStore(subscribe, getSnapshot, getSnapshot);
+  return useSyncExternalStore(subscribe, getSnapshot, getSnapshot);
 }
