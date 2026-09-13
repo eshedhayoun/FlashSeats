@@ -12,7 +12,7 @@ but `flashseats.payment.stripe.enabled` is **false by default**, so `dev`, `test
 and every drill still run the in-process stub through the complete journey, 3-D Secure included.
 
 **Read [`docs/00-architecture-decisions.md`](docs/00-architecture-decisions.md) before changing
-anything.** It contains 56 ADRs. Most record a defect and its fix — 034-039 come from the first
+anything.** It contains 57 ADRs. Most record a defect and its fix — 034-039 come from the first
 review pass over the built code, 040-042 from the second — and several look like over-engineering
 until you read the failure they prevent. 043-045 are the exception: forward-looking decisions about
 the operator surface, buyer accounts and what health should report, with nothing built against them
@@ -36,7 +36,7 @@ security posture, next stages, and the review-pass log. It is the doc to update 
 ## Document precedence
 
 ```
-00-architecture-decisions.md      ← highest authority (51 ADRs)
+00-architecture-decisions.md      ← highest authority (57 ADRs)
 05-global-standards.md            ← cross-cutting contract; module docs conform to it
 FE_SPEC.md                        ← client contract (repo root)
 03-end-to-end-flow.md             ← the authoritative user journey AND the operating envelope
@@ -364,7 +364,9 @@ Metrics are scraped **per replica**, not through nginx, and nginx deliberately r
 `/actuator/health`. `hikaricp_connections_pending` and `flashseats_stock_drift` are per-instance
 gauges; through a load balancer you get one replica at random.
 
-UIs: RabbitMQ `:15672`, Mailpit `:8025`, API docs `/docs`.
+UIs: RabbitMQ `:15672`, Mailpit `:8025`. There is no `/docs`: springdoc served an OpenAPI page
+derived purely from request mappings, with not one `@Operation` or `@Schema` behind it. The API
+contract is [`FE_SPEC.md`](FE_SPEC.md) §2.
 
 ## Docker config that is correctness, not tuning
 

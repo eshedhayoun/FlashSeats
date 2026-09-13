@@ -395,8 +395,8 @@ Base `/api/v1`. `fsid` is an `HttpOnly` cookie — **JavaScript never reads or s
 | all | `GET` | `/sale/{eventId}/state` | — | — | `200` | `EVENT_NOT_FOUND` |
 | V1→V2 | `POST` | `/queue/join` | — | `{eventId}` | `202` | `SALE_NOT_OPEN`, `SALE_PAUSED`, `RATE_LIMITED` |
 | V2 | `GET` | `/queue/stream?eventId=` | `Accept: text/event-stream` | — | SSE | — |
-| V2 | `GET` | `/queue/status?eventId=` | — | — | `200` | `NOT_IN_QUEUE` |
-| V2→V3 | `POST` | `/queue/admit` | `X-Queue-Pass-Token` | `{eventId}` | `200` | `QUEUE_PASS_INVALID`, `QUEUE_PASS_EXPIRED`, `VALIDATION_FAILED` |
+| V2 | `GET` | `/queue/status?eventId=` | — | — | `200` | — (a session that never joined is `phase: NOT_JOINED`, not an error) |
+| V2→V3 | `POST` | `/queue/admit` | `X-Queue-Pass-Token` | `{eventId}` | `200` | `QUEUE_PASS_INVALID`, `VALIDATION_FAILED` |
 | V3 | `POST` | `/holds` | `X-Admission-Token` | `{eventId, tierId, quantity}` | `201` | `INSUFFICIENT_STOCK`, `QUANTITY_EXCEEDS_LIMIT`, `HOLD_LIMIT_EXCEEDED`, `ADMISSION_EXPIRED`, `INVENTORY_UNAVAILABLE` |
 | V4 | `GET` | `/holds/{holdToken}` | — | — | `200` | `HOLD_NOT_FOUND`, `HOLD_EXPIRED` |
 | V4 | `DELETE` | `/holds/{holdToken}` | — | — | `204` | `HOLD_NOT_FOUND` |
@@ -674,8 +674,9 @@ const delay = Math.random() * Math.min(30_000, 500 * 2 ** attempt);
   shared corporate gateway or a carrier NAT can trip the IP bucket through no fault of the buyer,
   which is exactly why that bucket is deliberately loose.
 
-The same copy rule applies to `BOT_VERIFICATION_FAILED` if a challenge provider ever ships: never
-accuse a paying customer. False positives are real, and accusing one is worse than admitting a few
+The same copy rule will apply to whatever code a challenge provider raises if one ever ships
+(`BOT_VERIFICATION_FAILED` was removed from the registry as unreachable): never accuse a paying
+customer. False positives are real, and accusing one is worse than admitting a few
 scripts.
 
 ### When it ships (Stage 2)

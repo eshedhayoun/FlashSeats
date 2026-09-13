@@ -2,7 +2,6 @@ package com.flashseats.hold.facade;
 
 import com.flashseats.hold.exception.HoldAlreadySettledException;
 import com.flashseats.hold.exception.HoldExpiredException;
-import com.flashseats.hold.exception.HoldNotFoundException;
 import java.time.Instant;
 import java.util.Optional;
 
@@ -19,7 +18,9 @@ public interface HoldFacade {
     /**
      * The live hold, ownership-checked.
      *
-     * @throws HoldNotFoundException if it does not exist or belongs to another session
+     * @throws com.flashseats.shared.error.FlashSeatsException {@code HOLD_NOT_FOUND} if it does not
+     *     exist or belongs to another session — see
+     *     {@link com.flashseats.hold.exception.HoldErrors}
      * @throws HoldExpiredException if it has been settled or its window has passed
      */
     HoldSummary getActiveHold(String holdToken, String userSessionId);

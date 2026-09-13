@@ -1,6 +1,6 @@
 package com.flashseats.hold.service;
 
-import com.flashseats.catalog.exception.SaleNotOpenException;
+import com.flashseats.catalog.exception.CatalogErrors;
 import com.flashseats.catalog.facade.CatalogFacade;
 import com.flashseats.catalog.facade.EventWindowStatus;
 import com.flashseats.catalog.facade.TierSummary;
@@ -8,18 +8,18 @@ import com.flashseats.hold.config.HoldProperties;
 import com.flashseats.hold.event.TicketHeldEvent;
 import com.flashseats.hold.event.TicketHoldSettledEvent;
 import com.flashseats.hold.exception.HoldAlreadySettledException;
+import com.flashseats.hold.exception.HoldErrors;
 import com.flashseats.hold.exception.HoldExpiredException;
-import com.flashseats.hold.exception.HoldLimitExceededException;
 import com.flashseats.hold.exception.HoldNotFoundException;
 import com.flashseats.hold.exception.InsufficientStockException;
 import com.flashseats.hold.exception.InventoryUnavailableException;
-import com.flashseats.hold.exception.QuantityExceedsLimitException;
+import com.flashseats.hold.facade.HoldFacade;
+import com.flashseats.hold.facade.HoldSummary;
 import com.flashseats.hold.model.HoldStatus;
 import com.flashseats.hold.model.SettleReason;
 import com.flashseats.hold.model.TicketHold;
 import com.flashseats.hold.repository.TicketHoldRepository;
-import com.flashseats.queue.exception.AdmissionExpiredException;
-import com.flashseats.queue.exception.AdmissionRequiredException;
+import com.flashseats.queue.exception.QueueErrors;
 import com.flashseats.queue.facade.QueueFacade;
 import java.time.Clock;
 import java.time.Instant;
@@ -42,10 +42,17 @@ import org.springframework.transaction.annotation.Transactional;
  *   <li>A hold leaves {@code ACTIVE} only via the settle-once claim, and only the winner of that
  *       claim touches stock.
  * </ol>
+ *
+ * <p>This class <em>is</em> {@link HoldFacade}; the methods carrying that contract are grouped under
+ * one heading at the bottom. Other modules see only the interface, because this package is internal
+ * to the module and they may not name it. There is no separate delegating implementation: one
+ * existed, held no logic, and only added a hop between the contract and the code that honours it.
+ * The facade methods return {@link HoldSummary} records; the ones above them return the entity and
+ * are this module's own.
  */
 @Slf4j
 @Service
-public class HoldService {
+public class HoldService implements HoldFacade {
 
     /** The partial unique index from {@code V2__hold.sql} that caps a session at one live hold. */
     private static final String ONE_ACTIVE_HOLD_INDEX = "idx_holds_one_active_per_session";
@@ -106,11 +113,11 @@ public class HoldService {
         TierSummary tier = catalog.getTierSummary(eventId, tierId);
 
         if (tier.windowStatus() != EventWindowStatus.OPEN) {
-            throw new SaleNotOpenException(eventId, tier.windowStatus());
+            throw CatalogErrors.saleNotOpen(eventId, tier.windowStatus());
         }
         int maxQuantity = Math.min(properties.getMaxQuantity(), tier.maxPerOrder());
         if (quantity < 1 || quantity > maxQuantity) {
-            throw new QuantityExceedsLimitException(quantity, maxQuantity);
+            throw HoldErrors.quantityExceedsLimit(quantity, maxQuantity);
         }
 
         switch (catalog.tryReserve(eventId, tierId, quantity)) {
@@ -140,7 +147,7 @@ public class HoldService {
                 // which is exactly what the quantity CHECK did before V6 relaxed it.
                 throw violation;
             }
-            throw new HoldLimitExceededException(eventId);
+            throw HoldErrors.holdLimitExceeded(eventId);
         }
 
         events.publishEvent(new TicketHeldEvent(
@@ -175,37 +182,6 @@ public class HoldService {
         return hold;
     }
 
-    @Transactional(readOnly = true)
-    public Optional<TicketHold> findActiveHold(String sessionId, long eventId) {
-        return holds.findByUserSessionIdAndEventIdAndStatus(sessionId, eventId, HoldStatus.ACTIVE)
-                .filter(hold -> clock.instant().isBefore(hold.getExpiresAt()));
-    }
-
-    // ----------------------------------------------------------------- consume
-
-    /**
-     * Marks the hold as sold. <strong>Runs inside the caller's transaction and rolls back with
-     * it</strong> ({@link Propagation#MANDATORY} enforces that rather than assuming it).
-     *
-     * <p>Stock is deliberately <em>not</em> restored: the seats were bought. If the caller's
-     * transaction later rolls back, this claim rolls back too, the hold returns to {@code ACTIVE},
-     * and it expires normally — which is exactly why the claim lives in SQL and not in Redis
-     * (ADR-019).
-     *
-     * @throws HoldAlreadySettledException when the claim is lost, meaning the seats are no longer
-     *     ours and the caller must abort and refund
-     */
-    @Transactional(propagation = Propagation.MANDATORY)
-    public TicketHold consume(String holdToken) {
-        TicketHold hold = holds.findByHoldToken(holdToken)
-                .orElseThrow(() -> new HoldNotFoundException(holdToken));
-
-        if (holds.settle(holdToken, HoldStatus.CONSUMED, SettleReason.CONSUMED, clock.instant()) != 1) {
-            throw new HoldAlreadySettledException(holdToken);
-        }
-        return hold;
-    }
-
     // ----------------------------------------------------------------- release
 
     /** Buyer-initiated cancellation. Their place in the sale is unaffected (ADR-020). */
@@ -232,6 +208,7 @@ public class HoldService {
      *     <strong>must</strong> abort before charging: continuing would take money for seats a
      *     concurrent expiry has already given away (ADR-023).
      */
+    @Override
     @Transactional
     public Instant grantGrace(String holdToken) {
         TicketHold hold = holds.findByHoldToken(holdToken)
@@ -337,12 +314,93 @@ public class HoldService {
      * their seats, and the sweeper will hand those seats back. Excluding them would let a rebuild
      * and the sweeper each account for the same seats.
      */
+    @Override
     @Transactional(readOnly = true)
     public int sumActiveQuantityForTier(long tierId) {
         return holds.sumActiveQuantityForTier(tierId);
     }
 
+    // ------------------------------------------------- HoldFacade: the contract
+    //
+    // Everything below is what other modules may call. The methods above return the JPA entity and
+    // are this module's own; these return records, because handing an entity across a boundary
+    // leaks a lazy-loading proxy and a persistence mapping into a module that must know neither
+    // (global standards §5).
+
+    /**
+     * {@inheritDoc}
+     *
+     * <p><strong>Annotated even though {@link #requireActiveHold} already is, and that is not
+     * redundant.</strong> This delegates to it on {@code this}, and Spring's proxy does not
+     * intercept self-invocation — without the annotation here the read would run with no transaction
+     * at all, silently. It had one before: the call used to arrive from a separate
+     * {@code HoldFacadeImpl} and therefore went through the proxy. Collapsing that class into this
+     * one moved the call inside the bean, which is exactly the boundary loss ADR-023 warns about.
+     */
+    @Override
+    @Transactional(readOnly = true)
+    public HoldSummary getActiveHold(String holdToken, String userSessionId) {
+        return toSummary(requireActiveHold(holdToken, userSessionId));
+    }
+
+    /** {@inheritDoc} */
+    @Override
+    @Transactional(readOnly = true)
+    public Optional<HoldSummary> findActiveHold(String userSessionId, long eventId) {
+        return holds.findByUserSessionIdAndEventIdAndStatus(userSessionId, eventId, HoldStatus.ACTIVE)
+                .filter(hold -> clock.instant().isBefore(hold.getExpiresAt()))
+                .map(HoldService::toSummary);
+    }
+
+    /**
+     * Marks the hold as sold. <strong>Runs inside the caller's transaction and rolls back with
+     * it</strong> ({@link Propagation#MANDATORY} enforces that rather than assuming it).
+     *
+     * <p>Stock is deliberately <em>not</em> restored: the seats were bought. If the caller's
+     * transaction later rolls back, this claim rolls back too, the hold returns to {@code ACTIVE},
+     * and it expires normally — which is exactly why the claim lives in SQL and not in Redis
+     * (ADR-019).
+     *
+     * @throws HoldAlreadySettledException when the claim is lost, meaning the seats are no longer
+     *     ours and the caller must abort and refund
+     */
+    @Override
+    @Transactional(propagation = Propagation.MANDATORY)
+    public HoldSummary consumeHold(String holdToken) {
+        TicketHold hold = holds.findByHoldToken(holdToken)
+                .orElseThrow(() -> new HoldNotFoundException(holdToken));
+
+        if (holds.settle(holdToken, HoldStatus.CONSUMED, SettleReason.CONSUMED, clock.instant()) != 1) {
+            throw new HoldAlreadySettledException(holdToken);
+        }
+        return toSummary(hold);
+    }
+
+    /**
+     * {@inheritDoc}
+     *
+     * <p>A consumed hold is the one ending that does <em>not</em> publish
+     * {@code TicketHoldSettledEvent} — there are no seats to give back — so this is the only thing
+     * that clears its timer.
+     */
+    @Override
+    public void discardTimer(String holdToken) {
+        timers.disarm(holdToken);
+    }
+
     // ----------------------------------------------------------------- helpers
+
+    /** The one place a hold entity becomes the record other modules see. */
+    private static HoldSummary toSummary(TicketHold hold) {
+        return new HoldSummary(
+                hold.getHoldToken(),
+                hold.getUserSessionId(),
+                hold.getEventId(),
+                hold.getTierId(),
+                hold.getQuantity(),
+                hold.getExpiresAt(),
+                hold.getCreatedAt());
+    }
 
     /**
      * Whether this violation is the one-live-hold-per-session index, and not some other constraint.
@@ -367,12 +425,12 @@ public class HoldService {
      */
     private void requireAdmission(String sessionId, long eventId, String admissionToken) {
         if (admissionToken == null || admissionToken.isBlank()) {
-            throw new AdmissionRequiredException();
+            throw QueueErrors.admissionRequired();
         }
         if (!queue.verifyAdmission(admissionToken, sessionId, eventId)) {
             // Signature was fine but the session is gone, or the token was never ours. Either way the
             // buyer's route back is the same: rejoin the queue.
-            throw new AdmissionExpiredException();
+            throw QueueErrors.admissionExpired();
         }
     }
 

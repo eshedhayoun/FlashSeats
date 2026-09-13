@@ -1,6 +1,6 @@
 package com.flashseats.queue.service;
 
-import com.flashseats.catalog.exception.SaleNotOpenException;
+import com.flashseats.catalog.exception.CatalogErrors;
 import com.flashseats.catalog.facade.CatalogFacade;
 import com.flashseats.catalog.facade.EventSummary;
 import com.flashseats.catalog.facade.EventWindowStatus;
@@ -8,7 +8,8 @@ import com.flashseats.queue.config.QueueOrdering;
 import com.flashseats.queue.config.QueueProperties;
 import com.flashseats.queue.dto.AdmitResponse;
 import com.flashseats.queue.dto.QueueStatusResponse;
-import com.flashseats.queue.exception.QueuePassInvalidException;
+import com.flashseats.queue.exception.QueueErrors;
+import com.flashseats.queue.facade.QueueFacade;
 import com.flashseats.queue.facade.QueuePhase;
 import com.flashseats.queue.facade.QueueState;
 import java.nio.charset.StandardCharsets;
@@ -23,10 +24,17 @@ import org.springframework.data.redis.core.RedisCallback;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.stereotype.Service;
 
-/** Joining, position, and the pass-for-admission exchange. */
+/**
+ * Joining, position, and the pass-for-admission exchange.
+ *
+ * <p>This class <em>is</em> {@link QueueFacade}. Other modules see only that interface, because this
+ * package is internal to the module and they may not name it. There is no separate delegating
+ * implementation: one existed, held a single null check, and only added a hop between the contract
+ * and the code that honours it.
+ */
 @Slf4j
 @Service
-public class QueueService {
+public class QueueService implements QueueFacade {
 
     private final StringRedisTemplate redis;
     private final CatalogFacade catalog;
@@ -71,14 +79,14 @@ public class QueueService {
     public QueueStatusResponse join(String sessionId, long eventId) {
         EventSummary event = catalog.getEventSummary(eventId);
         if (event.windowStatus() != EventWindowStatus.OPEN) {
-            throw new SaleNotOpenException(eventId, event.windowStatus());
+            throw CatalogErrors.saleNotOpen(eventId, event.windowStatus());
         }
 
         redis.opsForZSet()
                 .addIfAbsent(
                         QueueKeys.waiting(eventId),
                         sessionId,
-                        queueScore(sessionId, eventId));
+                        queueScore());
         expireWithSale(QueueKeys.waiting(eventId), event.saleEndTime());
 
         return status(sessionId, eventId, event.windowStatus());
@@ -92,7 +100,7 @@ public class QueueService {
      * representable as the double a ZSET score is — anything larger would collide after rounding and
      * hand two buyers the same position.
      */
-    private double queueScore(String sessionId, long eventId) {
+    private double queueScore() {
         if (properties.getOrdering() == QueueOrdering.RANDOM) {
             return ThreadLocalRandom.current().nextLong(1L << 53);
         }
@@ -124,6 +132,7 @@ public class QueueService {
                 clock.instant());
     }
 
+    @Override
     public QueueState getQueueState(String sessionId, long eventId) {
         return getQueueState(sessionId, eventId, catalog.getWindowStatus(eventId));
     }
@@ -288,7 +297,7 @@ public class QueueService {
         if (stored == null
                 || !stored.equals(passToken)
                 || !tokens.isValidPass(passToken, eventId, sessionId)) {
-            throw new QueuePassInvalidException();
+            throw QueueErrors.queuePassInvalid();
         }
 
         String admissionToken = tokens.mintAdmission(eventId, sessionId);
@@ -314,9 +323,14 @@ public class QueueService {
     /**
      * Two checks, both required: the signature proves the token was minted by us for this session and
      * this event; the Redis key proves it has not since expired or been revoked.
+     *
+     * <p>A missing token is answered here rather than by the caller. {@code hold} used to receive a
+     * null and hand it straight back, which meant the one rule this method exists to enforce had a
+     * second, silent home in another module.
      */
-    public boolean hasLiveAdmission(String admissionToken, String sessionId, long eventId) {
-        if (!tokens.isValidAdmission(admissionToken, eventId, sessionId)) {
+    @Override
+    public boolean verifyAdmission(String admissionToken, String sessionId, long eventId) {
+        if (admissionToken == null || !tokens.isValidAdmission(admissionToken, eventId, sessionId)) {
             return false;
         }
         String stored = redis.opsForValue().get(QueueKeys.admission(eventId, sessionId));
@@ -324,6 +338,7 @@ public class QueueService {
     }
 
     /** Called once an order is confirmed: the buyer has what they came for. */
+    @Override
     public void revokeAdmission(String sessionId, long eventId) {
         redis.delete(QueueKeys.admission(eventId, sessionId));
         redis.opsForZSet().remove(QueueKeys.admissions(eventId), sessionId);
