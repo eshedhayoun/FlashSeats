@@ -4,6 +4,7 @@ import Stack from "@mui/material/Stack";
 import Typography from "@mui/material/Typography";
 import { useNavigate } from "react-router-dom";
 import type { TerminalReason } from "../sale/routeFor";
+import { HomeButton } from "../shared/HomeButton";
 
 export function TerminalPage({ reason }: { reason: TerminalReason }) {
   const navigate = useNavigate();
@@ -12,6 +13,7 @@ export function TerminalPage({ reason }: { reason: TerminalReason }) {
   return (
     <Container maxWidth="sm" sx={{ py: 8 }}>
       <Stack spacing={2} alignItems="flex-start">
+        <HomeButton />
         <Typography component="h1" variant="h4">
           {soldOut ? "This event has sold out." : "Sales have ended."}
         </Typography>

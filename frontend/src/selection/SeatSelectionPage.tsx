@@ -13,6 +13,7 @@ import type { EventDetails, HoldResponse } from "../api/types";
 import { Countdown } from "../shared/Countdown";
 import { setHoldToken, getAdmissionToken } from "../sale/storage";
 import { TierCard } from "../landing/TierCard";
+import { HomeButton } from "../shared/HomeButton";
 
 export function SeatSelectionPage({
   event,
@@ -106,6 +107,7 @@ export function SeatSelectionPage({
   return (
     <Container maxWidth="sm" sx={{ py: 6 }}>
       <Stack spacing={3}>
+        <HomeButton />
         <Stack spacing={1}>
           <Typography component="h1" variant="h4">
             Choose your seats

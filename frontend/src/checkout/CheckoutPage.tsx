@@ -21,6 +21,7 @@ import {
   getIdempotencyKey,
   getHoldToken
 } from "../sale/storage";
+import { HomeButton } from "../shared/HomeButton";
 
 export function CheckoutPage({
   event,
@@ -135,6 +136,7 @@ export function CheckoutPage({
   return (
     <Container maxWidth="sm" sx={{ py: 6 }}>
       <Stack spacing={3}>
+        <HomeButton />
         <Typography component="h1" variant="h4">
           Complete your purchase
         </Typography>
