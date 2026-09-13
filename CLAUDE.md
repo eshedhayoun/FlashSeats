@@ -26,8 +26,9 @@ that only appear under a rollback, a dropped connection or real load.
 **The operating envelope is 3–10 concurrent sales**, not one
 ([`03-end-to-end-flow.md`](docs/03-end-to-end-flow.md) §2). Every capacity number written before
 ADR-049 silently assumed a single sale. Check which assumption a limit rests on before trusting it.
-**Five concurrent sales now sell out** — 2,496 of 2,500, no oversell, `hikaricp_connections_pending` at
-zero — measured in Pass 8 (`06-mvp-overview.md` §11). Checkout p99 is the one number still open.
+**Five concurrent sales now sell out** — 2,497 of 2,500, no oversell, `hikaricp_connections_pending` at
+zero (`06-mvp-overview.md` §11). Checkout p99 is the one number still open: Pass 9's review took it
+from 9.3 s to **6.4 s** by removing a transaction, against a 200 ms criterion.
 
 **For what is actually built**, read [`docs/06-mvp-overview.md`](docs/06-mvp-overview.md) — scope,
 security posture, next stages, and the review-pass log. It is the doc to update after every pass.
@@ -240,6 +241,7 @@ Do not reintroduce these — each cost a real defect in the first pass:
 | **A recovery path that reads a cache** | `prewarm` and the rebuild write inventory counters *derived from the tier list*. A stale list leaves a tier with no counter — a `503` for the rest of the sale — or rebuilds the wrong set. Probably-right input, definitely-wrong counter (ADR-051) |
 | **Caching a value derived from the clock** | A window status flips with no write to evict on, so the one thing nothing can detect goes stale. Cache the row; derive the status every call (ADR-051) |
 | **Disabling a feature in the test profile so the suite passes** | The configuration production runs then has no coverage at all. Give the fixture a seam instead — `SaleFixture.reset()` clears every `DerivedStateCache` (ADR-051) |
+| **An instrument stricter than the ADR it cites** | `pool-pressure.sh` failed a whole run on ONE non-zero drift sample while `sold-count.sh` read the ledger and found the invariant exact on every tier. ADR-046 says *sustained*, because Redis and PostgreSQL are not read in one snapshot. A false correctness alarm during a load drill costs more than no alarm: it is specific, so it gets believed (ADR-047) |
 | **Iterating open events in a fixed order while spending a shared budget** | Every replica reads the same ascending list, so the lowest event id takes the whole allowance every tick and the other sales stand still. Shuffle the order (ADR-049) |
 | **Compensating on an exception rather than on a fact** | `catch (RuntimeException)` around a settlement refunded a buyer whose seats were fine whenever the database blipped — and answered the provider `200`, so nothing ever retried. Only a *definite* failure may move money; ambiguity falls to the redelivery (ADR-056, ADR-046) |
 | **Cleanup in an unguarded `finally`** | A throw from `finally` **replaces** the value the block was returning. An unguarded `redis.delete` discarded a *successful* charge and marked the order `FAILED` — money moved, order says it did not. Guard it; the key expires anyway (ADR-056) |
@@ -338,7 +340,11 @@ docker/scripts/sse-cadence.sh 60                 # run DURING a load run: is Que
 docker/seed/seed-concurrent.sh                   # seeds 9001..9005, pre-warms all five
 docker/scripts/pool-pressure.sh 300 &            # THE instrument. Without it the drill
                                                  # proves nothing: the failure is latency,
-                                                 # not an error, so k6 sees a green run
+                                                 # not an error, so k6 sees a green run.
+                                                 # Needs FLASHSEATS_ADMIN_PLAINTEXT exported.
+                                                 # Drift fails only on CONSECUTIVE samples for
+                                                 # one replica -- ADR-046 says sustained, and a
+                                                 # single sample is the measurement's own gap
 docker compose --profile loadtest run --rm -e VUS=300 k6-concurrent
 docker/scripts/sold-count.sh                     # what was ACTUALLY sold, and the invariant per tier.
                                                  # k6's count is what the CLIENT saw: it abandons
