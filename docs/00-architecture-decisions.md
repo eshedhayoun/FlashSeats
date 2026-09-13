@@ -1903,3 +1903,152 @@ left is Redis. Two details keep it honest:
 **The general rule this is an instance of:** a cache is usually an optimisation, but in front of a
 control-plane read it is an *availability* decision. Ask not only what the read costs, but what else
 stops working when it is slow.
+
+---
+
+## ADR-052 — Stripe goes behind the seam that was already there; the breaker is a decorator
+
+**Context.** The MVP shipped `PaymentGateway` with one implementation, a stub, in the final position
+in the checkout sequence. Every idempotency layer around it was real from day one — `UNIQUE(hold_token)`,
+`SETNX payment:inflight:{holdToken}`, the two `REQUIRES_NEW` transactions bracketing the network call,
+find-or-create, the three-attempt ceiling, the compensating refund. **Only the gateway was fiction.**
+
+**Decision.** `StripePaymentGateway` implements the same interface, server-confirming PaymentIntents:
+the client keeps sending a `pm_...` and the server charges it. `PaymentGatewayConfig` builds exactly
+one `PaymentGateway` bean — Stripe when `flashseats.payment.stripe.enabled`, the stub otherwise —
+wrapped in `CircuitBreakingGateway`.
+
+**Why server-confirm rather than Payment Element.** Payment Element has the browser confirm and makes
+the webhook the *primary* settlement path. That inverts ADR-001's charge-then-consume ordering, and the
+synchronous `402`/`409` contract that `FE_SPEC` §2, the client's error table and half this document
+describe would become mostly dead code. The flow the whole system was built around is the one kept.
+
+**Why one assembled bean rather than `@ConditionalOnMissingBean`.** That condition was a good seam
+while there was one real implementation and one stub. With a provider, a stub *and* a decorator all
+implementing the interface, "whichever bean exists" stops being a seam and becomes an ambiguity.
+
+**Why the stub survives, and is the default.** `enabled` is false unless a deployment says otherwise,
+so a clean checkout, the whole test suite, the load harness and every drill run the complete buyer
+journey — decline, provider outage, 3-D Secure — with no keys and no network. A stub that were deleted
+on the day the real thing arrived would take the only deterministic coverage of those branches with it.
+Its token vocabulary is deliberately the provider's own (`pm_card_authenticationRequired`,
+`pm_card_chargeDeclined` alongside the older `pm_card_declined`), so one script drives either gateway.
+
+**Why the breaker is a decorator and counts only `GatewayTransportException`.** Resilience4j's Spring
+Boot starter targets Boot 3, so the plain artifacts are declared and one `CircuitBreaker` bean is built
+by hand. More importantly, the breaker must distinguish two things that an AOP-driven one cannot:
+
+| Provider says | Shape | Counted? |
+| :--- | :--- | :--- |
+| card refused | returned `GatewayResult.DECLINED` | **no** |
+| unreachable, 5xx, rate-limited | thrown `GatewayTransportException` | **yes** |
+
+A decline is a *correct answer*. A breaker that counted declines would open during an ordinary burst
+of expired cards — which during a flash sale is the normal state of the world, not a signal — and take
+a perfectly healthy sale's payments down with it. What the breaker exists to stop is ten thousand
+queued buyers each waiting out a 20-second read timeout against a provider that is already down,
+holding a pooled connection apiece, which under virtual threads is the system's real concurrency limit.
+
+An open breaker and a transport failure leave by the same door, `GatewayResult.error`, which the
+existing `ERROR → PAYMENT_GATEWAY_UNAVAILABLE → 503` path already handles: seats retained, **no payment
+attempt consumed**, exactly what `05-global-standards.md` §2 already promised for that code. Nothing
+above `CircuitBreakingGateway` changed to accommodate the breaker.
+
+`maxNetworkRetries(0)`: the provider's own client-side retry would be a second retry mechanism, and
+this system already has one — re-POSTing the same checkout body.
+
+---
+
+## ADR-053 — A webhook delivery is a claim, and a claim is released when its work did not happen
+
+**Context.** The charge settles and the buyer never sees the response — a dropped connection, a killed
+replica, a closed laptop. The money moved and nothing in this system knows it. The provider's webhook
+is the only remaining witness, and ADR-005 reserved `payment → order` as the one cross-module event
+precisely for it. Until now nothing traversed that edge.
+
+**Decision.** `POST /api/v1/payments/webhook` verifies, claims, settles, and reports:
+
+1. **Verify the signature over the raw bytes.** The endpoint is unauthenticated by necessity — the
+   provider cannot hold a session — so this is the only gate. The body is bound as a `String`, never a
+   DTO: the signature is over the bytes, not the meaning, and letting Jackson re-serialise an
+   equivalent object changes key order and whitespace and fails every legitimate delivery.
+   `WEBHOOK_SIGNATURE_INVALID` finally has a thrower.
+2. **Acknowledge every other event type with `200`.** A non-2xx asks for a redelivery of something we
+   will go on ignoring for ever.
+3. **Claim it.** `INSERT … ON CONFLICT (stripe_event_id) DO NOTHING`, rowcount as the answer — the same
+   shape as `notification_logs`, and never an insert whose exception is caught, which marks the
+   transaction rollback-only so the `catch` block's `return` throws at commit (ADR-038).
+4. **Publish `PaymentSettledEvent` synchronously.** The contract of the endpoint is that a failed
+   settlement becomes a non-2xx; an asynchronous listener's failure cannot be reported to the provider.
+   A plain `@EventListener`, not `@ApplicationModuleListener` — that needs the Modulith event-publication
+   registry, removed in ADR-009.
+5. **Release the claim if settlement throws**, then rethrow. Otherwise the redelivery is dismissed as a
+   duplicate and the buyer's charge never reaches an order. `processed_at IS NULL` therefore means *in
+   flight*, never *failed*: a failure leaves no row at all.
+
+**`order` settles it, and may refuse** (ADR-012, now reachable for the first time). The listener finds
+the order by `hold_token` — carried to the provider as metadata and back — and:
+
+| Order state | Action |
+| :--- | :--- |
+| `CONFIRMED` / `REFUNDED` | nothing; the synchronous path or an earlier delivery already resolved it |
+| `PENDING` / `FAILED`, hold still claimable | `OrderCommitService.confirm` — the same transaction the synchronous path uses, so the `ORDER_CONFIRMED` outbox row and the ticket follow identically |
+| hold gone | refund, `REFUNDED`, `ORDER_REFUNDED` outbox row |
+
+The hold can easily have expired during exactly the disconnect that made the webhook necessary, and
+another buyer may own those seats by now. Confirming anyway would charge one customer for inventory
+another already holds.
+
+**The endpoint is not exempt from rate limiting.** An exempt endpoint is an unmetered one
+(`docs/modules/bot.md` §6), and the IP bucket sits orders of magnitude above any delivery rate.
+
+**A refund that fails is no longer recorded as a refund.** The pre-existing compensation discarded
+`RefundResult`, so a provider that refused still produced an order marked `REFUNDED` and an email
+telling the buyer their money was on its way — money this business holds and should not, described to
+the only person who would notice as already returned. Both call sites now share `OrderRefundService`,
+which writes the failure into `failure_reason` and increments `flashseats.payment.refund.failed`.
+**Alarm on any non-zero value:** each one is money owed to a named buyer.
+
+---
+
+## ADR-054 — 3-D Secure resumes the existing intent; there is no resume endpoint
+
+**Context.** Three documents disagreed. `03-end-to-end-flow.md` §5 and `06-mvp-overview.md` §11 both
+specified `POST /api/v1/orders/checkout/resume`; `FE_SPEC.md` §2 said flatly that it does not exist,
+is not needed, and that **re-POSTing the same body is the retry**. FE_SPEC is the client contract and
+it is right: a second retry path would need its own idempotency story, and this system's whole
+guarantee is that there is exactly one.
+
+**Decision.** A challenge is a *pause in one checkout*, not a second checkout.
+
+- The gateway returns `REQUIRES_ACTION` with the intent id **and** a `clientSecret`.
+- `CheckoutService` throws `PaymentActionRequiredException` → `402 PAYMENT_ACTION_REQUIRED` carrying
+  `clientSecret` and `expiresAt`. (`05-global-standards.md` §2 said "follow `resumeUrl`" — a field that
+  existed nowhere; it now names the real contract.)
+- The client runs `stripe.handleNextAction(clientSecret)` and **re-POSTs the same body**.
+- `PaymentService` then looks for a `PROCESSING` ledger row for that hold and, finding one,
+  **retrieves that intent instead of charging**.
+
+**Three things already in place do the work**, which is why the server-side change is three lines:
+
+1. The throw lands in `CheckoutService`'s existing catch-all → `markAbandoned` → order `FAILED`,
+   resumable by find-or-create on the same order number, **no payment attempt consumed** (ADR-034).
+   A bank challenge is not one of the buyer's three cards.
+2. `payment:inflight` is released in a `finally` regardless, so the buyer is not locked out of their
+   own challenge.
+3. The `+120 s` grace was granted *before* the charge, so the challenge window is already paid for
+   (ADR-006, ADR-030). No new extension is granted, and none is needed.
+
+**Why retrieving is mandatory, not an optimisation.** The client mints one `idempotencyKey` per hold
+and reuses it on every retry (`FE_SPEC` §1). A second `charge` would therefore replay the provider's
+cached `requires_action` response **for ever**, and the buyer could never complete. Varying the key per
+attempt instead would create a *second* intent — so the buyer authenticates one payment and is billed
+for two. Retrieving the existing intent is the only correct shape, and `PaymentStatus.PROCESSING`,
+declared on day one and never written because the stub could not reach it, is what marks the row.
+
+**Accepted consequence.** While a challenge is outstanding, a *different* card in the body changes
+nothing: the resume re-reads the pending intent. A buyer who abandons the challenge cannot switch cards
+until the hold expires, which is minutes. The alternative is opening a second charge against a hold that
+already has one in flight, and that trade is not close. A *failed* challenge is different and resolves
+itself: the provider moves the intent to `requires_payment_method`, the retrieve returns `DECLINED`, the
+row goes `FAILED`, and the next attempt charges fresh.

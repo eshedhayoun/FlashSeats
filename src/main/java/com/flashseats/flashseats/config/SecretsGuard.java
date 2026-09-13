@@ -68,6 +68,24 @@ public class SecretsGuard {
             new Secret("flashseats.order.receipt-secret", "FLASHSEATS_RECEIPT_SECRET", DEFAULT_SECRET),
             new Secret("flashseats.admin.password", "FLASHSEATS_ADMIN_PASSWORD", null));
 
+    /**
+     * Guarded only once the real provider is switched on.
+     *
+     * <p>Unconditional would be wrong in both directions. A deployment running the stub has no
+     * Stripe account and nothing to set, so demanding keys would refuse to start a perfectly
+     * coherent configuration. A deployment running Stripe with the published webhook secret is worse
+     * than one with none: every real delivery fails its signature check, so a charge whose response
+     * was lost never reaches an order, and the symptom is silence that looks exactly like a quiet
+     * day. Both values are checked, because an API key with no usable webhook secret is a system
+     * that can take money and cannot finish the sale.
+     */
+    private static final List<Secret> GUARDED_WITH_STRIPE = List.of(
+            new Secret("flashseats.payment.stripe.api-key", "STRIPE_API_KEY", "sk_test_..."),
+            new Secret(
+                    "flashseats.payment.stripe.webhook-secret",
+                    "STRIPE_WEBHOOK_SECRET",
+                    "whsec_dev_only_change_me"));
+
     private final Environment environment;
 
     public SecretsGuard(Environment environment) {
@@ -76,8 +94,13 @@ public class SecretsGuard {
 
     @PostConstruct
     void requireRealSecrets() {
-        List<String> offenders = new ArrayList<>(GUARDED.size());
-        for (Secret secret : GUARDED) {
+        List<Secret> guarded = new ArrayList<>(GUARDED);
+        if (environment.getProperty("flashseats.payment.stripe.enabled", Boolean.class, false)) {
+            guarded.addAll(GUARDED_WITH_STRIPE);
+        }
+
+        List<String> offenders = new ArrayList<>(guarded.size());
+        for (Secret secret : guarded) {
             if (secret.isUnacceptable(environment.getProperty(secret.property()))) {
                 offenders.add(secret.property() + "  (set " + secret.envVar() + ")");
             }
