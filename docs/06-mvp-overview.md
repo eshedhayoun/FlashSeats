@@ -348,8 +348,10 @@ Honest list. None of these is hidden behind a passing test.
   that had not changed by one character. It cost the first two attempts at the Pass 8 drill and a
   hand-repair of `flyway_schema_history`. A migration is immutable once any database has run it;
   `CLAUDE.md` now carries the rule.
-- **The drift gauge is computed three times to produce one global answer.** Read-only and therefore
-  "safe on every replica", but all three replicas compute the same number.
+- **The drift gauge is computed three times to produce one global answer** — deliberately, and no
+  longer listed as something to fix. Each replica reporting its own measurement is what makes the gauge
+  truthful wherever it is scraped, and the duplication costs under 4 indexed queries a second
+  cluster-wide. See §11 Stage 4c item 5 for why making it a singleton would make it worse.
 - ~~**There is no way to retrieve a ticket.**~~ **Fixed:** `GET /orders/{orderNumber}/ticket.pdf`
   serves the same renderer used by notification, authorised by matching session or receipt token.
 - ~~**Dead facade surface.**~~ **Fixed:** the unused order summary and hold release facade paths are
@@ -569,8 +571,18 @@ dependency order. Everything in the first two groups is cheap; the third is the 
 4. ~~A per-event index in the emitter registry.~~ **Built**, with one race fixed afterwards: the index
    removed an event's session set once empty while a concurrent connect had already added itself to
    that instance, leaving a live connection in a set nothing iterates.
-5. Make the drift gauge a singleton under the promotion tick's Redis-lock pattern. **Still open** —
-   all three replicas compute the same global number every 60 s.
+5. ~~Make the drift gauge a singleton under the promotion tick's Redis-lock pattern.~~
+   **Will not do, and the reasoning matters more than the item.** `worstDrift` and `countersMissing`
+   are *per-replica* gauges and `pool-pressure.sh` scrapes each replica in rotation. Under a lock only
+   the winner updates its gauge and the other two report **0.0 for ever** — so an operator reading one
+   replica at random would be told drift is zero two times out of three, on the system's correctness
+   canary. It is also the shape ADR-046 explicitly rejected for the Redis-restart guard: *"the verdict
+   is derived, never consumed… each replica reaches the same conclusion independently."*
+   The cost it would save is nothing: `1 + 2 × tiers` queries per event per minute is **under 4 a
+   second cluster-wide** at the top of the `E = 3..10` envelope, on the Index Only Scan `V9` added for
+   it, in a run whose slow-query log was empty. The item predates both that index and any measurement.
+   **If the triple computation ever does need removing, the only safe form is compute-once-publish-to-all**
+   — one replica measures and the others report *its* number — never compute-once-and-let-the-others-lie.
 6. ~~Tune the allowance.~~ **Done:** 45 per tick, measured. Five sales now sell out with `pending` at
    zero; `denied` fell from 13,349 to 1,044, so the allowance shapes the opening burst rather than
    capping the sale.
