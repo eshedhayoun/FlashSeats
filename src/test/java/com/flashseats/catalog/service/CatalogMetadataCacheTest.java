@@ -9,12 +9,13 @@ import static org.mockito.Mockito.verifyNoMoreInteractions;
 import static org.mockito.Mockito.when;
 
 import com.flashseats.catalog.config.CatalogProperties;
-import com.flashseats.catalog.exception.EventNotFoundException;
 import com.flashseats.catalog.model.Event;
 import com.flashseats.catalog.model.EventStatus;
 import com.flashseats.catalog.model.TicketTier;
 import com.flashseats.catalog.repository.EventRepository;
 import com.flashseats.catalog.repository.TicketTierRepository;
+import com.flashseats.shared.error.ErrorCode;
+import com.flashseats.shared.error.FlashSeatsException;
 import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import java.time.Clock;
 import java.time.Duration;
@@ -76,7 +77,10 @@ class CatalogMetadataCacheTest {
     void doesNotRememberThatAnEventWasMissing() {
         when(events.findById(9001L)).thenReturn(Optional.empty(), Optional.of(event()));
 
-        assertThatThrownBy(() -> metadata.event(9001L)).isInstanceOf(EventNotFoundException.class);
+        assertThatThrownBy(() -> metadata.event(9001L))
+                .isInstanceOfSatisfying(
+                        FlashSeatsException.class,
+                        failure -> assertThat(failure.code()).isEqualTo(ErrorCode.EVENT_NOT_FOUND));
         assertThat(metadata.event(9001L)).isNotNull();
 
         verify(events, times(2)).findById(9001L);

@@ -1,23 +1,30 @@
-package com.flashseats.bot.facade;
+package com.flashseats.bot.service;
 
 import com.flashseats.bot.exception.BotVerificationFailedException;
+import com.flashseats.bot.facade.BotFacade;
 import com.flashseats.bot.model.BotOutcome;
-import com.flashseats.bot.service.BotAuditService;
-import com.flashseats.bot.service.RecaptchaService;
 import lombok.extern.slf4j.Slf4j;
-import org.springframework.stereotype.Component;
+import org.springframework.stereotype.Service;
 
-/** Thin delegation to {@link RecaptchaService}, plus the audit row each verdict earns. */
+/**
+ * The challenge check {@code queue} runs on join, and the audit row each verdict earns.
+ *
+ * <p>This class <em>is</em> {@link BotFacade} (ADR-057). It was a {@code BotFacadeImpl} in the
+ * {@code facade} package, written in the shape the other five modules used before that ADR removed
+ * them — but it was never the pure delegation those were: it decides what a verdict means and
+ * orchestrates two services to act on it. Global standards §5 rule 6 puts orchestration in a
+ * service, and rule 7 says the service implements the facade, so it belongs here under both.
+ */
 @Slf4j
-@Component
-class BotFacadeImpl implements BotFacade {
+@Service
+public class BotVerificationService implements BotFacade {
 
     private static final String JOIN_PATH = "/api/v1/queue/join";
 
     private final RecaptchaService recaptcha;
     private final BotAuditService audit;
 
-    BotFacadeImpl(RecaptchaService recaptcha, BotAuditService audit) {
+    public BotVerificationService(RecaptchaService recaptcha, BotAuditService audit) {
         this.recaptcha = recaptcha;
         this.audit = audit;
     }

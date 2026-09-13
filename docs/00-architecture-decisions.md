@@ -2198,3 +2198,90 @@ honest answer to a state this system does not model.
 place (ADR-039), so everything downstream reads the answer from `shared`'s `ClientAddress` request
 attribute rather than calling `getRemoteAddr()` again — which behind nginx is nginx, so every audit
 row in the deployment that matters recorded the same meaningless value.
+
+---
+
+## ADR-057 — The contract is a type, not a layer: facades are implemented by their services, and most exceptions are factories
+
+**Status:** accepted, Pass 9 (13 Sept 2026). Built.
+
+> Numbered 052 when written; renumbered to 057 on the merge with the payment work, which had taken
+> 052–056 in parallel. Two branches appending to the same log is exactly how a duplicate number
+> happens — check the tip before claiming one.
+
+**Context.** Eight passes of adding correctness left the logic sound and the *packaging* unreadable:
+215 Java files for ~8,360 lines of real code, 91 of them 25 lines or fewer. Two patterns produced
+most of that fan-out.
+
+**First, every module had a `*Facade` interface, a `*FacadeImpl`, and a service.** The Impl held no
+logic — `CatalogFacadeImpl` was twelve one-line delegations and said so in its own javadoc
+(*"deliberately no logic here"*). Tracing `checkout → charge` passed through six classes:
+`CheckoutService → PaymentFacade → PaymentFacadeImpl → PaymentService → PaymentGateway →
+StubPaymentGateway`. Fourteen of the twenty-one facade methods had exactly one production caller.
+
+**Second, every failure was its own class** — twenty-five of them, up to twelve in one module, most
+binding an `ErrorCode` to a message and nothing more. **Seventeen were never caught by type.** A
+reader could not learn what a module could refuse without opening a directory.
+
+**Decision.**
+
+1. **The module's service implements its own facade interface.** The five `*Impl` classes are gone.
+   The interface stays in the `@NamedInterface` `facade` package; the service stays in the internal
+   `service` package, which no other module may name. Where a service now carries both shapes —
+   `HoldService` returns entities internally and `HoldSummary` records across the boundary — the
+   facade methods are grouped under one heading, so a module's published contract is a *section of
+   one file* rather than a separate file that only forwards.
+
+2. **A failure gets a class only when something catches it by type, or when two sibling types keep a
+   distinction visible.** Everything else is a static factory on one `<Module>Errors` class in the
+   same `@NamedInterface` package. Twenty-five classes became ten plus four `Errors` files. Each
+   deleted class's javadoc moved onto its factory verbatim — those paragraphs are the record of why
+   a distinction exists, and this is a re-shelving, not a deletion.
+
+   Ten survive. `DuplicatePaymentException` is genuinely caught by type at `CheckoutService`.
+   `HoldNotFoundException` is caught by type at `PaymentSettlementService`, together with
+   `HoldExpiredException` and `HoldAlreadySettledException` — the three ways a webhook settlement
+   finds the seats gone, caught as a set so the buyer is refunded (ADR-053). **It was a factory for
+   about a week**: nothing caught it when this ADR was written, and the webhook receiver landed on a
+   parallel branch days later. The rule produced the right answer both times; what it cannot do is
+   see another branch's tip.
+   `HoldAlreadySettledException` and `OrderRefundedException` steer control flow.
+   `PaymentDeclinedException` and `TicketNotAvailableException` each choose between two answers.
+   `HoldExpiredException` carries `expiresAt`. `PaymentGatewayUnavailableException` stayed rather
+   than leave `payment` with a one-method `Errors` class. And **`InsufficientStockException` and
+   `InventoryUnavailableException` stay as a pair on purpose**: "pick another tier" and "we cannot
+   see our own inventory" is the distinction ADR-004 exists to protect, and two sibling types with
+   cross-referencing javadoc make it visible in a way two factory methods would not.
+
+**Why this is safe under Modulith, and why that is checked rather than argued.**
+`ApplicationModules.verify()` resolves **source-code type references**, not runtime bean types. Call
+sites name `CatalogFacade`; Spring injects `CatalogService`. No call site can name the service,
+because its package is internal. `ModularityTests` fails the build if any of that is wrong — so the
+claim is tested, not reasoned about. All 112 tests stayed green across both changes.
+
+**What this does not change.** The wire format is byte-identical: same `ErrorCode`, same RFC 7807
+body, same statuses. `ProblemResponseIT` needed no edit. The facade *interfaces* are unchanged
+except that `QueueFacade.verifyAdmission`'s null-token check moved out of the deleted Impl and into
+`QueueService`, where the rest of that rule already lived.
+
+**The rule this generalises.** A layer earns its place by holding a decision. A type that only
+forwards is not an abstraction — it is a second name for the same thing, and the reader pays for it
+on every trace. Prefer making the contract a *type* the compiler enforces over a *layer* a
+convention enforces.
+
+**Applied to `bot` on the merge.** Pass 9 added a tenth module facade, `BotFacadeImpl`, in the shape
+the other five used — written before this ADR existed. It was never pure delegation: it decides what
+a challenge verdict means and orchestrates two services to act on it, which global standards §5 rule
+6 already placed in a service. It is now `bot/service/BotVerificationService implements BotFacade`.
+Nothing about its behaviour changed. **That it appeared at all is the consequence worth noting**: a
+convention removed in one branch is re-added by any branch that forked before it, so rule 7 exists in
+§5 precisely because the ADR alone will not be read in time.
+
+**Consequences.**
+
+- Cross-module tracing is one hop shorter everywhere.
+- A module's whole failure surface is one file, readable top to bottom.
+- `FlashSeatsException`'s constructors are public, which is the point rather than a concession: a
+  refusal that needs no type should not have to invent one.
+- The temptation returns whenever someone adds a facade method and reaches for a matching `*Impl`.
+  Global standards §5 rule 7 now forbids it in the place they will look.

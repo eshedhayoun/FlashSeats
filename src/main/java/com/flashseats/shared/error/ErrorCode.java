@@ -10,6 +10,20 @@ import org.springframework.http.HttpStatus;
  *
  * <p>Each constant carries its HTTP status, and the RFC 7807 {@code type} URI is derived from the
  * constant name rather than hand-written, so a typo cannot silently disagree with the registry.
+ *
+ * <p><strong>Reachability is checked in both directions.</strong> Six codes were unreachable and
+ * were removed; a code is added when the path that raises it is, not before. An unreachable code is
+ * dead contract — a client writes a branch for a response the server can never send.
+ *
+ * <p>One exception survives deliberately: {@code BOT_VERIFICATION_FAILED} has a type but no throw
+ * site, because bot defence fails open and there is no challenge provider yet (ADR-011, ADR-055).
+ * {@code FE_SPEC.md} §2 tells clients so explicitly rather than letting them guess.
+ *
+ * <p>Four others were removed in the same pass and <strong>came straight back</strong> when the real
+ * gateway, the webhook and the IP-rule surface landed: {@code PAYMENT_ACTION_REQUIRED},
+ * {@code WEBHOOK_SIGNATURE_INVALID}, {@code BOT_VERIFICATION_FAILED} and {@code IP_BLOCKED}. That is
+ * the rule working in both directions rather than a mistake — but it is also the reason to delete a
+ * code only when its feature is genuinely not being built, rather than merely not built yet.
  */
 public enum ErrorCode {
 
@@ -21,7 +35,9 @@ public enum ErrorCode {
 
     // --- bot ----------------------------------------------------------------
     RATE_LIMITED(HttpStatus.TOO_MANY_REQUESTS),
+    /** A challenge was demanded and the token did not verify. */
     BOT_VERIFICATION_FAILED(HttpStatus.FORBIDDEN),
+    /** An operator rule denies this address outright. Terminal for the caller. */
     IP_BLOCKED(HttpStatus.FORBIDDEN),
     SESSION_INVALID(HttpStatus.UNAUTHORIZED),
 
@@ -43,13 +59,9 @@ public enum ErrorCode {
     STOCK_REBUILD_IN_PROGRESS(HttpStatus.SERVICE_UNAVAILABLE),
 
     // --- queue --------------------------------------------------------------
-    NOT_IN_QUEUE(HttpStatus.NOT_FOUND),
     QUEUE_PASS_INVALID(HttpStatus.UNAUTHORIZED),
-    QUEUE_PASS_EXPIRED(HttpStatus.GONE),
     ADMISSION_REQUIRED(HttpStatus.UNAUTHORIZED),
     ADMISSION_EXPIRED(HttpStatus.GONE),
-    QUEUE_UNAVAILABLE(HttpStatus.SERVICE_UNAVAILABLE),
-    SALE_EXHAUSTED(HttpStatus.CONFLICT),
 
     // --- hold ---------------------------------------------------------------
     INSUFFICIENT_STOCK(HttpStatus.CONFLICT),
@@ -62,14 +74,19 @@ public enum ErrorCode {
     // --- payment ------------------------------------------------------------
     PAYMENT_DECLINED(HttpStatus.PAYMENT_REQUIRED),
     PAYMENT_ATTEMPTS_EXHAUSTED(HttpStatus.PAYMENT_REQUIRED),
+    /**
+     * 3-D Secure. Carries {@code clientSecret}; the client runs the challenge and then re-POSTs the
+     * same checkout body — there is no resume endpoint, because that would be a second retry
+     * mechanism beside find-or-create (ADR-054).
+     */
     PAYMENT_ACTION_REQUIRED(HttpStatus.PAYMENT_REQUIRED),
     PAYMENT_GATEWAY_UNAVAILABLE(HttpStatus.SERVICE_UNAVAILABLE),
     DUPLICATE_PAYMENT(HttpStatus.CONFLICT),
+    /** Gateway-facing only: a webhook body whose signature did not verify. Never seen by a buyer. */
     WEBHOOK_SIGNATURE_INVALID(HttpStatus.BAD_REQUEST),
 
     // --- order --------------------------------------------------------------
     ORDER_NOT_FOUND(HttpStatus.NOT_FOUND),
-    ORDER_ALREADY_CONFIRMED(HttpStatus.CONFLICT),
     CHECKOUT_WINDOW_CLOSED(HttpStatus.CONFLICT),
     /**
      * Too little of the reservation remains to start a charge that could finish (ADR-030). Added to
@@ -95,9 +112,6 @@ public enum ErrorCode {
      */
     TICKET_NOT_AVAILABLE(HttpStatus.CONFLICT),
 
-    // --- notification -------------------------------------------------------
-    NOTIFICATION_LOG_NOT_FOUND(HttpStatus.NOT_FOUND),
-
     // --- admin --------------------------------------------------------------
     /**
      * No operator credentials, or the wrong ones.
@@ -115,8 +129,9 @@ public enum ErrorCode {
     SALE_PAUSED(HttpStatus.CONFLICT),
     /**
      * A resend was asked for but the original message is gone: {@code outbox_events} keeps payloads
-     * for {@code flashseats.outbox.purge-after-days} and this order is past it. Distinct from
-     * {@code NOTIFICATION_LOG_NOT_FOUND}, which means the notification itself was never recorded.
+     * for {@code flashseats.outbox.purge-after-days} and this order is past it. {@code 410}, not
+     * {@code 404}: the order and its message both existed, they have simply aged out, and a
+     * {@code 404} would send an operator hunting for a typo in the order number.
      */
     NOTIFICATION_PAYLOAD_UNAVAILABLE(HttpStatus.GONE);
 

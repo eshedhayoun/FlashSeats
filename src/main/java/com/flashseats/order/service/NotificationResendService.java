@@ -1,6 +1,6 @@
 package com.flashseats.order.service;
 
-import com.flashseats.order.exception.NotificationPayloadUnavailableException;
+import com.flashseats.order.exception.OrderErrors;
 import com.flashseats.order.model.OutboxEvent;
 import com.flashseats.order.repository.OutboxEventRepository;
 import lombok.extern.slf4j.Slf4j;
@@ -52,14 +52,16 @@ public class NotificationResendService {
      * Queues the order's confirmation message again.
      *
      * @return the id of the new outbox row
-     * @throws NotificationPayloadUnavailableException if the original message has been purged
+     * @throws com.flashseats.shared.error.FlashSeatsException
+     *     {@code NOTIFICATION_PAYLOAD_UNAVAILABLE} if the original message has been purged — see
+     *     {@link OrderErrors}
      */
     @Transactional
     public String resendTicket(String orderNumber) {
         OutboxEvent original = outbox
                 .findFirstByAggregateIdAndEventTypeOrderByCreatedAtDesc(
                         orderNumber, OrderCommitService.EVENT_ORDER_CONFIRMED)
-                .orElseThrow(() -> new NotificationPayloadUnavailableException(orderNumber));
+                .orElseThrow(() -> OrderErrors.notificationPayloadUnavailable(orderNumber));
 
         // A NEW row, not a reset of the old one. The original is the record that a message was
         // published, and rewriting history to re-drive it would lose the fact that this order needed

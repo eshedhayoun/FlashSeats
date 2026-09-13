@@ -17,7 +17,7 @@ import java.util.Map;
 public interface CatalogFacade {
 
     /**
-     * Returned by {@link #getRemaining} when the tier has no counter at all.
+     * Returned by {@link #getRemainingForEvent} when a tier has no counter at all.
      *
      * <p>Callers must treat this as a <strong>fault</strong>, never as zero: it means inventory state
      * is missing and needs rebuilding, not that the tier sold out (ADR-004).
@@ -25,8 +25,9 @@ public interface CatalogFacade {
     int COUNTER_UNAVAILABLE = -1;
 
     /**
-     * @throws com.flashseats.catalog.exception.EventNotFoundException if the event does not exist
-     * @throws com.flashseats.catalog.exception.TierNotFoundException if the tier is not this event's
+     * @throws com.flashseats.shared.error.FlashSeatsException {@code EVENT_NOT_FOUND} if the event
+     *     does not exist, {@code TIER_NOT_FOUND} if the tier is not this event's — see
+     *     {@link com.flashseats.catalog.exception.CatalogErrors}
      */
     TierSummary getTierSummary(long eventId, long tierId);
 
@@ -51,9 +52,9 @@ public interface CatalogFacade {
      * Total remaining across every tier of an event. Bounds how many buyers the queue admits.
      *
      * @return remaining seats, or {@link #COUNTER_UNAVAILABLE} when <em>any</em> tier of the event
-     *     has no counter. As with {@link #getRemaining}, that is a <strong>fault</strong> and must
-     *     never be read as a sold-out sale: doing so drained an entire waiting room in the first
-     *     pass, because a {@code SUM} over missing rows is indistinguishable from zero (ADR-035).
+     *     has no counter. That is a <strong>fault</strong> and must never be read as a sold-out
+     *     sale: doing so drained an entire waiting room in the first pass, because a {@code SUM}
+     *     over missing rows is indistinguishable from zero (ADR-035).
      */
     int getRemainingForEvent(long eventId);
 

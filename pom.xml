@@ -61,11 +61,13 @@
 			<groupId>org.springframework.boot</groupId>
 			<artifactId>spring-boot-starter-webmvc</artifactId>
 		</dependency>
-		<dependency>
-			<groupId>org.springdoc</groupId>
-			<artifactId>springdoc-openapi-starter-webmvc-ui</artifactId>
-			<version>3.1.0</version>
-		</dependency>
+		<!--
+			springdoc-openapi was removed. It served an OpenAPI document derived
+			entirely from request mappings: the codebase contains zero @Operation,
+			@Tag, @Schema or OpenAPI beans, so /docs described the shapes and none
+			of the meaning. FE_SPEC.md is the client contract and says what the
+			generated page could not. Re-add it with annotations, or not at all.
+		-->
 		<dependency>
 			<groupId>org.springframework.modulith</groupId>
 			<artifactId>spring-modulith-starter-core</artifactId>
@@ -155,12 +157,11 @@
 			<version>${pdfbox.version}</version>
 		</dependency>
 
-		<dependency>
-			<groupId>org.springframework.boot</groupId>
-			<artifactId>spring-boot-devtools</artifactId>
-			<scope>runtime</scope>
-			<optional>true</optional>
-		</dependency>
+		<!--
+			spring-boot-devtools was removed: nothing referenced it, and its restart
+			classloader is an active hazard next to the static, reused Testcontainers
+			in IntegrationTest.
+		-->
 		<dependency>
 			<groupId>org.postgresql</groupId>
 			<artifactId>postgresql</artifactId>
@@ -186,11 +187,12 @@
 			<artifactId>spring-boot-starter-data-redis-test</artifactId>
 			<scope>test</scope>
 		</dependency>
-		<dependency>
-			<groupId>org.springframework.boot</groupId>
-			<artifactId>spring-boot-starter-mail-test</artifactId>
-			<scope>test</scope>
-		</dependency>
+		<!--
+			spring-boot-starter-mail-test was removed: flashseats.notification.enabled
+			is false in the test profile, so EmailDispatcher is not even a bean and no
+			test asserts on mail. It comes back with the consumer tests that need it
+			(see REFACTORING_BLUEPRINT.md, Remaining Tasks 3.2).
+		-->
 		<dependency>
 			<groupId>org.springframework.boot</groupId>
 			<artifactId>spring-boot-starter-validation-test</artifactId>
@@ -243,11 +245,11 @@
 			<artifactId>awaitility</artifactId>
 			<scope>test</scope>
 		</dependency>
-		<dependency>
-			<groupId>org.springframework.security</groupId>
-			<artifactId>spring-security-test</artifactId>
-			<scope>test</scope>
-		</dependency>
+		<!--
+			spring-security-test was removed: no @WithMockUser or SecurityMockMvc
+			anywhere. OperatorSurfaceIT authenticates over real HTTP basic auth
+			through BuyerSession, which is the stronger test.
+		-->
 	</dependencies>
 	<dependencyManagement>
 		<dependencies>

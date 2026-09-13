@@ -1,7 +1,7 @@
 package com.flashseats.catalog.service;
 
 import com.flashseats.catalog.config.CatalogProperties;
-import com.flashseats.catalog.exception.EventNotFoundException;
+import com.flashseats.catalog.exception.CatalogErrors;
 import com.flashseats.catalog.model.EventStatus;
 import com.flashseats.catalog.repository.EventRepository;
 import com.flashseats.catalog.repository.TicketTierRepository;
@@ -92,7 +92,8 @@ public class CatalogMetadata implements DerivedStateCache {
     /**
      * One event's metadata.
      *
-     * @throws EventNotFoundException if there is no such row. Deliberately not remembered — see the
+     * @throws com.flashseats.shared.error.FlashSeatsException {@code EVENT_NOT_FOUND} — see
+     *     {@link CatalogErrors} — if there is no such row. Deliberately not remembered — see the
      *     class note on misses.
      */
     public EventRow event(long eventId) {
@@ -216,7 +217,7 @@ public class CatalogMetadata implements DerivedStateCache {
 
     private EventRow loadEvent(long eventId) {
         return EventRow.of(
-                events.findById(eventId).orElseThrow(() -> new EventNotFoundException(eventId)));
+                events.findById(eventId).orElseThrow(() -> CatalogErrors.eventNotFound(eventId)));
     }
 
     private List<EventRow> loadSelectable() {
