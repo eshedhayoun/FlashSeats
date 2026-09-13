@@ -839,8 +839,14 @@ Every value below is a named property in `application.properties`.
 | HikariCP pool | 30 max, 10 idle, 3 s timeout | std §7 |
 | Availability buckets | `SOLD_OUT` 0 · `LIMITED` < 10 % · `PLENTY` · **`UNKNOWN` = no counter** | **027 / 040** |
 
-There is no reCAPTCHA and no bot-score threshold. Rate limiting is session-first with an IP backstop
-(ADR-011); a challenge provider is a Stage 2 item and no property for one exists.
+| reCAPTCHA on join | `flashseats.bot.recaptcha.*` — **blank secret means OFF**, and off allows | **011 / 055** |
+| Challenge score threshold | 0.5; provider timeouts 1 s connect / 2 s read, both **correctness** | **055** |
+| Verification remembered per session | 900 s, `bot:verified:{sid}` | **055** |
+| `ip_rules` snapshot TTL | 10 s — **the TTL is the cross-replica invalidation** | **051 / 055** |
+
+Verification **fails open**: an unconfigured secret, a missing token, a timeout or a non-2xx all
+allow the join and are audited as degraded. Only a score the provider actively returns below the
+threshold refuses one (ADR-011, ADR-055).
 
 ---
 
@@ -881,11 +887,16 @@ genuine gap rather than a deleted idea:
 | `flashseats.sse.connections.active` | the input to every capacity question about the broadcaster |
 | `flashseats.payment.decline.ratio` | a spike is either a provider incident or a fraud rule mis-firing, and today both look like silence |
 | `flashseats.payment.webhook.received{type}` | a webhook secret mismatch rejects **every** delivery, and the symptom is indistinguishable from a quiet day |
+| `flashseats.bot.refusals{outcome}` | refusals are now durable in `bot_audit_logs`, but a dashboard still cannot answer "are we shedding load right now?" without a query |
 
 Controls: `POST /api/v1/admin/events/{id}/pause` and `/resume` (stop promotions and new holds, honour
 existing ones), `POST /api/v1/admin/events/{id}/rebuild-stock`,
-`GET /api/v1/admin/notifications/dlq`, `POST /api/v1/admin/notifications/resend/{orderNumber}`, and
-`GET /api/v1/admin/orders/{orderNumber}`. All are HTTP Basic, `ROLE_ADMIN`, and **curl-only — there
+`GET /api/v1/admin/notifications/dlq`, `POST /api/v1/admin/notifications/resend/{orderNumber}`,
+`GET /api/v1/admin/orders/{orderNumber}`, and the bot surface —
+`GET`/`POST` `/api/v1/admin/bot/ip-rules`, `DELETE /api/v1/admin/bot/ip-rules/{ip}` and
+`GET /api/v1/admin/bot/audit`. An address flooding a sale used to be answerable only by changing a
+property and restarting three replicas, during the sale; a rule now reaches every replica within
+`ip-rule-cache-ttl-ms` (ADR-055). All are HTTP Basic, `ROLE_ADMIN`, and **curl-only — there
 is no operator UI.**
 
 **Pause takes effect cluster-wide within `metadata-event-ttl-ms`** (1 s), not instantly: the replica

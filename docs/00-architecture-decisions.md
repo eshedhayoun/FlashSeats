@@ -2052,3 +2052,74 @@ until the hold expires, which is minutes. The alternative is opening a second ch
 already has one in flight, and that trade is not close. A *failed* challenge is different and resolves
 itself: the provider moves the intent to `requires_payment_method`, the retrieve returns `DECLINED`, the
 row goes `FAILED`, and the next attempt charges fresh.
+
+---
+
+## ADR-055 — Bot defence fails open, and its rules are never read from the database on the request path
+
+**Context.** `06-mvp-overview.md` §10 S5 has said the same thing since Pass 1: **session identity is
+free to mint.** ADR-011 makes the per-session bucket the primary rate-limit control, and anyone can
+discard a cookie to get a fresh one; the IP bucket is deliberately loose (300 burst) so that
+carrier-grade NAT populations are not blocked during exactly the spike this system exists to serve.
+ADR-039 made that backstop real by refusing `X-Forwarded-For` from untrusted peers, but the
+conclusion stood: **the session bucket does not constrain a determined attacker at all.** The named
+compensating control was a challenge on join, and it was deferred for four passes.
+
+Until now this module wrote no tables, had no operator surface, and read a `recaptchaToken` field
+that `queue` had accepted and ignored since day one.
+
+**Decision.** Three things, and a rule that governs all of them.
+
+**1. reCAPTCHA v3 on `POST /queue/join`, failing open.** Join is the one place a challenge is worth
+its cost: it is the front of the line, it is cheap to repeat, and everything after it is already
+gated by a queue pass and an admission the server issued. `queue ──► bot` is a new facade edge and
+cannot make the graph cyclic — `bot` depends on nothing but `shared`.
+
+Only a score the provider *actively returns* below `min-score` refuses a request. An unconfigured
+secret, a missing token, a timeout, a non-2xx and a malformed body all allow it. **Failing open is
+the decision, not a fallback**: a challenge provider's outage must not close a sale that ten thousand
+people are waiting for, and it would arrive at peak load, because that is when the provider is
+busiest too. Every degraded verification is audited — failing open is invisible from the outside, and
+"our bot defence was off for three hours" must not be learned afterwards from an absence.
+
+The provider timeouts (1 s connect, 2 s read) are therefore **correctness settings**. This call sits
+on the join path, and a default-timeout client there turns a provider slowdown into a sale-length
+outage — reintroducing the exact failure that failing open exists to prevent, through the client that
+implements it.
+
+**2. `ip_rules`, held in memory and re-read on a timer.** This is consulted on *every* API request.
+A per-request query would put the rate limiter — whose entire job is keeping load off the system —
+inside the connection pool it is protecting, queued behind the buyers it is shielding. That is
+ADR-051's trap ("a job that protects a resource by reading that resource") with the pool as the
+resource and the filter as the job, and it is the second time this repository has walked toward it.
+
+ADR-051's three rules apply unchanged: **the TTL is the cross-replica invalidation** (an operator's
+call evicts one replica; the others follow within 10 s), **the load happens outside every monitor**
+(one `AtomicReference` swapped after the read — blocking JDBC inside a `ConcurrentHashMap` bin pins
+carrier threads on JDK 21), and **expiry is derived from the clock on read, never baked into the
+snapshot** — a rule that lapses between reloads has to stop applying at its expiry, not at the
+cache's. A fourth is specific to this table: a failed reload **keeps the previous snapshot**, because
+the database being briefly unreachable must neither unblock every address nor block every address.
+
+An `ALLOW` rule exempts **the IP bucket only**, never the session bucket. It is for a known shared
+egress where hundreds of real buyers share one address; it is not a statement that the traffic is
+trusted.
+
+**3. `bot_audit_logs`, asynchronous and non-`ALLOWED` only.** There is no `ALLOWED` outcome and there
+must not be one — a row per allowed request is a write per request during precisely the traffic this
+system is built for, and it would make the table unreadable for the purpose it exists to serve.
+Writes go to a bounded queue with a **discard** policy: every row here is written on a path that has
+just refused someone, and the caller is very often an attacker, so a synchronous insert would let
+them convert their own `429`s into database load at whatever rate they can generate requests. If the
+audit trail cannot keep up, the right outcome is to lose audit rows. Evidence is not worth an outage.
+
+**The migration is `V11`, not `V6`.** Earlier documents called for `V6__bot.sql`. `V6` has been
+`V6__pass1_corrections.sql` in every database that has ever run this schema, and Flyway checksums the
+whole file — renumbering would refuse to start every container with a checksum mismatch.
+
+**What this does and does not close.** S5's compensating control now exists, but
+`flashseats.bot.recaptcha.secret` is blank in `dev`, `test` and a clean checkout, which means
+verification is **off** by default. That is deliberate — the stack must run from a clean checkout with
+no configuration — and it means the control is only real where someone sets the secret. ADR-044's
+verified buyer accounts remain the other route to the same problem: an account is a rate-limit bucket
+that costs something to mint, where a discarded cookie costs nothing.
