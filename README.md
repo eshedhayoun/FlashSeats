@@ -53,7 +53,7 @@ When a module spec disagrees with an ADR, **the ADR wins** and the module spec i
 
 | Module | Owns | Storage |
 | :--- | :--- | :--- |
-| `bot` | Signed session identity, rate limits, reCAPTCHA | PG + Redis |
+| `bot` | Rate limits, IP rules, the challenge check on join | PG + Redis |
 | `catalog` | Events, tiers, sale windows, **inventory** | PG + Redis |
 | `queue` | Waiting room, SSE, HMAC passes, admission control | Redis only |
 | `hold` | Time-bound reservations, settle-once stock restoration | PG + Redis |
@@ -61,21 +61,25 @@ When a module spec disagrees with an ADR, **the ADR wins** and the module spec i
 | `order` | ACID ledger, **checkout orchestration**, outbox | PG only |
 | `notification` | PDF tickets, email, DLQ replay | PG + RabbitMQ |
 | `saleflow` | Read-only rehydration endpoint | none |
-| `shared` | Open module: error codes, `SessionId`, `Money` | none |
+| `shared` | Open module: error codes, `SessionId`, `SignedToken`, `Clock`, the PDF renderer | none |
 
 Dependencies are acyclic and verified at build time by `ApplicationModules.verify()`:
 
 ```
                     shared        ← open module; everyone may depend on it
 
-filter   ──► bot
-queue    ──► catalog
+bot      ──► shared only          ← `filter` is a PACKAGE in `bot`, not a module
+queue    ──► catalog, bot         ← `bot` only on join; acyclic, `bot` needs nothing
 hold     ──► queue, catalog
 order    ──► hold, catalog, payment, queue
 saleflow ──► queue, hold, order, catalog     ← read-only leaf
-payment  ──( PaymentSettledEvent · webhook only )──► order
+payment  ──( PaymentSettledEvent · webhook path only )──► order
 order    ──( outbox → RabbitMQ )──► notification
 ```
+
+The last two arrows are **not** facade calls — one is a Spring event, the other a row RabbitMQ
+delivers. Either would be a cycle as a facade edge, which is why neither is one (ADR-005, ADR-009).
+Each module's service implements its own facade interface directly; there is no `*Impl` (ADR-057).
 
 ---
 
@@ -103,11 +107,13 @@ Full detail, with every edge case, in [`docs/03-end-to-end-flow.md`](docs/03-end
 
 ## Three ideas worth knowing
 
-**1. Overbooking is prevented in `hold`, not in the queue.**
+**1. Overbooking is prevented by an atomic reserve, not by the queue.**
 The queue exists so 9,500 people do not hit checkout at once — and so they learn their fate quickly.
-Correctness comes from an atomic reserve: a Redis Lua script in Phase 2+, and in Phase 1 a single
-row-locked statement, `UPDATE tier_inventory SET remaining = remaining - :q WHERE tier_id = :t AND
-remaining >= :q`. Overbooking is impossible from the very first phase.
+Correctness comes from `stock_reserve.lua`: `GET`, compare, `DECRBY` in one atomic step against
+`catalog:stock:{e}:{t}`, refusing to go below the requested quantity. **The counter lives in Redis
+and PostgreSQL keeps no copy of it** (ADR-046); the `tier_inventory` table this section used to
+describe was dropped in `V7`. `hold` moves stock only through `CatalogFacade` — the counter is
+`catalog`'s alone.
 
 **2. The settle-once claim, in PostgreSQL.**
 A hold ends in one of four ways — consumed, released, expired, swept — and three replicas may all
@@ -139,10 +145,12 @@ recovery is an explicit locked rebuild from PostgreSQL. See ADR-004.
 | **Messaging** | RabbitMQ 3.13 |
 | **Ops** | Actuator + Micrometer/Prometheus, Flyway, Testcontainers 1.21.3 |
 | **Phase 3** | Spring Security, Bucket4j 8.14.0 (Redis-backed), Stripe Java 29.2.0, Resilience4j 2.3.0 |
-| **Phase 4** | PDFBox 3.0.7, Thymeleaf, Mailpit, Nginx, k6 |
-| **Frontend** | React + TypeScript (Vite), MUI, `EventSource` |
+| **Phase 4** | PDFBox 3.0.7, Mailpit, Nginx, k6 |
+| **Frontend** | A single-file demo client at `/`; `EventSource` for the waiting room. The React SPA in [`FE_SPEC.md`](FE_SPEC.md) is specified, not built |
 
-All dependencies are already declared in [`pom.xml`](pom.xml), grouped by phase.
+All dependencies are declared in [`pom.xml`](pom.xml), grouped by phase. Thymeleaf is **not** among
+them — email bodies are text blocks in `EmailComposer` — and four more were removed in Pass 10 for
+having no reference at all; the pom records why beside each gap.
 
 > Resilience4j ships a Boot-3-targeted autoconfiguration starter, so we use the plain library
 > artifacts and declare the beans ourselves. **Redisson was dropped** (ADR-022): once the hold claim
