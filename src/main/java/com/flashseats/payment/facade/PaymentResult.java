@@ -11,11 +11,16 @@ package com.flashseats.payment.facade;
  * kept, the buyer retries — from "stop". An earlier design collapsed both into one failure event
  * whose documented behaviour was to release the hold, contradicting the very UX it was meant to
  * serve.
+ *
+ * <p>{@code clientSecret} is populated only alongside {@code requiresAction}, and it is the one
+ * value here the browser ever sees: it is what {@code stripe.handleNextAction} needs to run the
+ * 3-D Secure challenge. It is scoped to a single PaymentIntent and confers nothing else.
  */
 public record PaymentResult(
         String transactionReference,
         boolean succeeded,
         String gatewayReference,
+        String clientSecret,
         String failureCode,
         String failureReason,
         boolean retryable,

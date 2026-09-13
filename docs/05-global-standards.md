@@ -93,8 +93,8 @@ breaking change.
 | `VALIDATION_FAILED` | 400 | shared | Fix `violations` and resubmit |
 | `INTERNAL_ERROR` | 500 | shared | Show `traceId`, offer retry |
 | `RATE_LIMITED` | 429 | bot | Back off `retryAfterSeconds` |
-| `BOT_VERIFICATION_FAILED` | 403 | bot | Re-run reCAPTCHA |
-| `IP_BLOCKED` | 403 | bot | Terminal; contact support |
+| `BOT_VERIFICATION_FAILED` | 403 | bot | The challenge scored below the threshold. Reload for a fresh token and retry — **never** returned for a provider timeout or outage, which fail open (ADR-011, ADR-055) |
+| `IP_BLOCKED` | 403 | bot | A standing operator decision on this address. Terminal for the client — `retryable` is false; contact support (ADR-055) |
 | `SESSION_INVALID` | 401 | bot | Reload to obtain a fresh `fsid` |
 | `EVENT_NOT_FOUND` | 404 | catalog | — |
 | `TIER_NOT_FOUND` | 404 | catalog | — |
@@ -117,10 +117,10 @@ breaking change.
 | `QUANTITY_EXCEEDS_LIMIT` | 422 | hold | Max 6 per order |
 | `PAYMENT_DECLINED` | 402 | payment | Retry — see `attemptsRemaining` |
 | `PAYMENT_ATTEMPTS_EXHAUSTED` | 402 | payment | Terminal |
-| `PAYMENT_ACTION_REQUIRED` | 402 | payment | 3-D Secure — follow `resumeUrl` |
+| `PAYMENT_ACTION_REQUIRED` | 402 | payment | 3-D Secure. Run `handleNextAction` with the `clientSecret` on the problem document, then **re-POST the same checkout body** — there is no `resumeUrl` and no resume endpoint. Hold retained, **no attempt consumed** (ADR-054) |
 | `PAYMENT_GATEWAY_UNAVAILABLE` | 503 | payment | Circuit open; hold retained, **no payment attempt consumed**, and the retry genuinely works (ADR-034) |
 | `DUPLICATE_PAYMENT` | 409 | payment | A charge is already in flight. Do **not** re-enable the pay button; poll `/sale/{id}/state`. Bounded by `stale-pending-seconds` — it can no longer mean "forever" (ADR-034) |
-| `WEBHOOK_SIGNATURE_INVALID` | 400 | payment | Gateway only |
+| `WEBHOOK_SIGNATURE_INVALID` | 400 | payment | Provider callback only. Never retried — a caller who cannot sign will not do better on the fourth attempt (ADR-053) |
 | `ORDER_NOT_FOUND` | 404 | order | — |
 | `ORDER_ALREADY_CONFIRMED` | 409 | order | Return the existing receipt |
 | `CHECKOUT_WINDOW_CLOSED` | 409 | order | Past the 15-minute grace |

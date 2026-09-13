@@ -85,6 +85,20 @@ SAW_DRIFT=0
 SAW_MISSING=0
 SAMPLES=0
 
+# Drift is judged on CONSECUTIVE samples for the SAME replica, never on one.
+#
+# ADR-046 is explicit: alarm on *sustained* non-zero, because Redis and
+# PostgreSQL are not read in one snapshot — a hold created between the two reads
+# shows as a momentary gap that is not a defect. Failing on a single sample made
+# this instrument contradict the ADR it cites, and in the Pass 9 drill it called
+# a correctness failure on one sample out of sixty while sold-count.sh — the
+# authority, which reads the ledger — reported `sold + held + redis == capacity`
+# on every tier. An instrument that measures the wrong thing is worse than no
+# instrument, because its answer is specific (ADR-047).
+declare -A DRIFT_RUN=()
+SUSTAINED_DRIFT=0
+TRANSIENT_DRIFT=0
+
 printf 'Sampling %s every %ss for %ss. Pool maximum is %s per replica.\n\n' \
     "$REPLICAS" "$EVERY" "$DURATION" "$POOL_MAX"
 printf '%-9s %-8s %9s %9s %8s %8s\n' \
@@ -114,7 +128,16 @@ while [[ $(date +%s) -lt $DEADLINE ]]; do
         fi
         if [[ "$DRIFT" != "-" && "${DRIFT%%.*}" -ne 0 ]]; then
             SAW_DRIFT=1
-            FLAG="  <-- DRIFT, this is a correctness failure"
+            DRIFT_RUN[$replica]=$(( ${DRIFT_RUN[$replica]:-0} + 1 ))
+            if [[ "${DRIFT_RUN[$replica]}" -ge 2 ]]; then
+                SUSTAINED_DRIFT=1
+                FLAG="  <-- DRIFT, SUSTAINED — this is a correctness failure"
+            else
+                TRANSIENT_DRIFT=$((TRANSIENT_DRIFT + 1))
+                FLAG="  <-- drift on one sample; transient unless the next one repeats"
+            fi
+        elif [[ "$DRIFT" != "-" ]]; then
+            DRIFT_RUN[$replica]=0
         fi
         [[ "$MISSING" != "-" && "${MISSING%%.*}" -ne 0 ]] && SAW_MISSING=1
 
@@ -138,11 +161,22 @@ if [[ "$SAW_MISSING" -eq 1 ]]; then
     exit 1
 fi
 
-if [[ "$SAW_DRIFT" -eq 1 ]]; then
-    echo "  FAIL  flashseats_stock_drift went non-zero. Invariant 1 is broken:"
-    echo "        confirmed + held + remaining no longer equals capacity. Stop and"
-    echo "        read this as a correctness failure, not a capacity one (ADR-046)."
+if [[ "$SUSTAINED_DRIFT" -eq 1 ]]; then
+    echo "  FAIL  flashseats_stock_drift was non-zero on CONSECUTIVE samples for one"
+    echo "        replica. Invariant 1 is broken: confirmed + held + remaining no"
+    echo "        longer equals capacity. Read this as a correctness failure, not a"
+    echo "        capacity one (ADR-046)."
     exit 1
+fi
+
+if [[ "$SAW_DRIFT" -eq 1 ]]; then
+    echo "  NOTE  flashseats_stock_drift was non-zero on ${TRANSIENT_DRIFT} isolated sample(s) and"
+    echo "        zero on the next read of that replica. That is the measurement's own"
+    echo "        artefact, not a defect: Redis and PostgreSQL are not read in one"
+    echo "        snapshot, so a hold created between them shows as a momentary gap"
+    echo "        (ADR-046). Confirm with docker/scripts/sold-count.sh, which reads the"
+    echo "        ledger and is the authority."
+    echo
 fi
 
 if [[ "$WORST_PENDING" -gt 0 ]]; then
