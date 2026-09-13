@@ -43,7 +43,7 @@ Running the jar directly therefore requires a profile, which is the intended fai
 | :--- | :--- |
 | `http://localhost:8080` | The demo client — the whole journey in a browser |
 | `http://localhost:8025` | Mailpit — the ticket emails land here |
-| `http://localhost:8080/docs` | OpenAPI |
+| [`FE_SPEC.md`](../FE_SPEC.md) §2 | The API contract. There is no generated `/docs` page — springdoc described the shapes and none of the meaning |
 | `http://localhost:15672` | RabbitMQ (`flashseats` / `flashseats`) |
 
 The seeder creates two events: **Aurora Fest 2026**, open immediately with 700 seats across three
@@ -166,16 +166,22 @@ com.flashseats.<module>/
 ├── dto/          request/response records
 ├── event/        Spring application events (records)
 ├── exception/    extends shared FlashSeatsException, carries an ErrorCode   [@NamedInterface]
-├── facade/       interface + package-private Impl + record DTOs             [@NamedInterface]
+├── facade/       interface + record DTOs — the module's published contract   [@NamedInterface]
 ├── model/        JPA entities + enums                                        internal
 ├── repository/   Spring Data; conditional UPDATEs return int (rowcount)      internal
-└── service/      all business logic; owns every @Transactional               internal
+└── service/      all business logic; implements the facade                   internal
 ```
 
 Rules that hold everywhere:
 
-- **Services own transactions; facades never open one.** Two facade methods declare
-  `Propagation.MANDATORY` — they *require* the caller's transaction rather than assuming it.
+- **The service implements the facade; there is no separate `*Impl`.** Five existed, every one of
+  them pure delegation — `CatalogFacadeImpl` was twelve one-line methods — and all they added was a
+  hop between the contract and the code honouring it. The interface still lives in the
+  `@NamedInterface` package, the service still lives in an internal package no other module may
+  name, and `ApplicationModules.verify()` still proves it: Modulith checks *source-code type
+  references*, not runtime bean types.
+- **Services own transactions; facades never open one.** One facade method declares
+  `Propagation.MANDATORY` — it *requires* the caller's transaction rather than assuming it.
 - **Every claim is a conditional `UPDATE` returning `int`.** Never `SELECT` then update.
 - **Records across boundaries, never entities.**
 - **A slow call never sits inside a transaction.** Gateway calls, PDF rendering and SMTP are all
@@ -1389,3 +1395,56 @@ change ADR-049 ever needed — and the sale sells out.
   Pass 7, it now measures 0 pending and a **complete sellout — 2,500 of 2,500**. 112 tests green. The one number still open is checkout p99: 10 s
   against a 200 ms criterion, which `pending` at zero says is not the database, and which needs a host
   where the load generator is not sharing ten cores with three JVMs.
+
+### Pass 9 — the simplification pass
+
+- **Scope:** the whole codebase and every document, read for *legibility* rather than correctness.
+  The trigger was not a defect: eight passes of adding correctness had left 215 Java files holding
+  ~8,360 lines of real code — 91 of them 25 lines or fewer, 33 % of every file a comment — with six
+  classes on the path from `checkout` to `charge` and five representations of an event. The
+  guarantees were sound; nobody could find them. `REFACTORING_BLUEPRINT.md` is the pass's main
+  artefact and is now the repo's entry point.
+
+- **The finding that shaped it:** most of what looks removable here is load-bearing, and recording
+  *that* is worth more than the deletions. SSE looks like a duplicate of `/queue/status` polling and
+  is the cheap path — polling is the measured CPU hog at ~90,000 calls per replica per run against
+  ~1,100 checkouts. `saleflow` is a 205-line module for one endpoint and is the only host for a
+  four-facade read that keeps the graph acyclic. `LoggingOutboxPublisher` looks like a toy and is
+  what lets the whole suite test the three-transaction relay with no broker. Checkout step 0 looks
+  redundant with step 4 and must precede step 1. All of it is in the blueprint's §1.5 so the next
+  pass does not re-propose it.
+
+**Built (112 tests green after every stage, `ModularityTests` included):**
+
+| Change | Effect |
+| :--- | :--- |
+| **Five `*FacadeImpl` deleted; services implement their own facades** (ADR-052) | One hop shorter on every cross-module call, three shorter into `payment`. `CatalogFacadeImpl` was twelve one-line delegations |
+| **25 exception classes → 9 + four `<Module>Errors`** (ADR-052) | A module's whole failure surface is one readable file. 17 of the 25 were never caught by type; the javadoc moved verbatim |
+| **10 unreachable `ErrorCode` constants removed** | §12 item 7, in the direction nobody had checked. `FE_SPEC.md` had already begun warning clients off three of them — dead contract documenting its own uselessness |
+| **`V10__drop_unread_schema.sql`** | `outbox_events.last_error` (written by nothing, read by nothing) and **six indexes no query uses** — two of them on `ticket_holds`, i.e. maintained on every reserve |
+| **`PaymentResult` 7 fields → 4** | `retryable`, `requiresAction` and `failureCode` had no readers, while `retryable`'s own javadoc called it "the field that matters". It is not: the decision is made from the order's attempt budget |
+| **Dead enum values removed** | `PaymentStatus.PROCESSING`, `NotificationStatus.FAILED`, `GatewayResult.Outcome.REQUIRES_ACTION` — all declared, none ever assigned |
+| **Checkout lost one transaction** | `confirm` returned the `Order`, the caller discarded it and re-read the same row plus its items to build the receipt. It now returns the receipt, built from what it already holds |
+| **Four dangling infra references** | An nginx route to a nonexistent webhook, three Stripe/reCAPTCHA env vars reaching no Java code, `redis.conf` naming `hold_reserve.lua`, and a javadoc naming `AdminResendController` — the "class names that never existed" failure mode, alive in four places |
+| **Four pom dependencies removed** | `springdoc` (zero annotations behind it — `/docs` described shapes and no meaning), `devtools` (fights the static Testcontainers), `mail-test` and `security-test` (nothing uses either) |
+
+**Not done, and deliberately listed rather than quietly dropped:** the representation merges
+(blueprint Stage D — queue state still has four shapes, order line items four) and the absorption of
+the single-method wrappers (Stage E — `OrderNumbers`, `HoldKeys`, `SaleWindows`, the three
+one-method repositories, and `payment`'s gateway-record collapse). Both are behaviour-preserving and
+fully specified in the blueprint.
+
+**The gap this pass found and did not close.** `application-test.properties` sets
+`flashseats.notification.enabled=false`, which `@ConditionalOnProperty`-disables the Rabbit topology,
+both consumers and `EmailDispatcher`. **The entire 1,020-line `notification` module therefore has no
+test that drives a message through a listener** — no ack/nack, no DLX routing, no
+claim → render → send → mark, no `EmailComposer` (133 lines, zero tests), and no end-to-end refund
+path. This is the trap `CLAUDE.md` names as *"disabling a feature in the test profile so the suite
+passes"*, and its own prescribed fix applies: give the fixture a seam.
+`RabbitOutboxPublisherTest` already shows the pattern with its own Testcontainers broker. It is
+item 3.2 of the blueprint's checklist.
+
+**Also noticed, not fixed:** `README.md` §"Architecture at a glance" is materially stale — it
+describes `tier_inventory` (dropped in `V7`), a `filter ──► bot` module edge, a
+`PaymentSettledEvent` that exists in no Java file, and Thymeleaf. It predates ADR-046 and was not in
+this pass's scope.

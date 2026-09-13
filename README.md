@@ -15,7 +15,8 @@ Read in this order:
 
 | Document | What it covers |
 | :--- | :--- |
-| [`docs/00-architecture-decisions.md`](docs/00-architecture-decisions.md) | **Start here.** 30 ADRs — every non-obvious decision and the failure it prevents |
+| [`REFACTORING_BLUEPRINT.md`](REFACTORING_BLUEPRINT.md) | **Start here.** The whole system on one page — journey, module graph, where each concept lives, and what looks removable but is not. Then the staged refactor that makes the code match it |
+| [`docs/00-architecture-decisions.md`](docs/00-architecture-decisions.md) | 52 ADRs — every non-obvious decision and the failure it prevents. Read before changing a decision |
 | [`docs/01-system-architecture.md`](docs/01-system-architecture.md) | Stack, module map, dependency graph, deployment |
 | [`docs/02-high-level-design.md`](docs/02-high-level-design.md) | Infrastructure and the concurrency model |
 | [`docs/03-end-to-end-flow.md`](docs/03-end-to-end-flow.md) | **The authoritative user journey**, step by step |
@@ -173,7 +174,7 @@ declines and **keeps your seats**, `pm_card_error` fails the provider. The email
 
 | Service | Where | Credentials |
 | :--- | :--- | :--- |
-| App | http://localhost:8080 · API docs at `/docs` | — |
+| App | http://localhost:8080 | — |
 | PostgreSQL | `localhost:5432` | `flashseats` / `flashseats` |
 | Redis | `localhost:6379` | no auth (dev) |
 | RabbitMQ UI | http://localhost:15672 | `flashseats` / `flashseats` |
