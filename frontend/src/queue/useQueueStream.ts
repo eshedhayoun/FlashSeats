@@ -8,6 +8,7 @@ import type {
   SaleQueueState,
   TierAvailabilityEvent
 } from "../api/types";
+import { setLastEventId } from "../sale/storage";
 
 type ConnectionState = "connecting" | "open" | "reconnecting";
 
@@ -96,7 +97,13 @@ export function useQueueStream(eventId: number, onRefresh: () => void) {
           connect();
         }, delay);
       };
+      stream.addEventListener("message", (event) => {
+        const lastEventId = (event as MessageEvent).lastEventId;
+        if (lastEventId) setLastEventId(eventId, lastEventId);
+      });
       stream.addEventListener("position-update", (event) => {
+        const lastEventId = (event as MessageEvent).lastEventId;
+        if (lastEventId) setLastEventId(eventId, lastEventId);
         const update = JSON.parse((event as MessageEvent).data) as PositionUpdateEvent;
         setState((current) => ({
           ...current,
@@ -109,22 +116,30 @@ export function useQueueStream(eventId: number, onRefresh: () => void) {
         }));
       });
       stream.addEventListener("queue-promoted", (event) => {
+        const lastEventId = (event as MessageEvent).lastEventId;
+        if (lastEventId) setLastEventId(eventId, lastEventId);
         const promoted = JSON.parse((event as MessageEvent).data) as QueuePromotedEvent;
         setState((current) => ({ ...current, promoted }));
         stream?.close();
         onRefresh();
       });
       stream.addEventListener("tier-availability", (event) => {
+        const lastEventId = (event as MessageEvent).lastEventId;
+        if (lastEventId) setLastEventId(eventId, lastEventId);
         const availability = JSON.parse((event as MessageEvent).data) as TierAvailabilityEvent;
         setState((current) => ({ ...current, availability }));
       });
       stream.addEventListener("sale-exhausted", (event) => {
+        const lastEventId = (event as MessageEvent).lastEventId;
+        if (lastEventId) setLastEventId(eventId, lastEventId);
         const terminal = JSON.parse((event as MessageEvent).data) as SaleExhaustedEvent;
         setState((current) => ({ ...current, terminal }));
         stream?.close();
         onRefresh();
       });
       stream.addEventListener("sale-closed", (event) => {
+        const lastEventId = (event as MessageEvent).lastEventId;
+        if (lastEventId) setLastEventId(eventId, lastEventId);
         const terminal = JSON.parse((event as MessageEvent).data) as SaleClosedEvent;
         setState((current) => ({ ...current, terminal }));
         stream?.close();

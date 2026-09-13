@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { useNavigate, useParams } from "react-router-dom";
 import CircularProgress from "@mui/material/CircularProgress";
 import Container from "@mui/material/Container";
@@ -13,6 +13,8 @@ import { setAdmissionToken } from "./storage";
 import { useSaleState } from "./useSaleState";
 import { useEvent } from "../landing/useEvent";
 import { CheckoutPage } from "../checkout/CheckoutPage";
+import { DegradedState } from "../shared/DegradedState";
+import { TerminalPage } from "../terminal/TerminalPage";
 
 export function EventPage() {
   const eventId = Number(useParams().eventId);
@@ -22,15 +24,17 @@ export function EventPage() {
   const [admitting, setAdmitting] = useState(false);
   const [admitError, setAdmitError] = useState<ApiError | null>(null);
 
+  const refreshSale = useCallback(() => {
+    void sale.refresh();
+  }, [sale.refresh]);
+
   useEffect(() => {
-    if (sale.data?.route.view !== "promoted" || admitting) return;
+    const route = sale.data?.route;
+    if (route?.view !== "promoted" || admitting) return;
 
     setAdmitting(true);
     setAdmitError(null);
-    void admitQueue(
-      { eventId },
-      sale.data.route.passToken
-    )
+    void admitQueue({ eventId }, route.passToken)
       .then((response) => {
         setAdmissionToken(eventId, response.admissionToken);
         return sale.refresh();
@@ -49,7 +53,13 @@ export function EventPage() {
         );
       })
       .finally(() => setAdmitting(false));
-  }, [admitting, eventId, sale]);
+  }, [admitting, eventId, sale.data?.route, sale.refresh]);
+
+  useEffect(() => {
+    if (sale.data?.route.view === "confirmation") {
+      navigate(`/orders/${sale.data.route.orderNumber}`, { replace: true });
+    }
+  }, [navigate, sale.data?.route]);
 
   if (!Number.isInteger(eventId) || eventId <= 0) {
     return <Typography>This event link is invalid.</Typography>;
@@ -81,7 +91,7 @@ export function EventPage() {
       <QueuePage
         eventId={eventId}
         queue={route.queue}
-        onRefresh={() => void sale.refresh()}
+        onRefresh={refreshSale}
       />
     );
   }
@@ -101,7 +111,7 @@ export function EventPage() {
       event={eventResult.event}
       eventId={eventId}
       admissionExpiresAt={route.admissionExpiresAt}
-      onRefresh={() => void sale.refresh()}
+      onRefresh={refreshSale}
     />;
   }
   if (route.view === "checkout") {
@@ -110,32 +120,20 @@ export function EventPage() {
         event={eventResult.event}
         eventId={eventId}
         hold={route.hold}
-        onRefresh={() => void sale.refresh()}
+        onRefresh={refreshSale}
         onCompleted={(orderNumber) => {
           navigate(`/orders/${orderNumber}`);
         }}
       />
     );
   }
-  if (route.view === "confirmation") {
-    return <Typography>Order {route.orderNumber} confirmed.</Typography>;
-  }
   if (route.view === "degraded") {
-    return (
-      <Container sx={{ py: 8 }}>
-        <Typography variant="h5">We&apos;re checking the sale status</Typography>
-        <Typography color="text.secondary">
-          Some sale information is temporarily unavailable. Retrying is safe.
-        </Typography>
-      </Container>
-    );
+    return <DegradedState onRetry={refreshSale} />;
   }
 
-  return (
-    <Container sx={{ py: 8 }}>
-      <Typography variant="h4">
-        {route.reason === "SOLD_OUT" ? "This event has sold out." : "Sales have ended."}
-      </Typography>
-    </Container>
-  );
+  if (route.view === "terminal") {
+    return <TerminalPage reason={route.reason} />;
+  }
+
+  return <Typography>Opening your order…</Typography>;
 }
