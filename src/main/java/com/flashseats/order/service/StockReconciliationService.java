@@ -3,7 +3,7 @@ package com.flashseats.order.service;
 import com.flashseats.catalog.facade.CatalogFacade;
 import com.flashseats.hold.facade.HoldFacade;
 import com.flashseats.order.config.OrderProperties;
-import com.flashseats.order.exception.StockRebuildInProgressException;
+import com.flashseats.order.exception.OrderErrors;
 import com.flashseats.order.repository.OrderRepository;
 import io.micrometer.core.instrument.Gauge;
 import io.micrometer.core.instrument.MeterRegistry;
@@ -151,7 +151,8 @@ public class StockReconciliationService {
      * seats are lost revenue that the next rebuild recovers, while phantom seats are an oversell
      * that nothing recovers.
      *
-     * @throws StockRebuildInProgressException if another rebuild holds this event's lock
+     * @throws com.flashseats.shared.error.FlashSeatsException {@code STOCK_REBUILD_IN_PROGRESS}
+     *     if another rebuild holds this event's lock — see {@link OrderErrors}
      */
     public Map<Long, Integer> rebuild(long eventId) {
         Map<Long, Integer> first = lockedLedgerSnapshot(eventId);
@@ -179,7 +180,7 @@ public class StockReconciliationService {
     private Map<Long, Integer> lockedLedgerSnapshot(long eventId) {
         return locked.execute(status -> {
             if (!orders.tryStockRebuildLock(eventId)) {
-                throw new StockRebuildInProgressException(eventId);
+                throw OrderErrors.stockRebuildInProgress(eventId);
             }
             return remainingByTier(eventId);
         });

@@ -8,8 +8,7 @@ import com.flashseats.hold.facade.HoldSummary;
 import com.flashseats.order.config.OrderProperties;
 import com.flashseats.order.dto.CheckoutRequest;
 import com.flashseats.order.dto.OrderReceiptResponse;
-import com.flashseats.order.exception.CheckoutWindowClosedException;
-import com.flashseats.order.exception.InsufficientTimeRemainingException;
+import com.flashseats.order.exception.OrderErrors;
 import com.flashseats.order.exception.OrderRefundedException;
 import com.flashseats.payment.exception.DuplicatePaymentException;
 import com.flashseats.payment.exception.PaymentDeclinedException;
@@ -113,6 +112,7 @@ public class CheckoutService {
         // PENDING order that nothing ever resolves is a dead end — the buyer holds live seats they
         // can no longer buy — so every exit below leaves the row in a state a retry can resume
         // (ADR-034).
+        OrderReceiptResponse receipt;
         try {
             // 5. The one grace extension. Idempotent across retries; throws if the hold has been
             //    settled by a concurrent expiry — in which case we must NOT charge (ADR-023).
@@ -138,8 +138,11 @@ public class CheckoutService {
             }
 
             // 7. One transaction: consume, confirm, items, outbox. 8. Post-commit cleanup hangs off it.
+            //    The receipt comes back from the commit itself — everything in it was just written,
+            //    so re-reading the order to build it would cost a second pooled connection on the
+            //    one path where the pool is the measured ceiling.
             try {
-                commit.confirm(order.orderNumber(), hold, tier, payment);
+                receipt = commit.confirm(order.orderNumber(), hold, tier, payment);
             } catch (RuntimeException commitFailed) {
                 // 9. Money moved but the seats did not. Give it back and say so.
                 compensate(order.orderNumber(), payment, amountCents, commitFailed);
@@ -159,7 +162,7 @@ public class CheckoutService {
             throw unresolved;
         }
 
-        return new CheckoutOutcome(queries.receiptFor(order.orderNumber()), false);
+        return new CheckoutOutcome(receipt, false);
     }
 
     // ----------------------------------------------------------------- helpers
@@ -176,7 +179,7 @@ public class CheckoutService {
         if (tier.windowStatus() == EventWindowStatus.CLOSED && clock.instant().isBefore(graceEnds)) {
             return;
         }
-        throw new CheckoutWindowClosedException();
+        throw OrderErrors.checkoutWindowClosed();
     }
 
     /**
@@ -189,7 +192,7 @@ public class CheckoutService {
     private void requireTimeToComplete(Instant expiresAt) {
         long secondsLeft = Duration.between(clock.instant(), expiresAt).toSeconds();
         if (secondsLeft < properties.getMinRemainingSecondsForRetry()) {
-            throw new InsufficientTimeRemainingException(expiresAt);
+            throw OrderErrors.insufficientTimeRemaining(expiresAt);
         }
     }
 

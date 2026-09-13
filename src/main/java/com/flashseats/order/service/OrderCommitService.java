@@ -4,6 +4,8 @@ import com.flashseats.catalog.facade.TierSummary;
 import com.flashseats.hold.facade.HoldFacade;
 import com.flashseats.hold.facade.HoldSummary;
 import com.flashseats.order.config.OrderProperties;
+import com.flashseats.order.dto.OrderItemResponse;
+import com.flashseats.order.dto.OrderReceiptResponse;
 import com.flashseats.order.event.OrderConfirmedEvent;
 import com.flashseats.order.exception.OrderRefundedException;
 import com.flashseats.order.model.Order;
@@ -136,7 +138,7 @@ public class OrderCommitService {
         } catch (DataIntegrityViolationException concurrentCheckout) {
             // Two requests raced to create the row. UNIQUE(hold_token) let exactly one win; this is
             // the other one, and it is the same situation as finding a PENDING row above.
-            throw new DuplicatePaymentException(holdToken);
+            throw new DuplicatePaymentException();
         }
         return new CheckoutOrder(orderNumber, 0, false);
     }
@@ -151,9 +153,16 @@ public class OrderCommitService {
      *
      * <p>The outbox row is written here, not after: an order that is confirmed but whose ticket was
      * never queued is not a state this system can reach.
+     *
+     * <p><strong>Returns the receipt rather than the entity.</strong> It used to return the
+     * {@code Order} and the caller threw it away, then re-read the same row and its line items
+     * through a second read-only transaction to build exactly this. Everything the receipt needs is
+     * already in hand here — the order was just written, the line item was just constructed — so
+     * that read was a whole extra pooled connection per successful checkout, on the path whose
+     * measured ceiling is the connection pool.
      */
     @Transactional
-    public Order confirm(
+    public OrderReceiptResponse confirm(
             String orderNumber, HoldSummary hold, TierSummary tier, PaymentResult payment) {
 
         // Claim the seats first. Throws HoldAlreadySettledException if a concurrent expiry won,
@@ -189,7 +198,22 @@ public class OrderCommitService {
         events.publishEvent(new OrderConfirmedEvent(
                 orderNumber, hold.holdToken(), order.getUserSessionId(), hold.eventId(), clock.instant()));
 
-        return order;
+        // Built from the row and the line item written moments ago, not re-read. The line item is
+        // the one just constructed, so this costs no query either.
+        return new OrderReceiptResponse(
+                order.getOrderNumber(),
+                order.getStatus(),
+                order.getUserEmail(),
+                order.getTotalAmountCents(),
+                order.getCurrency(),
+                order.getReceiptToken(),
+                order.getCreatedAt(),
+                List.of(new OrderItemResponse(
+                        item.getEventId(),
+                        item.getTierId(),
+                        item.getTierName(),
+                        item.getQuantity(),
+                        item.getUnitPriceCents())));
     }
 
     /**
@@ -273,7 +297,7 @@ public class OrderCommitService {
         Instant strandedBefore =
                 clock.instant().minusSeconds(properties.getStalePendingSeconds());
         if (order.getUpdatedAt().isAfter(strandedBefore)) {
-            throw new DuplicatePaymentException(holdToken);
+            throw new DuplicatePaymentException();
         }
         log.warn(
                 "Resuming order {} stranded in PENDING since {}", order.getOrderNumber(), order.getUpdatedAt());

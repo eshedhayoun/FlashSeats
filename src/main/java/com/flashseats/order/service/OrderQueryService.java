@@ -5,8 +5,10 @@ import com.flashseats.catalog.facade.EventSummary;
 import com.flashseats.order.dto.AdminOrderResponse;
 import com.flashseats.order.dto.OrderItemResponse;
 import com.flashseats.order.dto.OrderReceiptResponse;
-import com.flashseats.order.exception.OrderNotFoundException;
+import com.flashseats.order.exception.OrderErrors;
 import com.flashseats.order.exception.TicketNotAvailableException;
+import com.flashseats.order.facade.OrderFacade;
+import com.flashseats.order.facade.OrderSummary;
 import com.flashseats.order.model.Order;
 import com.flashseats.order.model.OrderStatus;
 import com.flashseats.order.repository.OrderItemRepository;
@@ -17,9 +19,16 @@ import java.util.Optional;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
-/** Reads. No method here mutates anything. */
+/**
+ * Reads. No method here mutates anything.
+ *
+ * <p>This class <em>is</em> {@link OrderFacade}. Other modules see only that interface, because this
+ * package is internal to the module and they may not name it. There is no separate delegating
+ * implementation: one existed, held no logic, and only added a hop between the contract and the code
+ * that honours it.
+ */
 @Service
-public class OrderQueryService {
+public class OrderQueryService implements OrderFacade {
 
     private final OrderRepository orders;
     private final OrderItemRepository items;
@@ -40,7 +49,7 @@ public class OrderQueryService {
     @Transactional(readOnly = true)
     public OrderReceiptResponse receiptFor(String orderNumber) {
         return toReceipt(orders.findByOrderNumber(orderNumber)
-                .orElseThrow(() -> new OrderNotFoundException(orderNumber)));
+                .orElseThrow(() -> OrderErrors.orderNotFound(orderNumber)));
     }
 
     /**
@@ -56,7 +65,7 @@ public class OrderQueryService {
     @Transactional(readOnly = true)
     public AdminOrderResponse readForOperator(String orderNumber) {
         Order order = orders.findByOrderNumber(orderNumber)
-                .orElseThrow(() -> new OrderNotFoundException(orderNumber));
+                .orElseThrow(() -> OrderErrors.orderNotFound(orderNumber));
 
         return new AdminOrderResponse(
                 order.getOrderNumber(),
@@ -86,13 +95,13 @@ public class OrderQueryService {
             String orderNumber, String sessionId, String receiptToken) {
 
         Order order = orders.findByOrderNumber(orderNumber)
-                .orElseThrow(() -> new OrderNotFoundException(orderNumber));
+                .orElseThrow(() -> OrderErrors.orderNotFound(orderNumber));
 
         boolean ownSession = order.getUserSessionId().equals(sessionId);
         boolean validToken = receiptToken != null && receiptTokens.authorises(receiptToken, orderNumber);
         if (!ownSession && !validToken) {
             // 404 rather than 403: telling an unauthorised caller the order exists is itself a leak.
-            throw new OrderNotFoundException(orderNumber);
+            throw OrderErrors.orderNotFound(orderNumber);
         }
         return toReceipt(order);
     }
@@ -103,15 +112,21 @@ public class OrderQueryService {
      * <p>Feeds rehydration, which needs to answer "where is this buyer?" — and "they already bought"
      * is one of the answers (ADR-037). Restricting it to {@code PENDING} made a confirmed purchase
      * invisible the moment the page reloaded.
+     *
+     * <p>The status crosses as a string: {@code OrderStatus} is this module's business, not a shared
+     * type.
      */
+    @Override
     @Transactional(readOnly = true)
-    public Optional<Order> findLatest(String sessionId, long eventId) {
-        return orders.findFirstByUserSessionIdAndEventIdOrderByCreatedAtDesc(sessionId, eventId);
-    }
-
-    @Transactional(readOnly = true)
-    public Optional<Order> findByOrderNumber(String orderNumber) {
-        return orders.findByOrderNumber(orderNumber);
+    public Optional<OrderSummary> findLatestOrder(String sessionId, long eventId) {
+        return orders.findFirstByUserSessionIdAndEventIdOrderByCreatedAtDesc(sessionId, eventId)
+                .map(order -> new OrderSummary(
+                        order.getOrderNumber(),
+                        order.getStatus().name(),
+                        order.getEventId(),
+                        order.getTotalAmountCents(),
+                        order.getCurrency(),
+                        order.getCreatedAt()));
     }
 
     /**
@@ -165,12 +180,12 @@ public class OrderQueryService {
             String orderNumber, String sessionId, String receiptToken) {
 
         Order order = orders.findByOrderNumber(orderNumber)
-                .orElseThrow(() -> new OrderNotFoundException(orderNumber));
+                .orElseThrow(() -> OrderErrors.orderNotFound(orderNumber));
 
         boolean ownSession = order.getUserSessionId().equals(sessionId);
         boolean validToken = receiptToken != null && receiptTokens.authorises(receiptToken, orderNumber);
         if (!ownSession && !validToken) {
-            throw new OrderNotFoundException(orderNumber);
+            throw OrderErrors.orderNotFound(orderNumber);
         }
         if (order.getStatus() != OrderStatus.CONFIRMED) {
             throw new TicketNotAvailableException(orderNumber, order.getStatus());

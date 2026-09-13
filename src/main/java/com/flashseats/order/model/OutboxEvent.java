@@ -57,9 +57,6 @@ public class OutboxEvent {
     @Column(name = "retry_count", nullable = false)
     private int retryCount;
 
-    @Column(name = "last_error", length = 500)
-    private String lastError;
-
     /** When a relay took this row. Lets a crash between claim and publish be found and re-swept. */
     @Column(name = "claimed_at")
     private Instant claimedAt;

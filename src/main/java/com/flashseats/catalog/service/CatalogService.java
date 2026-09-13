@@ -4,10 +4,8 @@ import com.flashseats.catalog.config.CatalogProperties;
 import com.flashseats.catalog.dto.EventDetailResponse;
 import com.flashseats.catalog.dto.EventListItemResponse;
 import com.flashseats.catalog.dto.TierResponse;
-import com.flashseats.catalog.exception.EventNotFoundException;
-import com.flashseats.catalog.exception.EventNotPausableException;
-import com.flashseats.catalog.exception.PrewarmWindowClosedException;
-import com.flashseats.catalog.exception.TierNotFoundException;
+import com.flashseats.catalog.exception.CatalogErrors;
+import com.flashseats.catalog.facade.CatalogFacade;
 import com.flashseats.catalog.facade.EventSummary;
 import com.flashseats.catalog.facade.EventWindowStatus;
 import com.flashseats.catalog.facade.ReserveResult;
@@ -28,17 +26,21 @@ import org.springframework.context.ApplicationEventPublisher;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
-/** Event metadata, sale windows, and every movement of the inventory counter. */
+/**
+ * Event metadata, sale windows, and every movement of the inventory counter.
+ *
+ * <p>This class <em>is</em> {@link CatalogFacade}. Other modules see only that interface, because
+ * this package is internal to the module and they may not name it. There is no separate delegating
+ * implementation: one existed, held no logic, and only added a hop between the contract and the code
+ * that honours it.
+ *
+ * <p>{@code COUNTER_UNAVAILABLE} is inherited from the interface rather than redeclared here. It
+ * used to be mirrored, with a comment noting that the two had to agree — two constants that must
+ * hold the same value are one constant with a way to disagree.
+ */
 @Slf4j
 @Service
-public class CatalogService {
-
-    /**
-     * Stands in for a count that cannot be read — a fault, never "sold out".
-     * Mirrored on {@link com.flashseats.catalog.facade.CatalogFacade#COUNTER_UNAVAILABLE}, which is
-     * the value other modules see.
-     */
-    public static final int COUNTER_UNAVAILABLE = -1;
+public class CatalogService implements CatalogFacade {
 
     private final EventRepository events;
     private final StockCounterRepository stock;
@@ -119,12 +121,13 @@ public class CatalogService {
 
     // ----------------------------------------------------------- facade reads
 
+    @Override
     public TierSummary getTierSummary(long eventId, long tierId) {
         EventRow event = metadata.event(eventId);
         TierRow tier = metadata.tiers(eventId).stream()
                 .filter(candidate -> candidate.id() == tierId)
                 .findFirst()
-                .orElseThrow(() -> new TierNotFoundException(eventId, tierId));
+                .orElseThrow(() -> CatalogErrors.tierNotFound(eventId, tierId));
 
         return new TierSummary(
                 eventId,
@@ -140,6 +143,7 @@ public class CatalogService {
                 SaleWindows.statusOf(event, clock.instant()));
     }
 
+    @Override
     public EventSummary getEventSummary(long eventId) {
         EventRow event = metadata.event(eventId);
         return new EventSummary(
@@ -152,6 +156,7 @@ public class CatalogService {
                 SaleWindows.statusOf(event, clock.instant()));
     }
 
+    @Override
     public EventWindowStatus getWindowStatus(long eventId) {
         return SaleWindows.statusOf(metadata.event(eventId), clock.instant());
     }
@@ -167,6 +172,7 @@ public class CatalogService {
      *
      * <p>The window is still compared against the live clock; only the rows are remembered.
      */
+    @Override
     public List<Long> findOpenEventIds() {
         Instant now = clock.instant();
         return metadata.selectableEvents().stream()
@@ -177,6 +183,7 @@ public class CatalogService {
     }
 
     /** Open <em>or paused</em> — what an operator is still answerable for. See the repository. */
+    @Override
     public List<Long> findManagedEventIds() {
         Instant now = clock.instant();
         return metadata.selectableEvents().stream()
@@ -212,7 +219,8 @@ public class CatalogService {
      * unconditionally, including on the no-op branch, because a cache that is already correct loses
      * nothing by being told twice.
      *
-     * @throws EventNotPausableException if the event is {@code DRAFT} or {@code CANCELLED}, where
+     * @throws com.flashseats.shared.error.FlashSeatsException {@code SALE_PAUSED} — see
+     *     {@link CatalogErrors} — if the event is {@code DRAFT} or {@code CANCELLED}, where
      *     "paused" would mean nothing and un-pausing would publish something nobody published
      */
     @Transactional
@@ -221,7 +229,7 @@ public class CatalogService {
         EventStatus current = event.getStatus();
 
         if (current != EventStatus.PUBLISHED && current != EventStatus.PAUSED) {
-            throw new EventNotPausableException(eventId, current);
+            throw CatalogErrors.eventNotPausable(eventId, current);
         }
 
         EventStatus target = paused ? EventStatus.PAUSED : EventStatus.PUBLISHED;
@@ -249,6 +257,7 @@ public class CatalogService {
      * @return remaining seats across the event, or {@link #COUNTER_UNAVAILABLE} if any tier has no
      *     counter
      */
+    @Override
     public int getRemainingForEvent(long eventId) {
         List<Long> tierIds = tierIds(eventId);
         Map<Long, Integer> counters = stock.readAll(eventId, tierIds);
@@ -281,6 +290,7 @@ public class CatalogService {
      * on the broadcaster's sweep, on every replica, so borrowing the landing page's per-tier WARN
      * would turn one unreadable counter into a log flood during the incident that caused it.
      */
+    @Override
     public List<TierAvailability> getTierAvailability(long eventId) {
         List<TierRow> eventTiers = metadata.tiers(eventId);
         Map<Long, Integer> remainingByTier =
@@ -307,6 +317,7 @@ public class CatalogService {
      * the seats for good (ADR-023). The caller writes its hold row next and calls {@link #restore}
      * if it cannot.
      */
+    @Override
     public ReserveResult tryReserve(long eventId, long tierId, int quantity) {
         if (!epoch.isTrusted(eventId)) {
             // Redis is not the instance that vouched for this event. Its counter may read high by
@@ -341,6 +352,7 @@ public class CatalogService {
      * whichever hold happened to expire next, which is ADR-004's prohibition; the seats are reported
      * by {@code flashseats.stock.drift} and returned by a rebuild.
      */
+    @Override
     public void restore(long eventId, long tierId, int quantity) {
         if (!stock.restore(eventId, tierId, quantity)) {
             log.error(
@@ -371,7 +383,7 @@ public class CatalogService {
     public int prewarm(long eventId) {
         EventRow event = EventRow.of(requireEvent(eventId));
         if (SaleWindows.statusOf(event, clock.instant()) != EventWindowStatus.UPCOMING) {
-            throw new PrewarmWindowClosedException(eventId);
+            throw CatalogErrors.prewarmWindowClosed(eventId);
         }
 
         int seeded = 0;
@@ -398,6 +410,7 @@ public class CatalogService {
      * wrong (ADR-046).
      */
     @Transactional(readOnly = true)
+    @Override
     public Map<Long, Integer> getTierCapacities(long eventId) {
         Map<Long, Integer> capacities = new HashMap<>();
         for (TierRow tier : metadata.tiersUncached(eventId)) {
@@ -412,6 +425,7 @@ public class CatalogService {
      * <p>Deliberately not {@code @Transactional}: the only SQL here is the tier-id lookup, and
      * holding a pooled connection across a Redis round trip buys nothing.
      */
+    @Override
     public Map<Long, Integer> getLiveCounters(long eventId) {
         return stock.readAll(eventId, tierIds(eventId));
     }
@@ -423,6 +437,7 @@ public class CatalogService {
      * to keep in step. The numbers came from the ledger — {@code ticket_tiers} minus what
      * {@code order_items} sold and {@code ticket_holds} is holding — and go straight onto the keys.
      */
+    @Override
     public void applyRebuild(long eventId, Map<Long, Integer> remainingByTier) {
         Map<Long, Integer> before = stock.readAll(eventId, List.copyOf(remainingByTier.keySet()));
 
@@ -441,7 +456,7 @@ public class CatalogService {
     }
 
     private Event requireEvent(long eventId) {
-        return events.findById(eventId).orElseThrow(() -> new EventNotFoundException(eventId));
+        return events.findById(eventId).orElseThrow(() -> CatalogErrors.eventNotFound(eventId));
     }
 
     /**
