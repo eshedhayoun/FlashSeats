@@ -46,9 +46,10 @@ x-app: &app
     FLASHSEATS_ADMIN_USERNAME: ${FLASHSEATS_ADMIN_USERNAME:-admin}
     FLASHSEATS_ADMIN_PASSWORD: ${FLASHSEATS_ADMIN_PASSWORD:-admin}
     FLASHSEATS_COOKIE_SECURE: ${FLASHSEATS_COOKIE_SECURE:-false}
-    STRIPE_API_KEY: ${STRIPE_API_KEY:-}
-    STRIPE_WEBHOOK_SECRET: ${STRIPE_WEBHOOK_SECRET:-}
-    RECAPTCHA_SECRET: ${RECAPTCHA_SECRET:-}
+    # STRIPE_API_KEY, STRIPE_WEBHOOK_SECRET and RECAPTCHA_SECRET were passed here
+    # and read by nothing — no Java code references any of them. An env var the
+    # container receives and ignores reads exactly like one it uses. They come
+    # back with the integrations that need them.
     # The two halves of the concurrent-sales fix, overridable per run, because the
     # drill is a comparison and not a pass/fail (ADR-049, ADR-051). Defaults match
     # application.properties; a baseline run is
