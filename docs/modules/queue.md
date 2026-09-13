@@ -132,6 +132,11 @@ for sid in first `granted` of front:
   lives in another's heap. Without fan-out, roughly two-thirds of promotions vanish on three
   replicas — and the bug is invisible on one (ADR-007).
 
+**A session's state is one Redis round trip**, not four. `GET /queue/status` runs this code and is the
+most-called endpoint in the system by roughly 80× — ~90,000 calls per replica in a 300-VU five-sale run
+— so the round trips there dominate the cluster's CPU in a way nothing else does. `CLOSED` is answered
+before the read, so a finished sale's polling clients cost no Redis at all.
+
 **The tail of a sale is where the oversubscribe factor stops working.** `admittable` subtracts live
 passes and admissions from `floor(remaining × oversubscribeFactor)`, and at one seat remaining that
 product is 1 — so a single outstanding pass whose owner never bought blocks the last seat until the pass
@@ -187,7 +192,7 @@ Closing the draw at a fixed moment is the answer and is not built.
 
 | Gap | Detail |
 | :--- | :--- |
-| **The broadcaster does 3 Redis round trips per connection per tick** | Admission `GET`, pass `GET`, waiting `ZRANK`. The exhausted `EXISTS` is now hoisted to once per event per sweep; the remaining three are per session and not yet pipelined. Measured fine at 2,000 VUs on **one** sale; the cost is linear in connections × events, so `docker/scripts/sse-cadence.sh` at `E = 5` is what decides whether it needs the pipeline |
+| ~~**3 Redis round trips per connection per tick**~~ | **Closed.** One pipelined round trip: admission `GET` + `TTL`, pass `GET`, waiting `ZRANK`, and the exhausted `EXISTS` when a caller has not hoisted it. The reads were always independent — only the state machine is ordered, and it now decides over the values instead of between the calls |
 | **No per-event queue metrics** | `flashseats.queue.admissions` and `flashseats.queue.admission.budget.denied` are built and **untagged**, so they answer "is the cluster promoting?" and not "is *this* sale promoting?". Depth and active SSE connections are still unbuilt (`03` §7) |
 | **No `Last-Event-ID` replay** | The stream sends live state and heartbeats, but does not replay missed frames after a disconnect |
 

@@ -141,6 +141,9 @@ conclusion independently, and a rebuild performed on one releases the event on a
 - Create a counter in `restore`.
 - Let a Lua return code escape the repository.
 - Publish a count, or clamp `COUNTER_UNAVAILABLE` into a number.
+- **Sum an empty tier list and call it zero.** An event with no tiers is *unknowable* inventory, and
+  answering `0` makes the promotion worker mark it exhausted — permanently, since that marker clears
+  only when `remaining > 0`. Every event exists before its tiers do, so this is on the normal path.
 - Move stock inside a SQL transaction.
 - **Cache a window status, or anything else derived from the clock.** Cache the row; derive on read.
 - **Cache a miss.** Rows are inserted out of band by the seed scripts, so a remembered "no such event"

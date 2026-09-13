@@ -253,6 +253,17 @@ public class CatalogService {
         List<Long> tierIds = tierIds(eventId);
         Map<Long, Integer> counters = stock.readAll(eventId, tierIds);
 
+        if (tierIds.isEmpty()) {
+            // An event with NO TIERS is unknowable inventory, not zero inventory. Summing an empty
+            // list answers 0, which the promotion worker reads as sold out -- and it then marks the
+            // event exhausted permanently, because the marker clears only when remaining > 0 and a
+            // tier-less event never reports that. ADR-035's trap, surviving in the one method written
+            // to kill it: the guard below asks "is any counter missing?" and not "is there anything
+            // to count?". Reachable whenever an event exists before its tiers do, which is every
+            // seeder, every fixture and any future create-event endpoint.
+            log.error("Event {} has no tiers; remaining is unknowable, not zero", eventId);
+            return COUNTER_UNAVAILABLE;
+        }
         if (counters.size() < tierIds.size()) {
             log.error("Event {} has tiers with no inventory counter; remaining is unreadable", eventId);
             return COUNTER_UNAVAILABLE;
