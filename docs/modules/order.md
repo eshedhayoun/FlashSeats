@@ -58,6 +58,12 @@ already gone back. An unauthorised caller gets `404`, never `403`.
 **Facade:** `findLatestOrder` (rehydration for `saleflow`) — and nothing else. A `getOrderSummary`
 existed with zero callers anywhere and was deleted in Pass 7.
 
+**Inbound event:** this module listens for `payment`'s `PaymentSettledEvent` — **the only legitimate
+inbound edge into `order`**, and the only cross-module event in the system (ADR-005). It finishes a
+purchase whose buyer never saw the response, by the same `confirm` transaction the synchronous path
+uses, and refuses to confirm an order whose seats are gone (ADR-012, ADR-053). A synchronous edge
+from `payment` would close a cycle and fail the build; the listener is the shape that does not.
+
 ---
 
 ## 4. Checkout, in order
@@ -95,6 +101,11 @@ about a charge they never made. Two rules make it recoverable: every thrown exit
 number** — three declined attempts should not produce three references to explain to support.
 
 **A decline does not release the hold.** The UX promises the buyer they can try another card.
+
+**A 3-D Secure challenge exits at step 6 and re-enters at step 0.** It is thrown, so the existing
+catch-all marks the order `FAILED` — resumable on the same order number, **no attempt consumed** —
+and the buyer completes the challenge and re-POSTs the same body. There is no resume endpoint and
+there must not be one: a second retry path would need its own idempotency story (ADR-054).
 
 ---
 
@@ -150,7 +161,7 @@ exactly what ADR-023 forbids.
 
 | Gap | Detail |
 | :--- | :--- |
-| **Checkout costs eight sequential transactions** | Steps 0, 1, 2, 4, 5, the payment store, 7 and the closing read are each their own connection acquisition. ADR-049 budgets admission against this figure |
+| **Checkout costs nine sequential transactions** | Steps 0, 1, 2, 4, 5, **both** of the payment store's `REQUIRES_NEW` transactions bracketing the gateway call, 7, and the closing read are each their own connection acquisition. ADR-049 budgets admission against this figure, so the count is load-bearing rather than trivia — it was listed as eight here and nine in `06` §9 until Pass 9 |
 | **No outbox lag metric** | `flashseats.outbox.lag.seconds` is specified in `03` §7 and not built; a stalled relay currently surfaces as buyers not receiving tickets |
 
 ---

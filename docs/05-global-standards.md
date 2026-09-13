@@ -88,14 +88,18 @@ means *that opportunity is gone*. The SPA renders different screens.
 One namespace across all modules. `code` values are **stable API contract** — renaming one is a
 breaking change.
 
-**Every code here is reachable, and that is checked in both directions.** Ten were not and have been
-removed: `BOT_VERIFICATION_FAILED`, `IP_BLOCKED`, `NOT_IN_QUEUE`, `QUEUE_PASS_EXPIRED`,
-`QUEUE_UNAVAILABLE`, `SALE_EXHAUSTED`, `PAYMENT_ACTION_REQUIRED`, `WEBHOOK_SIGNATURE_INVALID`,
-`ORDER_ALREADY_CONFIRMED` and `NOTIFICATION_LOG_NOT_FOUND`. An unreachable code is dead contract —
-a client writes a branch for a response the server can never send, and `FE_SPEC.md` §2 had already
-started warning readers off three of them. **A code is added when the path that raises it is, not
-before**; the ones tied to deferred features (the webhook, 3-D Secure, a challenge provider, an IP
-blocklist) return with those features.
+**Every code here is reachable, and that is checked in both directions.** An unreachable code is
+dead contract — a client writes a branch for a response the server can never send, and `FE_SPEC.md`
+§2 had begun warning readers off three of them. **A code is added when the path that raises it is,
+not before.**
+
+Ten were unreachable and were removed in Pass 9. **Six stayed removed**: `NOT_IN_QUEUE`,
+`QUEUE_PASS_EXPIRED`, `QUEUE_UNAVAILABLE`, `SALE_EXHAUSTED`, `ORDER_ALREADY_CONFIRMED` and
+`NOTIFICATION_LOG_NOT_FOUND`. **Four came straight back** — `PAYMENT_ACTION_REQUIRED`,
+`WEBHOOK_SIGNATURE_INVALID`, `BOT_VERIFICATION_FAILED` and `IP_BLOCKED` — when the real gateway, the
+webhook and the IP-rule surface landed in the same week. That is the rule working in both
+directions, and also the caveat on it: **delete a code when its feature is not being built, not
+merely when it is not built yet.**
 
 Three sold-out answers were among them, and their absence is informative: "sold out" reaches the
 waiting room as the `sale-exhausted` SSE frame and the `EXHAUSTED` queue phase, never as an error
@@ -107,6 +111,8 @@ tells the client a state.
 | `VALIDATION_FAILED` | 400 | shared | Fix `violations` and resubmit |
 | `INTERNAL_ERROR` | 500 | shared | Show `traceId`, offer retry |
 | `RATE_LIMITED` | 429 | bot | Back off `retryAfterSeconds` |
+| `BOT_VERIFICATION_FAILED` | 403 | bot | The challenge scored below the threshold. Reload for a fresh token and retry — **never** returned for a provider timeout or outage, which fail open (ADR-011, ADR-055) |
+| `IP_BLOCKED` | 403 | bot | A standing operator decision on this address. Terminal for the client — `retryable` is false; contact support (ADR-055) |
 | `SESSION_INVALID` | 401 | bot | Reload to obtain a fresh `fsid` |
 | `EVENT_NOT_FOUND` | 404 | catalog | — |
 | `TIER_NOT_FOUND` | 404 | catalog | — |
@@ -125,8 +131,10 @@ tells the client a state.
 | `QUANTITY_EXCEEDS_LIMIT` | 422 | hold | Max 6 per order |
 | `PAYMENT_DECLINED` | 402 | payment | Retry — see `attemptsRemaining` |
 | `PAYMENT_ATTEMPTS_EXHAUSTED` | 402 | payment | Terminal |
+| `PAYMENT_ACTION_REQUIRED` | 402 | payment | 3-D Secure. Run `handleNextAction` with the `clientSecret` on the problem document, then **re-POST the same checkout body** — there is no `resumeUrl` and no resume endpoint. Hold retained, **no attempt consumed** (ADR-054) |
 | `PAYMENT_GATEWAY_UNAVAILABLE` | 503 | payment | Circuit open; hold retained, **no payment attempt consumed**, and the retry genuinely works (ADR-034) |
 | `DUPLICATE_PAYMENT` | 409 | payment | A charge is already in flight. Do **not** re-enable the pay button; poll `/sale/{id}/state`. Bounded by `stale-pending-seconds` — it can no longer mean "forever" (ADR-034) |
+| `WEBHOOK_SIGNATURE_INVALID` | 400 | payment | Provider callback only. Never retried — a caller who cannot sign will not do better on the fourth attempt (ADR-053) |
 | `ORDER_NOT_FOUND` | 404 | order | — |
 | `CHECKOUT_WINDOW_CLOSED` | 409 | order | Past the 15-minute grace |
 | `INSUFFICIENT_TIME_REMAINING` | 409 | order | Too little of the hold left to start a charge that could finish (ADR-030). Nothing charged; the order is left resumable |
@@ -266,7 +274,7 @@ A facade is the *only* legal cross-module surface. Every one obeys:
    between the contract and the code honouring it. The service lives in an internal package no
    other module may name, so the interface is still the only visible surface — Modulith checks
    *source-code type references*, not runtime bean types, and `ApplicationModules.verify()` is the
-   proof (ADR-052).
+   proof (ADR-057).
 8. **The graph stays acyclic.** Adding an edge requires checking `ApplicationModules.verify()`.
 
 ### There is no shared write — the inventory counter is catalog's alone

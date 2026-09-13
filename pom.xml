@@ -33,8 +33,8 @@
 		<bucket4j.version>8.14.0</bucket4j.version>
 		<testcontainers.version>1.21.3</testcontainers.version>
 		<pdfbox.version>3.0.7</pdfbox.version>
-		<!-- Pinned versions for Stage 2, kept so re-adding the dependency is a one-line change:
-		     stripe-java 29.2.0 · resilience4j 2.3.0 -->
+		<stripe.version>29.2.0</stripe.version>
+		<resilience4j.version>2.3.0</resilience4j.version>
 	</properties>
 	<dependencies>
 		<dependency>
@@ -115,15 +115,36 @@
 			<version>${bucket4j.version}</version>
 		</dependency>
 		<!--
-			Stripe, Resilience4j and Thymeleaf were declared here ahead of the stages that
-			use them, and none of them is on the classpath for a reason yet:
-
-			  - stripe-java      -> Stage 2, with StripeGateway and the webhook receiver
-			  - resilience4j-*   -> Stage 2, as plain beans (the Boot 3 starter does not apply)
-			  - thymeleaf        -> deferred indefinitely; EmailComposer builds the one small
-			                        HTML body in Java on purpose, and there is no templates/
-			                        directory. Its starter also autoconfigures a view resolver
-			                        into an API that returns nothing but JSON.
+			Stripe. Arrived in Stage 2 with StripePaymentGateway and the webhook receiver.
+			Note it is on the classpath unconditionally but only *used* when
+			flashseats.payment.stripe.enabled is true: dev and test keep the stub, and the
+			webhook receiver's signature verification (com.stripe.net.Webhook) is needed on
+			every profile, because that is how the tests sign their own payloads.
+		-->
+		<dependency>
+			<groupId>com.stripe</groupId>
+			<artifactId>stripe-java</artifactId>
+			<version>${stripe.version}</version>
+		</dependency>
+		<!--
+			Resilience4j as PLAIN artifacts, never the starter: resilience4j-spring-boot3
+			targets Boot 3 and autoconfigures against APIs this application does not have.
+			One CircuitBreaker bean, declared by hand in PaymentGatewayConfig.
+		-->
+		<dependency>
+			<groupId>io.github.resilience4j</groupId>
+			<artifactId>resilience4j-circuitbreaker</artifactId>
+			<version>${resilience4j.version}</version>
+		</dependency>
+		<dependency>
+			<groupId>io.github.resilience4j</groupId>
+			<artifactId>resilience4j-micrometer</artifactId>
+			<version>${resilience4j.version}</version>
+		</dependency>
+		<!--
+			Thymeleaf stays deferred indefinitely; EmailComposer builds the one small HTML
+			body in Java on purpose, and there is no templates/ directory. Its starter also
+			autoconfigures a view resolver into an API that returns nothing but JSON.
 
 			An unused dependency is not free: it ships in the image and it carries CVEs that
 			someone has to triage. They come back with the code that needs them.

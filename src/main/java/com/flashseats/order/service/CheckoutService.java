@@ -11,6 +11,7 @@ import com.flashseats.order.dto.OrderReceiptResponse;
 import com.flashseats.order.exception.OrderErrors;
 import com.flashseats.order.exception.OrderRefundedException;
 import com.flashseats.payment.exception.DuplicatePaymentException;
+import com.flashseats.payment.exception.PaymentActionRequiredException;
 import com.flashseats.payment.exception.PaymentDeclinedException;
 import com.flashseats.payment.facade.AuthorizeCommand;
 import com.flashseats.payment.facade.PaymentFacade;
@@ -59,6 +60,7 @@ public class CheckoutService {
     private final CatalogFacade catalog;
     private final PaymentFacade payments;
     private final OrderCommitService commit;
+    private final OrderRefundService refunds;
     private final OrderQueryService queries;
     private final OrderProperties properties;
     private final Clock clock;
@@ -68,6 +70,7 @@ public class CheckoutService {
             CatalogFacade catalog,
             PaymentFacade payments,
             OrderCommitService commit,
+            OrderRefundService refunds,
             OrderQueryService queries,
             OrderProperties properties,
             Clock clock) {
@@ -75,6 +78,7 @@ public class CheckoutService {
         this.catalog = catalog;
         this.payments = payments;
         this.commit = commit;
+        this.refunds = refunds;
         this.queries = queries;
         this.properties = properties;
         this.clock = clock;
@@ -129,6 +133,15 @@ public class CheckoutService {
                     request.paymentMethodId(),
                     request.idempotencyKey(),
                     order.attemptNumber() + 1));
+
+            // 3-D Secure. Thrown, so the catch-all below marks the order FAILED — resumable on the
+            // same order number, with NO attempt consumed (ADR-034). The buyer completes the
+            // challenge and re-POSTs this same body; there is no resume endpoint, and adding one
+            // would be a second retry mechanism (FE_SPEC §2). The grace extension granted at step 5
+            // is what pays for the challenge window (ADR-030).
+            if (payment.requiresAction()) {
+                throw new PaymentActionRequiredException(payment.clientSecret(), expiresAt);
+            }
 
             if (!payment.succeeded()) {
                 // The hold stays ACTIVE. The buyer was promised they could try another card.
@@ -198,12 +211,7 @@ public class CheckoutService {
 
     private void compensate(
             String orderNumber, PaymentResult payment, long amountCents, RuntimeException cause) {
-        log.error(
-                "Order {} could not be committed after a settled charge — refunding {} cents",
-                orderNumber,
-                amountCents,
-                cause);
-        payments.refund(payment.transactionReference(), amountCents, "order commit failed");
-        commit.markRefunded(orderNumber, cause.getMessage());
+        log.error("Commit failed after a settled charge for order {}", orderNumber, cause);
+        refunds.refund(orderNumber, payment.transactionReference(), amountCents, "order commit failed");
     }
 }
