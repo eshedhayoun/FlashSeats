@@ -7,16 +7,18 @@ import Stack from "@mui/material/Stack";
 import Typography from "@mui/material/Typography";
 import { ApiError } from "../api/errors";
 import { joinQueue } from "../api/endpoints";
-import { useSaleState } from "../sale/useSaleState";
 import { ProblemAlert } from "../shared/ProblemAlert";
 import { EventHeader } from "./EventHeader";
 import { TierCard } from "./TierCard";
 import { useEvent } from "./useEvent";
 
-export function LandingPage() {
+export function LandingPage({
+  onJoined
+}: {
+  onJoined: () => Promise<void>;
+}) {
   const eventId = Number(useParams().eventId);
   const eventResult = useEvent(eventId);
-  const saleResult = useSaleState(eventId);
   const [joining, setJoining] = useState(false);
   const [joinError, setJoinError] = useState<ApiError | null>(null);
   const [selectedTierId, setSelectedTierId] = useState<number | null>(null);
@@ -25,7 +27,7 @@ export function LandingPage() {
     return <ProblemAlert message="This event link is invalid." />;
   }
 
-  if (eventResult.status === "loading" || saleResult.status === "loading") {
+  if (eventResult.status === "loading") {
     return (
       <Container sx={{ py: 8 }}>
         <CircularProgress aria-label="Loading event" />
@@ -53,7 +55,7 @@ export function LandingPage() {
     setJoinError(null);
     try {
       await joinQueue({ eventId });
-      await saleResult.refresh();
+      await onJoined();
     } catch (cause) {
       setJoinError(
         cause instanceof ApiError
@@ -76,9 +78,6 @@ export function LandingPage() {
       <Stack spacing={3}>
         <EventHeader event={event} />
         {joinError && <ProblemAlert message={joinError.message} />}
-        {saleResult.error && (
-          <ProblemAlert message="Some sale state is temporarily unavailable. Retrying is safe." />
-        )}
         <Stack spacing={1.5}>
           <Typography component="h2" variant="h5">
             Tiers

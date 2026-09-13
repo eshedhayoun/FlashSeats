@@ -1,5 +1,5 @@
-import { useEffect, useState } from "react";
-import { useParams, useSearchParams } from "react-router-dom";
+import { useEffect, useRef, useState } from "react";
+import { useNavigate, useParams, useSearchParams } from "react-router-dom";
 import Alert from "@mui/material/Alert";
 import Button from "@mui/material/Button";
 import Card from "@mui/material/Card";
@@ -9,13 +9,14 @@ import Container from "@mui/material/Container";
 import Divider from "@mui/material/Divider";
 import Stack from "@mui/material/Stack";
 import Typography from "@mui/material/Typography";
-import { downloadTicket, getOrder } from "../api/endpoints";
+import { downloadTicket, getEvent, getOrder } from "../api/endpoints";
 import { ApiError } from "../api/errors";
 import type { OrderReceipt } from "../api/types";
 import { rememberOrder } from "../sale/storage";
 
 export function ConfirmationPage() {
   const { orderNumber = "" } = useParams();
+  const navigate = useNavigate();
   const [searchParams] = useSearchParams();
   const receiptToken = searchParams.get("receiptToken") ?? undefined;
   const [receipt, setReceipt] = useState<OrderReceipt | null>(null);
@@ -23,6 +24,9 @@ export function ConfirmationPage() {
   const [error, setError] = useState<ApiError | null>(null);
   const [downloadError, setDownloadError] = useState<string | null>(null);
   const [downloading, setDownloading] = useState(false);
+  const [ticketReady, setTicketReady] = useState(false);
+  const retryTimer = useRef<number | null>(null);
+  const eventId = receipt?.items[0]?.eventId;
 
   useEffect(() => {
     let active = true;
@@ -31,7 +35,19 @@ export function ConfirmationPage() {
       .then((nextReceipt) => {
         if (!active) return;
         setReceipt(nextReceipt);
-        rememberOrder(nextReceipt, "FlashSeats event");
+        const eventId = nextReceipt.items[0]?.eventId;
+        if (eventId == null) {
+          rememberOrder(nextReceipt, "FlashSeats event");
+          return;
+        }
+
+        void getEvent(eventId)
+          .then((event) => {
+            if (active) rememberOrder(nextReceipt, event.title);
+          })
+          .catch(() => {
+            if (active) rememberOrder(nextReceipt, "FlashSeats event");
+          });
       })
       .catch((cause: unknown) => {
         if (!active) return;
@@ -56,6 +72,39 @@ export function ConfirmationPage() {
     };
   }, [orderNumber, receiptToken]);
 
+  useEffect(() => {
+    return () => {
+      if (retryTimer.current !== null) {
+        window.clearInterval(retryTimer.current);
+      }
+    };
+  }, []);
+
+  const stopTicketPolling = () => {
+    if (retryTimer.current !== null) {
+      window.clearInterval(retryTimer.current);
+      retryTimer.current = null;
+    }
+  };
+
+  const pollTicket = () => {
+    stopTicketPolling();
+    retryTimer.current = window.setInterval(() => {
+      void downloadTicket(orderNumber, receiptToken)
+        .then((blob) => {
+          void blob;
+          setTicketReady(true);
+          setDownloadError(null);
+          stopTicketPolling();
+        })
+        .catch((cause: unknown) => {
+          if (!(cause instanceof ApiError) || !cause.retryable) {
+            stopTicketPolling();
+          }
+        });
+    }, 3000);
+  };
+
   const download = async () => {
     setDownloading(true);
     setDownloadError(null);
@@ -67,6 +116,8 @@ export function ConfirmationPage() {
       link.download = `${orderNumber}.pdf`;
       link.click();
       URL.revokeObjectURL(url);
+      setTicketReady(true);
+      stopTicketPolling();
     } catch (cause) {
       if (cause instanceof ApiError && cause.code === "TICKET_NOT_AVAILABLE") {
         setDownloadError(
@@ -74,6 +125,8 @@ export function ConfirmationPage() {
             ? "Your ticket is still being prepared. Try again in a moment."
             : "Your ticket could not be generated. Please contact support."
         );
+        setTicketReady(false);
+        if (cause.retryable) pollTicket();
       } else if (cause instanceof ApiError) {
         setDownloadError(cause.message);
       } else {
@@ -148,8 +201,9 @@ export function ConfirmationPage() {
           </CardContent>
         </Card>
         <Alert severity="success">
-          We&apos;re sending your tickets to <strong>{receipt.userEmail}</strong>.
-          They usually arrive within a minute.
+          Your receipt and tickets are being sent to{" "}
+          <strong>{receipt.userEmail}</strong> by email. They usually arrive
+          within a minute.
         </Alert>
         {downloadError && <Alert severity="info">{downloadError}</Alert>}
         <Button
@@ -164,6 +218,19 @@ export function ConfirmationPage() {
             "Download ticket"
           )}
         </Button>
+        {ticketReady && (
+          <Typography color="success.main">
+            Your ticket is ready to download.
+          </Typography>
+        )}
+        {eventId != null && (
+          <Button
+            variant="outlined"
+            onClick={() => navigate(`/events/${eventId}?buyMore=1`)}
+          >
+            Buy more tickets for this event
+          </Button>
+        )}
       </Stack>
     </Container>
   );

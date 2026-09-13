@@ -4,7 +4,7 @@ import CardContent from "@mui/material/CardContent";
 import Container from "@mui/material/Container";
 import Stack from "@mui/material/Stack";
 import Typography from "@mui/material/Typography";
-import type { SaleQueueState } from "../api/types";
+import type { Availability, SaleQueueState } from "../api/types";
 import { useQueueStream } from "./useQueueStream";
 
 export function QueuePage({
@@ -17,6 +17,7 @@ export function QueuePage({
   onRefresh: () => void;
 }) {
   const stream = useQueueStream(eventId, onRefresh);
+  const availability = stream.availability?.tiers ?? [];
 
   return (
     <Container maxWidth="sm" sx={{ py: 8 }}>
@@ -41,6 +42,16 @@ export function QueuePage({
                 ? "Connected"
                 : "Reconnecting — your place is saved"}
             </Typography>
+            {availability.length > 0 && (
+              <Stack spacing={1} width="100%" aria-label="Live ticket availability">
+                <Typography variant="subtitle2">Live availability</Typography>
+                {availability.map((tier) => (
+                  <Typography key={tier.tierId} color={availabilityColor(tier.level)}>
+                    Tier {tier.tierId}: {availabilityLabel(tier.level)}
+                  </Typography>
+                ))}
+              </Stack>
+            )}
             <Button variant="outlined" onClick={onRefresh}>
               Refresh status
             </Button>
@@ -49,4 +60,24 @@ export function QueuePage({
       </Card>
     </Container>
   );
+}
+
+function availabilityLabel(level: Availability): string {
+  return level === "SOLD_OUT"
+    ? "Sold out"
+    : level === "UNKNOWN"
+      ? "Temporarily unavailable"
+      : level === "LIMITED"
+        ? "Limited"
+        : "Available";
+}
+
+function availabilityColor(level: Availability) {
+  return level === "SOLD_OUT"
+    ? "text.secondary"
+    : level === "UNKNOWN"
+      ? "warning.main"
+      : level === "LIMITED"
+        ? "warning.dark"
+        : "success.main";
 }

@@ -12,7 +12,10 @@ export type UseSaleStateResult = {
   refresh: () => Promise<void>;
 };
 
-export function useSaleState(eventId: number): UseSaleStateResult {
+export function useSaleState(
+  eventId: number,
+  options: { buyMore?: boolean } = {}
+): UseSaleStateResult {
   const [status, setStatus] = useState<SaleStateStatus>("idle");
   const [data, setData] = useState<BootstrappedSale | null>(null);
   const [error, setError] = useState<ApiError | null>(null);
@@ -22,7 +25,7 @@ export function useSaleState(eventId: number): UseSaleStateResult {
     setError(null);
 
     try {
-      const next = await bootstrapSale(eventId);
+      const next = await bootstrapSale(eventId, options);
       setData(next);
       setStatus("ready");
     } catch (cause) {
@@ -39,7 +42,7 @@ export function useSaleState(eventId: number): UseSaleStateResult {
       setError(nextError);
       setStatus("error");
     }
-  }, [eventId]);
+  }, [eventId, options.buyMore]);
 
   useEffect(() => {
     void refresh();

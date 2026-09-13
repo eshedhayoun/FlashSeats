@@ -4,14 +4,12 @@ import CircularProgress from "@mui/material/CircularProgress";
 import Container from "@mui/material/Container";
 import FormControl from "@mui/material/FormControl";
 import FormHelperText from "@mui/material/FormHelperText";
-import InputLabel from "@mui/material/InputLabel";
-import MenuItem from "@mui/material/MenuItem";
-import Select, { type SelectChangeEvent } from "@mui/material/Select";
+import TextField from "@mui/material/TextField";
 import Stack from "@mui/material/Stack";
 import Typography from "@mui/material/Typography";
 import { createHold } from "../api/endpoints";
 import { ApiError } from "../api/errors";
-import type { EventDetails } from "../api/types";
+import type { EventDetails, HoldResponse } from "../api/types";
 import { Countdown } from "../shared/Countdown";
 import { setHoldToken, getAdmissionToken } from "../sale/storage";
 import { TierCard } from "../landing/TierCard";
@@ -20,15 +18,17 @@ export function SeatSelectionPage({
   event,
   eventId,
   admissionExpiresAt,
-  onRefresh
+  onRefresh,
+  onHoldCreated
 }: {
   event: EventDetails;
   eventId: number;
   admissionExpiresAt: string | null;
-  onRefresh: () => void;
+  onRefresh: () => Promise<void>;
+  onHoldCreated: (hold: HoldResponse) => void;
 }) {
   const [selectedTierId, setSelectedTierId] = useState<number | null>(null);
-  const [quantity, setQuantity] = useState(1);
+  const [quantity, setQuantity] = useState("1");
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const selectedTier = useMemo(
@@ -40,12 +40,25 @@ export function SeatSelectionPage({
     const tier = event.tiers.find((candidate) => candidate.tierId === tierId);
     if (!tier) return;
     setSelectedTierId(tier.tierId);
-    setQuantity((current) => Math.min(current, tier.maxPerOrder));
+    setQuantity((current) => {
+      const parsed = Number(current);
+      return String(Number.isInteger(parsed) ? Math.min(parsed, tier.maxPerOrder) : 1);
+    });
     setError(null);
   };
 
   const submit = async () => {
     if (!selectedTier) return;
+
+    const requestedQuantity = Number(quantity);
+    if (
+      !Number.isInteger(requestedQuantity) ||
+      requestedQuantity < 1 ||
+      requestedQuantity > selectedTier.maxPerOrder
+    ) {
+      setError(`Enter a whole number from 1 to ${selectedTier.maxPerOrder}.`);
+      return;
+    }
 
     const admissionToken = getAdmissionToken(eventId);
     if (!admissionToken) {
@@ -58,11 +71,12 @@ export function SeatSelectionPage({
     setError(null);
     try {
       const hold = await createHold(
-        { eventId, tierId: selectedTier.tierId, quantity },
+        { eventId, tierId: selectedTier.tierId, quantity: requestedQuantity },
         admissionToken
       );
       setHoldToken(eventId, hold.holdToken);
-      onRefresh();
+      onHoldCreated(hold);
+      await onRefresh();
     } catch (cause) {
       if (!(cause instanceof ApiError)) {
         setError("Those seats could not be reserved. Please try again.");
@@ -71,7 +85,7 @@ export function SeatSelectionPage({
         onRefresh();
       } else if (cause.code === "QUANTITY_EXCEEDS_LIMIT") {
         const serverLimit = selectedTier.maxPerOrder;
-        setQuantity(serverLimit);
+        setQuantity(String(serverLimit));
         setError(`The maximum for this tier is ${serverLimit}.`);
       } else if (cause.code === "HOLD_LIMIT_EXCEEDED") {
         setError("This session already holds seats. Rechecking your reservation…");
@@ -88,10 +102,6 @@ export function SeatSelectionPage({
       setSubmitting(false);
     }
   };
-
-  const quantityOptions = selectedTier
-    ? Array.from({ length: selectedTier.maxPerOrder }, (_, index) => index + 1)
-    : [];
 
   return (
     <Container maxWidth="sm" sx={{ py: 6 }}>
@@ -122,24 +132,22 @@ export function SeatSelectionPage({
         </Stack>
 
         <FormControl disabled={!selectedTier || submitting}>
-          <InputLabel id="quantity-label">Quantity</InputLabel>
-          <Select
-            labelId="quantity-label"
-            value={String(quantity)}
-            label="Quantity"
-            onChange={(event: SelectChangeEvent) =>
-              setQuantity(Number(event.target.value))
-            }
-          >
-            {quantityOptions.map((value) => (
-              <MenuItem key={value} value={value}>
-                {value}
-              </MenuItem>
-            ))}
-          </Select>
+          <TextField
+            label="Number of tickets"
+            type="number"
+            value={quantity}
+            onChange={(event) => setQuantity(event.target.value)}
+            inputProps={{
+              min: 1,
+              max: selectedTier?.maxPerOrder,
+              step: 1,
+              inputMode: "numeric"
+            }}
+            fullWidth
+          />
           <FormHelperText>
             {selectedTier
-              ? `Up to ${selectedTier.maxPerOrder} per order`
+              ? `Enter 1 to ${selectedTier.maxPerOrder} tickets`
               : "Select a tier first"}
           </FormHelperText>
         </FormControl>

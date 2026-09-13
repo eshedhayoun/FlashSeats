@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import Alert from "@mui/material/Alert";
 import Button from "@mui/material/Button";
 import Card from "@mui/material/Card";
@@ -12,6 +12,10 @@ import { checkout, releaseHold } from "../api/endpoints";
 import { ApiError } from "../api/errors";
 import type { EventDetails, ActiveHold } from "../api/types";
 import { Countdown } from "../shared/Countdown";
+import { serverClock } from "../clock/serverClock";
+import { useClockTick } from "../clock/useClockTick";
+import { decideTimerZero } from "./checkoutTimer";
+import { checkoutErrorState } from "./checkoutErrorState";
 import {
   clearHoldStorage,
   getIdempotencyKey,
@@ -31,6 +35,7 @@ export function CheckoutPage({
   onRefresh: () => void;
   onCompleted: (orderNumber: string) => void;
 }) {
+  useClockTick();
   const tier = event.tiers.find((candidate) => candidate.tierId === hold.tierId);
   const [email, setEmail] = useState("");
   const [paymentMethodId, setPaymentMethodId] = useState("pm_card_visa");
@@ -39,6 +44,7 @@ export function CheckoutPage({
   const [messageSeverity, setMessageSeverity] = useState<"error" | "info">("error");
   const [payDisabled, setPayDisabled] = useState(false);
   const [duplicatePayment, setDuplicatePayment] = useState(false);
+  const timerCheckForHold = useRef<string | null>(null);
 
   const total = useMemo(
     () => (tier ? (tier.priceCents * hold.quantity) / 100 : null),
@@ -50,6 +56,27 @@ export function CheckoutPage({
     const timer = window.setInterval(onRefresh, 2000);
     return () => window.clearInterval(timer);
   }, [duplicatePayment, onRefresh]);
+
+  useEffect(() => {
+    if (serverClock.remainingMs(hold.expiresAt) > 0) {
+      timerCheckForHold.current = null;
+      return;
+    }
+
+    const paymentInFlight = submitting || duplicatePayment;
+    if (decideTimerZero(paymentInFlight) === "complete-payment") {
+      setMessage("Completing your purchase…");
+      setMessageSeverity("info");
+      setPayDisabled(true);
+      return;
+    }
+
+    if (timerCheckForHold.current === hold.holdToken) return;
+    timerCheckForHold.current = hold.holdToken;
+    setMessage("Checking your reservation…");
+    setMessageSeverity("info");
+    void onRefresh();
+  }, [duplicatePayment, hold.expiresAt, hold.holdToken, onRefresh, submitting]);
 
   const submit = async () => {
     const holdToken = getHoldToken(eventId) ?? hold.holdToken;
@@ -78,62 +105,16 @@ export function CheckoutPage({
         setMessage("That payment could not be completed. Please try again.");
         setPayDisabled(false);
       } else {
-        handleCheckoutError(cause);
+        const next = checkoutErrorState(cause);
+        setMessage(next.message);
+        setMessageSeverity(next.severity);
+        setPayDisabled(next.payDisabled);
+        setDuplicatePayment(next.duplicatePayment);
+        if (next.clearHold) clearHoldStorage(eventId, hold.holdToken);
+        if (next.refreshSale) onRefresh();
       }
     } finally {
       setSubmitting(false);
-    }
-  };
-
-  const handleCheckoutError = (error: ApiError) => {
-    switch (error.code) {
-      case "PAYMENT_DECLINED":
-        setMessage(
-          `${error.message} Your seats are still held${
-            error.problem.attemptsRemaining == null
-              ? ""
-              : ` — ${error.problem.attemptsRemaining} attempt(s) left`
-          }.`
-        );
-        setPayDisabled(false);
-        return;
-      case "PAYMENT_GATEWAY_UNAVAILABLE":
-        setMessage(
-          `${error.message} The payment provider is having trouble. Your seats are held.`
-        );
-        setPayDisabled(false);
-        return;
-      case "PAYMENT_ATTEMPTS_EXHAUSTED":
-        setMessage(`${error.message} Release your seats to start over.`);
-        setPayDisabled(true);
-        return;
-      case "DUPLICATE_PAYMENT":
-        setMessage("Finishing a payment that is already in progress…");
-        setMessageSeverity("info");
-        setPayDisabled(true);
-        setDuplicatePayment(true);
-        return;
-      case "INSUFFICIENT_TIME_REMAINING":
-        setMessage(`${error.message} Release your seats and reserve again.`);
-        setPayDisabled(true);
-        return;
-      case "HOLD_EXPIRED":
-        clearHoldStorage(eventId, hold.holdToken);
-        setMessage("Your reservation expired. Nothing was charged.");
-        setPayDisabled(true);
-        onRefresh();
-        return;
-      case "ORDER_REFUNDED":
-        clearHoldStorage(eventId, hold.holdToken);
-        setMessage(
-          `${error.message} The charge succeeded but was refunded.`
-        );
-        setPayDisabled(true);
-        onRefresh();
-        return;
-      default:
-        setMessage(error.message);
-        setPayDisabled(false);
     }
   };
 

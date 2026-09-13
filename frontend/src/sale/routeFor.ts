@@ -16,7 +16,10 @@ function isPartial(state: SaleState, section: string) {
   return state.partial.includes(section);
 }
 
-export function routeFor(state: SaleState): SaleRoute {
+export function routeFor(
+  state: SaleState,
+  options: { buyMore?: boolean } = {}
+): SaleRoute {
   if (state.hold) {
     return { view: "checkout", hold: state.hold };
   }
@@ -44,7 +47,7 @@ export function routeFor(state: SaleState): SaleRoute {
     return { view: "queue", queue: state.queue };
   }
 
-  if (state.order?.status === "CONFIRMED") {
+  if (!options.buyMore && state.order?.status === "CONFIRMED") {
     return {
       view: "confirmation",
       orderNumber: state.order.orderNumber
