@@ -2,9 +2,14 @@ package com.flashseats.queue.service;
 
 import com.flashseats.catalog.facade.CatalogFacade;
 import com.flashseats.queue.config.QueueProperties;
+import io.micrometer.core.instrument.Counter;
+import io.micrometer.core.instrument.MeterRegistry;
 import java.time.Clock;
 import java.time.Duration;
 import java.time.Instant;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
@@ -17,12 +22,14 @@ import tools.jackson.databind.ObjectMapper;
 /**
  * Lets buyers out of the waiting room, at a rate the rest of the system can absorb.
  *
- * <p><strong>Two independent limits apply, and both matter.</strong> Admission control bounds
- * admission by <em>inventory</em> — promoting people into a sold-out sale just makes them wait
- * twenty minutes for a {@code 409} (ADR-008). The batch size bounds it by <em>capacity to serve</em>
- * — a tier with 5,000 seats left would otherwise admit 5,000 buyers into a checkout path backed by
- * 30 database connections, and under virtual threads nothing errors, requests simply pile up on the
- * pool while p99 collapses (ADR-028).
+ * <p><strong>Three independent limits apply, and all of them matter.</strong> Admission control
+ * bounds admission by <em>inventory</em> — promoting people into a sold-out sale just makes them
+ * wait twenty minutes for a {@code 409} (ADR-008). The batch size bounds one sale by <em>capacity to
+ * serve</em> — a tier with 5,000 seats left would otherwise admit 5,000 buyers into a checkout path
+ * backed by 30 database connections, and under virtual threads nothing errors, requests simply pile
+ * up on the pool while p99 collapses (ADR-028). And {@link GlobalPromotionBudget} bounds the
+ * <em>cluster</em>, because that pool is shared by every open sale and the batch size never was
+ * (ADR-049).
  *
  * <p><strong>Nobody is ever evicted.</strong> An abandoned entry reaches the front, is promoted,
  * never claims its pass, and that pass expires in two minutes — capacity comes back on its own. The
@@ -43,6 +50,9 @@ public class PromotionWorker {
     private final ObjectMapper json;
     private final Clock clock;
 
+    private final Counter admitted;
+    private final Counter budgetDenied;
+
     public PromotionWorker(
             StringRedisTemplate redis,
             CatalogFacade catalog,
@@ -50,7 +60,8 @@ public class PromotionWorker {
             QueueProperties properties,
             GlobalPromotionBudget globalBudget,
             ObjectMapper json,
-            Clock clock) {
+            Clock clock,
+            MeterRegistry meters) {
         this.redis = redis;
         this.catalog = catalog;
         this.tokens = tokens;
@@ -58,13 +69,39 @@ public class PromotionWorker {
         this.globalBudget = globalBudget;
         this.json = json;
         this.clock = clock;
+
+        // Without these two the new limit is invisible: "admitted slowly" and "nobody waiting" look
+        // identical from the outside, and the budget is a number somebody has to be able to tune.
+        this.admitted = Counter.builder("flashseats.queue.admissions")
+                .description("Buyers let out of a waiting room")
+                .register(meters);
+        this.budgetDenied = Counter.builder("flashseats.queue.admission.budget.denied")
+                .description("Buyers the cluster admission budget held back this tick (ADR-049)")
+                .register(meters);
     }
 
+    /**
+     * <strong>The order is shuffled, and that is what makes the shared budget fair.</strong>
+     *
+     * <p>Every replica reads the open events in the same ascending order, and the budget is claimed
+     * as each sale is reached. Iterating in a fixed order therefore lets the lowest event id take the
+     * whole allowance every second while the others get nothing — at {@code E = 5} that is one sale
+     * draining and four frozen. ADR-049's secondary cap does not help: once the cluster budget is
+     * smaller than {@code promotion-batch-size}, the per-event cap never binds.
+     *
+     * <p>A shuffle costs one line and gives every sale an equal chance of being served first, while
+     * still letting a busy sale use an allowance its quiet neighbours did not claim. Dividing the
+     * budget by {@code E} instead is the thing ADR-049 explicitly rejects — with four quiet sales it
+     * would cap the busy one at a fifth of what the cluster can serve.
+     */
     @Scheduled(
             fixedDelayString = "${flashseats.queue.promotion-interval-ms}",
             initialDelayString = "${flashseats.queue.promotion-interval-ms}")
     public void tick() {
-        for (long eventId : catalog.findOpenEventIds()) {
+        List<Long> openEvents = new ArrayList<>(catalog.findOpenEventIds());
+        Collections.shuffle(openEvents);
+
+        for (long eventId : openEvents) {
             try {
                 promote(eventId);
             } catch (RuntimeException failure) {
@@ -131,7 +168,13 @@ public class PromotionWorker {
             return;
         }
 
+        // Claimed against real demand, not against the cap: a sale with three people waiting asks
+        // for three, so the rest of the cluster's allowance stays available to the sales that can
+        // use it (ADR-049).
         long budgeted = globalBudget.claim(front.size());
+        if (budgeted < front.size()) {
+            budgetDenied.increment(front.size() - Math.max(budgeted, 0));
+        }
         if (budgeted <= 0) {
             return;
         }
@@ -144,6 +187,7 @@ public class PromotionWorker {
             issuePass(eventId, sessionId, now);
             promoted++;
         }
+        admitted.increment(promoted);
         log.debug("Promoted {} session(s) for event {}", promoted, eventId);
     }
 

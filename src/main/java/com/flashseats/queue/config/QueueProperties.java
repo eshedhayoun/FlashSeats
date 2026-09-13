@@ -28,17 +28,25 @@ public class QueueProperties {
     private int promotionBatchSize = 45;
 
     /**
-     * Cluster-wide database connection budget available to promoted buyers each promotion interval
-     * (ADR-049). This is shared across every open sale; {@link #promotionBatchSize} remains the
-     * per-event fairness cap.
+     * Buyers the whole cluster may admit in one promotion interval, shared across every open sale
+     * (ADR-049). {@link #promotionBatchSize} stays as the per-sale cap.
+     *
+     * <p><strong>45, for the same reason as the batch size above:</strong> ADR-028's
+     * {@code hikariMax × 1.5}, re-scoped from one sale to the whole cluster. That is the arithmetic the
+     * design already justified; ADR-049's only correction is which scope it applies at.
+     *
+     * <p>It replaces a two-property derivation — cluster connections ÷ connections per buyer, 90 ÷ 8 —
+     * whose <em>units did not work</em>: dividing a concurrency by a count of transactions yields
+     * neither, and the 11 it produced was treated as a rate. Measured, 11 per tick left
+     * {@code hikaricp_connections_pending} peaking at 10 of 90 while denying ten admissions for every
+     * one it granted, and five sales of 500 seats sold 76 % instead of selling out.
+     *
+     * <p>Raise it only against the instruments, never by argument: the ceiling is where
+     * {@code hikaricp_connections_pending} stops returning to zero, and
+     * {@code flashseats.queue.admission.budget.denied} staying high while the pool sits idle means
+     * there is room.
      */
-    private int globalAdmissionConnectionBudget = 90;
-
-    /**
-     * Estimated database connection cost of one buyer admitted into checkout (ADR-049). The global
-     * admission count per tick is {@code globalAdmissionConnectionBudget / databaseConnectionsPerBuyer}.
-     */
-    private int databaseConnectionsPerBuyer = 8;
+    private int globalAdmissionBudgetPerTick = 45;
 
     /**
      * Hold-to-order conversion is well under 100%, so admitting exactly {@code remainingStock}
@@ -104,27 +112,12 @@ public class QueueProperties {
         this.promotionBatchSize = promotionBatchSize;
     }
 
-    public int getGlobalAdmissionConnectionBudget() {
-        return globalAdmissionConnectionBudget;
-    }
-
-    public void setGlobalAdmissionConnectionBudget(int globalAdmissionConnectionBudget) {
-        this.globalAdmissionConnectionBudget = globalAdmissionConnectionBudget;
-    }
-
-    public int getDatabaseConnectionsPerBuyer() {
-        return databaseConnectionsPerBuyer;
-    }
-
-    public void setDatabaseConnectionsPerBuyer(int databaseConnectionsPerBuyer) {
-        this.databaseConnectionsPerBuyer = databaseConnectionsPerBuyer;
-    }
-
     public long getGlobalAdmissionBudgetPerTick() {
-        if (globalAdmissionConnectionBudget <= 0 || databaseConnectionsPerBuyer <= 0) {
-            return 0;
-        }
-        return globalAdmissionConnectionBudget / databaseConnectionsPerBuyer;
+        return globalAdmissionBudgetPerTick;
+    }
+
+    public void setGlobalAdmissionBudgetPerTick(int globalAdmissionBudgetPerTick) {
+        this.globalAdmissionBudgetPerTick = globalAdmissionBudgetPerTick;
     }
 
     public double getOversubscribeFactor() {

@@ -13,19 +13,18 @@ import com.flashseats.catalog.facade.EventWindowStatus;
 import com.flashseats.catalog.facade.ReserveResult;
 import com.flashseats.catalog.facade.TierAvailability;
 import com.flashseats.catalog.facade.TierSummary;
+import com.flashseats.catalog.model.AvailabilityLevel;
 import com.flashseats.catalog.model.Event;
 import com.flashseats.catalog.model.EventStatus;
-import com.flashseats.catalog.model.TicketTier;
 import com.flashseats.catalog.repository.EventRepository;
 import com.flashseats.catalog.repository.StockCounterRepository;
-import com.flashseats.catalog.repository.TicketTierRepository;
 import java.time.Clock;
 import java.time.Instant;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.concurrent.ConcurrentHashMap;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.context.ApplicationEventPublisher;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
@@ -42,41 +41,42 @@ public class CatalogService {
     public static final int COUNTER_UNAVAILABLE = -1;
 
     private final EventRepository events;
-    private final TicketTierRepository tiers;
     private final StockCounterRepository stock;
     private final StockEpoch epoch;
+    private final CatalogMetadata metadata;
+    private final ApplicationEventPublisher publisher;
     private final CatalogProperties properties;
     private final Clock clock;
-    private final Map<Long, Event> eventCache = new ConcurrentHashMap<>();
-    private final Map<Long, List<TicketTier>> tierCache = new ConcurrentHashMap<>();
 
     public CatalogService(
             EventRepository events,
-            TicketTierRepository tiers,
             StockCounterRepository stock,
             StockEpoch epoch,
+            CatalogMetadata metadata,
+            ApplicationEventPublisher publisher,
             CatalogProperties properties,
             Clock clock) {
         this.events = events;
-        this.tiers = tiers;
         this.stock = stock;
         this.epoch = epoch;
+        this.metadata = metadata;
+        this.publisher = publisher;
         this.properties = properties;
         this.clock = clock;
     }
 
     // ---------------------------------------------------------------- browse
 
-    @Transactional(readOnly = true)
     public List<EventListItemResponse> listEvents() {
         Instant now = clock.instant();
-        return events.findByStatusOrderBySaleStartTimeAsc(EventStatus.PUBLISHED).stream()
+        return metadata.selectableEvents().stream()
+                .filter(event -> event.status() == EventStatus.PUBLISHED)
                 .map(event -> new EventListItemResponse(
-                        event.getId(),
-                        event.getTitle(),
-                        event.getVenueName(),
-                        event.getEventStartTime(),
-                        event.getSaleStartTime(),
+                        event.id(),
+                        event.title(),
+                        event.venueName(),
+                        event.eventStartTime(),
+                        event.saleStartTime(),
                         SaleWindows.statusOf(event, now)))
                 .toList();
     }
@@ -87,29 +87,31 @@ public class CatalogService {
      * <p>Deliberately not wrapped in one transaction: the counters live in Redis now, and holding a
      * pooled database connection open across that round trip — on the single hottest endpoint in the
      * system — would spend the connection pool on a read that needs no consistency between the
-     * event's metadata and its inventory.
+     * event's metadata and its inventory. With the metadata cache warm it takes no connection at all
+     * (ADR-051).
      */
     public EventDetailResponse getEventDetail(long eventId) {
-        Event event = cachedEvent(eventId);
+        EventRow event = metadata.event(eventId);
         Instant now = clock.instant();
-        List<TicketTier> eventTiers = cachedTiers(eventId);
+        List<TierRow> eventTiers = metadata.tiers(eventId);
 
         // One round trip for every counter, not one per tier: every visitor loads this before the
         // sale and reloads it while they wait.
         Map<Long, Integer> remainingByTier =
-                stock.readAll(eventId, eventTiers.stream().map(TicketTier::getId).toList());
+                stock.readAll(eventId, eventTiers.stream().map(TierRow::id).toList());
 
-        List<TierResponse> tierResponses =
-                eventTiers.stream().map(tier -> toTierResponse(tier, remainingByTier)).toList();
+        List<TierResponse> tierResponses = eventTiers.stream()
+                .map(tier -> toTierResponse(tier, remainingByTier))
+                .toList();
 
         return new EventDetailResponse(
-                event.getId(),
-                event.getTitle(),
-                event.getDescription(),
-                event.getVenueName(),
-                event.getEventStartTime(),
-                event.getSaleStartTime(),
-                event.getSaleEndTime(),
+                event.id(),
+                event.title(),
+                event.description(),
+                event.venueName(),
+                event.eventStartTime(),
+                event.saleStartTime(),
+                event.saleEndTime(),
                 SaleWindows.statusOf(event, now),
                 now,
                 tierResponses);
@@ -117,55 +119,79 @@ public class CatalogService {
 
     // ----------------------------------------------------------- facade reads
 
-    @Transactional(readOnly = true)
     public TierSummary getTierSummary(long eventId, long tierId) {
-        Event event = cachedEvent(eventId);
-        TicketTier tier = cachedTiers(eventId).stream()
-                .filter(t -> t.getId().equals(tierId))
+        EventRow event = metadata.event(eventId);
+        TierRow tier = metadata.tiers(eventId).stream()
+                .filter(candidate -> candidate.id() == tierId)
                 .findFirst()
                 .orElseThrow(() -> new TierNotFoundException(eventId, tierId));
 
         return new TierSummary(
                 eventId,
-                tier.getId(),
-                tier.getTierName(),
-                tier.getPriceCents(),
-                tier.getCurrency(),
-                tier.getMaxPerOrder(),
-                event.getTitle(),
-                event.getVenueName(),
-                event.getEventStartTime(),
-                event.getSaleEndTime(),
+                tier.id(),
+                tier.tierName(),
+                tier.priceCents(),
+                tier.currency(),
+                tier.maxPerOrder(),
+                event.title(),
+                event.venueName(),
+                event.eventStartTime(),
+                event.saleEndTime(),
                 SaleWindows.statusOf(event, clock.instant()));
     }
 
-    @Transactional(readOnly = true)
     public EventSummary getEventSummary(long eventId) {
-        Event event = cachedEvent(eventId);
+        EventRow event = metadata.event(eventId);
         return new EventSummary(
-                event.getId(),
-                event.getTitle(),
-                event.getVenueName(),
-                event.getEventStartTime(),
-                event.getSaleStartTime(),
-                event.getSaleEndTime(),
+                event.id(),
+                event.title(),
+                event.venueName(),
+                event.eventStartTime(),
+                event.saleStartTime(),
+                event.saleEndTime(),
                 SaleWindows.statusOf(event, clock.instant()));
     }
 
-    @Transactional(readOnly = true)
     public EventWindowStatus getWindowStatus(long eventId) {
-        return SaleWindows.statusOf(cachedEvent(eventId), clock.instant());
+        return SaleWindows.statusOf(metadata.event(eventId), clock.instant());
     }
 
-    @Transactional(readOnly = true)
+    /**
+     * Ids of events inside their sale window right now — what the promotion worker ticks over.
+     *
+     * <p><strong>Served from the metadata cache, and that is a correctness choice rather than a
+     * performance one.</strong> This was a query per tick per replica — trivial in cost and fatal in
+     * dependency: under pool pressure the promoter queued for a connection behind the very buyers it
+     * existed to admit, one wait measured at 16 seconds inside a one-second tick. Nobody promoted means
+     * the waiting room does not drain, which means the buyers keep polling (ADR-051).
+     *
+     * <p>The window is still compared against the live clock; only the rows are remembered.
+     */
     public List<Long> findOpenEventIds() {
-        return events.findOpenEventIds(clock.instant());
+        Instant now = clock.instant();
+        return metadata.selectableEvents().stream()
+                .filter(event -> event.status() == EventStatus.PUBLISHED)
+                .filter(event -> isInsideWindow(event, now))
+                .map(EventRow::id)
+                .toList();
     }
 
     /** Open <em>or paused</em> — what an operator is still answerable for. See the repository. */
-    @Transactional(readOnly = true)
     public List<Long> findManagedEventIds() {
-        return events.findManagedEventIds(clock.instant());
+        Instant now = clock.instant();
+        return metadata.selectableEvents().stream()
+                .filter(event -> isInsideWindow(event, now))
+                .map(EventRow::id)
+                .toList();
+    }
+
+    /**
+     * The window predicate both id lists share, matching the repository's to the boundary: sale start
+     * inclusive, sale end exclusive. Two implementations that rounded an edge differently would put an
+     * event in the drift gauge's set and not the promoter's.
+     */
+    private static boolean isInsideWindow(EventRow event, Instant now) {
+        return !now.isBefore(event.saleStartTime()) && now.isBefore(event.saleEndTime());
     }
 
     /**
@@ -178,6 +204,13 @@ public class CatalogService {
      * operator can destroy in a moment takes a sale to rebuild.
      *
      * <p>Idempotent, so a second click is not an error.
+     *
+     * <p><strong>The eviction is published, not performed.</strong> It runs {@code AFTER_COMMIT}
+     * (see {@link CatalogMetadata}), because evicting inline leaves a window in which a concurrent
+     * reader re-caches the row this transaction is about to change — and the entry it writes would
+     * be fresh, so an operator's pause could fail on the replica that served it. Published
+     * unconditionally, including on the no-op branch, because a cache that is already correct loses
+     * nothing by being told twice.
      *
      * @throws EventNotPausableException if the event is {@code DRAFT} or {@code CANCELLED}, where
      *     "paused" would mean nothing and un-pausing would publish something nobody published
@@ -194,9 +227,9 @@ public class CatalogService {
         EventStatus target = paused ? EventStatus.PAUSED : EventStatus.PUBLISHED;
         if (current != target) {
             event.setStatus(target);
-            evictMetadata(eventId);
             log.warn("Event {} {} by an operator", eventId, paused ? "PAUSED" : "resumed");
         }
+        publisher.publishEvent(new EventMetadataChanged(eventId));
         return target;
     }
 
@@ -220,6 +253,17 @@ public class CatalogService {
         List<Long> tierIds = tierIds(eventId);
         Map<Long, Integer> counters = stock.readAll(eventId, tierIds);
 
+        if (tierIds.isEmpty()) {
+            // An event with NO TIERS is unknowable inventory, not zero inventory. Summing an empty
+            // list answers 0, which the promotion worker reads as sold out -- and it then marks the
+            // event exhausted permanently, because the marker clears only when remaining > 0 and a
+            // tier-less event never reports that. ADR-035's trap, surviving in the one method written
+            // to kill it: the guard below asks "is any counter missing?" and not "is there anything
+            // to count?". Reachable whenever an event exists before its tiers do, which is every
+            // seeder, every fixture and any future create-event endpoint.
+            log.error("Event {} has no tiers; remaining is unknowable, not zero", eventId);
+            return COUNTER_UNAVAILABLE;
+        }
         if (counters.size() < tierIds.size()) {
             log.error("Event {} has tiers with no inventory counter; remaining is unreadable", eventId);
             return COUNTER_UNAVAILABLE;
@@ -232,15 +276,18 @@ public class CatalogService {
      *
      * <p>The queue module deliberately receives only buckets, not counts. Exact live inventory
      * would become a public feed the moment it crossed the SSE boundary (ADR-027).
+     *
+     * <p>Buckets are computed directly here rather than through {@link #toTierResponse}: this runs
+     * on the broadcaster's sweep, on every replica, so borrowing the landing page's per-tier WARN
+     * would turn one unreadable counter into a log flood during the incident that caused it.
      */
     public List<TierAvailability> getTierAvailability(long eventId) {
-        List<TicketTier> eventTiers = cachedTiers(eventId);
+        List<TierRow> eventTiers = metadata.tiers(eventId);
         Map<Long, Integer> remainingByTier =
-                stock.readAll(eventId, eventTiers.stream().map(TicketTier::getId).toList());
+                stock.readAll(eventId, eventTiers.stream().map(TierRow::id).toList());
 
         return eventTiers.stream()
-                .map(tier -> new TierAvailability(
-                        tier.getId(), toTierResponse(tier, remainingByTier).availability().name()))
+                .map(tier -> new TierAvailability(tier.id(), bucketOf(tier, remainingByTier).name()))
                 .toList();
     }
 
@@ -314,18 +361,22 @@ public class CatalogService {
      * resurrect every ticket already sold — the highest-severity defect the design review found
      * (ADR-004). Recovery during a live sale is a rebuild from the ledger, never a reseed.
      *
+     * <p><strong>The tier list is read uncached.</strong> Events and tiers are inserted straight
+     * into PostgreSQL by the seed scripts, so a cached list could be a subset — and a tier left
+     * without a counter answers {@code 503} for the rest of the sale.
+     *
      * @return how many tier counters this call created. A repeat pre-warm returns 0 and changes
      *     nothing.
      */
     public int prewarm(long eventId) {
-        Event event = requireEvent(eventId);
+        EventRow event = EventRow.of(requireEvent(eventId));
         if (SaleWindows.statusOf(event, clock.instant()) != EventWindowStatus.UPCOMING) {
             throw new PrewarmWindowClosedException(eventId);
         }
 
         int seeded = 0;
-        for (TicketTier tier : cachedTiers(eventId)) {
-            if (stock.seedIfAbsent(eventId, tier.getId(), tier.getTotalCapacity())) {
+        for (TierRow tier : metadata.tiersUncached(eventId)) {
+            if (stock.seedIfAbsent(eventId, tier.id(), tier.totalCapacity())) {
                 seeded++;
             }
         }
@@ -339,12 +390,18 @@ public class CatalogService {
 
     // ----------------------------------------------------------------- rebuild
 
-    /** Tier id to the capacity it was created with — what a rebuild counts down from. */
+    /**
+     * Tier id to the capacity it was created with — what a rebuild counts down from.
+     *
+     * <p>Uncached for the same reason as {@link #prewarm}: these numbers are written onto the live
+     * counters, and a list that is merely probably right produces a counter that is definitely
+     * wrong (ADR-046).
+     */
     @Transactional(readOnly = true)
     public Map<Long, Integer> getTierCapacities(long eventId) {
         Map<Long, Integer> capacities = new HashMap<>();
-        for (TicketTier tier : cachedTiers(eventId)) {
-            capacities.put(tier.getId(), tier.getTotalCapacity());
+        for (TierRow tier : metadata.tiersUncached(eventId)) {
+            capacities.put(tier.id(), tier.totalCapacity());
         }
         return capacities;
     }
@@ -380,31 +437,11 @@ public class CatalogService {
     // ----------------------------------------------------------------- helpers
 
     private List<Long> tierIds(long eventId) {
-        return cachedTiers(eventId).stream().map(TicketTier::getId).toList();
+        return metadata.tiers(eventId).stream().map(TierRow::id).toList();
     }
 
     private Event requireEvent(long eventId) {
         return events.findById(eventId).orElseThrow(() -> new EventNotFoundException(eventId));
-    }
-
-    private Event cachedEvent(long eventId) {
-        if (!properties.isMetadataCacheEnabled()) {
-            return requireEvent(eventId);
-        }
-        return eventCache.computeIfAbsent(eventId, this::requireEvent);
-    }
-
-    private List<TicketTier> cachedTiers(long eventId) {
-        if (!properties.isMetadataCacheEnabled()) {
-            return tiers.findByEventIdOrderByPriceCentsDesc(eventId);
-        }
-        return tierCache.computeIfAbsent(
-                eventId, id -> List.copyOf(tiers.findByEventIdOrderByPriceCentsDesc(id)));
-    }
-
-    private void evictMetadata(long eventId) {
-        eventCache.remove(eventId);
-        tierCache.remove(eventId);
     }
 
     /**
@@ -417,21 +454,26 @@ public class CatalogService {
      * the landing page. An un-warmed event announced itself sold out before its sale had even
      * started, and the client rendered that tier unselectable with no way to retry.
      */
-    private TierResponse toTierResponse(TicketTier tier, Map<Long, Integer> remainingByTier) {
-        int remaining = remainingByTier.getOrDefault(tier.getId(), COUNTER_UNAVAILABLE);
-        if (remaining == COUNTER_UNAVAILABLE) {
+    private TierResponse toTierResponse(TierRow tier, Map<Long, Integer> remainingByTier) {
+        if (remainingByTier.getOrDefault(tier.id(), COUNTER_UNAVAILABLE) == COUNTER_UNAVAILABLE) {
             log.warn(
                     "Tier {} of event {} has no inventory counter; reporting availability as UNKNOWN",
-                    tier.getId(),
-                    tier.getEventId());
+                    tier.id(),
+                    tier.eventId());
         }
         return new TierResponse(
-                tier.getId(),
-                tier.getTierName(),
-                tier.getPriceCents(),
-                tier.getCurrency(),
-                tier.getMaxPerOrder(),
-                AvailabilityBuckets.of(
-                        remaining, tier.getTotalCapacity(), properties.getLimitedThresholdPercent()));
+                tier.id(),
+                tier.tierName(),
+                tier.priceCents(),
+                tier.currency(),
+                tier.maxPerOrder(),
+                bucketOf(tier, remainingByTier));
+    }
+
+    private AvailabilityLevel bucketOf(TierRow tier, Map<Long, Integer> remainingByTier) {
+        return AvailabilityBuckets.of(
+                remainingByTier.getOrDefault(tier.id(), COUNTER_UNAVAILABLE),
+                tier.totalCapacity(),
+                properties.getLimitedThresholdPercent());
     }
 }

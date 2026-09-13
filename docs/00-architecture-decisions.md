@@ -520,6 +520,23 @@ FIFO stays the default because it is easier to explain to users and to reason ab
 The change is one line — the ZSET score — so this is a configuration decision, not an architecture
 one.
 
+**Built in Pass 8, and the draw must stay a draw.** The first implementation scored by
+`SHA-256(eventId + ":" + sessionId)`, for idempotency: a rejoin recomputes the same number. It is also
+**precomputable**. Session ids are free to mint (§10 S5), so a bot generates candidates offline until
+it holds a low draw and walks to the front deterministically — the exact advantage this ADR exists to
+remove, restored in the mechanism meant to remove it.
+
+A fresh uniform draw on every attempt is already idempotent, because `ZADD NX` discards the second
+one: the place the first join won is the place that stands. The draw is bounded at 2^53 so it stays
+exactly representable as the double a ZSET score is; anything larger collides after rounding and hands
+two buyers the same position.
+
+One consequence to weigh before RANDOM is switched on for a real sale: a later joiner can draw a lower
+number, so a waiting buyer's true position can *worsen*, while `position-update` frames are clamped
+monotonic non-increasing (ADR-007). Under FIFO the clamp hides nothing; under RANDOM it hides that.
+Closing the draw at a fixed moment — a draw window rather than a rolling one — is the answer, and is
+not built.
+
 ---
 
 ## ADR-025 — `saleflow`: a read-only composition module
@@ -615,6 +632,26 @@ better for throughput: they arrive at seat selection already knowing what they a
 
 Buckets, not exact counts (ADR-004 note): exact live inventory drives panic-buying and hands
 scalpers a free feed.
+
+**Built in Pass 8 — as a diff in the broadcaster, not as an event.** `TierAvailabilityChangedEvent`
+does not exist. Each replica reads the buckets once per sweep through `CatalogFacade`, compares them
+with what it last sent, and broadcasts `tier-availability` to its own connections when they differ.
+
+That is strictly simpler and it fits what the frame is for. A bucket crossing is *derived from the
+counter*, exactly like exhaustion (ADR-035): publishing an event at the crossing means deciding which
+write owns the transition, in a module where the same seat can move by reserve, restore, rebuild or
+expiry. Reading the buckets where the frame is sent needs no such decision, costs one pipelined `MGET`
+per event per sweep, and carries no cross-replica fan-out because every replica reaches the same answer
+from the same counter.
+
+What it gives up: a buyer who connects between two changes sees no availability frame until the next
+one. The frame is advisory — the landing page and seat selection both carry the same buckets — so the
+gap costs a waiting buyer information they can refresh for, not correctness.
+
+The bucket crosses the facade as a string rather than `AvailabilityLevel`, because that enum lives in
+`catalog.model` and no other module may read a module's `model` package. Moving it to
+`catalog.facade`, where `EventWindowStatus` and `ReserveResult` already are, would make the contract
+typed; it is a rename nothing else depends on and it has not been done.
 
 ---
 
@@ -1587,6 +1624,11 @@ live sale. `AdminProblemResponses` writes RFC 7807 at the entry point and keeps 
 
 ## ADR-049 — Admission is budgeted globally, not per sale — *amends ADR-028*
 
+> **Built in Pass 8.** `queue:budget` is the allowance, claimed once per event per tick before anyone
+> is promoted. Three things the build settled, each below in **Construction**: the allowance is a
+> single key whose own TTL is the window, the open-event order is **shuffled** every tick, and the
+> transaction count this ADR's budget is derived from is **nine**, not eight.
+
 **Context.** ADR-028 caps the promotion batch at `hikariMaxPoolSize × 1.5` — 45 with the default
 pool of 30 — and calls that "capacity to serve". The derivation is correct and the assumption it
 rests on was never written down: **one sale at a time.**
@@ -1648,6 +1690,67 @@ correct place to hold people, and that is the whole thesis of the system.
 - The existing single-sale load results remain valid for what they measured. They simply do not
   generalise, and §9 says so.
 
+**Construction.**
+
+**The allowance is one key, and its own TTL is the window.** `queue:budget`, claimed by one Lua
+script: read what is spent, grant no more than what is left, `SET … PX interval` when the key is
+absent and `INCRBY` when it is not. One round trip and atomic, so two replicas promoting two
+different sales in the same second cannot both read the allowance as untouched.
+
+The first version derived a window id from each replica's own clock (`epochMillis / interval`) and
+spent it with `INCRBY` plus a compensating `DECRBY` of the overage. The arithmetic held — each claimer
+refunds exactly its own unused amount — but it cost three round trips and it made the replicas' clocks
+load-bearing: skew puts two replicas in adjacent windows, each with a full allowance. Anchoring the
+window to the key removes the clock from the question entirely.
+
+**The open-event order is shuffled every tick, and that is what makes the allowance fair.** Every
+replica reads `findOpenEventIds()` in the same ascending order and claims as it reaches each sale, so
+a fixed order lets the lowest event id take the whole allowance every second — at `E = 5`, one sale
+draining and four frozen. Decision 2's per-event cap does not save it: once the cluster allowance is
+smaller than `promotion-batch-size`, the per-event cap never binds at all. A shuffle gives every sale
+an equal chance of being served first while still letting a busy sale use what its quiet neighbours
+did not claim. Dividing the allowance by `E` is still rejected, for the reason already given.
+
+**It is claimed against demand, not against the cap.** The worker asks for the number of sessions
+actually at the front of that sale's queue, so a sale with three people waiting asks for three and
+the rest stays available — "a quiet sale returns what it does not use, in the same tick", literally.
+
+**It fails closed.** A script failure promotes nobody that tick and the next tick retries. The waiting
+room is correctness-neutral: a late promotion costs a second of someone's patience, while promoting
+without an allowance is the defect this ADR exists to prevent.
+
+**Two new counters, because the limit is otherwise invisible.**
+`flashseats.queue.admissions` and `flashseats.queue.admission.budget.denied`. The new failure mode is
+*admitted too slowly*, which looks exactly like *nobody waiting* from the outside — and the allowance
+is a number somebody has to be able to tune.
+
+**A correction this ADR's own arithmetic depends on.** A checkout is **nine** sequential
+transactions, not eight: every listing collapses `PaymentTransactionStore`'s two `REQUIRES_NEW`
+transactions — the pair that brackets the gateway call, and which its javadoc describes as two — into
+"the payment store".
+
+**And decision 3 was wrong, which the measurement found.** "Derive the budget from the true per-buyer
+connection cost" became `globalAdmissionConnectionBudget / databaseConnectionsPerBuyer` = 90 ÷ 8 = 11 —
+and **those units do not compose.** 90 is a *concurrency* (connections the cluster holds at one instant);
+8 is a *count* (transactions one buyer issues over a session lasting minutes). Their quotient is neither,
+and it was then spent as a **rate**, per tick, per second.
+
+The error is invisible in the algebra and obvious in the instruments. At 11 per tick:
+`hikaricp_connections_pending` peaked at **10 of 90** while
+`flashseats.queue.admission.budget.denied` logged **ten refusals for every admission granted**, and five
+500-seat sales sold **76 %** rather than selling out. The budget meant to stop the pool being the
+bottleneck had made itself the bottleneck, at a tenth of the pool's capacity.
+
+**So the two properties are replaced by one — `global-admission-budget-per-tick`, a rate, default 45.**
+That is ADR-028's `hikariMax × 1.5` re-scoped from one sale to the whole cluster, which keeps the
+lineage this ADR set out to correct without inventing a second derivation.
+
+**The general point is worth more than the number.** A capacity limit expressed as a formula over
+quantities that do not share units will look derived and be arbitrary. The honest form is a rate with a
+measured ceiling, and the ceiling is observable: raise it until
+`hikaricp_connections_pending` stops returning to zero. `denied` staying high while the pool sits idle
+means there is room; `pending` refusing to drain means there is not.
+
 ---
 
 ## ADR-050 — A ticket is retrievable, not only deliverable
@@ -1695,3 +1798,108 @@ ticket unavailable exactly when fulfilment is broken, which is the case the endp
   standard-14 font — moves with it, and its test moves with it too.
 - A future "resend to a corrected address" operator action becomes a small change rather than a new
   subsystem, because the buyer already has a path that does not depend on email at all.
+
+---
+
+## ADR-051 — Event and tier metadata are cached; the sale window is still derived
+
+**Context.** Nothing in this system was cached. `events` changes only when an operator pauses or
+resumes a sale and `ticket_tiers` never changes after creation, yet every window check, event
+summary, tier summary and tier-id lookup was its own PostgreSQL transaction — on the landing page,
+the queue-status poll, the SSE sweep, the rehydration endpoint and the promotion tick.
+
+At one sale that was invisible. At the `E = 3..10` envelope (ADR-049) it is the first thing to
+exhaust the connection pool, and it is *polling* traffic, which scales with waiting buyers rather
+than with admitted ones. The Pass 7 drill measured 202 connections pending against a pool of 30.
+
+**Decision.** `CatalogMetadata` holds two in-process caches — one event row, one tier list, both keyed
+by event id. Five rules make it safe, and every one of them is a defect that was written first.
+
+1. **Rows, not summaries, and never the window status.** The cache holds immutable `EventRow` /
+   `TierRow` records; `EventWindowStatus` is derived from the row and the clock on every call.
+   A cached window status is wrong the moment the clock crosses a boundary, and there is no write to
+   evict on — the one kind of staleness nothing can detect.
+2. **Every entry expires, and the TTL *is* the cross-replica invalidation.** Eviction reaches only
+   the replica that served the operator's call. Without a TTL, a paused sale answers `OPEN` on the
+   other two replicas for the life of the process — and `getWindowStatus` and `getTierSummary` gate
+   queue join, hold creation and checkout, so *pause stops nothing*. ADR-043 calls the operator
+   surface a correctness dependency; a cache without an expiry makes it a no-op. Events: 1 s. Tiers:
+   60 s, because they are immutable and the TTL is only there for rows the seed SQL inserts.
+3. **Loads happen outside the map.** `get`, then load, then `put` — never `computeIfAbsent`, which
+   runs the loader inside `ConcurrentHashMap`'s per-bin monitor. Blocking JDBC inside `synchronized`
+   **pins carrier threads** on JDK 21 (invariant 11, and why Redisson was removed in ADR-022); on a
+   cold key at sale open, thousands of virtual threads converge on one bin and pin every carrier at
+   once. A cache added to stop a stall would have introduced a worse one. Two threads racing the same
+   miss both query and both write the same answer: one wasted query, no correctness cost.
+4. **A miss is never cached.** Events and tiers are inserted straight into PostgreSQL by
+   `docker/seed/*.sql` and by the dev seeder, so a remembered "no such event" outlives the insert
+   that created it.
+5. **Recovery paths read the authority.** `prewarm` and `getTierCapacities` call `tiersUncached`.
+   Both write inventory counters derived from that list: a stale list leaves a tier with no counter,
+   which answers `503` for the rest of the sale (ADR-004), or makes a rebuild write counters derived
+   from the wrong set of tiers (ADR-046). A list that is merely probably right produces a counter that
+   is definitely wrong.
+
+**Eviction is published, not performed.** `setPaused` publishes `EventMetadataChanged` inside its
+transaction and the eviction runs `AFTER_COMMIT` (ADR-023's shape, one module over). Evicting inline
+leaves a window in which a concurrent reader re-caches the row the transaction is about to change —
+and the entry it writes is *fresh*, so with rule 2's TTL the operator's pause is merely delayed, and
+without it the pause would fail on the replica that served it.
+
+**Why not a cluster-wide invalidation channel.** `catalog` already owns a Redis prefix and could
+publish an invalidation. With a 1 s event TTL it would buy a fraction of a second on a control an
+operator measures in seconds, and it would add a failure mode — a missed message — that no TTL-bounded
+cache has. It becomes worth building when operators can *edit* an event, which no endpoint allows
+today (`catalog.md` §6).
+
+**The tests run with it enabled, and that is a decision.** The first version disabled caching in
+`application-test.properties` because the fixture truncates with `RESTART IDENTITY`, so ids come back
+as `1` and a surviving entry describes the previous test's sale. That leaves the configuration
+production actually runs with no coverage at all. Instead `SaleFixture.reset()` clears every
+`DerivedStateCache` — a one-method interface in `shared`, which exists because a test fixture
+importing `catalog.service` is precisely the boundary violation `ApplicationModules.verify()` catches,
+and it does not care that the caller is a test.
+
+**Consequences.**
+
+- On a hit, `getWindowStatus`, `getEventSummary`, `getTierSummary` and the landing page take **no
+  pooled connection at all**; those wrappers are no longer `@Transactional`.
+- `SaleWindows.statusOf` takes an `EventRow`. One mapping from entity to snapshot, one derivation of
+  the window — the property its javadoc already claimed.
+- `flashseats.catalog.metadata.cache{result=hit|miss}` is how the effect is read, and
+  `metadata-cache-enabled` is the switch that makes the concurrent-sales drill a comparison rather
+  than an assertion.
+- ~~`findOpenEventIds`, `findManagedEventIds` and `listEvents` are deliberately **not** cached. They
+  are clock-parameterised, and their cost is `O(replicas × ticks)` — about four queries per second
+  cluster-wide — not `O(requests)`.~~ **Reversed the same day; see below.**
+
+**Amendment — the three list reads are cached after all, for availability rather than cost.**
+
+The reasoning above is arithmetically right and asks the wrong question. Cost was never the issue: it
+really is about four queries a second cluster-wide. **Dependency** was the issue.
+
+`PromotionWorker.tick()` called `findOpenEventIds()` every second, which needed a pooled connection.
+So under pool pressure the promoter queued *behind the buyers it existed to admit*. The Pass 8 drill
+caught it: `Unable to acquire JDBC Connection … timed out after 16068ms (total=30, active=30, idle=0,
+waiting=63)` — **a sixteen-second wait inside a one-second tick.** A tick that does not run promotes
+nobody; a waiting room that does not drain keeps polling; polling is what saturated the pool. That is a
+feedback loop, and the component whose whole job is to bound admission was inside it.
+
+It explains the measurement that made no sense otherwise: the allowance permitted ~2,300 admissions
+over the run and only **352** happened. The allowance was never the binding limit — the tick was
+running roughly once every six to thirteen seconds instead of once a second.
+
+**So one query — every `PUBLISHED` or `PAUSED` event, any window — is cached under the event TTL, and
+all three list reads filter it in memory.** The promotion tick now needs **no** pooled connection on its
+hot path: the event row, the tier list and the open-event set are all cache reads, and the only thing
+left is Redis. Two details keep it honest:
+
+- **The window is still derived.** Only the rows are remembered; `saleStartTime <= now < saleEndTime`
+  is evaluated against the live clock, exactly as rule 1 requires of the status.
+- **`StockEpoch` keeps querying PostgreSQL directly.** It is the Redis-restart guard, it runs every
+  five seconds, and a fault detector should not read a cache. Its query is now also the surviving SQL
+  definition of the window that the in-memory filter must match.
+
+**The general rule this is an instance of:** a cache is usually an optimisation, but in front of a
+control-plane read it is an *availability* decision. Ask not only what the read costs, but what else
+stops working when it is slow.

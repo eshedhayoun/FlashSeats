@@ -34,7 +34,8 @@ so no client could reliably switch on them. That is the gap this closes.
 | Area | Provides |
 | :--- | :--- |
 | `error` | the canonical `ErrorCode` enum (standards §2), the `ProblemDetail` factory, the base exception that carries a code, and the single `@RestControllerAdvice` |
-| `identity` | **the filter that mints and verifies the `fsid` cookie**, the `SessionId` value type over it, and the argument resolver that is the **only** way identity enters a handler. Configured by `flashseats.session.*` |
+| `identity` | **the filter that mints and verifies the `fsid` cookie**, the `SessionId` value type over it, and the argument resolver that is the **only** way identity enters a handler. Configured by `flashseats.session.*`. Also `POST /api/v1/session/reset`, which expires the cookie — the one endpoint this module owns, and a demo affordance rather than part of the journey |
+| `cache` | `DerivedStateCache` — a one-method contract meaning *"this holds only state a database can regenerate, and any caller may drop all of it"*. It lives here so clearing every cache does not require a test fixture to import a module's `service` package (ADR-051) |
 | `security` | signed-token minting and verification — HMAC-SHA256 with a **length-prefixed `kind`**, so a token of one kind never verifies as another (ADR-039) |
 | `time` | the injectable `Clock` every timer flows from, and a shared expiry type |
 | `ticket` | the PDF renderer and its input record (ADR-050) |
@@ -96,7 +97,7 @@ onto a page by accident.
 
 | Gap | Detail |
 | :--- | :--- |
-| *(none outstanding)* | The `bot`/`shared` identity split and the renderer's placement were both closed in Pass 7 |
+| **`POST /session/reset` is unauthenticated, with no CSRF token** | It discards the caller's `fsid`, which *is* their queue position and their authority over their hold. A cross-site `POST` can therefore throw a visitor out of a line they were waiting in — a nuisance, not a disclosure, and recorded in `06-mvp-overview.md` §10. It exists for the bundled demo page; a real client has no reason to call it |
 
 ---
 
