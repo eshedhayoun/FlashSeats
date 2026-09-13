@@ -6,6 +6,7 @@ import Stack from "@mui/material/Stack";
 import Typography from "@mui/material/Typography";
 import type { Availability, SaleQueueState } from "../api/types";
 import { useQueueStream } from "./useQueueStream";
+import { HomeButton } from "../shared/HomeButton";
 
 export function QueuePage({
   eventId,
@@ -24,6 +25,7 @@ export function QueuePage({
       <Card>
         <CardContent>
           <Stack spacing={3} alignItems="center">
+            <HomeButton />
             <Typography color="text.secondary">You&apos;re in the queue</Typography>
             <Typography
               component="div"

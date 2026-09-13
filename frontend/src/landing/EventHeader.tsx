@@ -2,10 +2,12 @@ import Stack from "@mui/material/Stack";
 import Typography from "@mui/material/Typography";
 import type { EventDetails } from "../api/types";
 import { Countdown } from "../shared/Countdown";
+import { HomeButton } from "../shared/HomeButton";
 
 export function EventHeader({ event }: { event: EventDetails }) {
   return (
     <Stack spacing={1}>
+      <HomeButton />
       <Typography variant="overline" color="primary">
         FlashSeats
       </Typography>

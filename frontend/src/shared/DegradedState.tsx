@@ -2,6 +2,7 @@ import Button from "@mui/material/Button";
 import Container from "@mui/material/Container";
 import Stack from "@mui/material/Stack";
 import Typography from "@mui/material/Typography";
+import { HomeButton } from "./HomeButton";
 
 export function DegradedState({
   onRetry
@@ -11,6 +12,7 @@ export function DegradedState({
   return (
     <Container maxWidth="sm" sx={{ py: 8 }}>
       <Stack spacing={2}>
+        <HomeButton />
         <Typography component="h1" variant="h5">
           We&apos;re checking the sale status
         </Typography>
