@@ -88,13 +88,25 @@ means *that opportunity is gone*. The SPA renders different screens.
 One namespace across all modules. `code` values are **stable API contract** — renaming one is a
 breaking change.
 
+**Every code here is reachable, and that is checked in both directions.** Ten were not and have been
+removed: `BOT_VERIFICATION_FAILED`, `IP_BLOCKED`, `NOT_IN_QUEUE`, `QUEUE_PASS_EXPIRED`,
+`QUEUE_UNAVAILABLE`, `SALE_EXHAUSTED`, `PAYMENT_ACTION_REQUIRED`, `WEBHOOK_SIGNATURE_INVALID`,
+`ORDER_ALREADY_CONFIRMED` and `NOTIFICATION_LOG_NOT_FOUND`. An unreachable code is dead contract —
+a client writes a branch for a response the server can never send, and `FE_SPEC.md` §2 had already
+started warning readers off three of them. **A code is added when the path that raises it is, not
+before**; the ones tied to deferred features (the webhook, 3-D Secure, a challenge provider, an IP
+blocklist) return with those features.
+
+Three sold-out answers were among them, and their absence is informative: "sold out" reaches the
+waiting room as the `sale-exhausted` SSE frame and the `EXHAUSTED` queue phase, never as an error
+(ADR-035). `SALE_EXHAUSTED` existed because an earlier design refused a request; the current one
+tells the client a state.
+
 | Code | Status | Module | Meaning / client action |
 | :--- | :--- | :--- | :--- |
 | `VALIDATION_FAILED` | 400 | shared | Fix `violations` and resubmit |
 | `INTERNAL_ERROR` | 500 | shared | Show `traceId`, offer retry |
 | `RATE_LIMITED` | 429 | bot | Back off `retryAfterSeconds` |
-| `BOT_VERIFICATION_FAILED` | 403 | bot | Re-run reCAPTCHA |
-| `IP_BLOCKED` | 403 | bot | Terminal; contact support |
 | `SESSION_INVALID` | 401 | bot | Reload to obtain a fresh `fsid` |
 | `EVENT_NOT_FOUND` | 404 | catalog | — |
 | `TIER_NOT_FOUND` | 404 | catalog | — |
@@ -102,13 +114,9 @@ breaking change.
 | `SALE_CLOSED` | 409 | catalog | Terminal |
 | `INVENTORY_UNAVAILABLE` | 503 | catalog | **Fault** — retry; alarm fires server-side |
 | `PREWARM_WINDOW_CLOSED` | 409 | catalog | Admin only |
-| `NOT_IN_QUEUE` | 404 | queue | Rejoin |
 | `QUEUE_PASS_INVALID` | 401 | queue | Rejoin |
-| `QUEUE_PASS_EXPIRED` | 410 | queue | Rejoin |
 | `ADMISSION_EXPIRED` | 410 | queue | Rejoin the queue |
 | `ADMISSION_REQUIRED` | 401 | queue | Not admitted to the sale |
-| `QUEUE_UNAVAILABLE` | 503 | queue | Retry with backoff |
-| `SALE_EXHAUSTED` | 409 | queue | Sold out. **Not terminal** — exhaustion is derived from live stock and clears when seats return (ADR-035) |
 | `INSUFFICIENT_STOCK` | 409 | hold | Choose another tier |
 | `HOLD_NOT_FOUND` | 404 | hold | — |
 | `HOLD_EXPIRED` | 410 | hold | Reservation gone; nothing charged |
@@ -117,17 +125,13 @@ breaking change.
 | `QUANTITY_EXCEEDS_LIMIT` | 422 | hold | Max 6 per order |
 | `PAYMENT_DECLINED` | 402 | payment | Retry — see `attemptsRemaining` |
 | `PAYMENT_ATTEMPTS_EXHAUSTED` | 402 | payment | Terminal |
-| `PAYMENT_ACTION_REQUIRED` | 402 | payment | 3-D Secure — follow `resumeUrl` |
 | `PAYMENT_GATEWAY_UNAVAILABLE` | 503 | payment | Circuit open; hold retained, **no payment attempt consumed**, and the retry genuinely works (ADR-034) |
 | `DUPLICATE_PAYMENT` | 409 | payment | A charge is already in flight. Do **not** re-enable the pay button; poll `/sale/{id}/state`. Bounded by `stale-pending-seconds` — it can no longer mean "forever" (ADR-034) |
-| `WEBHOOK_SIGNATURE_INVALID` | 400 | payment | Gateway only |
 | `ORDER_NOT_FOUND` | 404 | order | — |
-| `ORDER_ALREADY_CONFIRMED` | 409 | order | Return the existing receipt |
 | `CHECKOUT_WINDOW_CLOSED` | 409 | order | Past the 15-minute grace |
 | `INSUFFICIENT_TIME_REMAINING` | 409 | order | Too little of the hold left to start a charge that could finish (ADR-030). Nothing charged; the order is left resumable |
 | `ORDER_REFUNDED` | 409 | order | A settled charge was refunded because the seats could not be delivered (ADR-012). Distinct from `HOLD_EXPIRED`, whose promise that nothing was charged would be false |
 | `TICKET_NOT_AVAILABLE` | 409 | order | The order is the caller's and has no ticket (ADR-050). Only a `CONFIRMED` order does; rendering for any other status would mint a document indistinguishable from a real ticket. Returned **only** to a caller who has already proved ownership, so it can afford to say why — an unauthorised one still gets `ORDER_NOT_FOUND`. `retryable` is true for `PENDING` and false for everything else |
-| `NOTIFICATION_LOG_NOT_FOUND` | 404 | notification | Admin only |
 | `SALE_PAUSED` | 409 | catalog | Pause or resume asked for on an event that is `DRAFT` or `CANCELLED`, where neither means anything (ADR-048) |
 | `NOTIFICATION_PAYLOAD_UNAVAILABLE` | 410 | order | A resend was asked for past `flashseats.outbox.purge-after-days`, so the stored message is gone. `410`, not `404`: the order existed and so did its message — they aged out, and a `404` would send an operator hunting a typo |
 | `ADMIN_AUTH_REQUIRED` | 401 | shared | No operator credentials, or the wrong ones |
@@ -250,14 +254,19 @@ A facade is the *only* legal cross-module surface. Every one obeys:
    order transaction and must join it — ADR-019.)
 3. **Records in, records out.** Immutable Java records only. **Never a JPA entity** — a detached
    entity leaks a lazy-loading proxy and a mapping across a boundary that is supposed to be opaque.
-4. **Module-owned exceptions only.** `HoldFacade` throws hold exceptions; it never surfaces a
+4. **Module-owned failures only.** A facade raises its module's own refusals — a `<Module>Errors`
+   factory or one of its few dedicated exception types — and never surfaces a
    `DataIntegrityViolationException`.
-5. **No `Optional` for absence that is an error.** Throw the module's `*NotFoundException`; reserve
+5. **No `Optional` for absence that is an error.** Raise the module's "not found" refusal; reserve
    `Optional` for genuinely optional reads.
 6. **One store per call where possible.** A facade that touches PostgreSQL *and* Redis *and* calls
    another facade is doing orchestration and belongs in a service.
-7. **Declared in the module's `facade` package**; the implementation is package-private where the
-   language allows.
+7. **Declared in the module's `facade` package, and implemented by the service itself.** There is
+   no separate `*Impl`: five existed, every one pure delegation, and all they added was a hop
+   between the contract and the code honouring it. The service lives in an internal package no
+   other module may name, so the interface is still the only visible surface — Modulith checks
+   *source-code type references*, not runtime bean types, and `ApplicationModules.verify()` is the
+   proof (ADR-052).
 8. **The graph stays acyclic.** Adding an edge requires checking `ApplicationModules.verify()`.
 
 ### There is no shared write — the inventory counter is catalog's alone

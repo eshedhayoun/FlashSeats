@@ -303,7 +303,6 @@ the gateway-level guard (ADR-014).
 | `503 PAYMENT_GATEWAY_UNAVAILABLE` | "Payment provider is having trouble. **Your seats are held.**" Retry after `retryAfterSeconds` |
 | `409 DUPLICATE_PAYMENT` | Ignore — a charge is in flight. Poll `/sale/state` every 2 s |
 | `409 ORDER_REFUNDED` | Terminal. The charge succeeded and could not be completed, so it was **refunded**. Say that plainly and name the order number |
-| `402 PAYMENT_ACTION_REQUIRED` | **Unreachable today.** Reserved for 3-DS in Stage 2 — see below |
 
 **A retry is the same request.** Re-POST `/orders/checkout` with the same body and the same
 `idempotencyKey`. Find-or-create on `UNIQUE(hold_token)` retries on the same order number, so three
@@ -383,8 +382,8 @@ Base `/api/v1`. `fsid` is an `HttpOnly` cookie — **JavaScript never reads or s
 | all | `GET` | `/sale/{eventId}/state` | — | — | `200` | `EVENT_NOT_FOUND` |
 | V1→V2 | `POST` | `/queue/join` | — | `{eventId}` | `202` | `SALE_NOT_OPEN`, `SALE_PAUSED`, `RATE_LIMITED` |
 | V2 | `GET` | `/queue/stream?eventId=` | `Accept: text/event-stream` | — | SSE | — |
-| V2 | `GET` | `/queue/status?eventId=` | — | — | `200` | `NOT_IN_QUEUE` |
-| V2→V3 | `POST` | `/queue/admit` | `X-Queue-Pass-Token` | `{eventId}` | `200` | `QUEUE_PASS_INVALID`, `QUEUE_PASS_EXPIRED`, `VALIDATION_FAILED` |
+| V2 | `GET` | `/queue/status?eventId=` | — | — | `200` | — (a session that never joined is `phase: NOT_JOINED`, not an error) |
+| V2→V3 | `POST` | `/queue/admit` | `X-Queue-Pass-Token` | `{eventId}` | `200` | `QUEUE_PASS_INVALID`, `VALIDATION_FAILED` |
 | V3 | `POST` | `/holds` | `X-Admission-Token` | `{eventId, tierId, quantity}` | `201` | `INSUFFICIENT_STOCK`, `QUANTITY_EXCEEDS_LIMIT`, `HOLD_LIMIT_EXCEEDED`, `ADMISSION_EXPIRED`, `INVENTORY_UNAVAILABLE` |
 | V4 | `GET` | `/holds/{holdToken}` | — | — | `200` | `HOLD_NOT_FOUND`, `HOLD_EXPIRED` |
 | V4 | `DELETE` | `/holds/{holdToken}` | — | — | `204` | `HOLD_NOT_FOUND` |
@@ -409,10 +408,12 @@ not needed. **Re-POST the same `/orders/checkout` body** — the endpoint is fin
 resubmission after success replays the receipt with `200` instead of `201` (ADR-002, ADR-034). That
 is the whole retry mechanism; do not build a second one.
 
-**Three registry codes are currently unreachable** and a client must not branch on them yet:
-`BOT_VERIFICATION_FAILED` (no challenge provider — §5), `PAYMENT_ACTION_REQUIRED` (no 3-DS; the
-gateway is a stub) and `WEBHOOK_SIGNATURE_INVALID` (no webhook). Handle them defensively as generic
-failures; they arrive with Stage 2.
+**There are no unreachable registry codes.** Three used to be listed here as "do not branch on
+these yet" — `BOT_VERIFICATION_FAILED`, `PAYMENT_ACTION_REQUIRED` and `WEBHOOK_SIGNATURE_INVALID` —
+and they, along with seven others, have been removed from the registry entirely. A code a client is
+told to ignore is contract that documents its own uselessness; these return with the features that
+raise them (a challenge provider, 3-D Secure, the webhook), and `05-global-standards.md` §2 has the
+full list. Every code the server can still send is one worth branching on.
 
 ### Error envelope — RFC 7807
 
@@ -659,8 +660,9 @@ const delay = Math.random() * Math.min(30_000, 500 * 2 ** attempt);
   shared corporate gateway or a carrier NAT can trip the IP bucket through no fault of the buyer,
   which is exactly why that bucket is deliberately loose.
 
-The same copy rule applies to `BOT_VERIFICATION_FAILED` if a challenge provider ever ships: never
-accuse a paying customer. False positives are real, and accusing one is worse than admitting a few
+The same copy rule will apply to whatever code a challenge provider raises if one ever ships
+(`BOT_VERIFICATION_FAILED` was removed from the registry as unreachable): never accuse a paying
+customer. False positives are real, and accusing one is worse than admitting a few
 scripts.
 
 ### When it ships (Stage 2)

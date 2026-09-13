@@ -15,18 +15,25 @@ import java.util.Map;
  * <p>{@code extensions} carries the RFC 7807 members that vary by failure — {@code retryable},
  * {@code attemptsRemaining}, {@code expiresAt}, {@code retryAfterSeconds}. Names and types are fixed
  * by global standards §1; the SPA switches on them.
+ *
+ * <p><strong>Most failures are raised through a module's {@code <Module>Errors} factory rather than
+ * by a dedicated subclass.</strong> Twenty-five subclasses existed and seventeen of them were never
+ * caught by type — they were a class per message, spread over a directory, so no reader could see
+ * what a module could refuse without opening all of it. A subclass is now written only when
+ * something catches it by type, or when two of them exist to keep a distinction visible (the
+ * inventory pair in {@code hold}). The constructors are public for exactly that reason.
  */
 public class FlashSeatsException extends RuntimeException {
 
     private final ErrorCode code;
     private final Map<String, Object> extensions = new LinkedHashMap<>();
 
-    protected FlashSeatsException(ErrorCode code, String detail) {
+    public FlashSeatsException(ErrorCode code, String detail) {
         super(detail);
         this.code = code;
     }
 
-    protected FlashSeatsException(ErrorCode code, String detail, Throwable cause) {
+    public FlashSeatsException(ErrorCode code, String detail, Throwable cause) {
         super(detail, cause);
         this.code = code;
     }

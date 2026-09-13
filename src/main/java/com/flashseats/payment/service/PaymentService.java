@@ -4,6 +4,7 @@ import com.flashseats.payment.config.PaymentProperties;
 import com.flashseats.payment.exception.DuplicatePaymentException;
 import com.flashseats.payment.exception.PaymentGatewayUnavailableException;
 import com.flashseats.payment.facade.AuthorizeCommand;
+import com.flashseats.payment.facade.PaymentFacade;
 import com.flashseats.payment.facade.PaymentResult;
 import com.flashseats.payment.facade.RefundResult;
 import com.flashseats.payment.gateway.GatewayCharge;
@@ -21,10 +22,15 @@ import org.springframework.stereotype.Service;
  * <p><strong>No method here is {@code @Transactional}, deliberately.</strong> Each brackets a network
  * call with two short transactions owned by {@link PaymentTransactionStore}, so no pooled connection
  * is ever held across the provider round trip (ADR-023).
+ *
+ * <p>This class <em>is</em> {@link PaymentFacade}. Other modules see only that interface, because
+ * this package is internal to the module and they may not name it. There is no separate delegating
+ * implementation: one existed, held no logic, and only added a hop between the contract and the
+ * code that honours it.
  */
 @Slf4j
 @Service
-public class PaymentService {
+public class PaymentService implements PaymentFacade {
 
     /** Owned by this module. Nothing else reads or writes this prefix. */
     private static final String INFLIGHT_KEY = "payment:inflight:";
@@ -59,6 +65,7 @@ public class PaymentService {
      * string is what stops a client that regenerates its key on retry from bypassing the guard
      * entirely.
      */
+    @Override
     public PaymentResult authorize(AuthorizeCommand command) {
         String inflightKey = INFLIGHT_KEY + command.holdToken();
         Boolean acquired = redis.opsForValue()
@@ -68,7 +75,7 @@ public class PaymentService {
                         Duration.ofSeconds(properties.getInflightTtlSeconds()));
 
         if (!Boolean.TRUE.equals(acquired)) {
-            throw new DuplicatePaymentException(command.holdToken());
+            throw new DuplicatePaymentException();
         }
 
         try {
@@ -92,10 +99,7 @@ public class PaymentService {
                     transaction.getTransactionReference(),
                     result.isSuccess(),
                     result.gatewayReference(),
-                    result.failureCode(),
-                    result.failureReason(),
-                    result.outcome() == GatewayResult.Outcome.DECLINED,
-                    result.outcome() == GatewayResult.Outcome.REQUIRES_ACTION);
+                    result.failureReason());
         } finally {
             // Released whatever happened. The order row remains the durable guard, so letting go
             // early costs nothing and avoids stranding a buyer behind their own failed attempt.
@@ -104,6 +108,7 @@ public class PaymentService {
     }
 
     /** Compensation for a charge that settled against seats we could not deliver (ADR-012). */
+    @Override
     public RefundResult refund(String transactionReference, long amountCents, String reason) {
         PaymentTransaction transaction = store.require(transactionReference);
 
