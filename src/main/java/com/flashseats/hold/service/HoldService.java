@@ -327,8 +327,18 @@ public class HoldService implements HoldFacade {
     // leaks a lazy-loading proxy and a persistence mapping into a module that must know neither
     // (global standards §5).
 
-    /** {@inheritDoc} */
+    /**
+     * {@inheritDoc}
+     *
+     * <p><strong>Annotated even though {@link #requireActiveHold} already is, and that is not
+     * redundant.</strong> This delegates to it on {@code this}, and Spring's proxy does not
+     * intercept self-invocation — without the annotation here the read would run with no transaction
+     * at all, silently. It had one before: the call used to arrive from a separate
+     * {@code HoldFacadeImpl} and therefore went through the proxy. Collapsing that class into this
+     * one moved the call inside the bean, which is exactly the boundary loss ADR-023 warns about.
+     */
     @Override
+    @Transactional(readOnly = true)
     public HoldSummary getActiveHold(String holdToken, String userSessionId) {
         return toSummary(requireActiveHold(holdToken, userSessionId));
     }
