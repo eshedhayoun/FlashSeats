@@ -470,9 +470,13 @@ removing a transaction from checkout is the claim being made.
 
 ## 3.4 Carried forward from `06-mvp-overview.md` §9
 
-- [ ] **Checkout p99 is the open number.** 682 ms at 300 VUs on one sale; **9.3 s at 300 VUs across
-      five**, against a 200 ms exit criterion. A 13× cost for the same VU count that the pool does not
-      explain. Needs a host where k6 is not competing for cores.
+- [ ] **Checkout p99 is the open number, and it is now stale in our favour.** 682 ms at 300 VUs on
+      one sale; **6.4 s at 300 VUs across five**, against a 200 ms exit criterion. That 6.4 s was
+      measured on nine sequential transactions per checkout. **Checkout now costs eight** — Pass 9
+      merged the 3-D Secure resume read into `beginAttempt` (10 → 9) and Pass 10's Stage G1 removed
+      the receipt re-read (9 → 8), and **the second one has never been measured.** Re-running the
+      drill is the cheapest real number available right now. It still needs a host where k6 is not
+      competing with the three JVMs for cores.
 - [ ] **A pool timeout surfaces to a buyer as `500 INTERNAL_ERROR` mid-checkout.** For what is really
       back-pressure, `503` with a `Retry-After` is the honest answer.
 - [ ] **The Playwright suite specified in `FE_SPEC.md` §8.** All four client rules are browser
@@ -482,5 +486,16 @@ removing a transaction from checkout is the claim being made.
       deterministic ones already skip it.
 - [ ] **The operator surface is curl-only.** ADR-043 calls it a correctness dependency; one that can
       only be driven by hand-written Basic-auth curl during an incident is half-built.
-- [ ] **Payment is a stub.** Every idempotency layer is real; the gateway is not. Re-add
-      `idx_orders_intent`, `idx_pay_order` and `idx_pay_hold` with the webhook.
+- [x] ~~**Payment is a stub.**~~ **Built** (Pass 9, ADR-052–056): a real `StripePaymentGateway`
+      behind the existing seam, a circuit-breaking decorator, the webhook receiver, 3-D Secure and
+      the settlement path. `STRIPE_ENABLED` defaults to **false**, so the stub is still what every
+      drill and the load harness run against — deliberately, since they need no account.
+- [ ] **The real provider path has only ever been proved by hand.** `PaymentWebhookIT` and
+      `ThreeDSecureIT` both run against `StubPaymentGateway`: correct about *this* system's
+      behaviour, silent about whether Stripe agrees. `docker/scripts/stripe-check.sh` is the proof
+      and needs a `sk_test_...` key plus the `stripe` CLI container. **Nobody has run it since the
+      simplification merge.**
+- [ ] **`idx_pay_order` and `idx_orders_intent` are indexes no query uses.** `V12` deliberately left
+      them: `payment_transactions` was under active construction and shaving writes off a table
+      someone is extending is not worth the coordination cost. Revisit once that module settles.
+      (`idx_pay_hold` is now genuinely used — it backs the 3-D Secure resume lookup. Do not drop it.)
