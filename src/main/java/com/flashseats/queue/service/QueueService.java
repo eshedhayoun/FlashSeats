@@ -11,12 +11,15 @@ import com.flashseats.queue.dto.QueueStatusResponse;
 import com.flashseats.queue.exception.QueuePassInvalidException;
 import com.flashseats.queue.facade.QueuePhase;
 import com.flashseats.queue.facade.QueueState;
+import java.nio.charset.StandardCharsets;
 import java.time.Clock;
 import java.time.Duration;
 import java.time.Instant;
+import java.util.List;
 import java.util.OptionalDouble;
 import java.util.concurrent.ThreadLocalRandom;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.data.redis.core.RedisCallback;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.stereotype.Service;
 
@@ -153,33 +156,90 @@ public class QueueService {
      * it once rather than once per session.
      */
     QueueState getQueueState(String sessionId, long eventId, EventWindowStatus window) {
-        return getQueueState(sessionId, eventId, window, isExhausted(eventId));
+        return getQueueState(sessionId, eventId, window, null);
     }
 
-    QueueState getQueueState(String sessionId, long eventId, EventWindowStatus window, boolean exhausted) {
+    QueueState getQueueState(String sessionId, long eventId, EventWindowStatus window, Boolean exhausted) {
+        // Before the read, not after: the window outranks every other state, so a closed sale costs
+        // no Redis at all. Reading first and discarding it would spend a round trip per poll for the
+        // hour a finished sale's clients keep polling.
         if (window == EventWindowStatus.CLOSED) {
             return new QueueState(QueuePhase.CLOSED, null, null, null, null);
         }
+        return decide(read(sessionId, eventId, exhausted), eventId);
+    }
 
-        String admissionToken = redis.opsForValue().get(QueueKeys.admission(eventId, sessionId));
-        if (admissionToken != null) {
-            Long ttl = redis.getExpire(QueueKeys.admission(eventId, sessionId));
+    /**
+     * Everything this session's state depends on, in <strong>one</strong> Redis round trip.
+     *
+     * <p>The reads used to be sequential — admission, its TTL, the pass, the exhausted marker, the
+     * rank — and this is the most-called path in the system by two orders of magnitude: a 300-VU
+     * five-sale run polls {@code /queue/status} <strong>132,000 times</strong> against 1,700
+     * checkouts. Four round trips there is four times the encode, decode and socket work of one, on
+     * the request that dominates the cluster's CPU.
+     *
+     * <p><strong>Reading eagerly does not change the answer.</strong> None of the reads decides what
+     * to read next; only {@link #decide} is ordered, and it still applies exactly the state machine
+     * its own javadoc describes. The cost is fetching a few values a short-circuit would have
+     * skipped, which inside one pipeline is far cheaper than the round trips it removes.
+     *
+     * @param exhausted pre-resolved by a caller sweeping many sessions of one event — it is per
+     *     event, not per session, so the broadcaster resolves it once and this skips it
+     */
+    private Snapshot read(String sessionId, long eventId, Boolean exhausted) {
+        String admissionKey = QueueKeys.admission(eventId, sessionId);
+        String passKey = QueueKeys.pass(eventId, sessionId);
+        String waitingKey = QueueKeys.waiting(eventId);
+        String exhaustedKey = QueueKeys.exhausted(eventId);
+
+        // The byte-level API rather than a StringRedisConnection cast: inside a pipeline the
+        // connection is a proxy, and the cast throws ClassCastException at runtime while compiling
+        // perfectly. Replies come back through the template's own String serializer.
+        List<Object> replies = redis.executePipelined((RedisCallback<Object>) connection -> {
+            connection.stringCommands().get(utf8(admissionKey));
+            connection.keyCommands().ttl(utf8(admissionKey));
+            connection.stringCommands().get(utf8(passKey));
+            connection.zSetCommands().zRank(utf8(waitingKey), utf8(sessionId));
+            if (exhausted == null) {
+                connection.keyCommands().exists(utf8(exhaustedKey));
+            }
+            return null;
+        });
+
+        int expected = exhausted == null ? 5 : 4;
+        if (replies.size() != expected) {
+            // Positional reads are only safe while the positions are known. Adding a command above
+            // without shifting the indices below would otherwise read a neighbour's value and answer
+            // confidently with the wrong phase.
+            throw new IllegalStateException(
+                    "Expected " + expected + " pipelined replies, got " + replies.size());
+        }
+
+        return new Snapshot(
+                (String) replies.get(0),
+                (Long) replies.get(1),
+                (String) replies.get(2),
+                (Long) replies.get(3),
+                exhausted != null ? exhausted : truthy(replies.get(4)));
+    }
+
+    private QueueState decide(Snapshot snapshot, long eventId) {
+        if (snapshot.admissionToken() != null) {
+            Long ttl = snapshot.admissionTtlSeconds();
             Instant expiresAt = ttl != null && ttl > 0 ? clock.instant().plusSeconds(ttl) : null;
             return new QueueState(QueuePhase.ADMITTED, null, null, expiresAt, null);
         }
 
-        String passToken = redis.opsForValue().get(QueueKeys.pass(eventId, sessionId));
-        if (passToken != null) {
-            return new QueueState(QueuePhase.PROMOTED, null, null, null, passToken);
+        if (snapshot.passToken() != null) {
+            return new QueueState(QueuePhase.PROMOTED, null, null, null, snapshot.passToken());
         }
 
-        if (exhausted) {
+        if (snapshot.exhausted()) {
             return new QueueState(QueuePhase.EXHAUSTED, null, null, null, null);
         }
 
-        Long rank = redis.opsForZSet().rank(QueueKeys.waiting(eventId), sessionId);
-        if (rank != null) {
-            int position = rank.intValue() + 1;
+        if (snapshot.rank() != null) {
+            int position = snapshot.rank().intValue() + 1;
             OptionalDouble estimate = drainRate.estimateSeconds(eventId, position);
             Integer estWaitSeconds = estimate.isPresent() ? (int) Math.ceil(estimate.getAsDouble()) : null;
             return new QueueState(QueuePhase.WAITING, position, estWaitSeconds, null, null);
@@ -187,6 +247,32 @@ public class QueueService {
 
         return QueueState.notJoined();
     }
+
+    private static byte[] utf8(String value) {
+        return value.getBytes(StandardCharsets.UTF_8);
+    }
+
+    /**
+     * {@code EXISTS} is a Redis integer; a driver may hand it back as {@code Boolean} or as a number.
+     *
+     * <p>{@code Boolean.TRUE.equals(1L)} is {@code false}, so taking the narrow view would make an
+     * exhausted sale report {@code WAITING} for ever — silently, and on the one path this design is
+     * most careful about (ADR-035, ADR-040). Accept either shape rather than depend on which.
+     */
+    private static boolean truthy(Object reply) {
+        if (reply instanceof Boolean value) {
+            return value;
+        }
+        return reply instanceof Number value && value.longValue() > 0;
+    }
+
+    /** One session's raw queue state, as Redis answered it. */
+    private record Snapshot(
+            String admissionToken,
+            Long admissionTtlSeconds,
+            String passToken,
+            Long rank,
+            boolean exhausted) {}
 
     // ------------------------------------------------------------------- admit
 

@@ -6,7 +6,7 @@ Guidance for Claude Code when working in this repository.
 
 FlashSeats — a high-concurrency ticket flash-sale engine. Modular monolith, Java 21, Spring Boot
 4.1.1. The **MVP is built and running**: all nine modules, the full journey from landing page to emailed
-PDF ticket, 108 tests green. **Inventory lives in Redis** (Stage 1, ADR-046): `catalog:stock:{e}:{t}`
+PDF ticket, 112 tests green. **Inventory lives in Redis** (Stage 1, ADR-046): `catalog:stock:{e}:{t}`
 is the live count and PostgreSQL keeps no copy of it.
 
 **Read [`docs/00-architecture-decisions.md`](docs/00-architecture-decisions.md) before changing
@@ -216,6 +216,8 @@ Do not reintroduce these — each cost a real defect in the first pass:
 | **Returning `OrderReceiptResponse` from an admin endpoint** | `receiptToken` is a 90-day bearer capability. An operator view would mint a durable impersonation link into terminal history and any log that records bodies (ADR-048) |
 | **Guarding a password with `equals("admin")`** | It refuses one known string. `{noop}hunter2` passes and is stored in plaintext. Refuse the *encoding*, not the value (ADR-048) |
 | **Editing a migration that has already been applied — even only its comments** | Flyway checksums the whole file. `V9`'s comment block was rewritten after the measurement that motivated it, and **every container then refused to start**: `Validate failed … checksum mismatch for version 9`, with identical DDL. A migration is immutable the moment any database has run it; new understanding goes in a new migration, an ADR, or the code that issues the query. Recovery is `UPDATE flyway_schema_history SET checksum = <resolved> WHERE version = …` (what `flyway repair` does) on every database that applied the old one |
+| **A guard that asks "is anything missing?" but never "is there anything there?"** | `counters.size() < tierIds.size()` is `0 < 0` for an event with no tiers — false — so it summed an empty list and answered `0`. The promoter reads 0 as sold out and marks the event exhausted *permanently*, because the marker clears only when `remaining > 0`. ADR-035's trap inside the method written to kill it, on the normal path: every event exists before its tiers do |
+| **Casting a pipelined Redis connection to `StringRedisConnection`** | Inside `executePipelined` the connection is a proxy. The cast compiles and throws `ClassCastException` at runtime. Use the byte-level `stringCommands()` / `keyCommands()` / `zSetCommands()` API. And read the replies defensively: `EXISTS` may come back `Boolean` **or** a number, and `Boolean.TRUE.equals(1L)` is `false` — which would report an exhausted sale as `WAITING` for ever |
 | **A capacity limit expressed as a formula over quantities that do not share units** | `90 connections / 8 transactions per buyer = 11` looks derived and is arbitrary: a concurrency over a count is neither, and it was then spent as a per-second rate. It capped a sale at 76 % while the pool sat 89 % idle. A limit is a rate with a **measured** ceiling — raise it until `hikaricp_connections_pending` stops returning to zero (ADR-049) |
 | **A scheduled job that protects a resource by reading that resource** | `PromotionWorker` bounds admission to protect the connection pool — and called `findOpenEventIds()`, a pooled read, every tick. Under pressure it queued behind the buyers it existed to admit: **16 s inside a 1 s tick**, so nobody was promoted, the queue did not drain, and the polling that saturated the pool continued. Ask not what a read costs but what stops working when it is slow (ADR-051) |
 | **A cache with no TTL** | Eviction reaches one replica. A paused sale then answers `OPEN` on the other two *for the life of the process*, and the window status gates join, holds and checkout — so pause stops nothing. The TTL **is** the cross-replica invalidation (ADR-051) |
@@ -285,7 +287,10 @@ docker/seed/seed.sh                              # seed event 9001, pre-warm, wa
                                                  # The `docker` profile seeds no catalog —
                                                  # CatalogDevSeeder is @Profile("dev") (ADR-047)
 docker/scripts/fanout-check.sh                   # PROVE promotion fan-out across replicas.
-                                                 # 30/30 across >= 2 upstreams or it fails
+                                                 # 30/30 across >= 2 upstreams or it fails.
+                                                 # Refuses a SOLD_OUT sale: a drained counter
+                                                 # promotes nobody, and the script used to call
+                                                 # that a fan-out failure. Re-seed first
 docker/scripts/hold-expiry-check.sh              # PROVE the expiry listener restores seats exactly
                                                  # once, and faster than the sweeper (ADR-048)
 docker compose --profile loadtest run --rm k6    # the load run; VUS=n to scale it down
