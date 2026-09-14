@@ -86,11 +86,11 @@ class OperatorSurfaceIT extends IntegrationTest {
         assertThat(response.json().get("total").asInt()).isEqualTo(1);
 
         var entry = response.json().get("entries").get(0);
-        assertThat(entry.get("orderNumber").asText()).isEqualTo("TK-00099");
-        assertThat(entry.get("recipientEmail").asText()).isEqualTo("buyer@example.com");
+        assertThat(entry.get("orderNumber").asString()).isEqualTo("TK-00099");
+        assertThat(entry.get("recipientEmail").asString()).isEqualTo("buyer@example.com");
         // The reason is the whole point: ADR-029 does not retry a deterministic failure, so this
         // stored string is the only account of what went wrong.
-        assertThat(entry.get("failureReason").asText()).contains("Font cannot draw");
+        assertThat(entry.get("failureReason").asString()).contains("Font cannot draw");
     }
 
     @Test
@@ -144,8 +144,8 @@ class OperatorSurfaceIT extends IntegrationTest {
         var response = new BuyerSession(port).get("/admin/orders/" + orderNumber, OPERATOR);
 
         assertThat(response.status()).isEqualTo(200);
-        assertThat(response.json().get("status").asText()).isEqualTo("CONFIRMED");
-        assertThat(response.json().get("holdToken").asText()).isNotBlank();
+        assertThat(response.json().get("status").asString()).isEqualTo("CONFIRMED");
+        assertThat(response.json().get("holdToken").asString()).isNotBlank();
         // receiptToken authorises reading this order from any device for 90 days. An operator has no
         // need of one, and it would land in terminal history and any log that records bodies.
         assertThat(response.json().has("receiptToken")).isFalse();
@@ -161,14 +161,14 @@ class OperatorSurfaceIT extends IntegrationTest {
 
         var paused = new BuyerSession(port).post("/admin/events/" + eventId + "/pause", null, OPERATOR);
         assertThat(paused.status()).isEqualTo(200);
-        assertThat(paused.json().get("status").asText()).isEqualTo("PAUSED");
+        assertThat(paused.json().get("status").asString()).isEqualTo("PAUSED");
 
         // SaleWindows reads anything but PUBLISHED as CLOSED, so the gates shut with no new code.
         assertThat(buyer.get("/events/" + eventId).text("windowStatus")).isEqualTo("CLOSED");
         assertThat(buyer.post("/queue/join", Map.of("eventId", eventId)).status()).isNotEqualTo(202);
 
         var resumed = new BuyerSession(port).post("/admin/events/" + eventId + "/resume", null, OPERATOR);
-        assertThat(resumed.json().get("status").asText()).isEqualTo("PUBLISHED");
+        assertThat(resumed.json().get("status").asString()).isEqualTo("PUBLISHED");
         assertThat(buyer.get("/events/" + eventId).text("windowStatus")).isEqualTo("OPEN");
 
         // Nothing was destroyed on the way through: the stock counter is exactly where it was.
@@ -182,7 +182,7 @@ class OperatorSurfaceIT extends IntegrationTest {
         var again = new BuyerSession(port).post("/admin/events/" + eventId + "/pause", null, OPERATOR);
 
         assertThat(again.status()).isEqualTo(200);
-        assertThat(again.json().get("status").asText()).isEqualTo("PAUSED");
+        assertThat(again.json().get("status").asString()).isEqualTo("PAUSED");
     }
 
     // ---------------------------------------------------------------- helpers
