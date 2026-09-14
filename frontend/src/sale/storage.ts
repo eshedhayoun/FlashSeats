@@ -25,14 +25,19 @@ export function removeSaleValue(eventId: number, name: string): void {
 }
 
 export function getAdmissionToken(eventId: number): string | null {
-  return getSaleValue(eventId, "admissionToken");
+  return (
+    localStorage.getItem(saleStorageKey(eventId, "admissionToken")) ??
+    getSaleValue(eventId, "admissionToken")
+  );
 }
 
 export function setAdmissionToken(eventId: number, token: string): void {
-  setSaleValue(eventId, "admissionToken", token);
+  localStorage.setItem(saleStorageKey(eventId, "admissionToken"), token);
+  removeSaleValue(eventId, "admissionToken");
 }
 
 export function removeAdmissionToken(eventId: number): void {
+  localStorage.removeItem(saleStorageKey(eventId, "admissionToken"));
   removeSaleValue(eventId, "admissionToken");
 }
 

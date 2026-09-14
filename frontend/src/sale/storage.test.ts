@@ -1,9 +1,12 @@
 import { beforeEach, describe, expect, it } from "vitest";
 import {
   clearHoldStorage,
+  getAdmissionToken,
   getHoldToken,
   getIdempotencyKey,
   getSaleValue,
+  removeAdmissionToken,
+  setAdmissionToken,
   setHoldToken,
   setSaleValue
 } from "./storage";
@@ -20,6 +23,17 @@ describe("event-scoped storage", () => {
 
     expect(getHoldToken(1)).toBe("hold-a");
     expect(getHoldToken(2)).toBe("hold-b");
+  });
+
+  it("keeps an admission token when a sale is reopened in another tab", () => {
+    setAdmissionToken(1, "admission-a");
+
+    expect(getAdmissionToken(1)).toBe("admission-a");
+    expect(sessionStorage.getItem("fs.1.admissionToken")).toBeNull();
+
+    removeAdmissionToken(1);
+
+    expect(getAdmissionToken(1)).toBeNull();
   });
 
   it("reuses one idempotency key for a hold", () => {
