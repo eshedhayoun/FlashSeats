@@ -8,7 +8,7 @@ import type {
   SaleQueueState,
   TierAvailabilityEvent
 } from "../api/types";
-import { setLastEventId } from "../sale/storage";
+import { getLastEventId, setLastEventId } from "../sale/storage";
 
 type ConnectionState = "connecting" | "open" | "reconnecting";
 
@@ -87,7 +87,11 @@ export function useQueueStream(eventId: number, onRefresh: () => void) {
     const connect = () => {
       if (disposed) return;
       setState((current) => ({ ...current, connection: "connecting" }));
-      stream = new EventSource(`/api/v1/queue/stream?eventId=${eventId}`, {
+      const lastEventId = getLastEventId(eventId);
+      const replayQuery = lastEventId
+        ? `&lastEventId=${encodeURIComponent(lastEventId)}`
+        : "";
+      stream = new EventSource(`/api/v1/queue/stream?eventId=${eventId}${replayQuery}`, {
         withCredentials: true
       });
 
