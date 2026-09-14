@@ -68,6 +68,16 @@ public final class QueueKeys {
         return "queue:events:" + eventId;
     }
 
+    /** Bounded replay log for durable, low-frequency SSE frames. */
+    public static String replay(long eventId) {
+        return "queue:replay:" + eventId;
+    }
+
+    /** Monotonic SSE event id for the replay log. */
+    public static String replaySequence(long eventId) {
+        return "queue:replay-seq:" + eventId;
+    }
+
     /** Makes the promotion tick a singleton across replicas (ADR-032). */
     public static String promotionLock(long eventId) {
         return "queue:promote:" + eventId;

@@ -46,6 +46,7 @@ public class PromotionWorker {
     private final CatalogFacade catalog;
     private final QueueTokens tokens;
     private final QueueProperties properties;
+    private final QueueReplayService replay;
     private final GlobalPromotionBudget globalBudget;
     private final ObjectMapper json;
     private final Clock clock;
@@ -58,6 +59,7 @@ public class PromotionWorker {
             CatalogFacade catalog,
             QueueTokens tokens,
             QueueProperties properties,
+            QueueReplayService replay,
             GlobalPromotionBudget globalBudget,
             ObjectMapper json,
             Clock clock,
@@ -66,6 +68,7 @@ public class PromotionWorker {
         this.catalog = catalog;
         this.tokens = tokens;
         this.properties = properties;
+        this.replay = replay;
         this.globalBudget = globalBudget;
         this.json = json;
         this.clock = clock;
@@ -289,7 +292,7 @@ public class PromotionWorker {
 
     private void publish(long eventId, QueueChannelMessage message) {
         try {
-            redis.convertAndSend(QueueKeys.events(eventId), json.writeValueAsString(message));
+            replay.publishAndFanOut(eventId, message);
         } catch (Exception failed) {
             log.error("Could not publish {} for event {}", message.type(), eventId, failed);
         }
