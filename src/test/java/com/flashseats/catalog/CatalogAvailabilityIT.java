@@ -45,7 +45,7 @@ class CatalogAvailabilityIT extends IntegrationTest {
                 .get("tiers")
                 .get(0)
                 .get("availability")
-                .asText();
+                .asString();
 
         assertThat(availability)
                 .describedAs(
@@ -65,7 +65,7 @@ class CatalogAvailabilityIT extends IntegrationTest {
         buyer.get("/events/" + eventId);
         fixture.drainTier(tierId);
 
-        assertThat(buyer.get("/events/" + eventId).json().get("tiers").get(0).get("availability").asText())
+        assertThat(buyer.get("/events/" + eventId).json().get("tiers").get(0).get("availability").asString())
                 .isEqualTo("SOLD_OUT");
     }
 
@@ -81,7 +81,7 @@ class CatalogAvailabilityIT extends IntegrationTest {
                         .get("tiers")
                         .get(0)
                         .get("availability")
-                        .asText())
+                        .asString())
                 .isEqualTo("PLENTY");
     }
 }
