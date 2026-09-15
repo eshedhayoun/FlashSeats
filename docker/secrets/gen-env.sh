@@ -22,6 +22,10 @@ cd "$(dirname "$0")/../.."
 
 ENV_FILE=".env"
 EXAMPLE_FILE=".env.example"
+DOCKER_CLI="docker"
+if command -v docker.exe >/dev/null 2>&1; then
+    DOCKER_CLI="docker.exe"
+fi
 
 if [[ ! -f "$EXAMPLE_FILE" ]]; then
     echo "error: $EXAMPLE_FILE not found; run this from the repository." >&2
@@ -79,8 +83,8 @@ done
 # the `tr` leave just the digest.
 if grep -qE '^FLASHSEATS_ADMIN_PASSWORD=\{noop\}|^FLASHSEATS_ADMIN_PASSWORD=admin$' "$ENV_FILE"; then
     ADMIN_PLAINTEXT="$(openssl rand -hex 24)"
-    ADMIN_HASH="$(docker run --rm httpd:alpine \
-        htpasswd -bnBC 12 "" "$ADMIN_PLAINTEXT" 2>/dev/null | tr -d ':\n')"
+    ADMIN_HASH="$("$DOCKER_CLI" run --rm httpd:alpine \
+        htpasswd -nbB -C 12 flashseats "$ADMIN_PLAINTEXT" 2>/dev/null | cut -d: -f2- | tr -d '\n')"
 
     if [[ -z "$ADMIN_HASH" ]]; then
         echo "  FLASHSEATS_ADMIN_PASSWORD  — FAILED to hash (is Docker running?)" >&2
