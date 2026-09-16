@@ -57,8 +57,7 @@ public class RateLimitService {
     }
 
     private boolean tryConsume(String key, Supplier<BucketConfiguration> configuration) {
-        return buckets.builder()
-                .build(key.getBytes(StandardCharsets.UTF_8), configuration)
+        return buckets.getProxy(key.getBytes(StandardCharsets.UTF_8), configuration)
                 .tryConsume(1);
     }
 
