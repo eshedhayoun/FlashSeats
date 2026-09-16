@@ -10,6 +10,8 @@ import com.flashseats.flashseats.support.IntegrationTest;
 import com.flashseats.flashseats.support.SaleFixture;
 import java.time.Duration;
 import java.time.Instant;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Map;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
@@ -134,4 +136,82 @@ class BotDefenceIT extends IntegrationTest {
             assertThat(entries).containsOnly("IP_BLOCKED");
         });
     }
+    @Test 
+    @DisplayName("The session bucket returns 429 when one session sends too many requests") 
+    void sessionRateLimitIsEnforced(){
+        BuyerSession buyer = new BuyerSession(port);
+        List<Integer> statuses = new ArrayList<>();
+        for(int i=0; i<20; i++){
+            var response = buyer.get("/events/" + eventId);
+            statuses.add(response.status());
+        }
+        assertThat(statuses).contains(429);
+        var refused = buyer.get("/events/" + eventId); 
+        assertThat(refused.status()).isEqualTo(429);
+        assertThat(refused.errorCode()).isEqualTo("RATE_LIMITED");
+        assertThat(refused.json().get("retryable").asBoolean()).isTrue(); 
+        assertThat(refused.json().get("retryAfterSeconds").asInt()).isPositive();
+    }
+    @Test
+    @DisplayName("RATE_LIMITED responses include Retry-After so the client knows when to retry") 
+    void rateLimitedResponseContainsRetryAfter(){
+        BuyerSession buyer = new BuyerSession(port);
+        for(int i=0; i<20; i++){
+            buyer.get("/events/" + eventId);
+        }
+        var refused = buyer.get("/events/" + eventId); 
+        assertThat(refused.status()).isEqualTo(429); 
+        assertThat(refused.errorCode()).isEqualTo("RATE_LIMITED"); 
+        assertThat(refused.json().get("retryAfterSeconds").asInt()).isEqualTo(2);
+    }
+    @Test 
+    @DisplayName("Many fresh sessions from one address eventually hit the shared IP backstop") 
+    void ipBackstopThrottlesManySessionsFromOneAddress(){
+        List<Integer> statuses = new ArrayList<>();
+        for(int i=0; i<100; i++){
+            BuyerSession buyer = new BuyerSession(port);
+            var response = buyer.get("/events/" + eventId);
+            statuses.add(response.status());
+        }
+        assertThat(statuses).contains(429);
+        var refused = new BuyerSession(port).get("/events/" + eventId);
+        assertThat(refused.status()).isEqualTo(429);
+        assertThat(refused.errorCode()).isEqualTo("RATE_LIMITED");
+        assertThat(refused.json().get("retryAfterSeconds").asInt()).isPositive();
+    }
+    @Test 
+    @DisplayName("Sharing an address does not make two legitimate sessions immediately fail together") 
+    void separateSessionsSharingIpGetIndependentSessionBuckets(){
+        BuyerSession first = new BuyerSession(port); 
+        BuyerSession second = new BuyerSession(port);
+        for (int i = 0; i < 5; i++) {
+            assertThat(first.get("/events/" + eventId).status()).isEqualTo(200); 
+        }
+        for (int i = 0; i < 5; i++) {
+            assertThat(second.get("/events/" + eventId).status()).isEqualTo(200); 
+        }
+    }
+    @Test
+    @DisplayName("An ALLOW rule bypasses only the IP bucket, not the session bucket") 
+    void allowRuleDoesNotDisableSessionRateLimit(){
+        ipRules.upsert("127.0.0.1", IpRuleAction.ALLOW, "shared egress", null); 
+        BuyerSession buyer = new BuyerSession(port); 
+        List<Integer> statuses = new ArrayList<>();
+        for(int i=0; i<25; i++){
+            var response = buyer.get("/events/" + eventId);
+            statuses.add(response.status());
+        }
+        assertThat(statuses).contains(429);
+    }
+    @Test 
+    @DisplayName("X-Forwarded-For is ignored when the connecting peer is not trusted") 
+    void forwardedAddressIsIgnoredFromUntrustedPeer(){
+        ipRules.upsert("127.0.0.1", IpRuleAction.DENY, "real client address", null); 
+        BuyerSession buyer = new BuyerSession(port);
+         // A caller cannot bypass the rule by inventing a different address in X-Forwarded-For. 
+        var refused = buyer.get( "/events/" + eventId, Map.of("X-Forwarded-For", "203.0.113.55"));
+        assertThat(refused.status()).isEqualTo(403);
+        assertThat(refused.errorCode()).isEqualTo("IP_BLOCKED");
+    }
+    
 }
