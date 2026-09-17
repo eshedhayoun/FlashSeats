@@ -25,15 +25,21 @@ public class BuyerSession {
 
     private static final ObjectMapper JSON = new ObjectMapper();
 
+    private final CookieManager cookies;
     private final HttpClient http;
     private final String baseUrl;
 
     public BuyerSession(int port) {
+        this.cookies = new CookieManager(null, CookiePolicy.ACCEPT_ALL);
         this.http = HttpClient.newBuilder()
-                .cookieHandler(new CookieManager(null, CookiePolicy.ACCEPT_ALL))
+                .cookieHandler(cookies)
                 .connectTimeout(Duration.ofSeconds(5))
                 .build();
         this.baseUrl = "http://localhost:" + port + "/api/v1";
+    }
+
+    public int cookieCount() {
+        return cookies.getCookieStore().getCookies().size();
     }
 
     public Response get(String path) {
