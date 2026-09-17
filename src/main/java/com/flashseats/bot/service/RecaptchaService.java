@@ -6,6 +6,7 @@ import java.util.Map;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.http.client.SimpleClientHttpRequestFactory;
+import org.springframework.http.client.ClientHttpRequestFactory;
 import org.springframework.http.MediaType;
 import org.springframework.stereotype.Service;
 import org.springframework.util.LinkedMultiValueMap;
@@ -48,14 +49,35 @@ public class RecaptchaService {
     private final RestClient http;
 
     public RecaptchaService(BotProperties properties, StringRedisTemplate redis) {
+        this(properties, redis, RestClient.builder());
+    }
+
+    RecaptchaService(
+            BotProperties properties, StringRedisTemplate redis, RestClient.Builder clientBuilder) {
+        this(properties, redis, requestFactory(properties), clientBuilder);
+    }
+
+    RecaptchaService(
+            BotProperties properties,
+            StringRedisTemplate redis,
+            ClientHttpRequestFactory requestFactory,
+            RestClient.Builder clientBuilder) {
+        this(properties, redis, clientBuilder.requestFactory(requestFactory).build());
+    }
+
+    RecaptchaService(BotProperties properties, StringRedisTemplate redis, RestClient http) {
         this.properties = properties;
         this.redis = redis;
+        this.http = http;
+    }
+
+    private static ClientHttpRequestFactory requestFactory(BotProperties properties) {
         // Timeouts set on the factory explicitly, never left to the default. A client with no
         // read timeout on the join path turns a provider slowdown into a sale-length outage.
         SimpleClientHttpRequestFactory factory = new SimpleClientHttpRequestFactory();
         factory.setConnectTimeout(Duration.ofMillis(properties.getRecaptcha().getConnectTimeoutMs()));
         factory.setReadTimeout(Duration.ofMillis(properties.getRecaptcha().getReadTimeoutMs()));
-        this.http = RestClient.builder().requestFactory(factory).build();
+        return factory;
     }
 
     /**
