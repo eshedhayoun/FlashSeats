@@ -11,7 +11,10 @@ import com.flashseats.payment.gateway.GatewayCharge;
 import com.flashseats.payment.gateway.GatewayResult;
 import com.flashseats.payment.gateway.PaymentGateway;
 import com.flashseats.payment.model.PaymentTransaction;
+import io.micrometer.core.instrument.Gauge;
+import io.micrometer.core.instrument.MeterRegistry;
 import java.time.Duration;
+import java.util.concurrent.atomic.AtomicLong;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.stereotype.Service;
@@ -39,16 +42,25 @@ public class PaymentService implements PaymentFacade {
     private final PaymentTransactionStore store;
     private final StringRedisTemplate redis;
     private final PaymentProperties properties;
+    private final AtomicLong gatewayAttempts = new AtomicLong();
+    private final AtomicLong declines = new AtomicLong();
 
     public PaymentService(
             PaymentGateway gateway,
             PaymentTransactionStore store,
             StringRedisTemplate redis,
-            PaymentProperties properties) {
+            PaymentProperties properties,
+            MeterRegistry meters) {
         this.gateway = gateway;
         this.store = store;
         this.redis = redis;
         this.properties = properties;
+        Gauge.builder(
+                        "flashseats.payment.decline.ratio",
+                        this,
+                        service -> service.declines.get() / (double) Math.max(1, service.gatewayAttempts.get()))
+                .description("Declined provider attempts divided by all provider attempts")
+                .register(meters);
     }
 
     /**
@@ -86,6 +98,7 @@ public class PaymentService implements PaymentFacade {
             // open a second intent and risk billing twice for one authentication.
             ChargeAttempt attempt = store.beginAttempt(command); // tx1
 
+            gatewayAttempts.incrementAndGet();
             GatewayResult result = attempt.isResume() // no transaction open
                     ? gateway.retrieve(attempt.resumableGatewayReference())
                     : gateway.charge(new GatewayCharge(
@@ -97,6 +110,9 @@ public class PaymentService implements PaymentFacade {
                             command.clientIdempotencyKey()));
 
             store.recordOutcome(attempt.transactionReference(), result); // tx2
+            if (result.outcome() == GatewayResult.Outcome.DECLINED) {
+                declines.incrementAndGet();
+            }
 
             if (result.outcome() == GatewayResult.Outcome.ERROR) {
                 log.warn("Gateway error for order {}: {}", command.orderNumber(), result.failureReason());

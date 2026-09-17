@@ -18,6 +18,12 @@ import org.springframework.data.repository.query.Param;
 
 public interface OutboxEventRepository extends JpaRepository<OutboxEvent, UUID> {
 
+    @Query("""
+            SELECT MIN(e.createdAt) FROM OutboxEvent e
+             WHERE e.status <> com.flashseats.order.model.OutboxStatus.PROCESSED
+            """)
+    Optional<Instant> oldestUnprocessedCreatedAt();
+
     /**
      * The most recent message published for an order, whatever became of it.
      *
