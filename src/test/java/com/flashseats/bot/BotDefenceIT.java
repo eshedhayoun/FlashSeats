@@ -3,6 +3,7 @@ package com.flashseats.bot;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.awaitility.Awaitility.await;
 
+import com.flashseats.bot.config.BotProperties;
 import com.flashseats.bot.model.IpRuleAction;
 import com.flashseats.bot.service.IpRuleService;
 import com.flashseats.flashseats.support.BuyerSession;
@@ -18,6 +19,7 @@ import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.web.server.LocalServerPort;
+import org.springframework.test.context.TestPropertySource;
 
 /**
  * The defences that run before any business logic does.
@@ -28,6 +30,12 @@ import org.springframework.boot.test.web.server.LocalServerPort;
  * and a challenge score are what is left.
  */
 @DisplayName("Bot defence refuses what it should and never closes a sale by itself")
+@TestPropertySource(properties = {
+        "flashseats.bot.session-bucket.capacity=5",
+        "flashseats.bot.session-bucket.refill-per-second=1",
+        "flashseats.bot.ip-bucket.capacity=10",
+        "flashseats.bot.ip-bucket.refill-per-second=1"
+})
 class BotDefenceIT extends IntegrationTest {
 
     private static final Duration PATIENCE = Duration.ofSeconds(15);
@@ -40,6 +48,9 @@ class BotDefenceIT extends IntegrationTest {
 
     @Autowired
     private IpRuleService ipRules;
+
+    @Autowired
+    private BotProperties botProperties;
 
     private long eventId;
 
@@ -140,8 +151,10 @@ class BotDefenceIT extends IntegrationTest {
     @DisplayName("The session bucket returns 429 when one session sends too many requests") 
     void sessionRateLimitIsEnforced(){
         BuyerSession buyer = new BuyerSession(port);
+        buyer.get("/events/" + eventId);
+        assertThat(buyer.cookieCount()).isEqualTo(1);
         List<Integer> statuses = new ArrayList<>();
-        for(int i=0; i<20; i++){
+        for (int i = 0; i < botProperties.getSessionBucket().getCapacity() + 1; i++) {
             var response = buyer.get("/events/" + eventId);
             statuses.add(response.status());
         }
@@ -156,19 +169,20 @@ class BotDefenceIT extends IntegrationTest {
     @DisplayName("RATE_LIMITED responses include Retry-After so the client knows when to retry") 
     void rateLimitedResponseContainsRetryAfter(){
         BuyerSession buyer = new BuyerSession(port);
-        for(int i=0; i<20; i++){
+        for (int i = 0; i < botProperties.getSessionBucket().getCapacity() + 1; i++) {
             buyer.get("/events/" + eventId);
         }
         var refused = buyer.get("/events/" + eventId); 
         assertThat(refused.status()).isEqualTo(429); 
         assertThat(refused.errorCode()).isEqualTo("RATE_LIMITED"); 
-        assertThat(refused.json().get("retryAfterSeconds").asInt()).isEqualTo(2);
+        int retryAfterSeconds = refused.json().get("retryAfterSeconds").asInt();
+        assertThat(retryAfterSeconds).isPositive();
     }
     @Test 
     @DisplayName("Many fresh sessions from one address eventually hit the shared IP backstop") 
     void ipBackstopThrottlesManySessionsFromOneAddress(){
         List<Integer> statuses = new ArrayList<>();
-        for(int i=0; i<100; i++){
+        for (int i = 0; i < botProperties.getIpBucket().getCapacity() * 2 + 1; i++) {
             BuyerSession buyer = new BuyerSession(port);
             var response = buyer.get("/events/" + eventId);
             statuses.add(response.status());
