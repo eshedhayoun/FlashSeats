@@ -5,6 +5,7 @@ import java.time.Duration;
 import java.util.Map;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.data.redis.core.StringRedisTemplate;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.http.client.SimpleClientHttpRequestFactory;
 import org.springframework.http.client.ClientHttpRequestFactory;
 import org.springframework.http.MediaType;
@@ -48,6 +49,7 @@ public class RecaptchaService {
     private final StringRedisTemplate redis;
     private final RestClient http;
 
+    @Autowired
     public RecaptchaService(BotProperties properties, StringRedisTemplate redis) {
         this(properties, redis, RestClient.builder());
     }
