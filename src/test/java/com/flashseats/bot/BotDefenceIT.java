@@ -67,12 +67,10 @@ class BotDefenceIT extends IntegrationTest {
     void joinSucceedsWithNoProvider() {
         BuyerSession buyer = new BuyerSession(port);
         buyer.get("/events/" + eventId);
-
         // No secret is set in the test profile, and no token is sent. Both are the "we cannot
         // verify" case, and the documented behaviour is to let the buyer in (ADR-011). A sale that
         // closed because a third party was unreachable would be the worse failure by far.
         var joined = buyer.post("/queue/join", Map.of("eventId", eventId));
-
         assertThat(joined.status()).isEqualTo(202);
         // A real place in the line, not merely a 202 that swallowed the request.
         assertThat(joined.text("phase")).isNotNull();
@@ -97,9 +95,7 @@ class BotDefenceIT extends IntegrationTest {
     void removingARuleTakesEffect() {
         ipRules.upsert("127.0.0.1", IpRuleAction.DENY, "integration test", null);
         assertThat(new BuyerSession(port).get("/events/" + eventId).status()).isEqualTo(403);
-
         ipRules.remove("127.0.0.1");
-
         // The replica that served the change drops its snapshot immediately; the others follow when
         // theirs expires. There is no restart in that sentence, which is the point — the previous
         // answer to an address flooding a sale was to change a property and restart three replicas,

@@ -76,6 +76,7 @@ read_gauge() {
     local replica="$1" metric="$2"
     docker.exe compose exec -T "$replica" sh -c \
         "curl -fsS -u '${ADMIN_USER}:${ADMIN_PASS}' 'http://localhost:8080/actuator/metrics/${metric}'" \
+        < /dev/null \
         2>/dev/null | tr ',' '\n' | grep -A1 '"VALUE"' | grep '"value"' \
         | head -1 | sed 's/[^0-9.]//g' || echo ""
 }

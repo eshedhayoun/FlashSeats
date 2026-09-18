@@ -141,3 +141,5 @@ echo
 echo "The password in .env is a bcrypt digest and CANNOT be used to log in. Scripts"
 echo "that call the admin API need the plaintext, so export it for the session:"
 echo "  export FLASHSEATS_ADMIN_PLAINTEXT='<the password above>'"
+
+

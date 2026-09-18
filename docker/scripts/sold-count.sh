@@ -35,6 +35,10 @@ cd "$(dirname "$0")/../.."
 FIRST_ID="${1:-9001}"
 EVENTS="${2:-5}"
 LAST_ID=$((FIRST_ID + EVENTS - 1))
+DOCKER_CLI="docker"
+if command -v docker.exe >/dev/null 2>&1; then
+    DOCKER_CLI="docker.exe"
+fi
 
 if [[ ! -f .env ]]; then
     echo "error: .env not found. Run docker/secrets/gen-env.sh first." >&2
@@ -48,7 +52,7 @@ PG_DB="$(grep -E '^POSTGRES_DB=' .env | head -1 | cut -d= -f2-)"
 PG_USER="${PG_USER:-flashseats}"
 PG_DB="${PG_DB:-flashseats}"
 
-rows="$(docker compose exec -T postgres psql -U "$PG_USER" -d "$PG_DB" -At -F'|' -c "
+rows="$("$DOCKER_CLI" compose exec -T postgres psql -U "$PG_USER" -d "$PG_DB" -At -F'|' -c "
 SELECT t.event_id, t.id, t.total_capacity,
        (SELECT coalesce(sum(oi.quantity),0)
           FROM order_items oi JOIN orders o ON o.id = oi.order_id
@@ -76,7 +80,7 @@ while IFS='|' read -r event tier cap sold held; do
     [[ -n "$event" ]] || continue
     # `< /dev/null` is load-bearing: docker reads stdin, and without it the first
     # call swallows the rest of the row list and the loop reports one tier.
-    redis="$(docker compose exec -T redis redis-cli --no-raw GET "catalog:stock:$event:$tier" \
+    redis="$("$DOCKER_CLI" compose exec -T redis redis-cli --no-raw GET "catalog:stock:$event:$tier" \
                  < /dev/null 2>/dev/null | tr -d '"\r')"
 
     if [[ "$redis" == "(nil)" || -z "$redis" ]]; then
