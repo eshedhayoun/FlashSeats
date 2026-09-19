@@ -30,8 +30,8 @@ import org.springframework.transaction.support.TransactionTemplate;
  *   <li><strong>An OPEN sale</strong> with its counters written directly. Pre-warm cannot be used
  *       here: it refuses on anything but an {@code UPCOMING} window (ADR-004), so a demo event that
  *       is open on startup would otherwise have no counters and every hold would answer 503.
- *   <li><strong>An UPCOMING sale</strong> with no counters, so the countdown and the admin pre-warm
- *       path stay demonstrable.
+ *   <li><strong>A second OPEN sale</strong> with its counter written directly, so both seeded
+ *       frontend journeys are usable after a normal development restart.
  * </ul>
  *
  * <p>Runs only when the database is empty, so a restart never duplicates or resets a sale in
@@ -97,20 +97,19 @@ public class CatalogDevSeeder implements ApplicationRunner {
         counters.add(seedTier(live, "Floor", 4_500, 150, 6));
         counters.add(seedTier(live, "General Admission", 2_500, 500, 6));
 
-        Event upcoming = saveEvent(
+        Event secondLive = saveEvent(
                 "Midnight Sessions",
                 "An intimate late set. Sale opens shortly.",
                 "The Vault",
                 eventDate,
-                now.plusSeconds(30), // still UPCOMING, so pre-warm is demonstrable
+                now.plusSeconds(30),
                 saleEnd);
-        // Deliberately no counter: POST /api/v1/admin/events/{id}/prewarm creates it.
-        tier(upcoming, "General Admission", 3_000, 200, 4);
+        counters.add(seedTier(secondLive, "General Admission", 3_000, 200, 4));
 
         log.info(
-                "Seeded dev catalog: event {} is OPEN with 700 seats, event {} is UPCOMING and un-warmed",
+                "Seeded dev catalog: event {} is OPEN with 700 seats, event {} is OPEN with 200 seats",
                 live.getId(),
-                upcoming.getId());
+                secondLive.getId());
         return counters;
     }
 
