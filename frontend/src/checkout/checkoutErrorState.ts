@@ -24,17 +24,33 @@ export function checkoutErrorState(error: ApiError): CheckoutErrorState {
         clearHold: false,
         refreshSale: false
       };
+
     case "PAYMENT_GATEWAY_UNAVAILABLE":
       return {
-        message: `${error.message} The payment provider is having trouble. Your seats are held.`,
+        message: `${error.message} The payment provider is having trouble. Your seats are still held.`,
         severity: "error",
         payDisabled: false,
         duplicatePayment: false,
         clearHold: false,
         refreshSale: false
       };
+
+    case "PAYMENT_ACTION_REQUIRED":
+      return {
+        message:
+          "Your bank needs to verify the payment. Your seats are still held.",
+        severity: "info",
+        payDisabled: true,
+        duplicatePayment: false,
+        clearHold: false,
+        refreshSale: false
+      };
+
     case "PAYMENT_ATTEMPTS_EXHAUSTED":
-      return terminal(`${error.message} Release your seats to start over.`);
+      return terminal(
+        `${error.message} Release your seats to start over.`
+      );
+
     case "DUPLICATE_PAYMENT":
       return {
         message: "Finishing a payment that is already in progress…",
@@ -44,20 +60,28 @@ export function checkoutErrorState(error: ApiError): CheckoutErrorState {
         clearHold: false,
         refreshSale: true
       };
+
     case "INSUFFICIENT_TIME_REMAINING":
-      return terminal(`${error.message} Release your seats and reserve again.`);
+      return terminal(
+        `${error.message} Release your seats and reserve again.`
+      );
+
     case "HOLD_EXPIRED":
       return {
         ...terminal("Your reservation expired. Nothing was charged."),
         clearHold: true,
         refreshSale: true
       };
+
     case "ORDER_REFUNDED":
       return {
-        ...terminal(`${error.message} The charge succeeded but was refunded.`),
+        ...terminal(
+          `${error.message} The charge succeeded but was refunded.`
+        ),
         clearHold: true,
         refreshSale: true
       };
+
     default:
       return {
         message: error.message,
