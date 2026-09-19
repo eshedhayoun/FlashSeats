@@ -69,7 +69,7 @@ export function getIdempotencyKey(eventId: number, holdToken: string): string {
 
 export function clearHoldStorage(eventId: number, holdToken: string): void {
   removeSaleValue(eventId, "holdToken");
-  removeSaleValue(eventId, `idem.${holdToken}`);
+  //removeSaleValue(eventId, `idem.${holdToken}`);
 }
 
 export function getRecentOrders(): RecentOrder[] {

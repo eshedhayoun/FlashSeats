@@ -3,12 +3,10 @@ import { ApiError } from "../api/errors";
 import { getEvent } from "../api/endpoints";
 import type { EventDetails } from "../api/types";
 import { serverClock } from "../clock/serverClock";
-import { useClockTick } from "../clock/useClockTick";
 
 type EventStatus = "loading" | "ready" | "error";
 
 export function useEvent(eventId: number) {
-  useClockTick();
   const [status, setStatus] = useState<EventStatus>("loading");
   const [event, setEvent] = useState<EventDetails | null>(null);
   const [error, setError] = useState<ApiError | null>(null);
@@ -27,6 +25,7 @@ export function useEvent(eventId: number) {
       })
       .catch((cause: unknown) => {
         if (!active) return;
+
         setError(
           cause instanceof ApiError
             ? cause
@@ -38,6 +37,7 @@ export function useEvent(eventId: number) {
                 code: "CLIENT_ERROR"
               })
         );
+
         setStatus("error");
       });
 
@@ -57,6 +57,7 @@ export function useEvent(eventId: number) {
     }
 
     openingRefresh.current = event.saleStartTime;
+
     void getEvent(eventId)
       .then((nextEvent) => {
         setEvent(nextEvent);
@@ -65,6 +66,7 @@ export function useEvent(eventId: number) {
       })
       .catch((cause: unknown) => {
         openingRefresh.current = null;
+
         setError(
           cause instanceof ApiError
             ? cause
@@ -76,7 +78,7 @@ export function useEvent(eventId: number) {
                 code: "CLIENT_ERROR"
               })
         );
-      })
+      });
   }, [event, eventId]);
 
   return { status, event, error };

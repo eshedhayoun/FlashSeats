@@ -20,6 +20,7 @@ export type Problem = {
   attemptsRemaining?: number;
   expiresAt?: string;
   retryAfterSeconds?: number;
+  clientSecret?: string;
 };
 
 export type EventTier = {

@@ -57,19 +57,14 @@ public class StripePaymentGateway implements PaymentGateway {
     @Override
     public GatewayResult charge(GatewayCharge charge) {
         PaymentIntentCreateParams params = PaymentIntentCreateParams.builder()
-                .setAmount(charge.amountCents())
-                .setCurrency(charge.currency().toLowerCase())
-                .setPaymentMethod(charge.paymentMethodId())
-                .setConfirm(true)
-                .setAutomaticPaymentMethods(PaymentIntentCreateParams.AutomaticPaymentMethods.builder()
-                        .setEnabled(true)
-                        .setAllowRedirects(
-                                PaymentIntentCreateParams.AutomaticPaymentMethods.AllowRedirects.NEVER)
-                        .build())
-                .putMetadata("orderNumber", charge.orderNumber())
-                .putMetadata("holdToken", charge.holdToken())
-                .build();
-
+            .setAmount(charge.amountCents())
+            .setCurrency(charge.currency().toLowerCase())
+            .setPaymentMethod(charge.paymentMethodId())
+            .setConfirm(true)
+            .addPaymentMethodType("card")
+            .putMetadata("orderNumber", charge.orderNumber())
+            .putMetadata("holdToken", charge.holdToken())
+            .build();
         RequestOptions options = charge.clientIdempotencyKey() == null
                         || charge.clientIdempotencyKey().isBlank()
                 ? baseOptions
