@@ -48,10 +48,13 @@ public class OutboxRelay {
         // PENDING, so the outcome of a bad batch is a retry rather than a lost ticket.
         List<UUID> published = publisher.publish(batch);
 
-        if (!published.isEmpty()) {
-            store.markProcessed(published); // tx2
-        }
+        List<OutboxEvent> publishedEvents = batch.stream()
+                .filter(event -> published.contains(event.getId()))
+                .toList();
 
+        if (!publishedEvents.isEmpty()) {
+            store.markProcessed(publishedEvents); // tx2
+        }
         if (published.size() < batch.size()) {
             log.warn(
                     "{} of {} outbox event(s) were not confirmed; they stay PROCESSING and will be"

@@ -8,7 +8,7 @@ import java.util.List;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.stereotype.Component;
-
+import java.time.Duration;
 /**
  * Builds sale fixtures by writing rows directly.
  *
@@ -215,6 +215,19 @@ public class SaleFixture {
         return jdbc.queryForObject(
                 "SELECT count(*) FROM outbox_events WHERE status = ?", Integer.class, status);
     }
+    //overloaded method to count outbox events by event type and status
+    public int countOutbox(String eventType, String status) {
+        return jdbc.queryForObject(
+                """
+                SELECT count(*)
+                FROM outbox_events
+                WHERE event_type = ?
+                AND status = ?
+                """,
+                Integer.class,
+                eventType,
+                status);
+    }
 
     /**
      * Leaves an order row {@code PENDING} for a hold, as a process killed mid-checkout would.
@@ -251,6 +264,18 @@ public class SaleFixture {
                 Timestamp.from(Instant.now().minus(by)),
                 Timestamp.from(Instant.now().minus(by)),
                 holdToken);
+    }
+    public void ageHold(String holdToken, Duration age, Duration remaining) {
+        Instant createdAt = Instant.now().minus(age);
+        Instant expiresAt = Instant.now().plus(remaining);
+
+        jdbc.update(
+                "UPDATE ticket_holds SET created_at = ?, expires_at = ? WHERE hold_token = ?",
+                Timestamp.from(createdAt),
+                Timestamp.from(expiresAt),
+                holdToken);
+
+        caches.forEach(DerivedStateCache::invalidateAll);
     }
 
     /** Pushes a hold's expiry into the past so the sweeper will reclaim it on its next pass. */

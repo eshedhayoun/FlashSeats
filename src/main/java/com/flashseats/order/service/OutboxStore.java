@@ -6,6 +6,7 @@ import com.flashseats.order.model.OutboxStatus;
 import com.flashseats.order.repository.OutboxEventRepository;
 import java.time.Clock;
 import java.time.Duration;
+import java.time.Instant;
 import java.util.Collection;
 import java.util.List;
 import java.util.UUID;
@@ -54,8 +55,15 @@ public class OutboxStore {
     }
 
     @Transactional
-    public void markProcessed(Collection<UUID> ids) {
-        outbox.markProcessed(ids, clock.instant());
+    public void markProcessed(Collection<OutboxEvent> events) {
+        Instant now = clock.instant();
+
+        for (OutboxEvent event : events) {
+            outbox.markProcessed(
+                    event.getId(),
+                    event.getRetryCount(),
+                    now);
+        }
     }
 
     /** Recovers rows whose relay died between claiming and publishing. */
