@@ -166,7 +166,10 @@ class PaymentWebhookIT extends IntegrationTest {
 
         // And the buyer is told, rather than finding out from their bank statement.
         await().atMost(PATIENCE)
-                .untilAsserted(() -> assertThat(fixture.countOutbox("PROCESSED")).isEqualTo(1));
+        .untilAsserted(() ->
+                assertThat(fixture.countOutbox("ORDER_REFUNDED", "PROCESSED")).isEqualTo(1));
+
+        assertThat(fixture.countOutbox("ORDER_CONFIRMED", "PROCESSED")).isZero();
     }
 
     @Test
