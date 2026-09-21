@@ -12,7 +12,8 @@ import com.stripe.net.Webhook;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.context.ApplicationEventPublisher;
 import org.springframework.stereotype.Service;
-
+import io.micrometer.core.instrument.Counter;
+import io.micrometer.core.instrument.MeterRegistry;
 /**
  * Verifies a provider delivery, claims it once, and lets {@code order} settle it.
  *
@@ -54,15 +55,19 @@ public class PaymentWebhookService {
     private final ApplicationEventPublisher events;
     private final PaymentProperties properties;
 
+    private final MeterRegistry meters;
+
     public PaymentWebhookService(
             WebhookEventStore webhookEvents,
             PaymentTransactionStore transactions,
             ApplicationEventPublisher events,
-            PaymentProperties properties) {
+            PaymentProperties properties,
+            MeterRegistry meters) {
         this.webhookEvents = webhookEvents;
         this.transactions = transactions;
         this.events = events;
         this.properties = properties;
+        this.meters = meters;
     }
 
     /**
@@ -72,6 +77,7 @@ public class PaymentWebhookService {
      */
     public void handle(String rawBody, String signature) {
         Event event = verify(rawBody, signature);
+        webhookReceived(event.getType());
 
         if (!SETTLED.equals(event.getType())) {
             log.debug("Ignoring webhook {} of type {}", event.getId(), event.getType());
@@ -158,5 +164,12 @@ public class PaymentWebhookService {
         }
         throw new IllegalStateException(
                 "Webhook " + event.getId() + " of type " + event.getType() + " is not a PaymentIntent");
+    }
+    private void webhookReceived(String eventType) {
+        Counter.builder("flashseats.payment.webhook.received")
+                .description("Verified Stripe webhooks received by event type")
+                .tag("type", eventType)
+                .register(meters)
+                .increment();
     }
 }

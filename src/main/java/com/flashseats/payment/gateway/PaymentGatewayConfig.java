@@ -13,6 +13,7 @@ import org.springframework.context.annotation.Configuration;
 import io.github.resilience4j.core.IntervalFunction;
 import io.github.resilience4j.retry.Retry;
 import io.github.resilience4j.retry.RetryConfig;
+import org.springframework.beans.factory.annotation.Qualifier;
 /**
  * Chooses the payment provider and wraps it in the breaker.
  *
@@ -68,8 +69,8 @@ public class PaymentGatewayConfig {
     @Bean
    public PaymentGateway paymentGateway(
         PaymentProperties properties,
-        CircuitBreaker paymentGatewayBreaker,
-        Retry paymentGatewayRetry){
+        @Qualifier("paymentGatewayBreaker") CircuitBreaker paymentGatewayBreaker,
+        @Qualifier("paymentGatewayRetry") Retry paymentGatewayRetry){
         PaymentGateway delegate;
         if (properties.getStripe().isEnabled()) {
             log.info("Payment gateway: Stripe");

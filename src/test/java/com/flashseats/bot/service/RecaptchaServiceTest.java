@@ -23,6 +23,12 @@ import org.springframework.web.client.ResourceAccessException;
 import org.springframework.test.web.client.MockRestServiceServer;
 import org.springframework.web.client.RestClient;
 import static org.mockito.Mockito.times;
+import com.flashseats.bot.exception.RecaptchaTransportException;
+import io.github.resilience4j.circuitbreaker.CircuitBreaker;
+import io.github.resilience4j.retry.Retry;
+import io.github.resilience4j.retry.RetryConfig;
+
+import static org.springframework.test.web.client.response.MockRestResponseCreators.withServerError;
 
 class RecaptchaServiceTest {
 
@@ -44,7 +50,7 @@ class RecaptchaServiceTest {
 
         assertThat(service.verify("session-1", "token")).isEqualTo(RecaptchaService.Verdict.PASSED);
 
-        verify(values).set("bot:verified:session-1", "1", Duration.ofSeconds(900));
+        verify(values).set("bot:verified:session-1", "1", Duration.ofSeconds(1800));
         server.verify();
     }
     @Test
@@ -68,7 +74,7 @@ class RecaptchaServiceTest {
         assertThat(service.verify("session-1", "token")).isEqualTo(RecaptchaService.Verdict.PASSED);
 
         verify(redis, times(2)).hasKey("bot:verified:session-1");
-        verify(values).set("bot:verified:session-1","1",Duration.ofSeconds(900));
+        verify(values).set("bot:verified:session-1","1",Duration.ofSeconds(1800));
 
         // The MockRestServiceServer has exactly one expected provider call.
         // If the second verify() contacted reCAPTCHA, this assertion would fail.
@@ -151,7 +157,84 @@ class RecaptchaServiceTest {
 
         server.verify();
     }
+    @Test
+    void retriesTransportFailureOnceAndThenSucceeds() {
+        BotProperties properties = properties();
+        StringRedisTemplate redis = mock(StringRedisTemplate.class);
 
+        RestClient.Builder builder = RestClient.builder();
+        MockRestServiceServer server = MockRestServiceServer.bindTo(builder).build();
+
+        // First provider call fails with 500.
+        server.expect(once(), requestTo(VERIFY_URL))
+                .andExpect(method(HttpMethod.POST))
+                .andRespond(withServerError());
+
+        // Retry succeeds.
+        server.expect(once(), requestTo(VERIFY_URL))
+                .andExpect(method(HttpMethod.POST))
+                .andRespond(withSuccess(
+                        "{\"success\":true,\"score\":0.9}",
+                        MediaType.APPLICATION_JSON));
+
+        CircuitBreaker circuitBreaker =
+                CircuitBreaker.ofDefaults("recaptcha-retry-test");
+
+        Retry retry = Retry.of(
+                "recaptcha-retry-test",
+                RetryConfig.custom()
+                        .maxAttempts(2)
+                        .waitDuration(Duration.ZERO)
+                        .retryExceptions(RecaptchaTransportException.class)
+                        .build());
+
+        RecaptchaService service = new RecaptchaService(
+                properties,
+                redis,
+                builder.build(),
+                circuitBreaker,
+                retry);
+
+        assertThat(service.verify("session-1", "token"))
+                .isEqualTo(RecaptchaService.Verdict.PASSED);
+
+        server.verify();
+    }
+
+    @Test
+    void failsOpenImmediatelyWhenCircuitIsOpen() {
+        BotProperties properties = properties();
+        StringRedisTemplate redis = mock(StringRedisTemplate.class);
+
+        RestClient.Builder builder = RestClient.builder();
+        MockRestServiceServer server = MockRestServiceServer.bindTo(builder).build();
+
+        CircuitBreaker circuitBreaker =
+                CircuitBreaker.ofDefaults("recaptcha-open-test");
+        circuitBreaker.transitionToOpenState();
+
+        Retry retry = Retry.of(
+                "recaptcha-open-test",
+                RetryConfig.custom()
+                        .maxAttempts(2)
+                        .waitDuration(Duration.ZERO)
+                        .retryExceptions(RecaptchaTransportException.class)
+                        .build());
+
+        RecaptchaService service = new RecaptchaService(
+                properties,
+                redis,
+                builder.build(),
+                circuitBreaker,
+                retry);
+
+        assertThat(service.verify("session-1", "token"))
+                .isEqualTo(RecaptchaService.Verdict.DEGRADED);
+
+        // There are deliberately no server expectations.
+        // Any provider call would make MockRestServiceServer fail the test.
+        server.verify();
+    }
     private static BotProperties properties() {
         BotProperties properties = new BotProperties();
         properties.getRecaptcha().setSecret("test-secret");

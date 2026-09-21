@@ -23,10 +23,15 @@ public class BotVerificationService implements BotFacade {
 
     private final RecaptchaService recaptcha;
     private final BotAuditService audit;
+    private final BotMetrics metrics;
 
-    public BotVerificationService(RecaptchaService recaptcha, BotAuditService audit) {
+    public BotVerificationService(
+            RecaptchaService recaptcha,
+            BotAuditService audit,
+            BotMetrics metrics) {
         this.recaptcha = recaptcha;
         this.audit = audit;
+        this.metrics = metrics;
     }
 
     @Override
@@ -35,7 +40,13 @@ public class BotVerificationService implements BotFacade {
 
         switch (verdict) {
             case FAILED -> {
-                audit.record(sessionId, ipAddress, JOIN_PATH, BotOutcome.VERIFICATION_FAILED, null);
+                metrics.recordRefusal(BotOutcome.VERIFICATION_FAILED);
+                audit.record(
+                        sessionId,
+                        ipAddress,
+                        JOIN_PATH,
+                        BotOutcome.VERIFICATION_FAILED,
+                        null);
                 throw new BotVerificationFailedException();
             }
             // Audited precisely because it is allowed. Failing open is invisible from the outside,
