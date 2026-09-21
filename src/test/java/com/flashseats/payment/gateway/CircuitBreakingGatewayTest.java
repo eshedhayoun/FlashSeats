@@ -8,7 +8,8 @@ import java.time.Duration;
 import java.util.concurrent.atomic.AtomicInteger;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
-
+import io.github.resilience4j.retry.Retry;
+import io.github.resilience4j.retry.RetryConfig;
 /**
  * What the breaker counts, and what it must not.
  *
@@ -68,6 +69,32 @@ class CircuitBreakingGatewayTest {
         assertThat(calls.get()).isEqualTo(100);
     }
 
+    @Test
+    @DisplayName("Repeated refund transport failures open the breaker")
+    void opensOnRefundTransportFailures() {
+        AtomicInteger calls = new AtomicInteger();
+        PaymentGateway gateway = breaking(new AlwaysFailing(calls));
+
+        for (int i = 0; i < 5; i++) {
+            GatewayResult result =
+                    gateway.refund("pi_123", 7_500, "hold expired");
+
+            assertThat(result.outcome())
+                    .isEqualTo(GatewayResult.Outcome.ERROR);
+        }
+
+        assertThat(calls.get()).isEqualTo(5);
+
+        GatewayResult refused =
+                gateway.refund("pi_123", 7_500, "hold expired");
+
+        assertThat(refused.outcome())
+                .isEqualTo(GatewayResult.Outcome.ERROR);
+        assertThat(refused.failureCode())
+                .isEqualTo("circuit_open");
+        assertThat(calls.get()).isEqualTo(5);
+    }
+
     private static PaymentGateway breaking(PaymentGateway delegate) {
         CircuitBreaker breaker = CircuitBreaker.of(
                 "test",
@@ -79,7 +106,8 @@ class CircuitBreakingGatewayTest {
                         .waitDurationInOpenState(Duration.ofMinutes(1))
                         .recordExceptions(GatewayTransportException.class)
                         .build());
-        return new CircuitBreakingGateway(delegate, breaker);
+        Retry retry = Retry.of("testRetry",RetryConfig.custom().maxAttempts(1).build());
+        return new CircuitBreakingGateway(delegate, breaker, retry);
     }
 
     private record AlwaysFailing(AtomicInteger calls) implements PaymentGateway {

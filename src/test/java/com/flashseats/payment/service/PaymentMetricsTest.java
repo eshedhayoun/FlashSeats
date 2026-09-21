@@ -15,6 +15,16 @@ import java.time.Duration;
 import org.junit.jupiter.api.Test;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.data.redis.core.ValueOperations;
+import static org.mockito.ArgumentMatchers.anyString;
+import com.flashseats.payment.exception.DuplicatePaymentException;
+import com.flashseats.payment.exception.PaymentGatewayUnavailableException;
+
+import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.verify;
+
+
+import com.flashseats.payment.gateway.GatewayCharge;
+import org.mockito.ArgumentCaptor;
 
 class PaymentMetricsTest {
 
@@ -55,6 +65,89 @@ class PaymentMetricsTest {
                 .isInstanceOf(RuntimeException.class);
 
         assertThat(meters.get("flashseats.payment.decline.ratio").gauge().value()).isZero();
+    }
+
+    @Test
+    void redisCleanupFailureDoesNotReplaceASuccessfulPaymentResult() {
+        when(store.beginAttempt(any()))
+                .thenReturn(new ChargeAttempt("tx_success", null));
+
+        when(gateway.charge(any()))
+                .thenReturn(GatewayResult.succeeded("ch_success"));
+
+        when(redis.delete(anyString()))
+                .thenThrow(new RuntimeException("redis unavailable"));
+
+        var result = payments.authorize(command("order-1", "hold-1"));
+
+        assertThat(result.succeeded()).isTrue();
+        assertThat(result.transactionReference()).isEqualTo("tx_success");
+        assertThat(result.gatewayReference()).isEqualTo("ch_success");
+        assertThat(result.failureReason()).isNull();
+    }
+    @Test
+    void existingInflightPaymentIsRejectedBeforeStartingAnotherCharge() {
+        when(values.setIfAbsent(any(), any(), any(Duration.class)))
+                .thenReturn(false);
+
+        assertThatThrownBy(() -> payments.authorize(command("order-1", "hold-1")))
+                .isInstanceOf(DuplicatePaymentException.class);
+
+        verify(store, never()).beginAttempt(any());
+        verify(gateway, never()).charge(any());
+    }
+
+    @Test
+    void forwardsTheExactChargeAndIdempotencyDataToTheGateway() {
+        when(store.beginAttempt(any()))
+                .thenReturn(new ChargeAttempt("tx_success", null));
+
+        when(gateway.charge(any()))
+                .thenReturn(GatewayResult.succeeded("ch_success"));
+
+        var command = new AuthorizeCommand(
+                "order-42",
+                "hold-42",
+                "session-7",
+                7_500,
+                "usd",
+                "pm_card_visa",
+                "client-idem-42",
+                1);
+
+        payments.authorize(command);
+
+        ArgumentCaptor<GatewayCharge> captor =
+                ArgumentCaptor.forClass(GatewayCharge.class);
+
+        verify(gateway).charge(captor.capture());
+
+        GatewayCharge charge = captor.getValue();
+
+        assertThat(charge.orderNumber()).isEqualTo("order-42");
+        assertThat(charge.holdToken()).isEqualTo("hold-42");
+        assertThat(charge.amountCents()).isEqualTo(7_500);
+        assertThat(charge.currency()).isEqualTo("usd");
+        assertThat(charge.paymentMethodId()).isEqualTo("pm_card_visa");
+        assertThat(charge.clientIdempotencyKey()).isEqualTo("client-idem-42");
+    }
+    @Test
+    void failedResumeRetrievalDoesNotStartASecondCharge() {
+        when(store.beginAttempt(any()))
+                .thenReturn(new ChargeAttempt("tx_existing", "pi_existing"));
+
+        when(gateway.retrieve("pi_existing"))
+                .thenReturn(
+                        GatewayResult.error(
+                                "provider_unavailable",
+                                "Stripe is unavailable."));
+
+        assertThatThrownBy(
+                () -> payments.authorize(command("order-1", "hold-1")))
+                .isInstanceOf(PaymentGatewayUnavailableException.class);
+
+        verify(gateway).retrieve("pi_existing");
+        verify(gateway, never()).charge(any());
     }
 
     private static AuthorizeCommand command(String orderNumber, String holdToken) {

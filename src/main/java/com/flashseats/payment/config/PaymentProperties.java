@@ -106,9 +106,9 @@ public class PaymentProperties {
     public static class Breaker {
 
         private int slidingWindowSize = 20;
-        private int minimumNumberOfCalls = 10;
+        private int minimumNumberOfCalls = 20;
         private float failureRateThresholdPercent = 50;
-        private int waitInOpenStateSeconds = 10;
+        private int waitInOpenStateSeconds = 30;
         private int permittedCallsInHalfOpenState = 3;
 
         public int getSlidingWindowSize() {
