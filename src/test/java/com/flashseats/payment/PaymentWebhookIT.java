@@ -15,6 +15,7 @@ import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.web.server.LocalServerPort;
+import io.micrometer.core.instrument.MeterRegistry;
 
 /**
  * The path that exists because the buyer's connection can be cut.
@@ -39,6 +40,9 @@ class PaymentWebhookIT extends IntegrationTest {
     private long eventId;
     private long tierId;
     private String admissionToken;
+
+    @Autowired
+    private MeterRegistry meters;
 
     @BeforeEach
     void seedSale() {
@@ -192,6 +196,38 @@ class PaymentWebhookIT extends IntegrationTest {
         assertThat(fixture.stockInvariantHolds(tierId)).isTrue();
     }
 
+    @Test
+    @DisplayName("A verified webhook increments the received metric by event type")
+    void recordsVerifiedWebhookByEventType() {
+        BuyerSession buyer = admittedBuyer();
+        String holdToken = reserve(buyer, 1);
+        fixture.strandPendingOrder(holdToken);
+
+        String delivery = eventId();
+        String body = StripeWebhooks.settledBody(
+                delivery,
+                "pi_metric_test",
+                holdToken,
+                7_500);
+
+        var existingCounter = meters.find("flashseats.payment.webhook.received")
+                .tag("type", "payment_intent.succeeded")
+                .counter();
+
+        double before = existingCounter == null
+                ? 0.0
+                : existingCounter.count();
+
+        assertThat(post(body, StripeWebhooks.signature(body)).status())
+                .isEqualTo(200);
+
+        var counter = meters.find("flashseats.payment.webhook.received")
+                .tag("type", "payment_intent.succeeded")
+                .counter();
+
+        assertThat(counter).isNotNull();
+        assertThat(counter.count() - before).isEqualTo(1.0);
+    }
     // ----------------------------------------------------------------- helpers
 
     private BuyerSession.Response post(String rawBody, String signature) {
