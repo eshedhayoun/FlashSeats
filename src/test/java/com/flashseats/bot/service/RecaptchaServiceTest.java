@@ -22,6 +22,7 @@ import org.springframework.http.client.ClientHttpRequestFactory;
 import org.springframework.web.client.ResourceAccessException;
 import org.springframework.test.web.client.MockRestServiceServer;
 import org.springframework.web.client.RestClient;
+import static org.mockito.Mockito.times;
 
 class RecaptchaServiceTest {
 
@@ -44,6 +45,65 @@ class RecaptchaServiceTest {
         assertThat(service.verify("session-1", "token")).isEqualTo(RecaptchaService.Verdict.PASSED);
 
         verify(values).set("bot:verified:session-1", "1", Duration.ofSeconds(900));
+        server.verify();
+    }
+    @Test
+    void cachedVerificationSkipsTheProviderOnTheNextRequest() {
+        BotProperties properties = properties();
+        StringRedisTemplate redis = mock(StringRedisTemplate.class);
+        ValueOperations<String, String> values = mock(ValueOperations.class);
+
+        org.mockito.Mockito.when(redis.opsForValue()).thenReturn(values);
+        org.mockito.Mockito.when(redis.hasKey("bot:verified:session-1")).thenReturn(false, true);
+
+        RestClient.Builder builder = RestClient.builder();
+        MockRestServiceServer server = MockRestServiceServer.bindTo(builder).build();
+
+        server.expect(once(), requestTo(VERIFY_URL)).andExpect(method(HttpMethod.POST)).andRespond(withSuccess("{\"success\":true,\"score\":0.9}",MediaType.APPLICATION_JSON));
+
+        RecaptchaService service = new RecaptchaService(properties,redis,builder.build());
+
+        assertThat(service.verify("session-1", "token")).isEqualTo(RecaptchaService.Verdict.PASSED);
+
+        assertThat(service.verify("session-1", "token")).isEqualTo(RecaptchaService.Verdict.PASSED);
+
+        verify(redis, times(2)).hasKey("bot:verified:session-1");
+        verify(values).set("bot:verified:session-1","1",Duration.ofSeconds(900));
+
+        // The MockRestServiceServer has exactly one expected provider call.
+        // If the second verify() contacted reCAPTCHA, this assertion would fail.
+        server.verify();
+    }
+    @Test
+    void redisFailureDoesNotPreventSuccessfulVerification() {
+        BotProperties properties = properties();
+        StringRedisTemplate redis = mock(StringRedisTemplate.class);
+
+        org.mockito.Mockito.when(redis.hasKey("bot:verified:session-1"))
+                .thenThrow(new RuntimeException("redis unavailable"));
+
+        org.mockito.Mockito.when(redis.opsForValue())
+                .thenThrow(new RuntimeException("redis unavailable"));
+
+        RestClient.Builder builder = RestClient.builder();
+        MockRestServiceServer server = MockRestServiceServer.bindTo(builder).build();
+
+        server.expect(once(), requestTo(VERIFY_URL))
+                .andExpect(method(HttpMethod.POST))
+                .andRespond(withSuccess(
+                        "{\"success\":true,\"score\":0.9}",
+                        MediaType.APPLICATION_JSON));
+
+        RecaptchaService service = new RecaptchaService(
+                properties,
+                redis,
+                builder.build());
+
+        assertThat(service.verify("session-1", "token"))
+                .isEqualTo(RecaptchaService.Verdict.PASSED);
+
+        // Redis was unavailable for both the read and the cache write,
+        // but the provider verification still succeeded and the request passed.
         server.verify();
     }
 

@@ -20,7 +20,9 @@ import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.web.server.LocalServerPort;
 import org.springframework.test.context.TestPropertySource;
-
+import org.junit.jupiter.api.MethodOrderer;
+import org.junit.jupiter.api.Order;
+import org.junit.jupiter.api.TestMethodOrder;
 /**
  * The defences that run before any business logic does.
  *
@@ -29,6 +31,7 @@ import org.springframework.test.context.TestPropertySource;
  * populations are not blocked during exactly the spike this system exists to serve. A manual block
  * and a challenge score are what is left.
  */
+@TestMethodOrder(MethodOrderer.OrderAnnotation.class)
 @DisplayName("Bot defence refuses what it should and never closes a sale by itself")
 @TestPropertySource(properties = {
         "flashseats.bot.session-bucket.capacity=5",
@@ -130,6 +133,7 @@ class BotDefenceIT extends IntegrationTest {
     }
 
     @Test
+    @Order(1)
     @DisplayName("A refusal is written to the audit trail, and a success is not")
     void onlyRefusalsAreAudited() {
         new BuyerSession(port).get("/events/" + eventId);
@@ -174,17 +178,39 @@ class BotDefenceIT extends IntegrationTest {
         int retryAfterSeconds = refused.json().get("retryAfterSeconds").asInt();
         assertThat(retryAfterSeconds).isPositive();
     }
-    @Test 
-    @DisplayName("Many fresh sessions from one address eventually hit the shared IP backstop") 
-    void ipBackstopThrottlesManySessionsFromOneAddress(){
-        List<Integer> statuses = new ArrayList<>();
-        for (int i = 0; i < botProperties.getIpBucket().getCapacity() * 2 + 1; i++) {
-            BuyerSession buyer = new BuyerSession(port);
-            var response = buyer.get("/events/" + eventId);
-            statuses.add(response.status());
+    @Test
+    @DisplayName("Many fresh sessions from one address eventually hit the shared IP backstop")
+    void ipBackstopThrottlesManySessionsFromOneAddress() throws Exception {
+        Long requests = botProperties.getIpBucket().getCapacity() * 4;
+
+        try (var executor = java.util.concurrent.Executors.newVirtualThreadPerTaskExecutor()) {
+            var start = new java.util.concurrent.CountDownLatch(1);
+            var tasks = new ArrayList<java.util.concurrent.Callable<Integer>>();
+
+            for (int i = 0; i < requests; i++) {
+                tasks.add(() -> {
+                    start.await();
+                    BuyerSession buyer = new BuyerSession(port);
+                    return buyer.get("/events/" + eventId).status();
+                });
+            }
+
+            var futures = tasks.stream()
+                    .map(executor::submit)
+                    .toList();
+
+            start.countDown();
+
+            List<Integer> statuses = new ArrayList<>();
+            for (var future : futures) {
+                statuses.add(future.get());
+            }
+
+            assertThat(statuses).contains(429);
         }
-        assertThat(statuses).contains(429);
+
         var refused = new BuyerSession(port).get("/events/" + eventId);
+
         assertThat(refused.status()).isEqualTo(429);
         assertThat(refused.errorCode()).isEqualTo("RATE_LIMITED");
         assertThat(refused.json().get("retryAfterSeconds").asInt()).isPositive();
@@ -223,5 +249,14 @@ class BotDefenceIT extends IntegrationTest {
         assertThat(refused.status()).isEqualTo(403);
         assertThat(refused.errorCode()).isEqualTo("IP_BLOCKED");
     }
-    
+    @Test
+    @DisplayName("Bot operator endpoints require admin authentication")
+    void botAdminEndpointsRequireAdminAuthentication() {
+        BuyerSession anonymous = new BuyerSession(port);
+        var refused = anonymous.get("/admin/bot/ip-rules");
+        assertThat(refused.status()).isEqualTo(401);
+        BuyerSession admin = new BuyerSession(port);
+        var allowed = admin.get("/admin/bot/ip-rules",BuyerSession.basicAuth("admin", "admin"));
+        assertThat(allowed.status()).isEqualTo(200);
+    }
 }

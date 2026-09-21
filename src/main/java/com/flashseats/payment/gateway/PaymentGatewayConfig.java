@@ -10,7 +10,9 @@ import java.time.Duration;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
-
+import io.github.resilience4j.core.IntervalFunction;
+import io.github.resilience4j.retry.Retry;
+import io.github.resilience4j.retry.RetryConfig;
 /**
  * Chooses the payment provider and wraps it in the breaker.
  *
@@ -64,7 +66,10 @@ public class PaymentGatewayConfig {
     }
 
     @Bean
-    public PaymentGateway paymentGateway(PaymentProperties properties, CircuitBreaker paymentGatewayBreaker) {
+   public PaymentGateway paymentGateway(
+        PaymentProperties properties,
+        CircuitBreaker paymentGatewayBreaker,
+        Retry paymentGatewayRetry){
         PaymentGateway delegate;
         if (properties.getStripe().isEnabled()) {
             log.info("Payment gateway: Stripe");
@@ -73,6 +78,16 @@ public class PaymentGatewayConfig {
             log.info("Payment gateway: in-process stub (flashseats.payment.stripe.enabled is false)");
             delegate = new StubPaymentGateway();
         }
-        return new CircuitBreakingGateway(delegate, paymentGatewayBreaker);
+        return new CircuitBreakingGateway(delegate,paymentGatewayBreaker,paymentGatewayRetry);
+    }
+    @Bean
+    public Retry paymentGatewayRetry() {
+        return Retry.of(
+                "paymentGatewayRetry",
+                RetryConfig.custom()
+                        .maxAttempts(3)
+                        .intervalFunction(IntervalFunction.ofExponentialBackoff())
+                        .retryExceptions(GatewayTransportException.class)
+                        .build());
     }
 }
