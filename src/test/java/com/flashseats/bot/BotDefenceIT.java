@@ -259,4 +259,33 @@ class BotDefenceIT extends IntegrationTest {
         var allowed = admin.get("/admin/bot/ip-rules",BuyerSession.basicAuth("admin", "admin"));
         assertThat(allowed.status()).isEqualTo(200);
     }
+    @Test
+    @DisplayName("A noisy session is throttled without blocking another legitimate session behind the same NAT")
+    void noisySessionDoesNotBlockLegitimateNatPeer() {
+        BuyerSession attacker = new BuyerSession(port);
+
+        // Consume the attacker's own session bucket.
+        for (int i = 0; i < botProperties.getSessionBucket().getCapacity(); i++) {
+            assertThat(attacker.get("/events/" + eventId).status())
+                    .isEqualTo(200);
+        }
+
+        // The next request from that same session is throttled.
+        var attackerRefused = attacker.get("/events/" + eventId);
+
+        assertThat(attackerRefused.status()).isEqualTo(429);
+        assertThat(attackerRefused.errorCode()).isEqualTo("RATE_LIMITED");
+
+        /*
+        * The important NAT property:
+        * the attacker's refused requests were stopped by the session bucket first,
+        * so they did not burn the shared IP bucket.
+        */
+        BuyerSession legitimate = new BuyerSession(port);
+
+        for (int i = 0; i < botProperties.getSessionBucket().getCapacity(); i++) {
+            assertThat(legitimate.get("/events/" + eventId).status())
+                    .isEqualTo(200);
+        }
+    }
 }
