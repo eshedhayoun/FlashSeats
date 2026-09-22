@@ -37,14 +37,29 @@ class BotMetricsTest {
                 .isEqualTo(1.0);
     }
 
-    @Test
-    void degradedVerificationIsNotCountedAsARefusal() {
+        @Test
+        void degradedVerificationIsNotCountedAsARefusal() {
         SimpleMeterRegistry registry = new SimpleMeterRegistry();
         BotMetrics metrics = new BotMetrics(registry);
 
         metrics.recordRefusal(BotOutcome.VERIFICATION_DEGRADED);
 
-        assertThat(registry.find("flashseats.bot.refusals").counter())
-                .isNull();
-    }
+        assertThat(
+                registry.get("flashseats.bot.refusals")
+                        .counter()
+                        .count())
+                .isZero();
+
+        assertThat(
+                registry.get("flashseats.bot.refusals")
+                        .counter()
+                        .count())
+                .isZero();
+
+        assertThat(
+                registry.get("flashseats.bot.refusals")
+                        .counter()
+                        .count())
+                .isZero();
+        }
 }
