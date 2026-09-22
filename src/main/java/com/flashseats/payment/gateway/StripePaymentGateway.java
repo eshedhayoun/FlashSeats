@@ -93,28 +93,62 @@ public class StripePaymentGateway implements PaymentGateway {
     }
 
     @Override
-    public GatewayResult refund(String gatewayReference, long amountCents, String reason) {
-        RefundCreateParams params = RefundCreateParams.builder()
-                .setPaymentIntent(gatewayReference)
-                .setAmount(amountCents)
-                // Stripe's reason vocabulary is a closed set of three. The real reason — which is
-                // always "we took the money and could not deliver the seats" — goes in metadata,
-                // where it survives for reconciliation instead of being rounded to the nearest enum.
-                .setReason(RefundCreateParams.Reason.REQUESTED_BY_CUSTOMER)
-                .putMetadata("flashseatsReason", reason)
-                .build();
+    public GatewayResult refund(
+            String gatewayReference,
+            long amountCents,
+            String reason) {
+
+        RefundCreateParams params =
+                RefundCreateParams.builder()
+                        .setPaymentIntent(gatewayReference)
+                        .setAmount(amountCents)
+
+                        // Stripe only accepts a small closed vocabulary
+                        // for this field. The application-specific reason
+                        // is preserved in metadata below.
+                        .setReason(
+                                RefundCreateParams.Reason.REQUESTED_BY_CUSTOMER)
+
+                        .putMetadata("flashseatsReason", reason)
+                        .build();
+
+        /*
+        * A refund is a money movement, so the provider request itself must be
+        * idempotent.
+        *
+        * FlashSeats performs full refunds, so the PaymentIntent id + amount
+        * uniquely identify the refund operation.
+        *
+        * If our application crashes after Stripe succeeds but before our DB
+        * records REFUNDED, retrying this exact request returns Stripe's
+        * idempotent result instead of creating another refund.
+        */
+        RequestOptions refundOptions =
+                baseOptions
+                        .toBuilderFullCopy()
+                        .setIdempotencyKey(
+                                "flashseats-refund-"
+                                        + gatewayReference
+                                        + "-"
+                                        + amountCents)
+                        .build();
+
         try {
-            stripe.refunds().create(params, baseOptions);
+            stripe.refunds().create(params, refundOptions);
+
             return GatewayResult.succeeded(gatewayReference);
+
         } catch (StripeException failed) {
-            // A failed refund is money we hold and should not, and it is NOT a transport concern:
-            // it must not be allowed to trip the breaker and it must not be retried blindly. The
-            // caller logs it for manual reconciliation.
-            log.error("Stripe refused a refund against {}", gatewayReference, failed);
-            return GatewayResult.error(codeOf(failed), messageOf(failed));
+            log.error(
+                    "Stripe refused a refund against {}",
+                    gatewayReference,
+                    failed);
+
+            return GatewayResult.error(
+                    codeOf(failed),
+                    messageOf(failed));
         }
     }
-
     /**
      * Maps an intent's status onto the three answers this system understands.
      *

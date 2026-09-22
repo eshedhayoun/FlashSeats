@@ -100,11 +100,31 @@ public class PaymentTransactionStore {
     }
 
     @Transactional(propagation = Propagation.REQUIRES_NEW)
-    public void recordRefund(String transactionReference, long amountCents) {
-        transactions.findByTransactionReference(transactionReference).ifPresent(transaction -> {
-            transaction.setStatus(PaymentStatus.REFUNDED);
-            transaction.setRefundedAmountCents(transaction.getRefundedAmountCents() + amountCents);
-        });
+    public void recordRefund(
+            String transactionReference,
+            long amountCents) {
+
+        transactions.findByTransactionReference(transactionReference)
+                .ifPresent(transaction -> {
+
+                    long alreadyRefunded =
+                            transaction.getRefundedAmountCents();
+
+                    /*
+                    * This system performs full refunds.
+                    *
+                    * If another recovery path reaches this method after the
+                    * refund was already recorded, do not add the amount again.
+                    */
+                    if (alreadyRefunded >= amountCents) {
+                        return;
+                    }
+
+                    transaction.setRefundedAmountCents(
+                            alreadyRefunded + amountCents);
+
+                    transaction.setStatus(PaymentStatus.REFUNDED);
+                });
     }
 
     /**

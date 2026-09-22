@@ -149,25 +149,61 @@ public class PaymentService implements PaymentFacade {
         }
     }
 
-    /** Compensation for a charge that settled against seats we could not deliver (ADR-012). */
     @Override
     public RefundResult refund(String transactionReference, long amountCents, String reason) {
         PaymentTransaction transaction = store.require(transactionReference);
+        /*
+        * Refunds are full-refund operations in FlashSeats.
+        *
+        * If the durable payment ledger already says this transaction has been
+        * refunded for the requested amount, do NOT call the provider again.
+        *
+        * This protects us from:
+        * - webhook redelivery
+        * - application retry
+        * - a crash after Stripe refunded but before our DB update
+        */
+        if (transaction.getRefundedAmountCents() >= amountCents) {
+            log.info(
+                    "Refund for {} already recorded ({} cents); not calling provider again",
+                    transactionReference,
+                    transaction.getRefundedAmountCents());
+
+            return new RefundResult(
+                    transactionReference,
+                    true,
+                    amountCents,
+                    null);
+        }
 
         GatewayResult result =
-                gateway.refund(transaction.getGatewayReference(), amountCents, reason);
+                gateway.refund(
+                        transaction.getGatewayReference(),
+                        amountCents,
+                        reason);
 
         if (result.isSuccess()) {
             store.recordRefund(transactionReference, amountCents);
-            return new RefundResult(transactionReference, true, amountCents, null);
+
+            return new RefundResult(
+                    transactionReference,
+                    true,
+                    amountCents,
+                    null);
         }
 
-        // A failed refund is money we hold and should not. It cannot be resolved automatically.
+        // A failed refund is money we hold and should not. It cannot be
+        // resolved automatically yet, so keep it visible for reconciliation.
         log.error(
                 "REFUND FAILED for {} ({} cents): {} — manual reconciliation required",
                 transactionReference,
                 amountCents,
                 result.failureReason());
-        return new RefundResult(transactionReference, false, 0, result.failureReason());
+
+        return new RefundResult(
+                transactionReference,
+                false,
+                0,
+                result.failureReason());
     }
 }

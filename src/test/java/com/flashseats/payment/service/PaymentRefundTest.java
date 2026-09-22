@@ -93,4 +93,42 @@ class PaymentRefundTest {
         // provider confirmed the refund.
         verify(store).recordRefund("tx_1", 7_500);
     }
+        @Test
+        void alreadyRefundedPaymentDoesNotCallGatewayAgain() {
+
+        PaymentTransaction transaction = new PaymentTransaction();
+
+        transaction.setTransactionReference("tx_1");
+        transaction.setGatewayReference("pi_123");
+        transaction.setRefundedAmountCents(7_500);
+
+        when(store.require("tx_1"))
+                .thenReturn(transaction);
+
+        var result =
+                payments.refund(
+                        "tx_1",
+                        7_500,
+                        "hold expired");
+
+        assertThat(result.succeeded())
+                .isTrue();
+
+        assertThat(result.transactionReference())
+                .isEqualTo("tx_1");
+
+        assertThat(result.refundedAmountCents())
+                .isEqualTo(7_500);
+
+        verify(gateway, never())
+                .refund(
+                        "pi_123",
+                        7_500,
+                        "hold expired");
+
+        verify(store, never())
+                .recordRefund(
+                        "tx_1",
+                        7_500);
+        }
 }
