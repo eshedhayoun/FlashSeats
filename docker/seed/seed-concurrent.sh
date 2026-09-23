@@ -28,6 +28,7 @@
 set -euo pipefail
 
 cd "$(dirname "$0")/../.."
+REDIS_CLI="./docker/scripts/redis-master-cli.sh"
 
 EVENTS="${EVENTS:-5}"
 FIRST_ID="${FIRST_ID:-9001}"
@@ -90,9 +91,9 @@ for id in $(seq "$FIRST_ID" "$LAST_ID"); do
                    "queue:admissions:${id}" "queue:exhausted:${id}" \
                    "queue:promote:${id}" \
                    "queue:pass:${id}:*" "queue:admit:${id}:*"; do
-        # shellcheck disable=SC2016
-        "$DOCKER_CLI" compose exec -T redis sh -c \
-            "redis-cli --scan --pattern '${pattern}' | xargs -r redis-cli DEL" >/dev/null
+        "$REDIS_CLI" --scan --pattern "$pattern" | while IFS= read -r key; do
+            [[ -n "$key" ]] && "$REDIS_CLI" DEL "$key" >/dev/null
+        done
     done
 done
 

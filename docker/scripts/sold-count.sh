@@ -31,6 +31,7 @@
 # ============================================================================
 set -uo pipefail
 cd "$(dirname "$0")/../.."
+REDIS_CLI="./docker/scripts/redis-master-cli.sh"
 
 FIRST_ID="${1:-9001}"
 EVENTS="${2:-5}"
@@ -80,7 +81,7 @@ while IFS='|' read -r event tier cap sold held; do
     [[ -n "$event" ]] || continue
     # `< /dev/null` is load-bearing: docker reads stdin, and without it the first
     # call swallows the rest of the row list and the loop reports one tier.
-    redis="$("$DOCKER_CLI" compose exec -T redis redis-cli --no-raw GET "catalog:stock:$event:$tier" \
+    redis="$("$REDIS_CLI" --no-raw GET "catalog:stock:$event:$tier" \
                  < /dev/null 2>/dev/null | tr -d '"\r')"
 
     if [[ "$redis" == "(nil)" || -z "$redis" ]]; then
