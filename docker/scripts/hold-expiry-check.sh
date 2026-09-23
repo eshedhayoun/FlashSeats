@@ -29,6 +29,7 @@
 set -euo pipefail
 
 cd "$(dirname "$0")/../.."
+REDIS_CLI="./docker/scripts/redis-master-cli.sh"
 
 EVENT_ID="${EVENT_ID:-9001}"
 TIER_ID="${TIER_ID:-9001}"
@@ -48,7 +49,7 @@ psql_q() {
     docker compose exec -T postgres psql -qtAX \
         -U "${POSTGRES_USER_VALUE:-flashseats}" -d "${POSTGRES_DB_VALUE:-flashseats}" -c "$1"
 }
-counter() { docker compose exec -T redis redis-cli GET "catalog:stock:${EVENT_ID}:${TIER_ID}" | tr -d '\r'; }
+counter() { "$REDIS_CLI" GET "catalog:stock:${EVENT_ID}:${TIER_ID}" | tr -d '\r'; }
 
 echo "Hold expiry listener — ${BASE_URL}, event ${EVENT_ID}"
 echo
@@ -97,11 +98,11 @@ HOLD_TOKEN="$(curl -fsS -b "$JAR" -H 'Content-Type: application/json' \
 HELD="$(counter)"
 echo "  held ${QUANTITY}: counter ${BEFORE} -> ${HELD}"
 
-if ! docker compose exec -T redis redis-cli EXISTS "hold:${HOLD_TOKEN}" | grep -q 1; then
+if ! "$REDIS_CLI" EXISTS "hold:${HOLD_TOKEN}" | grep -q 1; then
     echo "  FAIL  no hold:${HOLD_TOKEN} timer was armed. Is the listener wired at all?" >&2
     exit 1
 fi
-echo "  timer armed, TTL $(docker compose exec -T redis redis-cli TTL "hold:${HOLD_TOKEN}" | tr -d '\r')s"
+echo "  timer armed, TTL $("${REDIS_CLI}" TTL "hold:${HOLD_TOKEN}" | tr -d '\r')s"
 
 # --- expire it, in both places ----------------------------------------------
 # The row first, then the key. reclaimExpired re-reads the row and settles only
@@ -113,7 +114,7 @@ echo
 echo "  expiring the hold row, then firing the timer..."
 psql_q "UPDATE ticket_holds SET expires_at = now() - interval '5 seconds' WHERE hold_token = '${HOLD_TOKEN}';" >/dev/null
 START_MS=$(perl -MTime::HiRes=time -e 'print int(time*1000)')
-docker compose exec -T redis redis-cli PEXPIRE "hold:${HOLD_TOKEN}" 1 >/dev/null
+"$REDIS_CLI" PEXPIRE "hold:${HOLD_TOKEN}" 1 >/dev/null
 
 # --- watch, and keep watching past the first restore ------------------------
 # Polling rather than sleeping: the moment it returns is the measurement, and
