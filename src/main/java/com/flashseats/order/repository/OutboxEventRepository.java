@@ -4,7 +4,7 @@ import com.flashseats.order.model.OutboxEvent;
 import jakarta.persistence.LockModeType;
 import jakarta.persistence.QueryHint;
 import java.time.Instant;
-import java.util.Collection;
+
 import java.util.List;
 import java.util.Optional;
 import java.util.UUID;

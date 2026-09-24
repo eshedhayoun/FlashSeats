@@ -5,7 +5,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 import com.flashseats.flashseats.support.BuyerSession;
 import com.flashseats.flashseats.support.IntegrationTest;
 import com.flashseats.flashseats.support.SaleFixture;
-import java.time.Duration;
+
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
