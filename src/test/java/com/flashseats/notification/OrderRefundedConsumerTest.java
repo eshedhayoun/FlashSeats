@@ -13,6 +13,7 @@ import com.flashseats.notification.service.EmailComposer;
 import com.flashseats.notification.service.EmailDispatcher;
 import com.flashseats.notification.service.NotificationLogService;
 import com.rabbitmq.client.Channel;
+import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import java.nio.charset.StandardCharsets;
 import java.time.Instant;
 import java.util.List;
@@ -43,7 +44,8 @@ class OrderRefundedConsumerTest {
                     logs,
                     composer,
                     dispatcher,
-                    json);
+                    json,
+                    new SimpleMeterRegistry());
 
     @Test
     void refundNoticeIsSentToTheBuyer() throws Exception {
