@@ -4,7 +4,7 @@ import io.github.resilience4j.circuitbreaker.CallNotPermittedException;
 import io.github.resilience4j.circuitbreaker.CircuitBreaker;
 import java.util.function.Supplier;
 import lombok.extern.slf4j.Slf4j;
-import io.github.resilience4j.core.IntervalFunction;
+
 import io.github.resilience4j.retry.Retry;
 /**
  * A circuit breaker around whichever gateway is configured.
