@@ -407,14 +407,15 @@ Base `/api/v1`. `fsid` is an `HttpOnly` cookie — **JavaScript never reads or s
 | V4 | `POST` | `/orders/checkout` | — | `{holdToken, userEmail, paymentMethodId, idempotencyKey}` | `201`/`200` | `PAYMENT_DECLINED`, `PAYMENT_ATTEMPTS_EXHAUSTED`, `HOLD_EXPIRED`, `DUPLICATE_PAYMENT`, `PAYMENT_GATEWAY_UNAVAILABLE`, `CHECKOUT_WINDOW_CLOSED`, `INSUFFICIENT_TIME_REMAINING`, `ORDER_REFUNDED`, `SERVICE_BUSY` |
 | V5 | `GET` | `/orders/{orderNumber}?receiptToken=` | — | — | `200` | `ORDER_NOT_FOUND` |
 | V5 | `GET` | `/orders/{orderNumber}/ticket.pdf?receiptToken=` | `Accept: application/pdf, application/problem+json` | — | `200` | `ORDER_NOT_FOUND`, `TICKET_NOT_AVAILABLE` |
-| — | `POST` | `/session/reset` | — | — | `204` | — |
+| — | `POST` | `/session/reset` | `Content-Type: application/json` (required) | `{}` | `204` | `VALIDATION_FAILED` (`415`, any other content type) |
 
 **`POST /session/reset` is a demo affordance, not part of the buyer journey.** It expires the `fsid`
 cookie so the bundled demo page can start over as a new visitor. A production client must never call
 it: the session *is* the buyer's queue position and the only thing that authorises their hold, so
-clearing it discards both. It is unauthenticated and the API has no CSRF token, so a cross-site `POST`
-can discard a visitor's session — a nuisance rather than a disclosure, and recorded as an accepted
-demo exposure in `06-mvp-overview.md` §10.
+clearing it discards both. It is unauthenticated and the API has no CSRF token, so it accepts
+**only `application/json`** (ADR-060): a cross-site form cannot send that content type, and a
+cross-origin `fetch` that does needs a preflight nothing grants. Anything else answers `415` and
+expires nothing.
 
 > **`userSessionId` is never sent** — not in a body, not in a header, not in a query string. Identity
 > comes from the signed cookie alone (ADR-010). A request that carries it will be rejected.
