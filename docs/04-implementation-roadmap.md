@@ -211,7 +211,9 @@ below.
 - [ ] **Checkout p99 under 200 ms at peak.** Measured 682 ms at 300 VUs and 4,689 ms at 2,000. Not a
       verdict on the design: the three JVMs were at 130–190 % CPU each and k6 at 163 % on ten shared
       cores, with the whole stack plus the load generator on one laptop. Re-measure on a host where
-      the generator is not competing with the system under test.
+      the generator is not competing with the system under test. **Update (Pass 12, run H): 129 ms
+      at 300 VUs across five concurrent sales**, on the same laptop with nothing else running. That
+      is one run, so it is recorded as a data point and not ticked; `06` §11 has the Pass 13 sweep.
 - [x] **`stock.drift` zero for the entire run.** `flashseats_stock_drift` read `0.0` on all three
       replicas after every run.
 - [x] **Every SSE client receives its promotion across all 3 replicas.** 30/30, spread 10/10/10 over
