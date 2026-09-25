@@ -1,14 +1,18 @@
 package com.flashseats.shared.error;
 
+import java.sql.SQLTransientConnectionException;
 import java.util.List;
 import java.util.Map;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.core.Ordered;
 import org.springframework.core.annotation.Order;
+import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpStatusCode;
 import org.springframework.http.ProblemDetail;
 import org.springframework.http.ResponseEntity;
 import org.springframework.http.converter.HttpMessageNotReadableException;
+import org.springframework.jdbc.CannotGetJdbcConnectionException;
+import org.springframework.transaction.CannotCreateTransactionException;
 import org.springframework.web.ErrorResponse;
 import org.springframework.web.HttpMediaTypeNotAcceptableException;
 import org.springframework.web.HttpMediaTypeNotSupportedException;
@@ -37,6 +41,12 @@ import org.springframework.web.method.annotation.MethodArgumentTypeMismatchExcep
 @RestControllerAdvice
 @Order(Ordered.LOWEST_PRECEDENCE)
 public class GlobalExceptionHandler {
+
+    /**
+     * One second: long enough for a pool of 30 turning over millisecond transactions to have freed
+     * many connections, short enough that a buyer mid-checkout barely notices.
+     */
+    private static final int BUSY_RETRY_AFTER_SECONDS = 1;
 
     /** Every deliberate business failure in every module arrives here. */
     @ExceptionHandler(FlashSeatsException.class)
@@ -123,6 +133,36 @@ public class GlobalExceptionHandler {
     }
 
     /**
+     * A request that could not get a database connection in time (ADR-059).
+     *
+     * <p>That is back-pressure, not a fault: the pool is the system's real concurrency ceiling under
+     * virtual threads, and a caller who waited {@code connection-timeout} for it will very likely get
+     * one a second later. Answered {@code 500 INTERNAL_ERROR}, it was the least actionable code in the
+     * registry at the moment a buyer most needed to be told "retry" — and checkout is find-or-create,
+     * so a retry of the same body is always safe.
+     *
+     * <p><strong>Classified by cause, not by wrapper.</strong> {@code CannotCreateTransactionException}
+     * also means "the database is down" or "the credentials are wrong", and telling a client to retry
+     * those in one second is a lie. Only HikariCP's own timeout — an
+     * {@link SQLTransientConnectionException} somewhere in the chain — is busy; everything else goes
+     * to the backstop exactly as before.
+     */
+    @ExceptionHandler({CannotCreateTransactionException.class, CannotGetJdbcConnectionException.class})
+    public ResponseEntity<ProblemDetail> onNoConnection(Exception ex) {
+        if (!causedBy(ex, SQLTransientConnectionException.class)) {
+            return ResponseEntity.internalServerError().body(onUnhandled(ex));
+        }
+        log.warn("Connection pool exhausted; answering {}: {}", ErrorCode.SERVICE_BUSY, ex.getMessage());
+        ProblemDetail problem = ProblemDetails.of(
+                ErrorCode.SERVICE_BUSY,
+                "The service is busy. Please retry shortly.",
+                Map.of("retryable", true, "retryAfterSeconds", BUSY_RETRY_AFTER_SECONDS));
+        return ResponseEntity.status(ErrorCode.SERVICE_BUSY.status())
+                .header(HttpHeaders.RETRY_AFTER, Integer.toString(BUSY_RETRY_AFTER_SECONDS))
+                .body(problem);
+    }
+
+    /**
      * The backstop. Returns a bare {@code 500} carrying only a {@code traceId} — the stack trace
      * goes to the log, never to the client.
      */
@@ -131,6 +171,15 @@ public class GlobalExceptionHandler {
         log.error("Unhandled exception", ex);
         return ProblemDetails.of(
                 ErrorCode.INTERNAL_ERROR, "Something went wrong. Quote the traceId to support.");
+    }
+
+    private static boolean causedBy(Throwable ex, Class<? extends Throwable> type) {
+        for (Throwable cause = ex; cause != null; cause = cause.getCause()) {
+            if (type.isInstance(cause)) {
+                return true;
+            }
+        }
+        return false;
     }
 
     /** Names the offending parameter without echoing whatever the client sent. */

@@ -110,6 +110,7 @@ tells the client a state.
 | :--- | :--- | :--- | :--- |
 | `VALIDATION_FAILED` | 400 | shared | Fix `violations` and resubmit |
 | `INTERNAL_ERROR` | 500 | shared | Show `traceId`, offer retry |
+| `SERVICE_BUSY` | 503 | shared | **Back-pressure, not a fault**: no database connection came free inside `connection-timeout`. Carries `Retry-After` and `retryAfterSeconds`; re-send the same request after it — checkout is find-or-create, so that is always safe. Seats, if any, are untouched (ADR-059) |
 | `RATE_LIMITED` | 429 | bot | Back off `retryAfterSeconds` |
 | `BOT_VERIFICATION_FAILED` | 403 | bot | The challenge scored below the threshold. Reload for a fresh token and retry — **never** returned for a provider timeout or outage, which fail open (ADR-011, ADR-055) |
 | `IP_BLOCKED` | 403 | bot | A standing operator decision on this address. Terminal for the client — `retryable` is false; contact support (ADR-055) |

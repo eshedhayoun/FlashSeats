@@ -304,6 +304,7 @@ downgrade to no gateway-level guard at all.
 | `409 INSUFFICIENT_TIME_REMAINING` | "Not enough time left to complete this safely." Offer release + re-queue. Nothing was charged (ADR-030) |
 | `410 HOLD_EXPIRED` | Expired panel. Nothing charged — **say so explicitly** |
 | `503 PAYMENT_GATEWAY_UNAVAILABLE` | "Payment provider is having trouble. **Your seats are held.**" Retry after `retryAfterSeconds` |
+| `503 SERVICE_BUSY` | "We're handling a lot of traffic — retrying." Re-POST the **same body** after `Retry-After` (1 s); at most a handful of times, then a manual "Try again". Seats unaffected (ADR-059) |
 | `409 DUPLICATE_PAYMENT` | Ignore — a charge is in flight. Poll `/sale/state` every 2 s |
 | `409 ORDER_REFUNDED` | Terminal. The charge succeeded and could not be completed, so it was **refunded**. Say that plainly and name the order number |
 | `402 PAYMENT_ACTION_REQUIRED` | 3-D Secure. Keep `paymentInFlight` **true**, run `stripe.handleNextAction(problem.clientSecret)`, then **re-POST this same body**. Hold retained, **no attempt consumed** — see below |
@@ -403,17 +404,18 @@ Base `/api/v1`. `fsid` is an `HttpOnly` cookie — **JavaScript never reads or s
 | V3 | `POST` | `/holds` | `X-Admission-Token` | `{eventId, tierId, quantity}` | `201` | `INSUFFICIENT_STOCK`, `QUANTITY_EXCEEDS_LIMIT`, `HOLD_LIMIT_EXCEEDED`, `ADMISSION_EXPIRED`, `INVENTORY_UNAVAILABLE` |
 | V4 | `GET` | `/holds/{holdToken}` | — | — | `200` | `HOLD_NOT_FOUND`, `HOLD_EXPIRED` |
 | V4 | `DELETE` | `/holds/{holdToken}` | — | — | `204` | `HOLD_NOT_FOUND` |
-| V4 | `POST` | `/orders/checkout` | — | `{holdToken, userEmail, paymentMethodId, idempotencyKey}` | `201`/`200` | `PAYMENT_DECLINED`, `PAYMENT_ATTEMPTS_EXHAUSTED`, `HOLD_EXPIRED`, `DUPLICATE_PAYMENT`, `PAYMENT_GATEWAY_UNAVAILABLE`, `CHECKOUT_WINDOW_CLOSED`, `INSUFFICIENT_TIME_REMAINING`, `ORDER_REFUNDED` |
+| V4 | `POST` | `/orders/checkout` | — | `{holdToken, userEmail, paymentMethodId, idempotencyKey}` | `201`/`200` | `PAYMENT_DECLINED`, `PAYMENT_ATTEMPTS_EXHAUSTED`, `HOLD_EXPIRED`, `DUPLICATE_PAYMENT`, `PAYMENT_GATEWAY_UNAVAILABLE`, `CHECKOUT_WINDOW_CLOSED`, `INSUFFICIENT_TIME_REMAINING`, `ORDER_REFUNDED`, `SERVICE_BUSY` |
 | V5 | `GET` | `/orders/{orderNumber}?receiptToken=` | — | — | `200` | `ORDER_NOT_FOUND` |
 | V5 | `GET` | `/orders/{orderNumber}/ticket.pdf?receiptToken=` | `Accept: application/pdf, application/problem+json` | — | `200` | `ORDER_NOT_FOUND`, `TICKET_NOT_AVAILABLE` |
-| — | `POST` | `/session/reset` | — | — | `204` | — |
+| — | `POST` | `/session/reset` | `Content-Type: application/json` (required) | `{}` | `204` | `VALIDATION_FAILED` (`415`, any other content type) |
 
 **`POST /session/reset` is a demo affordance, not part of the buyer journey.** It expires the `fsid`
 cookie so the bundled demo page can start over as a new visitor. A production client must never call
 it: the session *is* the buyer's queue position and the only thing that authorises their hold, so
-clearing it discards both. It is unauthenticated and the API has no CSRF token, so a cross-site `POST`
-can discard a visitor's session — a nuisance rather than a disclosure, and recorded as an accepted
-demo exposure in `06-mvp-overview.md` §10.
+clearing it discards both. It is unauthenticated and the API has no CSRF token, so it accepts
+**only `application/json`** (ADR-060): a cross-site form cannot send that content type, and a
+cross-origin `fetch` that does needs a preflight nothing grants. Anything else answers `415` and
+expires nothing.
 
 > **`userSessionId` is never sent** — not in a body, not in a header, not in a query string. Identity
 > comes from the signed cookie alone (ADR-010). A request that carries it will be rejected.
@@ -571,6 +573,7 @@ seats*. Getting either wrong leaves a buyer mashing a button that cannot succeed
 | `PAYMENT_ATTEMPTS_EXHAUSTED` | **disabled** | held | Offer *Release seats* — a further attempt cannot be accepted |
 | `DUPLICATE_PAYMENT` | **disabled** | held | "Finishing a payment already in progress", then poll `/sale/state` |
 | `INVENTORY_UNAVAILABLE` | **enabled**, "Try again" | untouched | "Having trouble reading availability." **Never "sold out"** (ADR-004) |
+| `SERVICE_BUSY` | **enabled**, "Try again" | untouched | "We're handling a lot of traffic." Not a failure of theirs and not a decline — **no attempt was used**. Any endpoint can return it, not only checkout (ADR-059) |
 | `HOLD_EXPIRED` | — | gone | "Nothing was charged", then re-route |
 | `INSUFFICIENT_TIME_REMAINING` | **disabled** | **held** | Nothing charged, but the grace budget is spent. Offer *Release seats* — do **not** re-route |
 | `ORDER_REFUNDED` | — | gone | A charge settled and **was refunded** — do not claim nothing was charged |

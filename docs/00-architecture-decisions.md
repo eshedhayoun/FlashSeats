@@ -2422,3 +2422,168 @@ the pack becomes a problem.
 - The replay log is now safe to read by anyone who can read Redis, which is what lets it stay a
   per-event key rather than a per-session one.
 - A reader can tell what is built by reading the documents again.
+
+---
+
+## ADR-059 — A connection-pool timeout is back-pressure: `503 SERVICE_BUSY`, not `500`
+
+**Context.** Under virtual threads the HikariCP pool is the system's real concurrency ceiling, and a
+request that waits `connection-timeout` (3 s) for it throws `SQLTransientConnectionException`,
+wrapped by Spring as `CannotCreateTransactionException` or `CannotGetJdbcConnectionException`.
+Nothing named either, so both fell to `GlobalExceptionHandler`'s `Exception` backstop and a buyer
+mid-checkout was told **`500 INTERNAL_ERROR`** — 1,218 times across three replicas in the 2,000-VU
+run (`06` §11). The recovery was already correct: checkout is find-or-create, so re-POSTing the same
+body resumes the same order. The *answer* was wrong — the least actionable code in the registry, at
+exactly the moment a buyer most needed to be told "retry".
+
+**Decision.** A new registry code, `SERVICE_BUSY` (`503`, `shared`), carrying a `Retry-After: 1`
+header and `retryable: true, retryAfterSeconds: 1` — the extension members `RATE_LIMITED` and
+`PAYMENT_GATEWAY_UNAVAILABLE` already use. The handler classifies by **cause, not by wrapper**: only
+an `SQLTransientConnectionException` somewhere in the chain is busy. `CannotCreateTransactionException`
+also means "the database is down" and "the credentials are wrong", and telling a client to retry either
+in one second would be a lie — those still reach the backstop and answer `500`. Logged at `WARN`:
+back-pressure under a spike is expected, and an `ERROR` per rejected request buries real faults.
+
+**What it deliberately does not change.** `CheckoutService` refunds when `commit.confirm` throws after
+a successful charge. A pool timeout there is a transaction that never *began*, which is a definite
+failure, so the refund is right (ADR-056) and the buyer still gets `409 ORDER_REFUNDED`. The new
+handler only sees pool timeouts that happen before money moves, which the `unresolved` catch already
+rethrows unchanged after marking the order resumable (ADR-034).
+
+**Why one second.** A pool of 30 turning over millisecond transactions frees hundreds of connections a
+second when it is merely saturated; a longer hint would idle a buyer whose retry would have worked.
+`FE_SPEC` caps client retries at a handful and then asks the human, so a pool that stays exhausted does
+not become a retry storm above the API.
+
+**Consequences.**
+
+- The client contract gains one code, on any endpoint, with "Try again" enabled and seats untouched
+  (`FE_SPEC` §2 and the checkout error table).
+- Filters run before `DispatcherServlet`; a pool timeout inside one (the `ip_rules` snapshot reload)
+  still answers whatever that filter answers. ADR-055/056 already keep the request path off the pool.
+
+---
+
+## ADR-060 — `POST /session/reset` accepts only `application/json`
+
+**Context.** The endpoint expires the `fsid` cookie so the bundled demo page can start over as a new
+visitor. The session *is* the buyer's queue position and their only authority over their hold, and
+CSRF is disabled (`06` §10 S6), so a hidden form on any site could POST to it and throw a buyer out of
+the line they were waiting in. `06` §10 recorded it as S13 and offered two fixes: scope it to the demo
+profile, or require something a form post cannot send.
+
+**Decision.** `@PostMapping(value = "/reset", consumes = "application/json")`. An HTML form can send
+only `application/x-www-form-urlencoded`, `multipart/form-data` or `text/plain`; a cross-origin
+`fetch` carrying `application/json` is not a CORS-safelisted request and needs a preflight, and no
+CORS mapping here grants one. Anything else answers `415` through the existing handler, before the
+method runs, so no expiring cookie is written.
+
+**Why not the profile.** The cluster runs the `docker` profile and serves the demo page that calls
+this endpoint, so scoping it to `dev` would break the demo exactly where it is shown. The demo page's
+`api()` helper already sent `Content-Type: application/json`, and the React client never calls it —
+the fix needed no client change at all.
+
+**Consequences.**
+
+- S13 is closed. **S6 is not**: `POST /queue/join` and `POST /holds` still accept a cross-site
+  request. The same one-line control would apply to them, but both are on the buyer path and each
+  deserves its own check that every client sends JSON; it is left as recorded.
+- This relies on no CORS configuration being added. A future `CorsConfigurationSource` that allows
+  credentials from another origin reopens S13, and should be read against this ADR.
+
+---
+
+## ADR-061 — Cached test contexts are never paused
+
+**Context.** From the frontend merge onwards, `./mvnw test` depended on class order. In some orders,
+every `/queue` request in the shared integration-test context answered a bare `500` with no registry
+`code`. Pass 12 ruled out everything inside the application: contention, id collisions, the rate
+limiter, metrics, parallelism, context accumulation. It pinned `alphabetical` because that order was
+*verified green*, and recorded the pollution as open (`06` §9).
+
+**Finding.** Spring Framework 7 **pauses** a cached test context when a test class switches to a
+different context: it stops the paused context's `Lifecycle` beans, then restarts them on the next
+use. This suite has several contexts. `BotDefenceIT`, `RecaptchaFailOpenIT` and, from Pass 13,
+`NotificationListenerIT` each add properties, and that forces a context of their own. When a later
+class switched back to the shared context, that context had been through a pause and a resume.
+
+Adding `NotificationListenerIT` shrank the reproduction from "most of the suite" to three classes:
+`HoldLifecycleIT`, `NotificationListenerIT`, `CheckoutRecoveryIT`. With the size down to three,
+experiments became cheap:
+
+- The pair `NotificationListenerIT`, `CheckoutRecoveryIT` passes: the shared context is created
+  *after* the switch, so it has never been paused.
+- Removing `@DirtiesContext` from the new class changes nothing.
+- A temporary `HIGHEST_PRECEDENCE` servlet filter never saw the failing requests. They are answered
+  before the resumed context's filter chain runs, which is why `GlobalExceptionHandler` never logged
+  them.
+- `spring.test.context.cache.pause=never` makes the three-class run green, and makes the full suite
+  green in `alphabetical`, `reversealphabetical` and `filesystem` order.
+
+**Decision.** `src/test/resources/spring.properties` sets `spring.test.context.cache.pause=never`.
+This restores Spring 6's behaviour, which the suite was written against. It has to live in
+`spring.properties` rather than `application-test.properties`, because the cache reads it before any
+context exists.
+
+**Consequences.**
+
+- A cached context keeps its schedulers running while other classes run. Every context has its own
+  PostgreSQL and Redis, because Testcontainers reuse is not enabled on this machine
+  (`withReuse(true)` logs that it was ignored), so they cannot interfere through shared state.
+- **Open:** *why* a resumed context's embedded Tomcat answers without running its filters. It is
+  inferred to be the web server's restart, not demonstrated. It does not affect production, where
+  contexts are never paused. If Testcontainers reuse is ever enabled, reread this ADR, because the
+  contexts would then share containers.
+- Surefire stays pinned to `alphabetical`, now only because a stable order is worth having.
+- The lesson for this repo: when an intermittent failure depends on the number of Spring contexts,
+  suspect the test framework's context lifecycle before the application.
+
+---
+
+## ADR-062 — Each replica has a memory limit, and the image alone owns the JVM flags
+
+**Context.** Pass 13's load sweep at 2,000 VUs across five sales saw app replicas SIGKILLed mid-sale.
+The Docker VM's kernel log recorded `Out of memory: Killed process … (java)` three times, with RSS of
+4.0, 2.5 and 2.7 GiB. Three defects combined to cause it, and each was invisible on its own:
+
+1. **No container memory limit.** The Dockerfile set `-XX:MaxRAMPercentage=75`, and its comment
+   said this sizes the heap "from the container limit". There was no limit, so each JVM sized
+   itself against the whole 7.65 GiB VM. Three replicas could claim about 17 GiB between them. G1
+   grows the heap lazily, so this passed every run at 300–600 VUs, where each replica settled at
+   1.1–1.5 GiB, and only failed once the load pushed the heaps past what the VM could hold.
+2. **`compose.yaml` replaced the image's `JAVA_TOOL_OPTIONS`.** It set the variable to
+   `-XX:MaxRAMPercentage=75` alone, which silently dropped the image's `-XX:+ExitOnOutOfMemoryError`
+   and `-XX:+UseZGC`. Every cluster measurement ever recorded therefore ran on G1, not ZGC.
+3. **The JVM's collector choice depends on the limit.** Setting a 1.5 GiB limit on its own made
+   the JVM stop treating the container as a "server-class machine" (that needs ≥ 1,792 MB). It
+   silently switched to **SerialGC**, a single-threaded stop-the-world collector, on a server
+   carrying thousands of virtual threads. `-XX:+PrintFlagsFinal` inside the container showed this
+   before any run did.
+
+**Decision.**
+
+- `mem_limit: ${APP_MEM_LIMIT:-1536m}` on every app replica. This covers the 1.1–1.5 GiB they reach
+  at the load this host can serve, and it keeps three replicas plus the infrastructure and k6
+  inside the VM.
+- The Dockerfile is the **only** place `JAVA_TOOL_OPTIONS` is set:
+  `-XX:MaxRAMPercentage=70 -XX:+UseG1GC -XX:+ExitOnOutOfMemoryError`. 70 % leaves about 460 MiB of
+  the limit for metaspace, thread stacks and Lettuce/Tomcat's off-heap buffers. **G1 is named**,
+  so ergonomics cannot swap it for SerialGC. G1 rather than ZGC because G1 is what every number in
+  `06` §11 was measured on. `compose.yaml` now says in a comment why it does not set the variable.
+
+**Verified.** On the new configuration the same four runs, from 300 to 2,000 VUs, completed with
+**zero restarts**, zero unreadable metric samples and an exact ledger. At 2,000 VUs each replica
+peaked at 1.48–1.50 GiB against its 1.5 GiB limit. That is tight, but `ExitOnOutOfMemoryError`
+never fired, and the p99 there (6.1 s) is set by CPU, not by GC.
+
+**Consequences.**
+
+- A replica that genuinely runs out of heap now exits cleanly and restarts, instead of being
+  killed at random by the VM with a neighbour's memory. Either way the Redis-first ordering loses
+  only in-flight reservations, and only toward under-count (ADR-046). Pass 13 watched a rebuild
+  recover exactly those seats.
+- 2,000 VUs runs replicas at their limit on this host. Raising `APP_MEM_LIMIT` is the lever for a
+  bigger machine, but not on this 7.65 GiB VM.
+- The lesson for this repo: a flag that reads correctly in one file can be cancelled by another,
+  and a JVM decides things about itself from the container it finds. Check effective settings with
+  `java -XX:+PrintFlagsFinal -version` inside the container, not by reading the Dockerfile.

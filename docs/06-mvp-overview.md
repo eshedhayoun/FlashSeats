@@ -212,9 +212,11 @@ Findings that cost real time and would cost it again.
 ## 8. Verification
 
 ```bash
-./mvnw test        # 112 tests: unit, modularity, concurrency, journey, recovery, queue lifecycle,
+./mvnw test        # 228 tests: unit, modularity, concurrency, journey, recovery, queue lifecycle,
                    #             pre-warm, stock rebuild, drift, Redis-restart guard, the metadata
-                   #             cache's five rules, and the cluster admission allowance
+                   #             cache's five rules, the cluster admission allowance, payment and
+                   #             webhooks, bot defence, and fulfilment through a real broker.
+                   #             Green in alphabetical, reverse and filesystem order (ADR-061)
 ```
 
 | Test | What it proves |
@@ -228,6 +230,9 @@ Findings that cost real time and would cost it again.
 | `CheckoutRecoveryIT` | A gateway outage keeps the seats **and** the ability to pay for them; it costs none of the three card attempts; a charge genuinely in flight is still refused; an order stranded by a crash resumes once no charge can still be running. |
 | `QueueLifecycleIT` | An un-warmed event pauses promotion rather than selling out; a closed sale ends the wait instead of freezing it; a pass for one sale is never offered to another; exhaustion reverses when seats return. |
 | `NotificationClaimIT` | The claim blocks a duplicate, is terminal once sent, and releases a dead letter for replay. |
+| `NotificationListenerIT` | **Fulfilment through a real RabbitMQ and both real listeners**, the one thing the test profile's `notification.enabled=false` had left unexercised. One ticket per order even when the message is redelivered; a malformed message or a failed send goes to the DLQ after **one** attempt (ADR-029); a replay after the outage sends exactly once (ADR-038); and mail that was sent but not recorded stays `SENT`, so a replay cannot send a second ticket (ADR-042). Checked by mutation: removing that guard fails the test. |
+| `BackPressureResponseTest` | A HikariCP timeout is `503 SERVICE_BUSY` with `Retry-After`; any other transaction failure is still `500` (ADR-059). |
+| `SessionResetIT` | `POST /session/reset` refuses form and `text/plain` bodies with `415` and expires nothing; a JSON POST still works (ADR-060). |
 | `CatalogAvailabilityIT` | A tier with no counter reads `UNKNOWN`, a drained tier still reads `SOLD_OUT`, and the two are never the same answer (ADR-040). |
 | `ProblemResponseIT` | Spring's own binding failures are `400` with a registry `code`, not `500` (ADR-041). |
 | `RemainingForEventTest` | "Nothing known" is never "nothing left", at the method every admission decision reads: no tiers, a missing counter, genuinely drained and live are four distinct answers (ADR-004, ADR-035, ADR-040). |
@@ -258,14 +263,17 @@ Honest list. None of these is hidden behind a passing test.
   them, while each sits at **114–142 % of one core** with a 2,000-VU k6 competing for the same ten.
   2,000 VUs is still the ceiling here, but a 32 GB machine would not move it — a machine where the
   load generator is not sharing cores with the system under test would.
-- **Checkout p99 is 682 ms at 300 VUs on one sale, 6.4 s at 300 VUs across five — 9.3 s before
-  Pass 9's review removed a checkout transaction — and ~30–45 s at
-  2,000 VUs across five** — against a 200 ms exit criterion. The 2,000-VU figures are the host: ten
-  cores shared between three JVMs and the load generator, with `connections_pending` peaking at 10 of 90
-  in the run that sold 76 % of capacity. **The 300-VU five-sale number is the real open one**: 682 ms →
-  9.3 s for the same VU count spread over five sales is a 13× cost that the pool does not explain, and
-  finding what does is the next latency question. It needs a host where k6 is not competing for cores.
-- **A pool timeout surfaces to a buyer as `500 INTERNAL_ERROR` mid-checkout.** Not seen in the runs that
+- **Checkout p99 meets the 200 ms criterion up to about 600 VUs across five sales, on this
+  laptop.** The Pass 13 sweep (§11) measured 145 ms at 600, 201 ms at 300 VUs across *ten* sales,
+  207 ms at 1,000 across five, and 6.1 s at 2,000. Each is a single run with visible variance.
+  **The limit is host CPU, not the pool**: `hikaricp_connections_pending` was 0 on every sample of
+  every run, while the three replicas and k6 took all ten cores. The earlier five-sale figures —
+  9.3 s, 6.4 s and 4.8 s — were measured with other work on the same machine. Finding the pool's
+  own edge needs a host where the load generator is not competing with the system under test.
+- ~~**A pool timeout surfaces to a buyer as `500 INTERNAL_ERROR` mid-checkout.**~~ **Fixed (Pass 13,
+  ADR-059):** it is now `503 SERVICE_BUSY` with `Retry-After: 1`, classified by HikariCP's own
+  `SQLTransientConnectionException` in the cause chain so a database that is genuinely down still
+  answers `500`. The original finding, kept for the record: not seen in the runs that
   sell out — `pending` stays at zero there — but with `connection-timeout=3000`, CPU starvation produced
   1,218 of them across three replicas in the 2,000-VU run; one order was left `FAILED`. The compensation held — that tier's `sold + held + redis` was still
   exactly 500, so no seats were stranded — and a buyer's documented recovery (re-POST the same body)
@@ -377,40 +385,41 @@ Honest list. None of these is hidden behind a passing test.
 
 **Found in Pass 11, reading the frontend merge (PR #16):**
 
-- **`./mvnw test` does not pass in the default order, and has not since the merge.** 213 tests,
-  **10 failures**, all in `HoldLifecycleIT` and `HoldExpiryTimerIT`. Reproduced at the merge commit
-  unmodified, so it is not Pass 11's or Pass 12's doing.
-
-  **The symptom, now that the fixtures assert instead of waiting.** `POST /api/v1/queue/join` answers
-  **`500`** with Spring's bare four-field error body — `timestamp/status/error/path`, **no registry
-  `code`**. The classes used to spend 150 s timing out on a pass that was never coming; they now fail
-  in **0.1 s** naming the status, which is what made everything below possible.
-
-  **The decisive fact: `-Dsurefire.runOrder=reversealphabetical` is 213/213 green.** The suite is
-  order-dependent, and the default *filesystem* order — which is not even stable across machines — is
-  the unlucky one. That is a usable workaround today and an argument for pinning the order regardless.
-
-  **Ruled out by experiment, not by reasoning.** Machine contention (reproduced idle, twice). Event-id
-  collision (unique ids changed nothing). The bot rate limiter — `RateLimitService` versions its bucket
-  keys by capacity/refill, so `BotDefenceIT`'s deliberately tiny buckets cannot collide with anyone
-  else's. `BotMetrics` (null-safe). The refusal path (writes a proper coded `429`). Surefire
-  parallelism (none configured). Context accumulation — `@DirtiesContext(AFTER_CLASS)` on both classes
-  that fork a context changed nothing. And **no pairwise combination reproduces it**: order+payment,
-  catalog+queue, notification+shared+flashseats, both forking bot ITs, and the five bot unit tests that
-  run between them are each green with the hold ITs appended. It needs most of the suite to have run.
-
-  **Where the next attempt should start.** The throw is **outside Spring MVC**: `GlobalExceptionHandler`
-  has an `@ExceptionHandler(Exception.class)` backstop that logs "Unhandled exception", and it is never
-  invoked for these. Nothing in the app calls `sendError`, there is no custom `ErrorController`, and
-  `server.error.include-message=always` does **not** add a `message` to the body — so the response is
-  not `BasicErrorController`'s either, which is the most interesting unexplained detail. A throw in a
-  servlet filter fits the escape path; what does not fit is that Tomcat's container logger records
-  nothing. Instrument the filter chain itself rather than the application.
-
-  **Pinned, not fixed.** `pom.xml` now sets Surefire's `runOrder` to `alphabetical`, which is verified
-  green twice from cold containers. That is worth doing regardless — the default is *filesystem* order,
-  so two machines can disagree about whether the suite passes — but it is a workaround, and this item
-  stays open. A green suite is no longer evidence that the pollution went away.
+- ~~**`./mvnw test` does not pass in the default order.**~~ **Fixed, root cause found (Pass 13,
+  ADR-061).** The symptom was that, in some class orders, every `/queue` request in the shared test
+  context answered a bare `500` (`timestamp/status/error/path`, no registry `code`). Pass 12 ruled
+  out everything inside the application. The cause was outside it: **Spring Framework 7 pauses a
+  cached test context whenever a test class switches to a different context**, and restarts it when
+  a later class uses it again. The contexts that `BotDefenceIT` and `RecaptchaFailOpenIT` create
+  caused that switch. Adding `NotificationListenerIT`, a third such context, turned "needs most of the
+  suite" into a three-class reproduction: `HoldLifecycleIT` → `NotificationListenerIT` →
+  `CheckoutRecoveryIT`. A temporary highest-precedence servlet filter then showed that the failing
+  requests **never reached the resumed context's filter chain**, which matches Pass 12's finding
+  that `GlobalExceptionHandler` never saw them. `spring.test.context.cache.pause=never` in
+  `src/test/resources/spring.properties` fixes the reproduction. The full suite is green in
+  `alphabetical`, `reversealphabetical` and `filesystem` order. The pom keeps `alphabetical` pinned,
+  now only for a stable order. **Not established:** *why* a resumed context's embedded Tomcat
+  answers without running its filters. The fix does not depend on the answer, and it is recorded
+  as open in ADR-061.
+- ~~**Replicas were OOM-killed at 2,000 VUs.**~~ **Fixed (Pass 13, ADR-062).** No container memory
+  limit meant each JVM sized its heap against the whole Docker VM, so at 2,000 VUs the VM's kernel
+  killed three of them mid-sale. Seats in flight were under-counted, never oversold, and a rebuild
+  recovered them exactly (§11). Now each replica has a 1.5 GiB limit, and G1 and
+  `ExitOnOutOfMemoryError` are set explicitly. The same load then ran with zero restarts.
+- **An app replica can keep writing to a Redis node that Sentinel demoted while it was still up.**
+  Found in Pass 13 when rebuilding the cluster for the drill. The Pass 12 failover check had left
+  `redis-replica-2` as primary, and that state lives in the sentinel volumes, so it survives
+  `docker compose down`. On the next `up`, `redis` briefly started as a primary, the app replicas
+  connected to it, and Sentinel then made it a replica again. Lettuce looks up the primary through
+  Sentinel only when it opens a connection, and Redis does not close clients when a node becomes a
+  replica. So every write failed with `READONLY`, and every request answered a bare `500`: the rate
+  limiter's filter writes to Redis before Spring MVC is reached. Nothing sold, and nothing
+  oversold, because every Redis write failed. That is the fail-safe direction, but it is a total
+  outage. `docker compose --profile cluster restart app-1 app-2 app-3` recovers it, and so does
+  wiping the sentinel volumes. A real failover, where the old primary actually goes *down*, drops
+  the connections and does not hit this, which matches Pass 12's result. **Not fixed.** The fix
+  would be a Lettuce topology refresh or a reconnect on `READONLY`, and it deserves its own test on
+  the cluster profile.
 - ~~**SSE reconnect replay never fired.**~~ **Fixed** (ADR-058). Live frames carried a
   per-connection `"local-N"` id, retained frames carried a Redis sequence, and the replay parsed the
   header as a number — so the normal case, where the last frame received was a two-second position
@@ -436,7 +445,7 @@ Honest list. None of these is hidden behind a passing test.
 **This MVP is not production-ready, and the gaps are deliberate rather than overlooked.** Everything
 below is a real exposure someone should close before real money moves through it.
 
-### Closed in Pass 1
+### Closed in Pass 1 (and later)
 
 | # | Was | Now |
 | :-- | :--- | :--- |
@@ -445,6 +454,7 @@ below is a real exposure someone should close before real money moves through it
 | S3 | **`Secure` cookie defaults to false** | Now `${FLASHSEATS_COOKIE_SECURE:false}`, so it is set per environment rather than edited in a properties file. The default stays `false` because a `Secure` cookie is silently dropped over `http://localhost` and would break every local session |
 | S4 | **Receipt tokens never expire** and were `sign(orderNumber)` — deterministic, so derivable by counting against sequential order numbers | Payload is `orderNumber:expiry:nonce`, mirroring `QueueTokens`. Default lifetime 90 days (`flashseats.order.receipt-token-ttl-days`) |
 | S11 | **`X-Forwarded-For` trusted from any client** — anyone could rotate a fake address for unlimited fresh IP buckets, or poison a real one. With the session bucket already free to mint, this left *no* effective rate limit for a cookie-less caller | Honoured only from a peer in `flashseats.bot.trusted-proxies`, **empty by default** (ADR-039) |
+| S13 | **`POST /session/reset` discarded the caller's identity on a cross-site form post** — under S6 a hidden form on any site could throw a waiting buyer out of the queue and cut them off from their live hold | **Closed in Pass 13** (ADR-060): the endpoint `consumes` `application/json` only. A form can send only `urlencoded`/`multipart`/`text/plain`, and a cross-origin JSON `fetch` needs a preflight nothing grants, so anything else is `415` and expires nothing. The demo page already sent JSON; kept on every profile because the cluster serves that page. **S6 itself is unchanged** for the other mutating endpoints |
 
 ### Must fix before any deployment
 
@@ -458,7 +468,6 @@ below is a real exposure someone should close before real money moves through it
 | :-- | :--- | :--- |
 | S5 | **Session identity is free to mint** | The rate limiter's primary bucket is per-`fsid`, and anyone can discard a cookie to get a fresh one. The IP bucket is therefore the only real backstop — and it is deliberately loose (300 burst) so NAT populations are not blocked. This is the ADR-011 trade working as designed, but it means **the session bucket does not constrain a determined attacker at all.** Pass 1 made the IP bucket real (S11). **Pass 9 built the compensating control** — reCAPTCHA v3 on join, failing open, plus `ip_rules` for the manual case (ADR-055). **It is off by default**, because `flashseats.bot.recaptcha.secret` is blank in a clean checkout, so this closes only where someone sets the secret. ADR-044's verified accounts remain the other route: an account costs something to mint, a discarded cookie costs nothing. |
 | S6 | **CSRF is disabled while a cookie authorises actions** | Justified for a stateless JSON API, and the checkout path is safe because it needs a `holdToken` an attacker cannot guess. But a cross-site `POST /queue/join` or `POST /holds` *would* succeed against a logged-in visitor and could be used to consume their one-hold-per-event allowance. Low impact, non-zero. Require a custom header, or re-enable CSRF for the mutating endpoints. |
-| S13 | **`POST /api/v1/session/reset` discards the caller's identity, unauthenticated** | A demo affordance: it expires the `fsid` cookie so the bundled page can start over as a new visitor. Under S6 a cross-site `POST` therefore throws a visitor out of a queue they were waiting in and cuts them off from their own live hold — no disclosure, but during a flash sale it is the most damaging thing on the CSRF list, because the session *is* the queue position. Scope it to the demo profile, or make it a `DELETE` that requires a header a form post cannot send. |
 | S7 | **Order numbers are sequential** | `TK-00001`, `TK-00002`. Access is properly controlled, so this is not an IDOR — but it publishes exact sales volume to anyone who buys one ticket. It was worse in combination with S4: a deterministic receipt token over a countable order number meant one leaked secret enumerated every buyer's email. The nonce closes that; the volume leak remains. Prefer a non-sequential public reference. |
 | S8 | **SSE connections are uncapped per session** | The stream is exempt from per-request rate accounting (correctly — it is one connection, not a request stream), and nothing limits how many a single session opens. A few thousand connections would exhaust the container. Cap concurrent streams per session and per IP. |
 | S9 | **PII is stored and logged in clear** | `orders.user_email` and `notification_logs.recipient_email` are plaintext, with no retention policy and no deletion path. Whatever regime applies, decide it explicitly. |
@@ -789,6 +798,73 @@ nonetheless the first time the **200 ms checkout p99 exit criterion has been met
 first evidence that the criterion is reachable on this design rather than only on a bigger machine.
 One run, one host: treat it as a data point, not as the criterion being closed. Sampling covered the
 ramp and steady state; the last ~45 s of ramp-down was not sampled.
+
+#### Pass 13 — finding the edge (25 Sept 2026)
+
+Runs A–H all *passed*, and a drill that only passes has not found its edge. This sweep went looking
+for it on the same laptop, with nothing else running. The host has 10 cores and a 7.65 GiB Docker VM.
+Each run used the same runner: seed, then `pool-pressure.sh`, a `docker stats` sampler every 10 s,
+`k6-concurrent`, and finally `sold-count.sh`, with replica restart counts recorded before and after.
+The pass criteria were fixed before the first run:
+- `pending` sustained above 0
+- ledger sellout below 99 %
+- checkout p99 above 200 ms
+- any drift or oversell stops the sweep as a correctness failure
+
+**On the final configuration** (per-replica memory limit and explicit G1, ADR-062):
+
+| Run | E × VUs | peak `pending` | **seats sold (ledger)** | checkout p99 | replica CPU peak | restarts |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+| **I′** | **10 × 300** | **0** | **4,997 / 5,000** | 201 ms | 2.6–2.8 cores | 0 |
+| **K′** | 5 × 600 | **0** | 2,498 / 2,500 | **145 ms** | 3.0–3.7 cores | 0 |
+| **J′** | 5 × 1,000 | **0** | 2,499 / 2,500 | 207 ms | 3.1–3.4 cores | 0 |
+| **L′** | 5 × 2,000 | **0** | **2,500 / 2,500** | **6,059 ms** | 2.8–3.0 cores | 0 |
+
+`sold + held + redis == capacity` on every tier of every run, zero inventory `503`s and zero
+rate-limited requests.
+
+**The stated ceiling, for this host:**
+- **Correctness holds at every load tried.** No oversell, no drift and no lost seat, up to 2,000 VUs
+  across five sales. Ten concurrent sales, the top of the operating envelope in `03` §2, sell out.
+  That had never been measured before.
+- **The 200 ms latency criterion holds up to about 600 VUs across five sales.** It is at the line
+  at 300 VUs across ten sales and at 1,000 across five (201 and 207 ms), and it collapses by
+  2,000 (6.1 s).
+- **The limit is CPU, not the connection pool.** `hikaricp_connections_pending` read 0 on every
+  sample of every run, including the one with a 6 s p99. Meanwhile each replica peaked at around
+  3 cores and k6 took 1.4–2.1 more, which is the whole machine. So the pool's own edge (ADR-049)
+  is **beyond what this laptop can generate**. The load generator saturates the host before the
+  pool saturates. A host where k6 runs elsewhere is the only way to find the pool's edge. §9
+  already said that, and now there is a number behind it.
+- Single runs, with visible run-to-run variance: I′ measured 201 ms here and 106 ms on the
+  configuration below. Treat each figure as ± tens of ms, not as exact.
+
+**What the first attempt found, before that configuration existed.** The same sweep, run first
+with the replicas as they were, went wrong at 2,000 VUs in two separate ways:
+
+| Run | E × VUs | peak `pending` | seats sold (ledger) | p99 | what happened |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| I | 10 × 300 | 0 | 4,997 / 5,000 | 106 ms | clean |
+| J | 5 × 1,000 | 7 (one sample) | 2,500 / 2,500 | 390 ms | clean |
+| K | 5 × 600 | 0 | 2,499 / 2,500 | 147 ms | clean |
+| L | 5 × 2,000 | 0 | 2,500 / 2,500 | 6,130 ms | the instrument reported sustained drift; the ledger was exact |
+| L2 | 5 × 2,000 | 0 | **1,765 / 2,500** | 7,992 ms | **replicas OOM-killed mid-sale**; the ledger showed 3 seats under-counted |
+
+1. **L's "sustained drift" was the instrument, not the system.** The drift gauge is recomputed
+   every 60 s, and under load `pool-pressure.sh` reached app-3 every ~24 s. So it read the **same
+   computation twice** and called that sustained. The next computation read 0, and the ledger was
+   exact. The instrument now requires non-zero drift across a whole drift interval, which means two
+   separate computations. This is ADR-047's trap again, "an instrument stricter than the ADR it
+   cites", this time in the time dimension.
+2. **L2 was real, and it shows the design doing what it claims.** The Docker VM's kernel log shows
+   the OOM killer taking three `java` processes, with RSS of 4.0, 2.5 and 2.7 GiB. The replicas had
+   no memory limit, so `MaxRAMPercentage=75` sized each heap against the whole VM (ADR-062). A
+   replica killed between the Redis decrement and the hold insert loses exactly those seats.
+   `sold-count.sh` showed tiers 9003 and 9004 at 499 and 498. They were **under-counted, never
+   over**, which is invariant 12's promised direction under an ambiguous failure. `rebuild-stock`
+   on each event restored both to exactly 500. That makes it the first time the crash-recovery
+   path has been exercised by a *real* crash under load rather than argued for. The 70 % sellout
+   is the outage: whatever was in flight on a killed replica was lost.
 
 Run F's table below is kept because it is the one that exposed the tail-of-sale edge, four seats short:
 
@@ -1858,3 +1934,44 @@ times and the recovery once. Correct by design and mildly unhelpful during an in
 narrower and sharper: **a path no test and no script exercises is not "probably fine", it is
 unknown.** Every defect here lived in exactly such a path — a profile the suite never starts, a shell
 the author never ran — and each was found in the first minute of trying to use it.
+
+### Pass 13 — evidence, back-pressure, and finding the edge
+
+- **Scope:** close the largest coverage hole (fulfilment was never driven through a listener), make
+  two error paths honest, close S13, find the load edge instead of passing again, and tidy the
+  repository's setup story. Each fix got a test that failed before it, and its docs in the same
+  commit.
+
+**Built:**
+
+| Change | Effect |
+| :--- | :--- |
+| **`NotificationListenerIT`** | Fulfilment through a real RabbitMQ with both real listeners and the production topology. Only SMTP is faked. It proves dedupe on redelivery, dead-letter after one attempt (ADR-029), exactly-once replay (ADR-038), and that a delivered-but-unrecorded message stays `SENT` (ADR-042). Checked by mutation: removing the ADR-042 guard fails it |
+| **`503 SERVICE_BUSY`** (ADR-059) | A HikariCP timeout was `500 INTERNAL_ERROR`. It is back-pressure, so it now gets `Retry-After: 1`. It is classified by the cause chain, so a database that is down is still `500` |
+| **`/session/reset` accepts JSON only** (ADR-060) | S13 closed: a cross-site form can no longer expire a buyer's session. No client change was needed |
+| **The order-dependent suite, root-caused** (ADR-061) | Spring Framework 7 pauses cached test contexts, and the resumed context answered every `/queue` request before its own filters ran. Pass 12 had ruled out everything inside the application; the cause was outside it. **228 tests, green in alphabetical, reverse and filesystem order** |
+| **Replica memory limit, explicit G1** (ADR-062) | Replicas were OOM-killed by the Docker VM at 2,000 VUs. The same load now runs with zero restarts |
+| **Drill instruments corrected** | `seed-concurrent.sh` could not seed anything but five sales (a psql `\set` overrode `-v`), and its per-key Redis clean-up outran the pre-warm window. `pool-pressure.sh` read one drift computation twice and called it sustained |
+| **README** | The environment files in the order a new developer creates them, and a repository-layout section |
+
+**Measured** (§11): ten concurrent sales sell out, and correctness held at every load up to 2,000
+VUs. p99 meets 200 ms to about 600 VUs across five sales, and the limit is host CPU, not the pool.
+The run that crashed became the best evidence in the pass: a real mid-sale crash left 3 seats
+under-counted and none oversold, and `rebuild-stock` recovered them exactly.
+
+**Found and not fixed, recorded in §9:** a Redis node demoted by Sentinel while still up keeps the
+replicas' connections, so every write fails `READONLY` until the replicas restart. It was hit on
+this pass's first cluster boot because the Pass 12 failover test had left its state in the sentinel
+volumes.
+
+**Considered and declined: moving the backend into `backend/`.** It would change about fifty paths
+across the Dockerfile, compose, the drill scripts and the docs, and it would conflict with both
+teammates' branches, all for no change in behaviour, late in the project and on a cluster that has
+only just started working. The README explains the layout instead.
+
+**The transferable lesson.** Pass 12 learned that an unexercised path is unknown. This pass learned
+the version of that for *instruments*: **every number here was wrong at least once because of the
+thing measuring it, not the thing measured.** A test harness paused its own context, a seed script
+could not seed what it claimed, a sampler read one computation twice, and a Dockerfile flag was
+cancelled by a compose file. Each was found by distrusting a result that looked either too good or
+too bad, and by asking which layer produced it.
