@@ -42,8 +42,9 @@ replica's heap, which is why queue promotions fan out over Redis Pub/Sub (ADR-00
 | **Lombok** | managed | Boilerplate reduction. |
 
 > Earlier drafts of these documents said "Spring Boot 3.x". The build is on **Boot 4.1.1** with
-> **Modulith 2.1.1**, and the base package is `com.flashseats.flashseats`, not `com.app`. All docs
-> now reflect the build.
+> **Modulith 2.1.1**, and the base package is `com.flashseats`, not `com.app`. The application class sits at
+> that root, and the app-wide configuration (security, `SecretsGuard`, MVC) is its own leaf module,
+> `com.flashseats.app`, which nothing depends on. All docs now reflect the build.
 
 ### Added per phase
 

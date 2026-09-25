@@ -2587,3 +2587,34 @@ never fired, and the p99 there (6.1 s) is set by CPU, not by GC.
 - The lesson for this repo: a flag that reads correctly in one file can be cancelled by another,
   and a JVM decides things about itself from the container it finds. Check effective settings with
   `java -XX:+PrintFlagsFinal -version` inside the container, not by reading the Dockerfile.
+
+---
+
+## ADR-063 — ADR-057's exception rule, applied without exceptions
+
+**Status:** accepted, Pass 14. Amends ADR-057.
+
+**Context.** ADR-057 set the rule: *"a failure gets a class only when something catches it by type,
+or when two sibling types keep a distinction visible."* It then kept seven classes for other
+reasons. `PaymentDeclinedException` and `TicketNotAvailableException` "chose between two answers".
+`OrderRefundedException` "steered control flow". `PaymentGatewayUnavailableException` avoided "a
+one-method `Errors` class". `PaymentActionRequiredException`, `WebhookSignatureInvalidException` and
+`BotVerificationFailedException` arrived on branches that forked before the rule. Pass 14 checked
+all seven: **none is caught by type anywhere in `main`.** Choosing a code, a message or a
+`retryable` flag from an argument is exactly what a static factory does. And "steers control flow"
+had become untrue once `CheckoutService`'s catch-all caught `RuntimeException`.
+
+**Decision.** All seven become factories: `PaymentErrors.{declined, actionRequired,
+gatewayUnavailable, webhookSignatureInvalid}`, `OrderErrors.{refunded, ticketNotAvailable}` and
+`BotErrors.verificationFailed`. The classes that remain are the ones something catches:
+`DuplicatePaymentException`, the three `Hold*` exceptions `PaymentSettlementService` catches as a
+set, and `RecaptchaTransportException`. The `InsufficientStock`/`InventoryUnavailable` pair also
+stays, for ADR-057's distinction reason, which still holds.
+
+**What does not change.** The wire format stays byte-identical: same codes, statuses and extension
+members, in the same order. `ProblemResponseIT` and the checkout ITs pass unedited. The two unit
+tests that asserted `isInstanceOf(...)` now assert the `ErrorCode`, which is the contract a client
+actually sees.
+
+**The rule, stated so it cannot drift again.** A class only if a `catch` names it. Everything else is
+one static method on `<Module>Errors`, and a module's refusals are read from that one file.

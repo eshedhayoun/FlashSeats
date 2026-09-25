@@ -15,7 +15,7 @@ import org.springframework.web.bind.annotation.RestController;
  * endpoint path still names the event, because that is what an operator is thinking about.
  *
  * <p>Guarded by {@code ROLE_ADMIN} in
- * {@link com.flashseats.flashseats.config.SecurityConfig}.
+ * {@link com.flashseats.app.SecurityConfig}.
  */
 @RestController
 @RequestMapping("/api/v1/admin/events")

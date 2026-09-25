@@ -18,17 +18,10 @@ import org.springframework.transaction.TransactionDefinition;
 import org.springframework.transaction.support.TransactionTemplate;
 
 /**
- * The ledger's opinion of how many seats are left, and the repair when the live counter disagrees.
- *
- * <p><strong>Why this lives in {@code order}.</strong> The invariant spans three modules'
- * tables — {@code ticket_tiers}, {@code order_items}, {@code ticket_holds} — and {@code order} is
- * the only module that can legally reach all three: it owns the orders, and {@code order → hold} and
- * {@code order → catalog} are existing facade edges. Putting it in {@code catalog} would give
- * {@code catalog} its first outbound dependency and make the graph cyclic; reading the other
- * modules' tables with one native query would hide the same violation somewhere
- * {@code ApplicationModules.verify()} cannot see it.
- *
- * <p>Redis is the live counter and PostgreSQL is the ledger. Everything here compares the two.
+ * The ledger's count of seats left, and the repair when the live counter disagrees. It lives in
+ * {@code order} because the invariant spans {@code ticket_tiers}, {@code order_items} and
+ * {@code ticket_holds}, and only {@code order} reaches all three through existing edges without a
+ * cycle.
  */
 @Slf4j
 @Service
@@ -137,22 +130,13 @@ public class StockReconciliationService {
     // ------------------------------------------------------------------ rebuild
 
     /**
-     * ADR-004's only legal recovery from a lost or wrong counter.
-     *
-     * <p>Takes two ledger snapshots a settling window apart and writes the <strong>smaller</strong>
-     * of the two. That is what makes the procedure safe to run on a live sale: a reserve decrements
-     * Redis just before its hold row commits, so a lone snapshot can miss a hold that is about to
-     * exist and write a count that is too high — an oversell created by the repair itself. By the
-     * second read that hold has landed. Seats genuinely abandoned — decremented by a replica that
-     * then died — read identically both times and are correctly returned.
-     *
-     * <p>Taking the minimum also means any hold created <em>during</em> the window is subtracted,
-     * which errs toward under-counting. That is the direction this whole design errs in: invisible
-     * seats are lost revenue that the next rebuild recovers, while phantom seats are an oversell
-     * that nothing recovers.
+     * ADR-004's only legal recovery from a lost or wrong counter. Takes two ledger snapshots a settling
+     * window apart and writes the <strong>smaller</strong>: a reserve decrements Redis just before its
+     * hold row commits, so one snapshot can miss a hold about to exist and oversell. The minimum errs
+     * toward under-counting, which a later rebuild recovers (invariant 12).
      *
      * @throws com.flashseats.shared.error.FlashSeatsException {@code STOCK_REBUILD_IN_PROGRESS}
-     *     if another rebuild holds this event's lock — see {@link OrderErrors}
+     *     if another rebuild holds this event's lock
      */
     public Map<Long, Integer> rebuild(long eventId) {
         Map<Long, Integer> first = lockedLedgerSnapshot(eventId);

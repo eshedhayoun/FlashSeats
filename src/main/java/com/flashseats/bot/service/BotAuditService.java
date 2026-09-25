@@ -14,20 +14,10 @@ import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
 /**
- * Records refusals, asynchronously and at best effort.
- *
- * <p><strong>Asynchronous is the whole design, not an optimisation.</strong> Every row written here
- * is written on a path that has just refused someone, and the caller is very often an attacker. A
- * synchronous insert would let them convert their own {@code 429}s into database writes at whatever
- * rate they can generate requests — turning the rate limiter into an amplifier for the load it
- * exists to shed, and doing it during the flash sale, against the pool checkout needs.
- *
- * <p><strong>Bounded, and it drops rather than blocks.</strong> {@code DiscardPolicy} on a queue of
- * 1,000: if the audit trail cannot keep up, the right outcome is to lose audit rows, never to make
- * the request path wait on them. An audit log is evidence, and evidence is not worth an outage.
- *
- * <p>Nothing here is on the allowed path. There is no {@code ALLOWED} outcome and there must not be
- * one — that would be a write per request during exactly the traffic this system is built for.
+ * Records refusals, asynchronously and at best effort (ADR-055). Every row is written on a path an
+ * attacker controls the rate of, so a synchronous insert would turn their {@code 429}s into database
+ * load. It uses a bounded queue with {@code DiscardPolicy}, because evidence is not worth an outage.
+ * The allowed path writes nothing.
  */
 @Slf4j
 @Service

@@ -2,9 +2,9 @@ package com.flashseats.bot;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
-import com.flashseats.flashseats.support.BuyerSession;
-import com.flashseats.flashseats.support.IntegrationTest;
-import com.flashseats.flashseats.support.SaleFixture;
+import com.flashseats.app.support.BuyerSession;
+import com.flashseats.app.support.IntegrationTest;
+import com.flashseats.app.support.SaleFixture;
 
 import java.util.ArrayList;
 import java.util.List;

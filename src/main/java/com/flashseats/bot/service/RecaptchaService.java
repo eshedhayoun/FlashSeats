@@ -23,18 +23,10 @@ import org.springframework.web.client.RestClient;
 import lombok.extern.slf4j.Slf4j;
 
 /**
- * Asks the challenge provider whether a visitor looks human, and <strong>fails open</strong>.
- *
- * <p>This is §10 S5's missing compensating control. Session identity is free to mint, so the
- * per-session limit does not constrain a determined attacker by itself. The IP bucket is deliberately
- * looser so carrier-grade NAT populations are not blocked.
- *
- * <p><strong>Failing open is the decision, not a fallback.</strong> Provider timeouts, network
- * failures, 5xx responses, malformed responses and an open circuit all produce {@link Verdict#DEGRADED}
- * and therefore allow the request. A low reCAPTCHA score is the only provider result that refuses.
- *
- * <p>Verification is cached per session. A buyer who rejoins after a dropped connection does not need
- * to prove the same thing again.
+ * Asks the challenge provider whether a visitor looks human, and <strong>fails open</strong>: only a
+ * low score refuses (ADR-011, ADR-055). Timeouts, errors, malformed answers and an open circuit all
+ * produce {@link Verdict#DEGRADED} and allow the request. It is the compensating control for
+ * free-to-mint sessions (§10 S5). Verification is cached per session.
  */
 @Slf4j
 @Service

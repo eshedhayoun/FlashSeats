@@ -3,9 +3,9 @@ package com.flashseats.hold;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.awaitility.Awaitility.await;
 
-import com.flashseats.flashseats.support.BuyerSession;
-import com.flashseats.flashseats.support.IntegrationTest;
-import com.flashseats.flashseats.support.SaleFixture;
+import com.flashseats.app.support.BuyerSession;
+import com.flashseats.app.support.IntegrationTest;
+import com.flashseats.app.support.SaleFixture;
 import com.flashseats.hold.facade.HoldFacade;
 import com.flashseats.hold.service.HoldService;
 import java.time.Duration;

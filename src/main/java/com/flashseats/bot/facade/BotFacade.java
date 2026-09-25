@@ -17,8 +17,8 @@ public interface BotFacade {
      * configured lets the visitor through; only a token the provider actively scores below the
      * threshold is refused. A challenge provider's outage must not close a sale.
      *
-     * @throws com.flashseats.bot.exception.BotVerificationFailedException only when the provider
-     *     returned a score below {@code flashseats.bot.recaptcha.min-score}
+     * @throws com.flashseats.shared.error.FlashSeatsException {@code BOT_VERIFICATION_FAILED} only
+     *     when the provider returned a score below {@code flashseats.bot.recaptcha.min-score}
      */
     void verifyHuman(String sessionId, String recaptchaToken, String ipAddress);
 }

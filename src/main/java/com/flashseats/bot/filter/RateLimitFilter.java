@@ -25,15 +25,9 @@ import org.springframework.web.filter.OncePerRequestFilter;
 import tools.jackson.databind.ObjectMapper;
 
 /**
- * Applies the operator's address rules, then the session and IP token buckets.
- *
- * <p>Runs after {@link SessionIdentityFilter}, so every request already has a verified identity to
- * charge against.
- *
- * <p><strong>The rule lookup is a memory read, never a query.</strong> This runs on every API
- * request, and a filter that reads the database to decide whether to shed load puts itself inside
- * the connection pool it exists to protect — queued behind the very buyers it is shielding
- * (ADR-051, ADR-055). {@link IpRuleService} holds a TTL-bounded snapshot.
+ * Applies the operator's address rules, then the session and IP token buckets. Runs after
+ * {@link SessionIdentityFilter}, so every request has an identity to charge. The rule lookup is a
+ * memory read, never a query (ADR-055).
  */
 @Component
 @Order(Ordered.HIGHEST_PRECEDENCE + 30)
@@ -61,16 +55,8 @@ public class RateLimitFilter extends OncePerRequestFilter {
     }
 
     /**
-     * Only the API is metered.
-     *
-     * <p>The SSE stream <strong>is</strong> filtered — it is a single request that opens a
-     * connection, and it is charged exactly once, here, at connect. What it is exempt from is
-     * per-<em>frame</em> accounting, which it gets for free: the frames are pushed by the server and
-     * never come back through this filter. Charging per frame would throttle precisely the buyers
-     * who are waiting patiently.
-     *
-     * <p>It used to be skipped entirely, which is not the same thing (ADR-011, {@code bot.md} §4):
-     * a session could open unlimited streams and spend nothing at all.
+     * Only the API is metered. The SSE stream is charged once, at connect; its server-pushed frames
+     * never pass back through this filter, so patient buyers are not throttled per frame (ADR-011).
      */
     @Override
     protected boolean shouldNotFilter(HttpServletRequest request) {
@@ -129,20 +115,10 @@ public class RateLimitFilter extends OncePerRequestFilter {
     }
 
     /**
-     * The client's address, from the socket unless a <em>trusted</em> proxy says otherwise.
-     *
-     * <p>Behind a load balancer the real address arrives in {@code X-Forwarded-For} and the first
-     * entry is the client; without honouring it every request would appear to come from the balancer
-     * and the IP bucket would throttle the entire sale at once.
-     *
-     * <p><strong>But the header is client-supplied</strong> (ADR-039). Trusting it unconditionally —
-     * which this filter did — let anyone rotate a fake address and mint an unlimited number of fresh
-     * IP buckets, or poison someone else's. Since a caller who simply discards their cookie also
-     * gets a fresh session bucket, that left no effective rate limit at all, while ADR-011 was
-     * relying on the IP bucket as its backstop.
-     *
-     * <p>The list is <strong>empty by default</strong>, so an app with nothing in front of it uses
-     * the socket address and the header is ignored. Populate it wherever a proxy terminates.
+     * The client's address: the socket, unless a <em>trusted</em> proxy says otherwise (ADR-039).
+     * {@code X-Forwarded-For} is client-supplied, so it is honoured only from
+     * {@code flashseats.bot.trusted-proxies}, which is empty by default. Trusting it blindly gave anyone
+     * unlimited fresh IP buckets.
      */
     private String clientIpOf(HttpServletRequest request) {
         String peer = request.getRemoteAddr();

@@ -3,9 +3,9 @@ package com.flashseats.catalog;
 import static java.nio.charset.StandardCharsets.UTF_8;
 import static org.assertj.core.api.Assertions.assertThat;
 
-import com.flashseats.flashseats.support.BuyerSession;
-import com.flashseats.flashseats.support.IntegrationTest;
-import com.flashseats.flashseats.support.SaleFixture;
+import com.flashseats.app.support.BuyerSession;
+import com.flashseats.app.support.IntegrationTest;
+import com.flashseats.app.support.SaleFixture;
 import java.util.Base64;
 import java.util.Map;
 import org.junit.jupiter.api.BeforeEach;

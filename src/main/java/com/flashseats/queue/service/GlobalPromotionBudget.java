@@ -8,27 +8,13 @@ import org.springframework.data.redis.core.script.RedisScript;
 import org.springframework.stereotype.Component;
 
 /**
- * One shared promotion allowance for the whole cluster (ADR-049).
+ * One shared promotion allowance for the whole cluster (ADR-049). The per-event tick lock does not
+ * stop five sales each sending a full batch into the same connection pool, which surfaces only as
+ * p99 collapse.
  *
- * <p>The per-event tick lock stops two replicas promoting the <em>same</em> sale in one second. It
- * does nothing about five healthy sales each sending a full batch into the <em>same</em> connection
- * pool: at {@code E} open events and {@code R} replicas that is {@code R × E × batchSize} buyers per
- * second arriving at a checkout backed by {@code R × 30} connections. Under virtual threads nothing
- * errors — the requests queue on HikariCP while p99 collapses, and the Pass 7 drill measured 31.3 s
- * against a 200 ms criterion with 202 connections pending.
- *
- * <p>So the allowance is spent in Redis, where every replica and every sale draw on one pool for the
- * same interval.
- *
- * <p><strong>It is claimed, not divided.</strong> Dividing the batch by the number of open sales is
- * simpler and wrong in both directions: with one open sale it throttles the system to a fraction of
- * what it can serve, and {@code E} changes whenever an operator publishes an event. A claim tracks
- * real demand — a quiet sale asks for nothing and its share goes to whoever is promoting.
- *
- * <p><strong>It fails closed.</strong> If the claim cannot be made, nobody is promoted this tick and
- * the next tick tries again. The waiting room is correctness-neutral: a late promotion costs a
- * second of someone's patience, while promoting without an allowance is the defect this class
- * exists to prevent.
+ * <p>The allowance is <strong>claimed, not divided</strong>, so a quiet sale's share goes to whoever
+ * is promoting. It <strong>fails closed</strong>: no claim means no promotion this tick, and a late
+ * promotion costs a second while an unbounded one is the defect.
  */
 @Slf4j
 @Component

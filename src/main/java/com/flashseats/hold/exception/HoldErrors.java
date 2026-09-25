@@ -4,21 +4,10 @@ import com.flashseats.shared.error.ErrorCode;
 import com.flashseats.shared.error.FlashSeatsException;
 
 /**
- * The refusals {@code hold} raises that carry no branching of their own.
- *
- * <p>Five of this module's failures are still classes, and each earns it:
- *
- * <ul>
- *   <li>{@link InsufficientStockException} and {@link InventoryUnavailableException} — the pair
- *       ADR-004 exists to keep apart. "Pick another tier" and "we cannot see our own inventory" are
- *       different answers, and two sibling types make that visible in a way two factory methods
- *       would not.
- *   <li>{@link HoldNotFoundException}, {@link HoldExpiredException} and
- *       {@link HoldAlreadySettledException} — the three ways a webhook settlement can find the seats
- *       gone. {@code PaymentSettlementService} catches them as a set and refunds, so all three have
- *       to be types (ADR-053). {@code HoldExpiredException} also carries {@code expiresAt}, and is
- *       the one message in the product that must always be able to promise nothing was charged.
- * </ul>
+ * The refusals {@code hold} raises (ADR-057, ADR-063). Five remain classes:
+ * {@link InsufficientStockException} and {@link InventoryUnavailableException}, the pair ADR-004
+ * keeps apart ("pick another tier" is not "we cannot see our inventory"), and the three
+ * {@code Hold*} exceptions {@code PaymentSettlementService} catches as a set (ADR-053).
  */
 public final class HoldErrors {
 

@@ -2,16 +2,10 @@ package com.flashseats.order.exception;
 
 import com.flashseats.shared.error.ErrorCode;
 import com.flashseats.shared.error.FlashSeatsException;
+import com.flashseats.order.model.OrderStatus;
 import java.time.Instant;
 
-/**
- * The refusals {@code order} raises that carry no branching of their own.
- *
- * <p>Two of this module's failures are still classes: {@link OrderRefundedException}, because it is
- * the one answer that must never be mistaken for an expired hold — that message promises nothing was
- * charged, and here it would be false — and {@link TicketNotAvailableException}, which branches both
- * its wording and its {@code retryable} flag on the order's status.
- */
+/** The refusals {@code order} raises (ADR-057, ADR-063). */
 public final class OrderErrors {
 
     private OrderErrors() {}
@@ -60,21 +54,42 @@ public final class OrderErrors {
     }
 
     /**
-     * A resend was asked for, but the message it would replay no longer exists.
-     *
-     * <p>{@code outbox_events} keeps payloads for {@code flashseats.outbox.purge-after-days} and the
-     * nightly purge has removed this one. The ticket is not recoverable by replay: the snapshot it was
-     * rendered from is gone, and rebuilding one from the current catalog would produce a ticket for
-     * the event as it is <em>now</em> rather than as it was sold.
-     *
-     * <p>{@code 410 Gone} rather than {@code 404}, and the distinction is the useful part of the
-     * answer: the order existed and its message existed, they have simply aged out. A {@code 404}
-     * would send an operator looking for a typo in the order number.
+     * A resend was asked for, but the outbox payload has passed
+     * {@code flashseats.outbox.purge-after-days}. It is not reconstructed from the current catalog,
+     * which would print the event as it is now, not as it was sold. {@code 410 Gone}, not {@code 404}:
+     * the order exists, its message aged out.
      */
     public static FlashSeatsException notificationPayloadUnavailable(String orderNumber) {
         return new FlashSeatsException(
                 ErrorCode.NOTIFICATION_PAYLOAD_UNAVAILABLE,
                 "No stored message remains for order " + orderNumber + "; it has passed the outbox"
                         + " retention window and cannot be replayed.");
+    }
+
+    /**
+     * The charge settled, the seats could not be delivered, and the money was refunded (ADR-012).
+     * Never reported as an expired hold: that message promises nothing was charged, which would be
+     * false here.
+     */
+    public static FlashSeatsException refunded() {
+        return new FlashSeatsException(
+                        ErrorCode.ORDER_REFUNDED,
+                        "Your seats were taken before payment completed. You have been refunded in full.")
+                .with("retryable", false);
+    }
+
+    /**
+     * The caller owns this order, and it has no ticket (ADR-050). Only a {@code CONFIRMED} order
+     * has one: a PDF for anything else is a forgery this system printed itself. {@code PENDING} may
+     * still confirm, so it alone is {@code retryable}.
+     */
+    public static FlashSeatsException ticketNotAvailable(OrderStatus status) {
+        return new FlashSeatsException(
+                        ErrorCode.TICKET_NOT_AVAILABLE,
+                        status == OrderStatus.PENDING
+                                ? "This order is still being completed. Your ticket will be ready shortly."
+                                : "There is no ticket for this order.")
+                .with("orderStatus", status.name())
+                .with("retryable", status == OrderStatus.PENDING);
     }
 }

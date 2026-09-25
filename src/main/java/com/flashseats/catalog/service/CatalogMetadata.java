@@ -19,35 +19,18 @@ import org.springframework.transaction.event.TransactionPhase;
 import org.springframework.transaction.event.TransactionalEventListener;
 
 /**
- * Event and tier metadata, read from memory instead of from a pooled connection (ADR-051).
- *
- * <p><strong>Why this exists.</strong> {@code events} changes only when an operator pauses or
- * resumes a sale and {@code ticket_tiers} never changes at all, yet every window check, event
- * summary, tier summary and tier-id lookup was its own PostgreSQL transaction — on the landing page,
- * the queue-status poll and the rehydration endpoint. At {@code E = 3..10} concurrent sales that
- * traffic, not admission, was the first thing to exhaust the connection pool (ADR-049).
- *
- * <p><strong>Four rules hold this together, and each one is a defect that was written first.</strong>
+ * Event and tier metadata read from memory instead of a pooled connection (ADR-051). These rows
+ * barely change, yet every window check and tier lookup was its own transaction, and at 3–10
+ * concurrent sales that traffic exhausted the pool first (ADR-049). Four rules:
  *
  * <ul>
- *   <li><strong>Every entry expires.</strong> The TTL <em>is</em> the cross-replica invalidation:
- *       eviction reaches only the replica that served the operator's call, so without a TTL a paused
- *       sale keeps answering {@code OPEN} on the other two for the life of the process — and
- *       {@code getWindowStatus} and {@code getTierSummary} gate queue join, holds and checkout, so
- *       pause would stop nothing. It also bounds rows created out of band by the seed SQL.
- *   <li><strong>Loads happen outside the map.</strong> Never {@code computeIfAbsent}: that runs the
- *       loader inside {@code ConcurrentHashMap}'s per-bin monitor, and blocking JDBC inside
- *       {@code synchronized} pins carrier threads on JDK 21 — the reason Redisson was removed
- *       (ADR-022). A cold key at sale open would stall every carrier at once. Two threads racing the
- *       same miss both query and both write the same answer, which costs one extra query and no
- *       correctness.
- *   <li><strong>A miss is never cached.</strong> Events and tiers are inserted straight into
- *       PostgreSQL by {@code docker/seed/*.sql}, so a remembered "no such event" would outlive the
- *       insert that created it.
- *   <li><strong>Recovery paths do not read this.</strong> {@link #tiersUncached} is what
- *       {@code prewarm} and a rebuild use. A stale tier list would make pre-warm seed a subset —
- *       leaving a tier with no counter, which answers {@code 503} for the rest of the sale (ADR-004)
- *       — or make a rebuild write counters derived from the wrong set of tiers (ADR-046).
+ *   <li><strong>Every entry expires</strong>: the TTL is the cross-replica invalidation, or a paused
+ *       sale answers {@code OPEN} on the other replicas forever.
+ *   <li><strong>Loads happen outside the map</strong>, never in {@code computeIfAbsent}: blocking
+ *       JDBC inside its per-bin lock pins carrier threads (ADR-022).
+ *   <li><strong>A miss is never cached</strong>: seed SQL inserts rows behind the app's back.
+ *   <li><strong>Recovery paths do not read this</strong>: {@link #tiersUncached} serves pre-warm and
+ *       rebuild, where a stale tier list would leave a tier with no counter (ADR-004, ADR-046).
  * </ul>
  */
 @Slf4j
@@ -106,21 +89,10 @@ public class CatalogMetadata implements DerivedStateCache {
     }
 
     /**
-     * Every {@code PUBLISHED} or {@code PAUSED} event, ordered by sale start.
-     *
-     * <p><strong>This one is cached for availability, not for cost.</strong> The three list reads
-     * derived from it — open ids, managed ids, the public listing — are a handful of queries a second
-     * cluster-wide, so caching them saves nothing worth mentioning. What it buys is that
-     * {@code PromotionWorker.tick()} needs <em>no pooled connection</em>.
-     *
-     * <p>That matters because the first version left it uncached on exactly the cost argument, and the
-     * Pass 8 drill showed the argument was the wrong one. Under pool pressure the tick waited on the
-     * same queue as the buyers it existed to admit — one logged wait was <strong>16 seconds inside a
-     * one-second tick</strong> — so nobody was promoted, the waiting room did not drain, and the buyers kept
-     * polling. The component that protects the pool must not be able to starve on it.
-     *
-     * <p>Safe to cache because, unlike the reads derived from it, it is not parameterised by the
-     * clock: the window comparison happens in memory against this snapshot.
+     * Every {@code PUBLISHED} or {@code PAUSED} event, ordered by sale start. Cached for
+     * <strong>availability, not cost</strong>: it lets {@code PromotionWorker.tick()} run without a
+     * pooled connection, because the component that protects the pool must not starve on it (ADR-051).
+     * It is not clock-dependent, so caching it is safe.
      */
     public List<EventRow> selectableEvents() {
         return read(listCache, ALL, properties.getMetadataEventTtlMs(), this::loadSelectable);

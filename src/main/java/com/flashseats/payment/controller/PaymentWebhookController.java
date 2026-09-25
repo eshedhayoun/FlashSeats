@@ -9,20 +9,11 @@ import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RestController;
 
 /**
- * The payment provider's callback. The only endpoint this module has.
+ * The payment provider's callback, and this module's only endpoint.
  *
- * <p><strong>{@code String}, not a DTO.</strong> The signature is computed over the exact bytes of
- * the body; binding to an object and letting Jackson re-serialise it changes key order, whitespace
- * and number formatting, and the signature then fails on every legitimate delivery. The raw body is
- * handed to the service unmodified and parsed only after it has been verified.
- *
- * <p>Deliberately <strong>not</strong> exempt from rate limiting. An exempt endpoint is an unmetered
- * one ({@code docs/modules/bot.md} §6), and the IP bucket — 300 burst, 150/s — sits orders of
- * magnitude above any real delivery rate.
- *
- * <p>Nginx gives this path {@code proxy_next_upstream off}: a replayed delivery is safe, because
- * {@code webhook_events} dedupes on the provider's event id, but it is pointless — the provider
- * redelivers on any non-2xx, and more patiently than a load balancer would.
+ * <p>The body is a {@code String}, not a DTO: the signature covers the exact bytes, and a Jackson
+ * round trip changes key order and whitespace, so every legitimate delivery would fail. Not exempt
+ * from rate limiting; the IP bucket sits far above any real delivery rate.
  */
 @RestController
 @RequestMapping("/api/v1/payments")

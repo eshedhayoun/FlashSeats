@@ -20,21 +20,12 @@ import org.springframework.stereotype.Component;
 import tools.jackson.databind.ObjectMapper;
 
 /**
- * Lets buyers out of the waiting room, at a rate the rest of the system can absorb.
+ * Lets buyers out of the waiting room at a rate the rest of the system can absorb. Three limits
+ * apply: remaining inventory (ADR-008), the per-sale batch that protects the connection pool
+ * (ADR-028), and {@link GlobalPromotionBudget} for the cluster (ADR-049).
  *
- * <p><strong>Three independent limits apply, and all of them matter.</strong> Admission control
- * bounds admission by <em>inventory</em> — promoting people into a sold-out sale just makes them
- * wait twenty minutes for a {@code 409} (ADR-008). The batch size bounds one sale by <em>capacity to
- * serve</em> — a tier with 5,000 seats left would otherwise admit 5,000 buyers into a checkout path
- * backed by 30 database connections, and under virtual threads nothing errors, requests simply pile
- * up on the pool while p99 collapses (ADR-028). And {@link GlobalPromotionBudget} bounds the
- * <em>cluster</em>, because that pool is shared by every open sale and the batch size never was
- * (ADR-049).
- *
- * <p><strong>Nobody is ever evicted.</strong> An abandoned entry reaches the front, is promoted,
- * never claims its pass, and that pass expires in two minutes — capacity comes back on its own. The
- * previous design removed entries whose heartbeat had lapsed, which deleted live buyers from the
- * line during an ordinary Wi-Fi to cellular handover (ADR-026).
+ * <p><strong>Nobody is ever evicted.</strong> An abandoned entry is promoted, never claims its pass,
+ * and the pass expires in two minutes (ADR-026).
  */
 @Slf4j
 @Component
@@ -84,18 +75,10 @@ public class PromotionWorker {
     }
 
     /**
-     * <strong>The order is shuffled, and that is what makes the shared budget fair.</strong>
-     *
-     * <p>Every replica reads the open events in the same ascending order, and the budget is claimed
-     * as each sale is reached. Iterating in a fixed order therefore lets the lowest event id take the
-     * whole allowance every second while the others get nothing — at {@code E = 5} that is one sale
-     * draining and four frozen. ADR-049's secondary cap does not help: once the cluster budget is
-     * smaller than {@code promotion-batch-size}, the per-event cap never binds.
-     *
-     * <p>A shuffle costs one line and gives every sale an equal chance of being served first, while
-     * still letting a busy sale use an allowance its quiet neighbours did not claim. Dividing the
-     * budget by {@code E} instead is the thing ADR-049 explicitly rejects — with four quiet sales it
-     * would cap the busy one at a fifth of what the cluster can serve.
+     * <strong>The order is shuffled, and that is what makes the shared budget fair</strong> (ADR-049).
+     * Every replica reads the same ascending list, so a fixed order lets the lowest event id take the
+     * whole allowance every tick. Dividing the budget by {@code E} is rejected: it caps a busy sale
+     * beside quiet ones.
      */
     @Scheduled(
             fixedDelayString = "${flashseats.queue.promotion-interval-ms}",
@@ -221,18 +204,10 @@ public class PromotionWorker {
     }
 
     /**
-     * Stock is gone and nobody holds a claim on it. Say so — once — and change nothing else.
-     *
-     * <p><strong>The waiting set is deliberately left intact</strong> (ADR-035). Deleting it was the
-     * original behaviour and it is unrecoverable: the condition that triggers this is a live
-     * inventory read, a released hold puts seats straight back, and a missing counter used to look
-     * exactly like a sold-out sale. Everyone in the line was deleted on the strength of a number
-     * that could be wrong a second later.
-     *
-     * <p>Setting the marker instead makes the state <em>derived</em>: {@code getQueueState} reports
-     * {@code EXHAUSTED} while it exists, the next tick with stock removes it, and every buyer's
-     * position is exactly where they left it. {@code SETNX} is also what makes the frame publish
-     * once rather than every second for the rest of the sale.
+     * Stock is gone and nobody holds a claim on it: say so once, and change nothing else. The waiting
+     * set stays intact (ADR-035). The trigger is a live inventory read that a released hold can
+     * reverse a second later. The {@code SETNX} marker makes {@code EXHAUSTED} a derived state, cleared
+     * by the next tick with stock, and publishes the frame once.
      */
     private void exhaust(long eventId, Instant now) {
         Boolean firstToSee = redis.opsForValue()
@@ -255,22 +230,15 @@ public class PromotionWorker {
     }
 
     private void expireWithSale(String key, Instant now, Instant saleEndTime) {
-        QueueKeyLifetimes.expireWithSale(
+        QueueKeys.expireWithSale(
                 redis, key, now, saleEndTime, properties.getKeyRetentionAfterSaleSeconds());
     }
 
     /**
-     * Makes the tick a singleton across replicas.
-     *
-     * <p>A plain Redis {@code SET NX PX} rather than a PostgreSQL advisory lock (ADR-032). A
-     * transaction-scoped advisory lock only holds while a transaction is open, and this worker's
-     * entire job is Redis writes — which may not happen inside a SQL transaction (ADR-023). The two
-     * documented rules contradict each other here; a self-expiring Redis lock satisfies both.
-     *
-     * <p>Deliberately not released: the TTL is shorter than the tick interval, so it frees itself,
-     * and never deleting it removes any chance of one replica releasing another's lock. If a tick
-     * somehow overruns the TTL, two replicas may both promote — bounded by the batch size, and
-     * already absorbed by the oversubscribe factor.
+     * Makes the tick a singleton across replicas with Redis {@code SET NX PX} (ADR-032): the worker's
+     * writes are Redis, so a transaction-scoped advisory lock cannot hold them (ADR-023). Never
+     * released: the TTL is shorter than the tick, so no replica can release another's lock. An overrun
+     * is bounded by the batch size.
      */
     private boolean acquireTickLock(long eventId) {
         Boolean acquired = redis.opsForValue()

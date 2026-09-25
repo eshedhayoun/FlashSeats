@@ -2,7 +2,7 @@ package com.flashseats.payment.service;
 
 import com.flashseats.payment.config.PaymentProperties;
 import com.flashseats.payment.exception.DuplicatePaymentException;
-import com.flashseats.payment.exception.PaymentGatewayUnavailableException;
+import com.flashseats.payment.exception.PaymentErrors;
 import com.flashseats.payment.facade.AuthorizeCommand;
 import com.flashseats.payment.facade.PaymentFacade;
 import com.flashseats.payment.facade.PaymentResult;
@@ -21,16 +21,9 @@ import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.stereotype.Service;
 
 /**
- * Charging and refunding.
- *
- * <p><strong>No method here is {@code @Transactional}, deliberately.</strong> Each brackets a network
- * call with two short transactions owned by {@link PaymentTransactionStore}, so no pooled connection
- * is ever held across the provider round trip (ADR-023).
- *
- * <p>This class <em>is</em> {@link PaymentFacade}. Other modules see only that interface, because
- * this package is internal to the module and they may not name it. There is no separate delegating
- * implementation: one existed, held no logic, and only added a hop between the contract and the
- * code that honours it.
+ * Charging and refunding; implements {@link PaymentFacade} (ADR-057). No method is
+ * {@code @Transactional}: each network call is bracketed by two short transactions on
+ * {@link PaymentTransactionStore} (ADR-023).
  */
 @Slf4j
 @Service
@@ -57,20 +50,8 @@ public class PaymentService implements PaymentFacade {
         this.redis = redis;
         this.properties = properties;
         /*
-         * One counter, tagged by outcome, rather than a decline RATIO.
-         *
-         * The ratio this replaced was cumulative since JVM start -- declines divided
-         * by all attempts, for the life of the process. 03 section 7 says the metric
-         * exists because "a spike is either a provider incident or a fraud rule
-         * mis-firing", and a lifetime ratio is the one shape that cannot show a
-         * spike: every sample dilutes the next, so an outage at hour six barely
-         * moves a number six hours of healthy traffic have flattened.
-         *
-         * Counters leave the windowing to whoever is asking, which is where it
-         * belongs: rate(attempts{outcome="declined"}[5m]) / rate(attempts[5m]) is
-         * the decline ratio over any window, and the same series answers "are we
-         * reaching the provider at all" without a second metric. Outcome is a
-         * four-value enum, so the tag cannot explode.
+         * One counter tagged by outcome, not a lifetime ratio, which cannot show a spike.
+         * rate(attempts{outcome="declined"}[5m]) / rate(attempts[5m]) is the ratio over any window.
          */
         for (GatewayResult.Outcome outcome : GatewayResult.Outcome.values()) {
             attemptsByOutcome.put(
@@ -132,7 +113,7 @@ public class PaymentService implements PaymentFacade {
 
             if (result.outcome() == GatewayResult.Outcome.ERROR) {
                 log.warn("Gateway error for order {}: {}", command.orderNumber(), result.failureReason());
-                throw new PaymentGatewayUnavailableException(result.failureReason());
+                throw PaymentErrors.gatewayUnavailable();
             }
 
             return new PaymentResult(
@@ -169,20 +150,9 @@ public class PaymentService implements PaymentFacade {
     public RefundResult refund(String transactionReference, long amountCents, String reason) {
         PaymentTransaction transaction = store.require(transactionReference);
         /*
-         * Refunds here are full-refund operations, so a ledger that already records
-         * this amount means the work is done and the provider round trip is waste.
-         * Webhook redelivery and application retry both arrive this way.
-         *
-         * What this does NOT protect against is the interesting case: a crash after
-         * the provider refunded but before our DB recorded it. There
-         * refundedAmountCents is still zero, so this guard does not fire at all —
-         * and it must not, because we genuinely do not know the money moved. That
-         * case is covered one layer down, by the idempotency key
-         * StripePaymentGateway.refund sets over (intent, amount): the retried
-         * request returns the provider's original result instead of refunding twice.
-         *
-         * Stated explicitly because a guard whose comment claims a guarantee it does
-         * not hold is how the layer that actually holds it gets removed later.
+         * Full refunds only, so a ledger already recording this amount means the work is done. This does
+         * NOT cover a crash after the provider refunded but before we recorded it; the idempotency key
+         * StripePaymentGateway.refund sets over (intent, amount) covers that.
          */
         if (amountCents > 0 && transaction.getRefundedAmountCents() >= amountCents) {
             log.info(

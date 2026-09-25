@@ -6,7 +6,8 @@ import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
-import com.flashseats.notification.consumer.OrderRefundedConsumer;
+import com.flashseats.notification.consumer.NotificationConsumer;
+import com.flashseats.shared.ticket.TicketPdfRenderer;
 import com.flashseats.notification.dto.OrderConfirmedPayload;
 import com.flashseats.notification.model.NotificationKind;
 import com.flashseats.notification.service.EmailComposer;
@@ -22,7 +23,7 @@ import org.springframework.amqp.core.Message;
 import org.springframework.amqp.core.MessageProperties;
 import tools.jackson.databind.ObjectMapper;
 
-class OrderRefundedConsumerTest {
+class NotificationConsumerTest {
 
     private final NotificationLogService logs =
             org.mockito.Mockito.mock(NotificationLogService.class);
@@ -39,9 +40,10 @@ class OrderRefundedConsumerTest {
     private final Channel channel =
             org.mockito.Mockito.mock(Channel.class);
 
-    private final OrderRefundedConsumer consumer =
-            new OrderRefundedConsumer(
+    private final NotificationConsumer consumer =
+            new NotificationConsumer(
                     logs,
+                    org.mockito.Mockito.mock(TicketPdfRenderer.class),
                     composer,
                     dispatcher,
                     json,

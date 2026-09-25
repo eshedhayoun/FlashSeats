@@ -17,27 +17,13 @@ import org.springframework.context.event.EventListener;
 import org.springframework.stereotype.Service;
 
 /**
- * Finishes a purchase whose buyer never saw the response.
+ * Finishes a purchase whose buyer never saw the response: the charge settled, the HTTP answer was
+ * lost, and the provider's webhook is the only witness.
  *
- * <p>The charge settled at the provider and the HTTP answer was lost — a dropped connection, a
- * killed replica, a closed laptop. The money moved and, until this runs, nothing in this system
- * knows it. The provider's webhook is the only remaining witness.
- *
- * <p>A plain {@link EventListener}, not {@code @ApplicationModuleListener}: the latter needs the
- * Modulith event-publication registry, which was deliberately removed in favour of the hand-rolled
- * outbox (ADR-009). Synchronous on purpose — the webhook receiver's contract is that a failure here
- * becomes a non-2xx, and a listener that failed asynchronously could not be reported to the provider
- * at all.
- *
- * <p><strong>It may not finalise an order whose seats are gone</strong> (ADR-012). The hold can
- * easily have expired during exactly the disconnect that made this webhook necessary, and by now
- * another buyer may own those seats. Confirming anyway would charge one customer for inventory
- * another already holds. So the hold is re-claimed the same way the synchronous path claims it, and
- * if that fails the charge is refunded and the buyer is told.
- *
- * <p>Note what this does <em>not</em> do: price anything. {@code amountCents} arrives on the event
- * and is used only to size the refund; the confirmation prices from the tier like every other path
- * (ADR-013).
+ * <p>A plain synchronous {@link EventListener}, because the Modulith publication registry was removed
+ * (ADR-009) and a failure here must become the webhook's non-2xx. It re-claims the hold exactly as
+ * checkout does, and if the seats are gone it refunds rather than confirm inventory another buyer
+ * holds (ADR-012). It prices nothing: the confirmation prices from the tier (ADR-013).
  */
 @Slf4j
 @Service
@@ -96,20 +82,10 @@ public class PaymentSettlementService {
     }
 
     /**
-     * <strong>Only a definite failure is compensated.</strong>
-     *
-     * <p>The three exceptions caught here are the hold module's way of saying the seats are
-     * provably not ours: not found, expired, already settled. Those are facts, and a refund is the
-     * right answer to a fact.
-     *
-     * <p>Everything else — a pool timeout, an {@code InventoryUnavailableException}, a commit that
-     * failed for reasons nobody has established — is <em>ambiguous</em>, and propagates. That
-     * releases the webhook claim and earns a redelivery, which is the only outcome that can still
-     * come out right. Catching it would refund a buyer whose seats are perfectly fine and then
-     * answer the provider {@code 200}, so nothing would ever retry and the mistake would be final.
-     *
-     * <p>This is ADR-046's rule reaching money: a definite rollback is safe to compensate, an
-     * ambiguous failure is not.
+     * <strong>Only a definite failure is compensated</strong> (ADR-056). The three exceptions caught
+     * here are the hold module stating the seats are gone, and a refund is the right answer to a fact.
+     * Anything else, such as a pool timeout or a failed commit, is ambiguous and propagates, which
+     * releases the webhook claim and earns a redelivery. ADR-046's rule, applied to money.
      */
     private void settle(Order order, PaymentSettledEvent event) {
         String orderNumber = order.getOrderNumber();

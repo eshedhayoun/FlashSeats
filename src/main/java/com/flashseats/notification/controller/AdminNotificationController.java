@@ -10,20 +10,11 @@ import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
 
 /**
- * What did not get delivered.
+ * What did not get delivered: the listing that makes ADR-029's no-retry dead-letter queue and
+ * ADR-038's re-claimable rows usable. Resending lives in {@code order} ({@code AdminOrderController}),
+ * because a resend needs the original payload and only the outbox has it.
  *
- * <p>This is half of the capability ADR-029 and ADR-038 have been assuming. ADR-029 sends
- * deterministic failures straight to the dead-letter queue <em>with no retries</em> — correct, since
- * a render that fails once fails identically three times and only delays the queue — but correct
- * <strong>only if someone can find them</strong>. ADR-038 then made a dead-lettered claim
- * re-claimable specifically so a replay would send. Until now nothing could list them and nothing
- * could trigger that replay, which made the DLQ a black hole with a paid buyer's ticket in it.
- *
- * <p>The other half — actually resending — lives in {@code order}, and that is not an inconsistency:
- * a resend needs the original <em>payload</em>, and this module does not have it. See
- * {@code AdminResendController}.
- *
- * <p>Guarded by {@code ROLE_ADMIN} in {@link com.flashseats.flashseats.config.SecurityConfig}.
+ * <p>Guarded by {@code ROLE_ADMIN} in {@link com.flashseats.app.SecurityConfig}.
  */
 @RestController
 @RequestMapping("/api/v1/admin/notifications")

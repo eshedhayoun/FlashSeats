@@ -8,17 +8,9 @@ import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.stereotype.Component;
 
 /**
- * Arms and disarms the {@code hold:{token}} expiry timer.
- *
- * <p><strong>Every method here is best-effort, and that is a design property rather than a
- * concession.</strong> The timer only makes expiry <em>fast</em>;
- * {@link HoldReconciliationSweeper} is what makes it <em>correct</em>. So a Redis outage that loses
- * every key costs latency and nothing else, and no caller needs to handle a failure — which is why
- * none of these throw.
- *
- * <p>It follows that arming must never run inside a transaction (ADR-023). Redis does not roll back:
- * a timer armed for a hold whose row then failed to commit would fire against a hold that does not
- * exist. Callers arm from {@code AFTER_COMMIT}.
+ * Arms and disarms the {@code hold:{token}} expiry timer. Everything here is best-effort and never
+ * throws: the timer only makes expiry fast, and {@link HoldReconciliationSweeper} makes it correct.
+ * Callers arm {@code AFTER_COMMIT}, so a timer never outlives a rolled-back hold (ADR-023).
  */
 @Slf4j
 @Component
