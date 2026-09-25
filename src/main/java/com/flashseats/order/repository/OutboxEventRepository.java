@@ -1,10 +1,10 @@
 package com.flashseats.order.repository;
 
 import com.flashseats.order.model.OutboxEvent;
+import com.flashseats.order.model.OutboxStatus;
 import jakarta.persistence.LockModeType;
 import jakarta.persistence.QueryHint;
 import java.time.Instant;
-
 import java.util.List;
 import java.util.Optional;
 import java.util.UUID;
@@ -18,11 +18,24 @@ import org.springframework.data.repository.query.Param;
 
 public interface OutboxEventRepository extends JpaRepository<OutboxEvent, UUID> {
 
-    @Query("""
-            SELECT MIN(e.createdAt) FROM OutboxEvent e
-             WHERE e.status <> com.flashseats.order.model.OutboxStatus.PROCESSED
-            """)
-    Optional<Instant> oldestUnprocessedCreatedAt();
+    /**
+     * The oldest row in one status, for the fulfilment-lag gauge.
+     *
+     * <p><strong>By status, not by {@code <> PROCESSED}</strong>, and that is the whole point. The
+     * two indexes this table has are partial — `(created_at) WHERE status = 'PENDING'` and
+     * `(claimed_at) WHERE status = 'PROCESSING'` (`V3`) — and PostgreSQL cannot prove that
+     * {@code status <> 'PROCESSED'} implies either predicate. Asked that way the gauge sequentially
+     * scanned the whole table, <em>including</em> every processed row not yet purged, every ten
+     * seconds, on every replica: an observer putting load on the pool it exists to observe, which is
+     * ADR-051's trap reached through a metric.
+     *
+     * <p>Two bounded reads instead of one unbounded one. {@code PENDING} is served by its index
+     * directly; {@code PROCESSING} holds only in-flight claims — a batch per replica — so scanning
+     * its partial index costs nothing. Deliberately **no new index**: this table is written on every
+     * checkout, and `V12` has already had to drop indexes nothing queried.
+     */
+    @Query("SELECT MIN(e.createdAt) FROM OutboxEvent e WHERE e.status = :status")
+    Optional<Instant> oldestCreatedAtWithStatus(@Param("status") OutboxStatus status);
 
     /**
      * The most recent message published for an order, whatever became of it.
@@ -67,19 +80,19 @@ public interface OutboxEventRepository extends JpaRepository<OutboxEvent, UUID> 
      * the first one wakes up. {@code retryCount} is the claim generation: stale-claim recovery
      * increments it, so an old relay cannot mark the newer relay's claim as processed (ADR-009).
      */
-     @Modifying(flushAutomatically = true)
-     @Query("""
+    @Modifying(flushAutomatically = true)
+    @Query("""
             UPDATE OutboxEvent e
-                SET e.status = com.flashseats.order.model.OutboxStatus.PROCESSED,
-                e.processedAt = :now
-                WHERE e.id = :id
-                AND e.status = com.flashseats.order.model.OutboxStatus.PROCESSING
-                AND e.retryCount = :retryCount
-                """)
-     int markProcessed(
-                @Param("id") UUID id,
-                @Param("retryCount") int retryCount,
-                @Param("now") Instant now);
+               SET e.status = com.flashseats.order.model.OutboxStatus.PROCESSED,
+                   e.processedAt = :now
+             WHERE e.id = :id
+               AND e.status = com.flashseats.order.model.OutboxStatus.PROCESSING
+               AND e.retryCount = :retryCount
+            """)
+    int markProcessed(
+            @Param("id") UUID id,
+            @Param("retryCount") int retryCount,
+            @Param("now") Instant now);
 
     /**
      * Returns rows stranded in {@code PROCESSING} to {@code PENDING}.
