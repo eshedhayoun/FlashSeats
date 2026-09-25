@@ -2,8 +2,8 @@ package com.flashseats.notification;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
-import com.flashseats.flashseats.support.IntegrationTest;
-import com.flashseats.flashseats.support.SaleFixture;
+import com.flashseats.app.support.IntegrationTest;
+import com.flashseats.app.support.SaleFixture;
 import com.flashseats.notification.model.NotificationKind;
 import com.flashseats.notification.service.NotificationLogService;
 import org.junit.jupiter.api.BeforeEach;

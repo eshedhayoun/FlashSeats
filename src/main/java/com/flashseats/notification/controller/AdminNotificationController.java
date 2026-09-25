@@ -23,7 +23,7 @@ import org.springframework.web.bind.annotation.RestController;
  * a resend needs the original <em>payload</em>, and this module does not have it. See
  * {@code AdminResendController}.
  *
- * <p>Guarded by {@code ROLE_ADMIN} in {@link com.flashseats.flashseats.config.SecurityConfig}.
+ * <p>Guarded by {@code ROLE_ADMIN} in {@link com.flashseats.app.SecurityConfig}.
  */
 @RestController
 @RequestMapping("/api/v1/admin/notifications")

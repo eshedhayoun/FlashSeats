@@ -93,8 +93,10 @@ describing superseded designs. That is the failure mode this rule exists to stop
   Jackson 2 class is on the classpath with no bean behind it), `@EntityScan` is now
   `org.springframework.boot.persistence.autoconfigure.EntityScan`, and Flyway needs
   `spring-boot-starter-flyway` — `flyway-core` alone runs no migrations.
-- Base package is **`com.flashseats`** (the app class lives in `com.flashseats.flashseats`).
-  Older docs said `com.app.*`; that namespace does not exist.
+- Base package is **`com.flashseats`**, and `FlashseatsApplication` sits at that root, so scanning
+  needs no widening. App-wide configuration (security, `SecretsGuard`, MVC) is in
+  `com.flashseats.app`, a leaf module nothing may depend on. Before Pass 14 the app class was in
+  `com.flashseats.flashseats`. Older docs said `com.app.*`; that namespace does not exist.
 - Redis is a **single primary + Sentinel**, not Cluster (ADR-018). The `CROSSSLOT` argument that
   originally motivated this is moot — `stock_reserve.lua` now touches one key — but keyspace
   notifications are still per-node and a handful of keys is nowhere near a single primary's ceiling.
@@ -121,7 +123,8 @@ describing superseded designs. That is the failure mode this rule exists to stop
 - **The webhook secret is minted per `stripe listen` session**, not per account. A stale one rejects
   every delivery and the symptom is silence that looks exactly like a quiet day.
 - **Redisson is gone** (ADR-022). Distributed locks are `pg_try_advisory_xact_lock`.
-- There are **nine** modules: seven domain + `shared` (open) + `saleflow` (read-only leaf).
+- There are **nine** modules: seven domain + `shared` (open) + `saleflow` (read-only leaf). `app`
+  (security and startup guards) is a tenth *package* Modulith sees, and it has no inbound edges.
 - **`SecretsGuard` refuses to start** outside `dev`/`test` while any secret is still
   `dev-only-change-me` — including `docker compose --profile cluster`, which runs the `docker`
   profile. Generate them per `.env.example` (ADR-039).

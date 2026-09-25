@@ -1,4 +1,4 @@
-package com.flashseats.flashseats.support;
+package com.flashseats.app.support;
 
 import com.flashseats.shared.cache.DerivedStateCache;
 import java.sql.Timestamp;

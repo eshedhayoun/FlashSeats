@@ -1,4 +1,4 @@
-package com.flashseats.flashseats.config;
+package com.flashseats.app;
 
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.context.annotation.Bean;

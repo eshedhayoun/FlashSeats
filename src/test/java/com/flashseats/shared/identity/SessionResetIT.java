@@ -2,7 +2,7 @@ package com.flashseats.shared.identity;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
-import com.flashseats.flashseats.support.IntegrationTest;
+import com.flashseats.app.support.IntegrationTest;
 import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;

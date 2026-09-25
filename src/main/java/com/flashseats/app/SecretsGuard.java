@@ -1,4 +1,4 @@
-package com.flashseats.flashseats.config;
+package com.flashseats.app;
 
 import jakarta.annotation.PostConstruct;
 import java.util.ArrayList;

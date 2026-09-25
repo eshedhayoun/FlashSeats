@@ -2,7 +2,7 @@ package com.flashseats.order;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
-import com.flashseats.flashseats.support.IntegrationTest;
+import com.flashseats.app.support.IntegrationTest;
 import com.flashseats.notification.model.NotificationKind;
 import com.flashseats.notification.model.NotificationLog;
 import com.flashseats.notification.model.NotificationStatus;
