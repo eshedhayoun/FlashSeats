@@ -1,6 +1,8 @@
 package com.flashseats.bot.config;
 
 import java.util.List;
+import lombok.Getter;
+import lombok.Setter;
 import org.springframework.boot.context.properties.ConfigurationProperties;
 
 /**
@@ -12,6 +14,8 @@ import org.springframework.boot.context.properties.ConfigurationProperties;
  * filter too.
  */
 @ConfigurationProperties(prefix = "flashseats.bot")
+@Getter
+@Setter
 public class BotProperties {
 
     private final Bucket sessionBucket = new Bucket(20, 10);
@@ -44,34 +48,6 @@ public class BotProperties {
      */
     private List<String> trustedProxies = List.of();
 
-    public List<String> getTrustedProxies() {
-        return trustedProxies;
-    }
-
-    public void setTrustedProxies(List<String> trustedProxies) {
-        this.trustedProxies = trustedProxies;
-    }
-
-    public Bucket getSessionBucket() {
-        return sessionBucket;
-    }
-
-    public Bucket getIpBucket() {
-        return ipBucket;
-    }
-
-    public Recaptcha getRecaptcha() {
-        return recaptcha;
-    }
-
-    public long getIpRuleCacheTtlMs() {
-        return ipRuleCacheTtlMs;
-    }
-
-    public void setIpRuleCacheTtlMs(long ipRuleCacheTtlMs) {
-        this.ipRuleCacheTtlMs = ipRuleCacheTtlMs;
-    }
-
     /**
      * The challenge provider.
      *
@@ -86,6 +62,8 @@ public class BotProperties {
      * sale-length outage, which is the failure mode failing open exists to prevent, reintroduced by
      * the client that implements it.
      */
+    @Getter
+    @Setter
     public static class Recaptcha {
 
         private String secret = "";
@@ -103,54 +81,6 @@ public class BotProperties {
          */
         private long verifiedTtlSeconds = 900;
 
-        public String getSecret() {
-            return secret;
-        }
-
-        public void setSecret(String secret) {
-            this.secret = secret;
-        }
-
-        public String getVerifyUrl() {
-            return verifyUrl;
-        }
-
-        public void setVerifyUrl(String verifyUrl) {
-            this.verifyUrl = verifyUrl;
-        }
-
-        public double getMinScore() {
-            return minScore;
-        }
-
-        public void setMinScore(double minScore) {
-            this.minScore = minScore;
-        }
-
-        public int getConnectTimeoutMs() {
-            return connectTimeoutMs;
-        }
-
-        public void setConnectTimeoutMs(int connectTimeoutMs) {
-            this.connectTimeoutMs = connectTimeoutMs;
-        }
-
-        public int getReadTimeoutMs() {
-            return readTimeoutMs;
-        }
-
-        public void setReadTimeoutMs(int readTimeoutMs) {
-            this.readTimeoutMs = readTimeoutMs;
-        }
-
-        public long getVerifiedTtlSeconds() {
-            return verifiedTtlSeconds;
-        }
-
-        public void setVerifiedTtlSeconds(long verifiedTtlSeconds) {
-            this.verifiedTtlSeconds = verifiedTtlSeconds;
-        }
-
         /** Verification runs only when a secret is configured. Blank is "off", and off is allowed. */
         public boolean isEnabled() {
             return secret != null && !secret.isBlank();
@@ -158,28 +88,14 @@ public class BotProperties {
     }
 
     /** A token bucket: {@code capacity} tokens, refilled at {@code refillPerSecond}. */
+    @Getter
+    @Setter
     public static class Bucket {
         private long capacity;
         private long refillPerSecond;
 
         Bucket(long capacity, long refillPerSecond) {
             this.capacity = capacity;
-            this.refillPerSecond = refillPerSecond;
-        }
-
-        public long getCapacity() {
-            return capacity;
-        }
-
-        public void setCapacity(long capacity) {
-            this.capacity = capacity;
-        }
-
-        public long getRefillPerSecond() {
-            return refillPerSecond;
-        }
-
-        public void setRefillPerSecond(long refillPerSecond) {
             this.refillPerSecond = refillPerSecond;
         }
     }

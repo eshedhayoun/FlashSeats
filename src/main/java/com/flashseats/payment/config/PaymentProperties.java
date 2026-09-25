@@ -1,9 +1,13 @@
 package com.flashseats.payment.config;
 
+import lombok.Getter;
+import lombok.Setter;
 import org.springframework.boot.context.properties.ConfigurationProperties;
 
 /** Payment tunables. */
 @ConfigurationProperties(prefix = "flashseats.payment")
+@Getter
+@Setter
 public class PaymentProperties {
 
     /**
@@ -18,22 +22,6 @@ public class PaymentProperties {
 
     private final Breaker breaker = new Breaker();
 
-    public int getInflightTtlSeconds() {
-        return inflightTtlSeconds;
-    }
-
-    public void setInflightTtlSeconds(int inflightTtlSeconds) {
-        this.inflightTtlSeconds = inflightTtlSeconds;
-    }
-
-    public Stripe getStripe() {
-        return stripe;
-    }
-
-    public Breaker getBreaker() {
-        return breaker;
-    }
-
     /**
      * The real provider.
      *
@@ -47,6 +35,8 @@ public class PaymentProperties {
      * their own payloads with this value, so gating it on {@code enabled} would leave the endpoint
      * untested on exactly the configuration the tests run.
      */
+    @Getter
+    @Setter
     public static class Stripe {
 
         private boolean enabled = false;
@@ -54,46 +44,6 @@ public class PaymentProperties {
         private String webhookSecret = "whsec_dev_only_change_me";
         private int connectTimeoutMillis = 5_000;
         private int readTimeoutMillis = 20_000;
-
-        public boolean isEnabled() {
-            return enabled;
-        }
-
-        public void setEnabled(boolean enabled) {
-            this.enabled = enabled;
-        }
-
-        public String getApiKey() {
-            return apiKey;
-        }
-
-        public void setApiKey(String apiKey) {
-            this.apiKey = apiKey;
-        }
-
-        public String getWebhookSecret() {
-            return webhookSecret;
-        }
-
-        public void setWebhookSecret(String webhookSecret) {
-            this.webhookSecret = webhookSecret;
-        }
-
-        public int getConnectTimeoutMillis() {
-            return connectTimeoutMillis;
-        }
-
-        public void setConnectTimeoutMillis(int connectTimeoutMillis) {
-            this.connectTimeoutMillis = connectTimeoutMillis;
-        }
-
-        public int getReadTimeoutMillis() {
-            return readTimeoutMillis;
-        }
-
-        public void setReadTimeoutMillis(int readTimeoutMillis) {
-            this.readTimeoutMillis = readTimeoutMillis;
-        }
     }
 
     /**
@@ -103,6 +53,8 @@ public class PaymentProperties {
      * last N charges failed to reach the provider", and a sale's request rate varies by three orders
      * of magnitude between a quiet minute and the first second of a drop.
      */
+    @Getter
+    @Setter
     public static class Breaker {
 
         private int slidingWindowSize = 20;
@@ -110,45 +62,5 @@ public class PaymentProperties {
         private float failureRateThresholdPercent = 50;
         private int waitInOpenStateSeconds = 30;
         private int permittedCallsInHalfOpenState = 3;
-
-        public int getSlidingWindowSize() {
-            return slidingWindowSize;
-        }
-
-        public void setSlidingWindowSize(int slidingWindowSize) {
-            this.slidingWindowSize = slidingWindowSize;
-        }
-
-        public int getMinimumNumberOfCalls() {
-            return minimumNumberOfCalls;
-        }
-
-        public void setMinimumNumberOfCalls(int minimumNumberOfCalls) {
-            this.minimumNumberOfCalls = minimumNumberOfCalls;
-        }
-
-        public float getFailureRateThresholdPercent() {
-            return failureRateThresholdPercent;
-        }
-
-        public void setFailureRateThresholdPercent(float failureRateThresholdPercent) {
-            this.failureRateThresholdPercent = failureRateThresholdPercent;
-        }
-
-        public int getWaitInOpenStateSeconds() {
-            return waitInOpenStateSeconds;
-        }
-
-        public void setWaitInOpenStateSeconds(int waitInOpenStateSeconds) {
-            this.waitInOpenStateSeconds = waitInOpenStateSeconds;
-        }
-
-        public int getPermittedCallsInHalfOpenState() {
-            return permittedCallsInHalfOpenState;
-        }
-
-        public void setPermittedCallsInHalfOpenState(int permittedCallsInHalfOpenState) {
-            this.permittedCallsInHalfOpenState = permittedCallsInHalfOpenState;
-        }
     }
 }

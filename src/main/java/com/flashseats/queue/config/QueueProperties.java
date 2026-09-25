@@ -1,9 +1,13 @@
 package com.flashseats.queue.config;
 
+import lombok.Getter;
+import lombok.Setter;
 import org.springframework.boot.context.properties.ConfigurationProperties;
 
 /** Waiting-room tunables (ADR-007, ADR-020, ADR-026, ADR-028, ADR-049). */
 @ConfigurationProperties(prefix = "flashseats.queue")
+@Getter
+@Setter
 public class QueueProperties {
 
     /** Signs pass and admission tokens. Rotating it invalidates every live pass. */
@@ -71,92 +75,4 @@ public class QueueProperties {
      * {@code noeviction}, so a key with no TTL is a leak nothing else will clean up.
      */
     private long keyRetentionAfterSaleSeconds = 3_600;
-
-    public String getPassSecret() {
-        return passSecret;
-    }
-
-    public void setPassSecret(String passSecret) {
-        this.passSecret = passSecret;
-    }
-
-    public int getPassTtlSeconds() {
-        return passTtlSeconds;
-    }
-
-    public void setPassTtlSeconds(int passTtlSeconds) {
-        this.passTtlSeconds = passTtlSeconds;
-    }
-
-    public int getAdmissionTtlSeconds() {
-        return admissionTtlSeconds;
-    }
-
-    public void setAdmissionTtlSeconds(int admissionTtlSeconds) {
-        this.admissionTtlSeconds = admissionTtlSeconds;
-    }
-
-    public long getPromotionIntervalMs() {
-        return promotionIntervalMs;
-    }
-
-    public void setPromotionIntervalMs(long promotionIntervalMs) {
-        this.promotionIntervalMs = promotionIntervalMs;
-    }
-
-    public int getPromotionBatchSize() {
-        return promotionBatchSize;
-    }
-
-    public void setPromotionBatchSize(int promotionBatchSize) {
-        this.promotionBatchSize = promotionBatchSize;
-    }
-
-    public long getGlobalAdmissionBudgetPerTick() {
-        return globalAdmissionBudgetPerTick;
-    }
-
-    public void setGlobalAdmissionBudgetPerTick(int globalAdmissionBudgetPerTick) {
-        this.globalAdmissionBudgetPerTick = globalAdmissionBudgetPerTick;
-    }
-
-    public double getOversubscribeFactor() {
-        return oversubscribeFactor;
-    }
-
-    public void setOversubscribeFactor(double oversubscribeFactor) {
-        this.oversubscribeFactor = oversubscribeFactor;
-    }
-
-    public QueueOrdering getOrdering() {
-        return ordering;
-    }
-
-    public void setOrdering(QueueOrdering ordering) {
-        this.ordering = ordering;
-    }
-
-    public long getSsePositionIntervalMs() {
-        return ssePositionIntervalMs;
-    }
-
-    public void setSsePositionIntervalMs(long ssePositionIntervalMs) {
-        this.ssePositionIntervalMs = ssePositionIntervalMs;
-    }
-
-    public long getSseHeartbeatMs() {
-        return sseHeartbeatMs;
-    }
-
-    public void setSseHeartbeatMs(long sseHeartbeatMs) {
-        this.sseHeartbeatMs = sseHeartbeatMs;
-    }
-
-    public long getKeyRetentionAfterSaleSeconds() {
-        return keyRetentionAfterSaleSeconds;
-    }
-
-    public void setKeyRetentionAfterSaleSeconds(long keyRetentionAfterSaleSeconds) {
-        this.keyRetentionAfterSaleSeconds = keyRetentionAfterSaleSeconds;
-    }
 }

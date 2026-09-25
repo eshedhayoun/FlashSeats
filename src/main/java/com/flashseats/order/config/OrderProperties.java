@@ -1,9 +1,13 @@
 package com.flashseats.order.config;
 
+import lombok.Getter;
+import lombok.Setter;
 import org.springframework.boot.context.properties.ConfigurationProperties;
 
 /** Checkout and outbox tunables. */
 @ConfigurationProperties(prefix = "flashseats.order")
+@Getter
+@Setter
 public class OrderProperties {
 
     /**
@@ -56,68 +60,4 @@ public class OrderProperties {
 
     /** How long a receipt link stays usable (ADR-039). Long enough to survive a forwarded email. */
     private int receiptTokenTtlDays = 90;
-
-    public int getCheckoutGraceMinutes() {
-        return checkoutGraceMinutes;
-    }
-
-    public void setCheckoutGraceMinutes(int checkoutGraceMinutes) {
-        this.checkoutGraceMinutes = checkoutGraceMinutes;
-    }
-
-    public int getMaxPaymentAttempts() {
-        return maxPaymentAttempts;
-    }
-
-    public void setMaxPaymentAttempts(int maxPaymentAttempts) {
-        this.maxPaymentAttempts = maxPaymentAttempts;
-    }
-
-    public int getMinRemainingSecondsForRetry() {
-        return minRemainingSecondsForRetry;
-    }
-
-    public void setMinRemainingSecondsForRetry(int minRemainingSecondsForRetry) {
-        this.minRemainingSecondsForRetry = minRemainingSecondsForRetry;
-    }
-
-    public int getStalePendingSeconds() {
-        return stalePendingSeconds;
-    }
-
-    public void setStalePendingSeconds(int stalePendingSeconds) {
-        this.stalePendingSeconds = stalePendingSeconds;
-    }
-
-    public int getRebuildSettleMillis() {
-        return rebuildSettleMillis;
-    }
-
-    public void setRebuildSettleMillis(int rebuildSettleMillis) {
-        this.rebuildSettleMillis = rebuildSettleMillis;
-    }
-
-    public int getDriftIntervalMs() {
-        return driftIntervalMs;
-    }
-
-    public void setDriftIntervalMs(int driftIntervalMs) {
-        this.driftIntervalMs = driftIntervalMs;
-    }
-
-    public String getReceiptSecret() {
-        return receiptSecret;
-    }
-
-    public void setReceiptSecret(String receiptSecret) {
-        this.receiptSecret = receiptSecret;
-    }
-
-    public int getReceiptTokenTtlDays() {
-        return receiptTokenTtlDays;
-    }
-
-    public void setReceiptTokenTtlDays(int receiptTokenTtlDays) {
-        this.receiptTokenTtlDays = receiptTokenTtlDays;
-    }
 }
