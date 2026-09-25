@@ -36,6 +36,20 @@ correctness-neutral: delete the whole module and the sale is still correct, just
 | `queue:promote:{e}` | String | 900 ms | makes the promotion tick a singleton across replicas (ADR-032) |
 | `queue:budget` | String | one promotion interval | **the cluster-wide admission allowance** (ADR-049) |
 | `queue:events:{e}` | Pub/Sub | — | promotion fan-out to whichever replica holds the SSE connection (ADR-007) |
+| `queue:replay:{e}` | ZSET, score = sequence | sale end + retention | the last 256 **broadcast** frames, so a reconnecting client can be handed what it missed (ADR-058) |
+| `queue:replay-seq:{e}` | String | sale end + retention | the monotonic sequence behind those frames |
+
+**The replay log retains broadcast frames only** — `tier-availability`, `sale-closed`,
+`sale-exhausted`. It is one key per *event*, shared by everyone watching that sale and outliving the
+sale itself, and the only session-targeted frame this module sends carries a `passToken`: a
+single-use capability whose own key expires in 120 s. A promoted buyer's reconnect is served by
+**re-reading `queue:pass:{e}:{sid}`** on connect and rebuilding the frame, never by replaying it
+(ADR-058). That also means it works with no `Last-Event-ID` at all, and cannot return a pass that has
+since been spent.
+
+**The replay sequence is the only SSE `id` this module issues.** Position updates and the re-derived
+promotion are sent with no `id` field, which leaves a client's last-event-id pointing at the last
+frame it could actually ask to have replayed.
 
 Every per-buyer key is **scoped by event**. One visitor in two concurrent sales would otherwise have
 one promotion overwrite the other (ADR-036). **`queue:budget` is the deliberate exception**, and it is
@@ -65,14 +79,19 @@ in line, which is a fairness failure, not a correctness one.
 | Frame | Payload | Cadence |
 | :--- | :--- | :--- |
 | `position-update` | `{position, aheadOfYou, estWaitSeconds}` | 2 s, **clamped monotonic non-increasing** |
-| `queue-promoted` | `{passToken, expiresInSeconds}` | on promotion |
+| `queue-promoted` | `{passToken, expiresInSeconds}` | on promotion, **and on connect** when the session already holds a live pass — rebuilt from Redis, not replayed (ADR-058) |
 | `tier-availability` | `{tiers:[{tierId, level}]}` | on change — each replica diffs the buckets it last sent (ADR-027) |
 | `sale-exhausted` | `{soldOutAt}` | when derived — **not terminal**, it un-derives if stock returns |
 | `sale-closed` | `{closedAt}` | terminal; the stream is completed |
 | *(comment)* | `:hb` | 15 s |
 
-`estWaitSeconds` is `null` when unknown, never a `-1` sentinel. Every frame carries an incrementing
-`id:` so a reconnect can send `Last-Event-ID`.
+`estWaitSeconds` is `null` when unknown, never a `-1` sentinel.
+
+**Only the replayable frames carry an `id:`**, and they are exactly the broadcast ones the replay log
+retains. A reconnect sends that sequence back as `Last-Event-ID` — as a header, or as a
+`?lastEventId=` query parameter for clients that cannot set one — and receives the broadcasts it
+missed. Everything else is sent with no `id:` at all, so it cannot overwrite the sequence a reconnect
+depends on (ADR-058).
 
 ### Facade
 
@@ -194,7 +213,7 @@ Closing the draw at a fixed moment is the answer and is not built.
 | :--- | :--- |
 | ~~**3 Redis round trips per connection per tick**~~ | **Closed.** One pipelined round trip: admission `GET` + `TTL`, pass `GET`, waiting `ZRANK`, and the exhausted `EXISTS` when a caller has not hoisted it. The reads were always independent — only the state machine is ordered, and it now decides over the values instead of between the calls |
 | **No per-event queue metrics** | `flashseats.queue.admissions` and `flashseats.queue.admission.budget.denied` are built and **untagged**, so they answer "is the cluster promoting?" and not "is *this* sale promoting?". Depth and active SSE connections are still unbuilt (`03` §7) |
-| **No `Last-Event-ID` replay** | The stream sends live state and heartbeats, but does not replay missed frames after a disconnect |
+| ~~**No `Last-Event-ID` replay**~~ | **Closed** (ADR-058). Broadcast frames are retained in `queue:replay:{e}` and replayed on reconnect; per-session state is re-derived on connect rather than replayed, because the only session frame carries a capability |
 
 ---
 

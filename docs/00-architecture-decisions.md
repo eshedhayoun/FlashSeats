@@ -2285,3 +2285,140 @@ convention removed in one branch is re-added by any branch that forked before it
   refusal that needs no type should not have to invent one.
 - The temptation returns whenever someone adds a facade method and reaches for a matching `*Impl`.
   Global standards §5 rule 7 now forbids it in the place they will look.
+
+---
+
+## ADR-058 — What arrived with the frontend merge: Sentinel, a broadcast-only replay log, and the metric set
+
+**Status:** accepted, Pass 11 (25 Sept 2026). Built.
+
+> **This ADR is written after the fact, and that is the finding.** PR #16 merged 7,943 files —
+> Redis Sentinel, SSE reconnect replay, most of the metric set that three documents called
+> "specified, not built", and a React SPA — **with no document change at all.** In this repo a stale
+> spec is a standing order to build the wrong thing (`CLAUDE.md`, "Updating the docs is part of the
+> change"), so for a week `06` §11 told every reader Sentinel was deferred while three sentinels were
+> running, and `04` still said Stripe was unbuilt. The work is good; it was invisible. Nothing below
+> is a new decision — it is the record that should have been committed with the code, plus the three
+> defects that reading it that way exposed.
+
+### Decision 1 — Sentinel is built, and it supersedes ADR-047's Decision 5
+
+ADR-047 deferred Sentinel with a reason: no Phase 4 exit criterion needs failover, and the
+Redis-restart criterion reads more cleanly against a standalone instance that simply stops. That
+argument has been spent. The `cluster` profile now runs **one primary, two replicas and three
+sentinels** (`quorum 2`, `down-after 5000 ms`, `failover-timeout 60 s`), and the application
+discovers the primary through `spring.data.redis.sentinel.*` in `application-docker.properties`.
+Dev, test and the plain `docker compose up -d` stack stay standalone.
+
+**The consequence that matters is not failover, it is what failover does to inventory.** Every
+Redis process has its own `run_id`, and `StockEpoch` vouches each event's counters against the
+`run_id` that derived them. A promoted replica is a different process, so after a failover **every
+managed event is distrusted at once** and holds are refused until each is rebuilt. That is not a
+regression — AOF is `appendfsync everysec`, so a replica promoted mid-sale is a second behind and its
+counters read *high*, which is the one inventory failure no ordering of operations can prevent
+(ADR-046). ADR-047 said Sentinel "does not weaken that guard — it makes it matter more"; this is
+what that sentence costs in practice: **failover keeps the cluster up and stops the sale**, and an
+operator must run `POST /admin/events/{id}/rebuild-stock` to restart it.
+
+`docker/scripts/sentinel-failover-check.sh` proves the topology — promotion within 30 s, the old
+primary rejoining as a healthy replica — and says in its own header that it is deliberately *not* an
+inventory test. The inventory half is the manual step above, and it is listed in `06` §11.
+
+**Two operational notes.** The sentinels monitor a fixed IP rather than a service name
+(`sentinel resolve-hostnames no`), so compose now pins `172.28.0.11-16` — which makes the `ipam`
+hazard `CLAUDE.md` already documents live: change that block and `docker compose down` first, or
+containers reattach without their DNS aliases and every service name resolves `NXDOMAIN`. And the
+sentinels carry no `auth-pass`, matching the current unauthenticated Redis; both move together or
+neither does.
+
+### Decision 2 — The replay log retains broadcasts only, and a capability is never replayed
+
+`queue:replay:{e}` (ZSET, frame JSON scored by sequence, capped at 256) and
+`queue:replay-seq:{e}` (String, the monotonic sequence) bridge an SSE reconnect: a client sends
+`Last-Event-ID` and receives the frames it missed. Both expire with the sale plus
+`key-retention-after-sale-seconds`.
+
+**Only broadcast frames are retained.** The log is one ZSET per event, shared by everyone watching
+that sale and outliving the sale itself. The only session-targeted frame this system sends is
+`queue-promoted`, and it carries a `passToken` — a single-use bearer capability whose own key expires
+in 120 s. Retaining it turns a two-minute capability into a durable per-event record filed next to
+the session id it belongs to, readable by anything with Redis access long after it was spent. That
+is the shape ADR-048 already refused when it kept `receiptToken` out of an operator response, and it
+was how this shipped.
+
+**A promoted buyer's reconnect is served by re-deriving, not replaying.** `GET /queue/stream` reads
+`getQueueState` on connect and rebuilds `queue-promoted` from the live
+`queue:pass:{e}:{sid}` key. This is the `hold:{token}` idiom in a new place — the Redis hint is never
+the authority, the real thing is re-read (ADR-048) — and it is strictly better than a replay: it needs
+no `Last-Event-ID`, so it also works in a fresh tab or on another device, and it cannot hand back a
+pass that has since been spent or has expired.
+
+**One id space, and it belongs to the replay log.** Only retained frames carry an SSE `id`. Position
+updates, `sale-exhausted` and the re-derived promotion are sent with **no `id` field at all**, which
+the SSE specification defines as leaving the client's last-event-id untouched. So whatever a browser
+quotes back is always a sequence this log minted.
+
+> **The defect that made this concrete.** As merged, live frames carried a per-connection
+> `"local-N"` id while retained frames carried the sequence, and `after()` parsed the header with
+> `Long.parseLong` and returned nothing when it failed. Positions arrive every two seconds, so a
+> reconnect almost always quoted a `local-N` — and the replay answered every one of them with an
+> empty list. **The feature could not fire on the normal path**, and nothing failed, because there
+> was no test. `local-N` also restarts at zero on each connection, so those ids were not monotonic
+> either. An id space with two authorities is not an id space.
+
+### Decision 3 — The metric set is built; three gauges remain specified
+
+`flashseats.outbox.lag.seconds`, `flashseats.dlq.depth`, `flashseats.payment.decline.ratio`,
+`flashseats.payment.webhook.received{type}`, `flashseats.bot.refusals{outcome}` and
+`flashseats.notification.delivered` / `.failed` now emit. `03` §7's "specified, not built" table is
+down to `flashseats.queue.depth{event}`, `flashseats.hold.conversion.ratio{event}` and
+`flashseats.sse.connections.active`. No alarm thresholds changed.
+
+`bot` also gained a second hand-declared `CircuitBreaker`, around the reCAPTCHA call. `CLAUDE.md`
+said there was exactly one, in `payment`; there are two, and both are plain Resilience4j beans
+because the starter targets Boot 3.
+
+**One tunable was left half-changed and is now aligned.** `BotProperties.verifiedTtlSeconds`'s field
+default moved from 900 to 1800 while `application.properties` continued to ship 900 — so the
+*effective* TTL never changed, but the new unit test asserted `PT30M`, which is to say it asserted a
+default production does not use. The field default is 900 again, matching what ships and what the key
+tables say, and the test now derives its expectation from the configured value rather than a literal,
+so the two cannot drift apart again. Whether 15 minutes is the right number is a separate question
+from whether four places agree on it; `04`'s "cached per session for 30 min" is the remaining
+statement of the other view.
+
+### Decision 4 — The client mirrors the payment seam, and the dependencies leave the repository
+
+The SPA could not start without `VITE_STRIPE_PUBLISHABLE_KEY`: `stripe.ts` threw at module load and
+`CheckoutPage` imported it at the top level, so a clean checkout rendered a white screen. Meanwhile
+`flashseats.payment.stripe.enabled` is **false by default**, which means the configuration every
+developer, the load harness and every drill actually runs — the stub gateway — was the one
+configuration the client could not exercise. The client now follows the server: no key means the stub,
+and the checkout page offers the stub's documented magic tokens, so decline, gateway outage and 3-D
+Secure are walkable in a browser with no account. It also mints **one idempotency key per hold** and
+reuses it across retries, as `FE_SPEC` §3 has always specified; as merged it minted a fresh key per
+attempt, which opens a second PaymentIntent — the failure ADR-054 exists to prevent, approached from
+the other side.
+
+**The SPA is not wired into the cluster**, deliberately and for now: `npm run dev` proxies to
+`:8080`, nginx serves no static root, and the demo client at `src/main/resources/static` remains what
+the cluster serves. Wiring it touches `nginx.conf`, which is correctness rather than tuning, and it
+deserves its own pass.
+
+**57 MB of `node_modules`, `frontend/dist`, four `tsc` outputs and five scratch files** were tracked,
+because the `.gitignore` rules for them were added in the same merge that tracked the files, and an
+ignore rule never applies to a path git already tracks. They are untracked now and the rules are
+real. **The blobs stay in history on purpose** — the pack is 24 MB, and a `filter-repo` rewrite costs
+every collaborator a re-clone and every open branch a rebase. That trade is worth revisiting only if
+the pack becomes a problem.
+
+**Consequences.**
+
+- A Sentinel failover is now a *sale-stopping* event until an operator rebuilds. That is the design
+  working, and it is the strongest argument yet for the operator console `06` §9 still lists as
+  missing: the recovery is one call, and it is currently a hand-written `curl`.
+- Every capacity number in `06` §11 was measured against standalone Redis. None of them has been
+  re-measured through Sentinel.
+- The replay log is now safe to read by anyone who can read Redis, which is what lets it stay a
+  per-event key rather than a per-session one.
+- A reader can tell what is built by reading the documents again.
