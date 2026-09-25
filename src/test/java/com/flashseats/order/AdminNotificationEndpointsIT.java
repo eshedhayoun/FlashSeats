@@ -124,7 +124,7 @@ class AdminNotificationEndpointsIT extends IntegrationTest {
         assertThat(eventId).isNotNull();
 
         // The consumer will receive the message again, find SENT (not DLQ), and ack silently
-        // (proven by OrderConfirmedConsumerIT#sentRowNotReclaimable)
+        // (proven by NotificationListenerIT and NotificationClaimIT#sentIsTerminal)
     }
 
     @Test
