@@ -1,11 +1,13 @@
 package com.flashseats.bot.service;
 
+import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.when;
 
-import com.flashseats.bot.exception.BotVerificationFailedException;
+import com.flashseats.shared.error.ErrorCode;
+import com.flashseats.shared.error.FlashSeatsException;
 import com.flashseats.bot.model.BotOutcome;
 import org.junit.jupiter.api.Test;
 
@@ -25,7 +27,8 @@ class BotVerificationServiceTest {
 
         assertThatThrownBy(() ->
                 service.verifyHuman("session-1", "token", "203.0.113.10"))
-                .isInstanceOf(BotVerificationFailedException.class);
+                .isInstanceOfSatisfying(FlashSeatsException.class, failure ->
+                        assertThat(failure.code()).isEqualTo(ErrorCode.BOT_VERIFICATION_FAILED));
 
         verify(metrics).recordRefusal(BotOutcome.VERIFICATION_FAILED);
 

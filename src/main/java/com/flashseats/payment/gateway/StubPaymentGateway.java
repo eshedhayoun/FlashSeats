@@ -4,27 +4,19 @@ import java.util.UUID;
 import lombok.extern.slf4j.Slf4j;
 
 /**
- * An in-process gateway that behaves like a real one, steered by the payment method id.
- *
- * <p>The token names mirror the provider's test cards, so the demo UI, the integration tests and the
- * load harness can drive every branch of the checkout sequence — including the ones that are easy to
- * get wrong — with no keys and no network:
+ * An in-process gateway steered by the payment method id, named after the provider's test cards, so
+ * the demo, the tests and the load harness drive every branch with no keys:
  *
  * <table border="1">
  *   <caption>Stub behaviour</caption>
  *   <tr><th>{@code paymentMethodId}</th><th>Outcome</th></tr>
- *   <tr><td>{@code pm_card_declined}</td><td>declined — the buyer keeps their seats and may retry</td></tr>
- *   <tr><td>{@code pm_card_error}</td><td>transport failure — a {@code 503}, seats retained, no attempt consumed</td></tr>
- *   <tr><td>{@code pm_card_authentication_required}</td><td>3-D Secure — {@code 402 PAYMENT_ACTION_REQUIRED}, then {@link #retrieve} settles it</td></tr>
+ *   <tr><td>{@code pm_card_declined}</td><td>declined; seats kept, retry allowed</td></tr>
+ *   <tr><td>{@code pm_card_error}</td><td>transport failure; {@code 503}, no attempt consumed</td></tr>
+ *   <tr><td>{@code pm_card_authentication_required}</td><td>3-D Secure; {@link #retrieve} then settles it</td></tr>
  *   <tr><td>anything else</td><td>succeeded</td></tr>
  * </table>
  *
- * <p>{@link #retrieve} always answers {@code SUCCEEDED}: it models the buyer having completed the
- * challenge, which is the case the resume path exists to serve. That one token plus this one method
- * are what make the entire 3-D Secure round trip testable without Stripe.
- *
- * <p>Selected by {@link PaymentGatewayConfig} whenever {@code flashseats.payment.stripe.enabled} is
- * false, which is the default — so a clean checkout runs the full journey with no configuration.
+ * <p>The default gateway, since {@code flashseats.payment.stripe.enabled} is false by default.
  */
 @Slf4j
 public class StubPaymentGateway implements PaymentGateway {

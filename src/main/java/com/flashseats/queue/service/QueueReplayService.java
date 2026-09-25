@@ -11,27 +11,13 @@ import org.springframework.stereotype.Component;
 import tools.jackson.databind.ObjectMapper;
 
 /**
- * Persists the low-frequency <strong>broadcast</strong> queue frames needed to bridge an SSE
- * reconnect, and publishes every frame through the Pub/Sub fan-out (ADR-007).
+ * Keeps the recent <strong>broadcast</strong> frames so an SSE reconnect can be caught up, and
+ * publishes every frame through the Pub/Sub fan-out (ADR-007).
  *
- * <p><strong>Only broadcast frames are retained, and that is a rule rather than an optimisation.</strong>
- * The log is one ZSET per event, shared by everyone watching that sale and outliving the sale itself
- * by {@code key-retention-after-sale-seconds}. A session-targeted frame is addressed to one buyer, and
- * the only one this system sends carries a {@code passToken} — a single-use bearer capability whose own
- * key expires in 120 s. Writing it here would turn a two-minute capability into a durable per-event
- * record sitting next to the session id it belongs to, which is the shape ADR-048 already refused for
- * {@code receiptToken}.
- *
- * <p><strong>What replaces replay for the promoted buyer</strong> is a live read. The stream endpoint
- * asks {@link QueueService#getQueueState} on connect and sends {@code queue-promoted} when the phase
- * says so, reading the pass from {@code queue:pass:&#123;e&#125;:&#123;sid&#125;} — the same idiom as
- * the {@code hold:&#123;token&#125;} timer, where the Redis hint is never the authority and the real
- * thing is re-read (ADR-048). It is also strictly better than a replay: it needs no
- * {@code Last-Event-ID}, so it works in a fresh tab or on another device, and it cannot hand back a
- * pass that has since expired.
- *
- * <p>Position frames are live-only for a different reason — the controller sends the current position
- * on connect, and retaining every two-second update would make this an unbounded copy of the queue.
+ * <p>Only broadcasts are retained. The one session-targeted frame carries a single-use
+ * {@code passToken}, and this log outlives the sale (ADR-058). A promoted buyer's reconnect instead
+ * re-reads the live pass ({@link QueueBroadcaster#connect}). Position frames are live-only too:
+ * {@code connect} sends the current position.
  */
 @Slf4j
 @Component

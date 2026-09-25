@@ -1,4 +1,4 @@
-package com.flashseats.order.event;
+package com.flashseats.order.service;
 
 import java.time.Instant;
 

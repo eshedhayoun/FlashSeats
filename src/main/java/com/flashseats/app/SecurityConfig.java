@@ -1,4 +1,4 @@
-package com.flashseats.flashseats.config;
+package com.flashseats.app;
 
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.context.annotation.Bean;
@@ -13,19 +13,10 @@ import org.springframework.security.provisioning.InMemoryUserDetailsManager;
 import org.springframework.security.web.SecurityFilterChain;
 
 /**
- * Application-wide HTTP security.
- *
- * <p>This class is not optional. {@code spring-boot-starter-security} is on the classpath, and
- * without an explicit chain Boot's default would put <em>every</em> endpoint behind a generated
- * password — the whole sale included.
- *
- * <p>Two rules: {@code /api/v1/admin/**} requires {@code ROLE_ADMIN}, and everything else is open.
- * "Admin Only" in a module spec is an enforced role, not a comment (global standards §1).
- *
- * <p>The API is stateless — identity is the signed {@code fsid} cookie, never an
- * {@code HttpSession} — so servlet sessions are disabled and CSRF is off. CSRF protection defends a
- * cookie-authenticated <em>browser form post</em>; here the cookie carries no authority to act, only
- * a visitor id, and the admin surface is HTTP Basic.
+ * Application-wide HTTP security. Without an explicit chain, Boot would lock every endpoint behind a
+ * generated password. {@code /api/v1/admin/**} and {@code /actuator/**} (except health) require
+ * {@code ROLE_ADMIN}; everything else is open. Stateless: identity is the signed {@code fsid} cookie,
+ * so servlet sessions and CSRF are off (§10 S6; ADR-060 closes the one CSRF path that mattered).
  */
 @Configuration
 public class SecurityConfig {
@@ -56,17 +47,9 @@ public class SecurityConfig {
     }
 
     /**
-     * How {@code flashseats.admin.password} is read.
-     *
-     * <p>A <strong>delegating</strong> encoder, so the stored value names its own algorithm:
-     * {@code {bcrypt}$2a$...} anywhere real, {@code {noop}admin} in {@code dev} and {@code test}
-     * where the whole point is that a clean checkout runs with no configuration. The prefix is what
-     * lets the two coexist without a second property or a profile branch, and what lets the
-     * algorithm be upgraded later without touching this class.
-     *
-     * <p>{@code SecretsGuard} is the other half: outside {@code dev}/{@code test} it refuses to
-     * start on any {@code {noop}} value at all, so a plaintext password cannot reach a deployment by
-     * being different from the one string somebody thought to check for.
+     * A delegating encoder, so the stored value names its algorithm: {@code {bcrypt}...} anywhere real,
+     * {@code {noop}admin} on {@code dev}/{@code test}. {@code SecretsGuard} refuses any {@code {noop}}
+     * value outside those profiles (ADR-048).
      */
     @Bean
     public PasswordEncoder passwordEncoder() {
@@ -74,17 +57,8 @@ public class SecurityConfig {
     }
 
     /**
-     * The single operator account.
-     *
-     * <p><strong>Still in memory, and that is a decision rather than an omission.</strong> There is
-     * one operator identity and no requirement for a second; a table, a migration and a
-     * user-management surface to administer one row would be machinery guarding nothing. §10's S12
-     * asks for this bean to be replaced <em>"before anyone else needs access"</em>, and the moment a
-     * second operator or an audit trail of who paused a sale is wanted, that is what changes — this
-     * bean, and nothing around it, which is the property worth keeping.
-     *
-     * <p>What was genuinely wrong, and is fixed, is that the credential used to be stored and
-     * compared in plaintext.
+     * The single operator account, stored bcrypt-hashed. It is in memory on purpose: one identity needs
+     * no user-management surface. Replace this bean when a second operator appears (§10 S12).
      */
     @Bean
     public UserDetailsService adminUser(

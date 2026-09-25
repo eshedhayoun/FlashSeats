@@ -4,8 +4,8 @@ import static org.assertj.core.api.Assertions.assertThat;
 
 import com.flashseats.catalog.facade.CatalogFacade;
 import com.flashseats.catalog.facade.ReserveResult;
-import com.flashseats.flashseats.support.IntegrationTest;
-import com.flashseats.flashseats.support.SaleFixture;
+import com.flashseats.app.support.IntegrationTest;
+import com.flashseats.app.support.SaleFixture;
 import java.util.concurrent.Callable;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;

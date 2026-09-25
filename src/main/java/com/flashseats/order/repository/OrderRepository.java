@@ -40,15 +40,8 @@ public interface OrderRepository extends JpaRepository<Order, Long> {
     int sumConfirmedQuantityForTier(@Param("tierId") long tierId);
 
     /**
-     * Takes the per-event stock-rebuild lock.
-     *
-     * <p>It lives on this repository because {@code order} is the module that runs the rebuild — it
-     * is the only one that can see all three of the ledger's terms — and a lock needs a connection
-     * from whoever is about to use it.
-     *
-     * <p><strong>Transaction-scoped</strong>: released on commit or rollback, so it cannot be leaked
-     * by a crashed replica and needs no unlock call. Redisson was dropped once this was its last
-     * remaining use (ADR-022).
+     * Takes the per-event stock-rebuild lock, {@code pg_try_advisory_xact_lock}: transaction-scoped,
+     * so a crashed replica cannot leak it (ADR-022). It is here because {@code order} runs the rebuild.
      *
      * @return false when another rebuild already holds it
      */

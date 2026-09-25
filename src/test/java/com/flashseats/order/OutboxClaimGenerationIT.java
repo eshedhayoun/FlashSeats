@@ -2,8 +2,8 @@ package com.flashseats.order;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
-import com.flashseats.flashseats.support.IntegrationTest;
-import com.flashseats.flashseats.support.SaleFixture;
+import com.flashseats.app.support.IntegrationTest;
+import com.flashseats.app.support.SaleFixture;
 import com.flashseats.order.model.OutboxEvent;
 import com.flashseats.order.model.OutboxStatus;
 import com.flashseats.order.repository.OutboxEventRepository;

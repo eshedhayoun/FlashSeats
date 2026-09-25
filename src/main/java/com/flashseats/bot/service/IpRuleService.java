@@ -17,39 +17,19 @@ import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
 /**
- * The operator's address list, held in memory and re-read on a timer.
- *
- * <p><strong>This is consulted on every single API request, so it may never touch the database on
- * that path.</strong> A per-request query would put the rate limiter — whose entire job is to keep
- * load off the system — inside the connection pool it is protecting, queued behind the buyers it
- * exists to shield. That is ADR-051's trap ("a job that protects a resource by reading that
- * resource") with the pool as the resource and the filter as the job.
- *
- * <p>Four rules, each of which is a defect somewhere in this repository's history:
+ * The operator's address list, held in memory and re-read on a timer. It is consulted on
+ * <strong>every</strong> API request, so it never touches the database on that path (ADR-055). Rules:
  *
  * <ol>
- *   <li><strong>The whole table is one snapshot, with a TTL, and the TTL <em>is</em> the
- *       cross-replica invalidation.</strong> An operator's call evicts on the replica that served
- *       it; the others pick the change up when their snapshot expires. Without an expiry a block
- *       would be permanent on one replica and absent on the other two, for the life of the process
+ *   <li>The whole table is one snapshot with a TTL, and the TTL is the cross-replica invalidation
  *       (ADR-051).
- *   <li><strong>The load happens outside every monitor.</strong> There is no map to lock: a single
- *       {@link AtomicReference} is swapped after the read completes. Blocking JDBC inside a
- *       {@code ConcurrentHashMap} bin pins carrier threads on JDK 21 (invariant 11), and this runs
- *       on the hottest path in the system.
- *   <li><strong>One reload at a time, and one per window even when it fails.</strong> Both halves
- *       are about behaviour under trouble rather than under load: without single flight, every
- *       thread arriving at an expiry issues its own query; without stamping the failed attempt, an
- *       unreachable database is retried <em>per request</em>. Either way the component whose job is
- *       shedding load becomes the thing generating it, at exactly the wrong moment.
- *   <li><strong>A failed reload keeps the previous snapshot.</strong> The database being briefly
- *       unreachable must not unblock every address at once — nor block every address at once. The
- *       last known answer is better than either.
+ *   <li>The load happens outside every monitor: one {@link AtomicReference} is swapped after the read
+ *       (invariant 11).
+ *   <li>One reload at a time, one per window even when it fails (ADR-056).
+ *   <li>A failed reload keeps the previous snapshot.
  * </ol>
  *
- * <p>Expiry is evaluated against the clock on read, never baked into the snapshot: a rule that
- * expires between two reloads must stop applying the moment it expires, not when the TTL next
- * lapses. Same reasoning as ADR-051's rule about never caching a value derived from the clock.
+ * <p>Rule expiry is evaluated against the clock on read, never baked into the snapshot.
  */
 @Slf4j
 @Service
@@ -120,24 +100,11 @@ public class IpRuleService implements DerivedStateCache {
     // ----------------------------------------------------------------- internals
 
     /**
-     * The snapshot, reloaded at most once per TTL and at most once at a time.
-     *
-     * <p>Two guards, and both are about what this method does when it is <em>not</em> working:
-     *
-     * <ul>
-     *   <li><strong>Single flight.</strong> Without {@code reloading}, every thread arriving between
-     *       the expiry and the first successful {@code set} issues its own {@code findAll()} — at a
-     *       few thousand requests a second that is a pool spike every TTL, from the component whose
-     *       job is keeping load off the pool. The losers serve the stale snapshot, which is exactly
-     *       what a TTL means anyway.
-     *   <li><strong>Backoff on failure.</strong> The failure path stamps the clock like a success,
-     *       so an unreachable database is retried once per TTL rather than once per request. Without
-     *       it, a database outage makes this filter open a connection <em>per request</em> — the
-     *       load-shedder becoming the load, during the incident it exists to survive.
-     * </ul>
-     *
-     * <p>{@link java.util.concurrent.atomic.AtomicBoolean}, never a lock. This runs on every API
-     * request, and blocking here would pin carrier threads on JDK 21 (invariant 11).
+     * The snapshot, reloaded at most once per TTL and once at a time. <strong>Single flight</strong>:
+     * losers serve the stale snapshot rather than all querying. <strong>Backoff on failure</strong>: a
+     * failed reload is stamped like a success, so an unreachable database is retried once per TTL, not
+     * per request (ADR-056). An {@link java.util.concurrent.atomic.AtomicBoolean}, never a lock
+     * (invariant 11).
      */
     private Snapshot current() {
         long now = clock.millis();

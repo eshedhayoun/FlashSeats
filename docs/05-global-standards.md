@@ -415,7 +415,7 @@ Required alarms:
 | `flashseats.outbox.lag.seconds` | > 60 | fulfilment is stalling |
 | `flashseats.dlq.depth` | > 0 | tickets are not reaching buyers |
 | `flashseats.queue.promotion.rate` | 0 while depth > 0 | the queue has stalled |
-| `flashseats.payment.decline.ratio` | > 0.2 | gateway or configuration problem |
+| `flashseats.payment.attempts{outcome}` | declined share > 0.2 over 5 m | gateway or configuration problem. A counter, not a lifetime ratio, which cannot show a spike |
 | `jvm.threads.pinned` | > 0 | virtual-thread pinning (§7) |
 
 `stock.drift` compares the live counter against
@@ -459,3 +459,48 @@ Sections 5, 6, 7 and 9 are new in the 2nd pass — their absence is exactly what
 - [ ] Redis keys list owner and TTL
 - [ ] Metrics named per §9
 - [ ] No contradiction with any ADR
+
+---
+
+## 11. Code layout — the conventions every module follows
+
+Written down in Pass 14, because the drift it fixed (below) came from conventions nobody had stated.
+A reviewer checks new code against this list.
+
+**Packages, per module**, and nothing else:
+
+| Package | Holds | Visible to other modules? |
+| :--- | :--- | :--- |
+| `facade` | the interface and the records that cross the boundary | yes — `@NamedInterface` |
+| `exception` | `<Module>Errors` plus any exception a `catch` names | yes — `@NamedInterface` |
+| `event` | an event **another module** listens to (only `payment` has one) | yes — `@NamedInterface` |
+| `controller`, `dto` | endpoints and their request/response records | no |
+| `service` | the logic, the facade implementation, in-module events, key and token helpers | no |
+| `model`, `repository`, `config` | entities, Spring Data repositories, `@ConfigurationProperties` | no |
+
+App-wide wiring (security, startup guards) lives in `com.flashseats.app`, a leaf nothing depends
+on. The application class sits at the root package, so scanning needs no widening.
+
+**Rules**
+
+1. **A facade is implemented by its module's service.** There is no `*Impl` (ADR-057, §5 rule 7).
+2. **An exception class exists only if a `catch` names it.** Every other refusal is a static
+   method on `<Module>Errors`, which can branch its code, message and extensions as freely as a
+   constructor (ADR-063).
+3. **Controllers only map.** They read the request, call one service method, and return. Flow —
+   ordering, orchestration, a guard like the bot check — lives in the service.
+4. **A separate bean for a separate transaction.** A `@Transactional` method called on `this` runs
+   with no transaction, so the short transactions around a network call live on their own bean
+   (`*Store`, `OrderCommitService`) — ADR-023. That split is required, not duplication.
+5. **Behaviour next to its data.** A rule computed from one type is a method on that type
+   (`EventRow.windowStatus`, `AvailabilityLevel.of`), not a separate `*Helper`.
+6. **Mapping.** Entity → response is a static `of` on the response record, or built in the service
+   for a read model. Never in a controller body, and never an entity across a module boundary.
+7. **Metrics.** A counter is registered in the one class that increments it. A `*Metrics` bean
+   exists only for a gauge that polls state (`OutboxMetrics`, `NotificationMetrics`) or a counter
+   incremented from more than one class (`BotMetrics`).
+8. **`@ConfigurationProperties` are Lombok `@Getter @Setter` beans**, not records. Integration tests
+   adjust live beans to avoid forking Spring contexts (ADR-061).
+9. **Comments say why, briefly, and cite the ADR.** No history in code ("used to", "Pass N"). The
+   ADR log is the record of how a decision came to be.
+

@@ -4,18 +4,10 @@ import java.time.Instant;
 import java.util.List;
 
 /**
- * The fulfilment message, as JSON, written into the outbox inside the order transaction.
- *
- * <p><strong>A complete, self-contained snapshot</strong> (ADR-015). {@code notification} calls no
- * facade and knows nothing about {@code catalog}, so everything needed to render a ticket — the
- * event's title, venue and date, and every line item — has to be here.
- *
- * <p>{@code items} is an <strong>array</strong>. An earlier design carried a single flat
- * {@code tierName}/{@code quantity} pair, which would have rendered the wrong ticket for any
- * multi-tier order.
- *
- * <p>This record is not shared with {@code notification}. The two modules are coupled by the wire
- * format, not by a Java type — which is what lets either one be deployed without the other.
+ * The fulfilment message, written into the outbox inside the order transaction. <strong>A complete,
+ * self-contained snapshot</strong> (ADR-015): event title, venue, date and every line item, because
+ * {@code notification} calls no facade. {@code items} is an array, one ticket page per tier. Not
+ * shared with {@code notification}: the modules share a wire format, not a Java type.
  */
 public record OutboxPayload(
         String eventType,

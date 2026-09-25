@@ -556,14 +556,15 @@ tx2 (short):  UPDATE outbox_events SET status='PROCESSED', processed_at=now()
 order.events.exchange  (topic)  ── order.confirmed ──►  notification.order-confirmed.queue
                                 └─ order.refunded  ──►  notification.order-refunded.queue
       ↓
-OrderConfirmedConsumer                                    -- no @Transactional around 2-4
-   1. INSERT notification_logs (order_number, kind='TICKET_DELIVERY', status='PENDING')
-        └─ unique violation ⇒ already handled ⇒ ack and stop
-   2. PDFBox renders the ticket in memory
-   3. Thymeleaf renders the HTML body
-   4. JavaMailSender → SMTP (Mailpit locally)
-   5. status='SENT', sent_at=now, basicAck
-   ✗ on failure: 3 retries (5s, 30s, 2m) → DLQ, status='DLQ'
+NotificationConsumer (one flow, two listeners)          -- no @Transactional around 2-3
+   1. claim: INSERT notification_logs (order_number, kind, status='PENDING') ON CONFLICT DO NOTHING,
+      or re-claim a row in 'DLQ'                          ⇒ rowcount 0: already handled, ack, stop
+   2. TICKET_DELIVERY: PDFBox renders the ticket; REFUND_NOTICE: no attachment
+   3. EmailComposer builds the HTML; JavaMailSender → SMTP (Mailpit locally)
+   4. status='SENT', sent_at=now, basicAck
+   ✗ on failure: NO retries (ADR-029) → basicNack(requeue=false) → DLQ
+      · not yet sent  ⇒ status='DLQ'  (re-claimable, so an operator replay sends)
+      · already sent  ⇒ status='SENT' (ADR-042 — a DLQ row would authorise a second ticket)
 ```
 
 **`FOR UPDATE SKIP LOCKED`** stops three replicas from publishing the same event three times.

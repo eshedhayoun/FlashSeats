@@ -5,8 +5,8 @@ import static org.awaitility.Awaitility.await;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.doThrow;
 
-import com.flashseats.flashseats.support.IntegrationTest;
-import com.flashseats.flashseats.support.SaleFixture;
+import com.flashseats.app.support.IntegrationTest;
+import com.flashseats.app.support.SaleFixture;
 import com.flashseats.notification.config.RabbitTopologyConfig;
 import com.flashseats.notification.model.NotificationKind;
 import com.flashseats.notification.model.NotificationLog;

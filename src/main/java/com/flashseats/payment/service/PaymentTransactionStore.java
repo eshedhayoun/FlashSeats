@@ -12,15 +12,9 @@ import org.springframework.transaction.annotation.Propagation;
 import org.springframework.transaction.annotation.Transactional;
 
 /**
- * The <strong>short</strong> transactions that bracket a gateway call.
- *
- * <p>They live on their own bean rather than as private methods on {@link PaymentService} because
- * Spring's transaction proxy does not intercept self-invocation: a {@code @Transactional} method
- * called from inside the same object runs with no transaction at all, silently. Splitting the class
- * is what makes the boundary real, and it makes it visible in the code as well.
- *
- * <p>{@code REQUIRES_NEW} because the caller may already be inside a transaction; the record of an
- * attempt must survive independently of whatever the caller later decides to do.
+ * The <strong>short</strong> transactions that bracket a gateway call. A separate bean because
+ * Spring's proxy does not intercept self-invocation. {@code REQUIRES_NEW}, so an attempt's record
+ * survives whatever the caller decides next.
  */
 @Component
 public class PaymentTransactionStore {
@@ -32,17 +26,9 @@ public class PaymentTransactionStore {
     }
 
     /**
-     * Opens one charge attempt: resume the intent this hold is already authenticating, or record a
-     * new one.
-     *
-     * <p><strong>One transaction, not two.</strong> Looking for a resumable row in its own
-     * {@code REQUIRES_NEW} read would add a tenth sequential transaction to <em>every</em> checkout
-     * in order to serve the 3-D Secure minority — and the admission allowance is derived from that
-     * count (ADR-049), while ADR-051 exists because pooled reads on hot paths are what binds at
-     * {@code E = 3..10} sales. Doing both here keeps the cost exactly where it was.
-     *
-     * <p>It also closes a race the two-call version had: two requests could each find nothing and
-     * each insert. The in-flight guard makes that unlikely rather than impossible.
+     * Opens one charge attempt: resume the intent this hold is authenticating, or record a new one. It
+     * is one transaction, not two, so the 3-D Secure minority adds no transaction to every checkout
+     * (ADR-049, ADR-051).
      */
     @Transactional(propagation = Propagation.REQUIRES_NEW)
     public ChargeAttempt beginAttempt(AuthorizeCommand command) {
@@ -68,16 +54,10 @@ public class PaymentTransactionStore {
     }
 
     /**
-     * Records what the provider answered.
-     *
-     * <p>{@code REQUIRES_ACTION} lands as {@link PaymentStatus#PROCESSING} — the state that was
-     * declared on day one and never written, because the stub had no way to reach it. It is what
-     * {@link #beginAttempt} looks for, so recording it correctly is what makes the 3-D Secure
-     * resume find its intent rather than open a second one.
-     *
-     * <p>The gateway reference is only ever <em>overwritten</em>, never cleared: a decline arriving
-     * against an intent that had already been created would otherwise erase the one id support and
-     * reconciliation have to work from.
+     * Records what the provider answered. {@code REQUIRES_ACTION} lands as
+     * {@link PaymentStatus#PROCESSING}, which is what {@link #beginAttempt} resumes. The gateway
+     * reference is only ever overwritten, never cleared: it is the id support and reconciliation work
+     * from.
      */
     @Transactional(propagation = Propagation.REQUIRES_NEW)
     public void recordOutcome(String transactionReference, GatewayResult result) {

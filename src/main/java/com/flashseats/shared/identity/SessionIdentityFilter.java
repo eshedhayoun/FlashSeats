@@ -19,20 +19,10 @@ import org.springframework.stereotype.Component;
 import org.springframework.web.filter.OncePerRequestFilter;
 
 /**
- * Issues and verifies the signed {@code fsid} cookie that is the system's only source of identity.
- *
- * <p>Format: {@code base64url(uuid).base64url(HMAC-SHA256(uuid, secret))}, set {@code HttpOnly} so
- * JavaScript can never read it. Queue position, hold ownership and order lookup all key off this
- * value, which is why it may never arrive in a request body or header (ADR-010).
- *
- * <p>A tampered cookie is <strong>replaced</strong> with a fresh identity rather than rejected. The
- * visitor did nothing an error page would help with, and a hard failure on a corrupted cookie would
- * strand them with no way to recover.
- *
- * <p><strong>It lives in the kernel, beside {@link SessionIdArgumentResolver}.</strong> It used to be
- * in {@code bot}, which meant the one thing every module's authorisation rests on was owned by the
- * abuse-defence module, and the mint/verify half was a package away from the type/resolve half with
- * nothing but a request-attribute string joining them. {@code bot} is now purely rate limiting.
+ * Issues and verifies the signed {@code fsid} cookie, the system's only source of identity
+ * (ADR-010): {@code base64url(uuid).base64url(HMAC-SHA256(uuid, secret))}, {@code HttpOnly}. A
+ * tampered cookie is <strong>replaced</strong> with a fresh identity rather than rejected, because
+ * the visitor cannot act on an error.
  */
 @Component
 @Order(Ordered.HIGHEST_PRECEDENCE + 20)
