@@ -7,7 +7,7 @@ public enum EventStatus {
     /**
      * Selling is halted by an operator, and can be resumed.
      *
-     * <p><strong>It closes the sale for free.</strong> {@code SaleWindows.statusOf} already answers
+     * <p><strong>It closes the sale for free.</strong> {@code EventRow.windowStatus} already answers
      * {@code CLOSED} for anything that is not {@code PUBLISHED}, so every gate that consults the
      * window — the queue join, the hold, the checkout — refuses without a line of new code. That is
      * the whole reason pause is a publication state rather than a fourth window status: a new

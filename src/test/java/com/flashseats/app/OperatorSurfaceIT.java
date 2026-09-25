@@ -163,7 +163,7 @@ class OperatorSurfaceIT extends IntegrationTest {
         assertThat(paused.status()).isEqualTo(200);
         assertThat(paused.json().get("status").asString()).isEqualTo("PAUSED");
 
-        // SaleWindows reads anything but PUBLISHED as CLOSED, so the gates shut with no new code.
+        // EventRow.windowStatus reads anything but PUBLISHED as CLOSED, so the gates shut with no new code.
         assertThat(buyer.get("/events/" + eventId).text("windowStatus")).isEqualTo("CLOSED");
         assertThat(buyer.post("/queue/join", Map.of("eventId", eventId)).status()).isNotEqualTo(202);
 

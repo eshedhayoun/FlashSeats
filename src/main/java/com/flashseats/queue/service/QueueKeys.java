@@ -1,5 +1,9 @@
 package com.flashseats.queue.service;
 
+import java.time.Duration;
+import java.time.Instant;
+import org.springframework.data.redis.core.StringRedisTemplate;
+
 /**
  * Every Redis key this module owns, formatted in one place.
  *
@@ -111,5 +115,21 @@ public final class QueueKeys {
      */
     public static String exhausted(long eventId) {
         return "queue:exhausted:" + eventId;
+    }
+
+    /**
+     * Sets {@code key} to expire {@code retentionSeconds} after the sale ends (ADR-036).
+     *
+     * <p>Every queue key expires and none is deleted by the application: deleting a live waiting room
+     * cannot be undone, and Redis runs {@code noeviction}, so a key with no TTL is a leak nothing
+     * else cleans up. Idempotent; the promotion tick refreshes it every second. A sale already past
+     * the retention window sets nothing, because Redis reads a non-positive TTL as "delete now".
+     */
+    static void expireWithSale(
+            StringRedisTemplate redis, String key, Instant now, Instant saleEndTime, long retentionSeconds) {
+        Duration ttl = Duration.between(now, saleEndTime.plusSeconds(retentionSeconds));
+        if (ttl.isPositive()) {
+            redis.expire(key, ttl);
+        }
     }
 }

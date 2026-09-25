@@ -5,8 +5,6 @@ import com.flashseats.catalog.facade.CatalogFacade;
 import com.flashseats.catalog.facade.EventWindowStatus;
 import com.flashseats.catalog.facade.TierSummary;
 import com.flashseats.hold.config.HoldProperties;
-import com.flashseats.hold.event.TicketHeldEvent;
-import com.flashseats.hold.event.TicketHoldSettledEvent;
 import com.flashseats.hold.exception.HoldAlreadySettledException;
 import com.flashseats.hold.exception.HoldErrors;
 import com.flashseats.hold.exception.HoldExpiredException;
