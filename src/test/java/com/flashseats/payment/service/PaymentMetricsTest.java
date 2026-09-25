@@ -41,8 +41,12 @@ class PaymentMetricsTest {
         payments = new PaymentService(gateway, store, redis, new PaymentProperties(), meters);
     }
 
+    private double attempts(String outcome) {
+        return meters.get("flashseats.payment.attempts").tag("outcome", outcome).counter().count();
+    }
+
     @Test
-    void countsDeclinesButNotSuccessfulAttempts() {
+    void countsEachOutcomeSeparately() {
         when(store.beginAttempt(any())).thenReturn(
                 new ChargeAttempt("tx_success", null),
                 new ChargeAttempt("tx_declined", null));
@@ -53,18 +57,23 @@ class PaymentMetricsTest {
         payments.authorize(command("order-1", "hold-1"));
         payments.authorize(command("order-2", "hold-2"));
 
-        assertThat(meters.get("flashseats.payment.decline.ratio").gauge().value()).isEqualTo(0.5);
+        assertThat(attempts("succeeded")).isEqualTo(1);
+        assertThat(attempts("declined")).isEqualTo(1);
     }
 
     @Test
-    void doesNotCountGatewayErrorsAsDeclines() {
+    void countsAGatewayErrorAsAnError_notADecline() {
         when(store.beginAttempt(any())).thenReturn(new ChargeAttempt("tx_error", null));
         when(gateway.charge(any())).thenReturn(GatewayResult.error("unavailable", "offline"));
 
         assertThatThrownBy(() -> payments.authorize(command("order-1", "hold-1")))
                 .isInstanceOf(RuntimeException.class);
 
-        assertThat(meters.get("flashseats.payment.decline.ratio").gauge().value()).isZero();
+        // A provider outage and a refused card are different events with different
+        // responses, and a ratio that conflated them would open the breaker on healthy
+        // traffic (ADR-052). Separate series keep them distinguishable.
+        assertThat(attempts("error")).isEqualTo(1);
+        assertThat(attempts("declined")).isZero();
     }
 
     @Test

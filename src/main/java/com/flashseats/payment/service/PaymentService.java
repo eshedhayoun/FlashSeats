@@ -11,10 +11,11 @@ import com.flashseats.payment.gateway.GatewayCharge;
 import com.flashseats.payment.gateway.GatewayResult;
 import com.flashseats.payment.gateway.PaymentGateway;
 import com.flashseats.payment.model.PaymentTransaction;
-import io.micrometer.core.instrument.Gauge;
+import io.micrometer.core.instrument.Counter;
 import io.micrometer.core.instrument.MeterRegistry;
 import java.time.Duration;
-import java.util.concurrent.atomic.AtomicLong;
+import java.util.EnumMap;
+import java.util.Map;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.stereotype.Service;
@@ -42,8 +43,8 @@ public class PaymentService implements PaymentFacade {
     private final PaymentTransactionStore store;
     private final StringRedisTemplate redis;
     private final PaymentProperties properties;
-    private final AtomicLong gatewayAttempts = new AtomicLong();
-    private final AtomicLong declines = new AtomicLong();
+    private final Map<GatewayResult.Outcome, Counter> attemptsByOutcome =
+            new EnumMap<>(GatewayResult.Outcome.class);
 
     public PaymentService(
             PaymentGateway gateway,
@@ -55,12 +56,30 @@ public class PaymentService implements PaymentFacade {
         this.store = store;
         this.redis = redis;
         this.properties = properties;
-        Gauge.builder(
-                        "flashseats.payment.decline.ratio",
-                        this,
-                        service -> service.declines.get() / (double) Math.max(1, service.gatewayAttempts.get()))
-                .description("Declined provider attempts divided by all provider attempts")
-                .register(meters);
+        /*
+         * One counter, tagged by outcome, rather than a decline RATIO.
+         *
+         * The ratio this replaced was cumulative since JVM start -- declines divided
+         * by all attempts, for the life of the process. 03 section 7 says the metric
+         * exists because "a spike is either a provider incident or a fraud rule
+         * mis-firing", and a lifetime ratio is the one shape that cannot show a
+         * spike: every sample dilutes the next, so an outage at hour six barely
+         * moves a number six hours of healthy traffic have flattened.
+         *
+         * Counters leave the windowing to whoever is asking, which is where it
+         * belongs: rate(attempts{outcome="declined"}[5m]) / rate(attempts[5m]) is
+         * the decline ratio over any window, and the same series answers "are we
+         * reaching the provider at all" without a second metric. Outcome is a
+         * four-value enum, so the tag cannot explode.
+         */
+        for (GatewayResult.Outcome outcome : GatewayResult.Outcome.values()) {
+            attemptsByOutcome.put(
+                    outcome,
+                    Counter.builder("flashseats.payment.attempts")
+                            .description("Provider charge attempts by outcome")
+                            .tag("outcome", outcome.name().toLowerCase())
+                            .register(meters));
+        }
     }
 
     /**
@@ -98,7 +117,6 @@ public class PaymentService implements PaymentFacade {
             // open a second intent and risk billing twice for one authentication.
             ChargeAttempt attempt = store.beginAttempt(command); // tx1
 
-            gatewayAttempts.incrementAndGet();
             GatewayResult result = attempt.isResume() // no transaction open
                     ? gateway.retrieve(attempt.resumableGatewayReference())
                     : gateway.charge(new GatewayCharge(
@@ -110,9 +128,7 @@ public class PaymentService implements PaymentFacade {
                             command.clientIdempotencyKey()));
 
             store.recordOutcome(attempt.transactionReference(), result); // tx2
-            if (result.outcome() == GatewayResult.Outcome.DECLINED) {
-                declines.incrementAndGet();
-            }
+            attemptsByOutcome.get(result.outcome()).increment();
 
             if (result.outcome() == GatewayResult.Outcome.ERROR) {
                 log.warn("Gateway error for order {}: {}", command.orderNumber(), result.failureReason());
