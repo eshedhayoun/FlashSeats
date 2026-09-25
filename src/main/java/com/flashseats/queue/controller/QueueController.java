@@ -5,8 +5,10 @@ import com.flashseats.queue.dto.AdmitRequest;
 import com.flashseats.queue.dto.AdmitResponse;
 import com.flashseats.queue.dto.JoinQueueRequest;
 import com.flashseats.queue.dto.QueueStatusResponse;
-import com.flashseats.queue.service.QueueService;
+import com.flashseats.queue.facade.QueuePhase;
+import com.flashseats.queue.service.QueueChannelMessage;
 import com.flashseats.queue.service.QueueReplayService;
+import com.flashseats.queue.service.QueueService;
 import com.flashseats.queue.service.SseEmitterRegistry;
 import com.flashseats.shared.identity.SessionId;
 import com.flashseats.shared.web.ClientAddress;
@@ -109,8 +111,18 @@ public class QueueController {
      * Live position updates.
      *
      * <p>Frames: {@code position-update} (clamped monotonic), {@code queue-promoted},
-     * {@code sale-exhausted}, {@code sale-closed}, plus comment heartbeats. Every frame carries an
-     * id so a reconnect can send {@code Last-Event-ID}.
+     * {@code sale-exhausted}, {@code sale-closed}, plus comment heartbeats.
+     *
+     * <p><strong>Only the replayable frames carry an SSE {@code id}</strong>, and they are exactly the
+     * broadcast ones {@link QueueReplayService} retains. A frame with no {@code id} leaves the
+     * browser's last-event-id alone, so the {@code Last-Event-ID} of a reconnect always names a
+     * sequence the replay log minted rather than the position update that happened to arrive last.
+     *
+     * <p>Per-session state is not replayed, it is <strong>re-derived</strong>: a buyer who was
+     * promoted while their socket was dead gets {@code queue-promoted} rebuilt from the live pass
+     * below. That works with no {@code Last-Event-ID} at all — a fresh tab, another device — and it
+     * cannot hand back a pass that has since been spent or expired, because the pass key is the
+     * authority and it is read here rather than trusted from a log (ADR-058).
      *
      * <p>If the stream cannot be established at all the client polls {@code /queue/status}, which
      * returns the same information — the buyer should never have to care which transport is live.
@@ -123,12 +135,13 @@ public class QueueController {
             SessionId session) {
         SseEmitter emitter = emitters.register(session.value(), eventId, STREAM_TIMEOUT_MS);
 
+        // The header is what a browser's EventSource sends by itself; the query parameter is for
+        // clients that cannot set one. Retained frames are broadcasts, so there is nothing here to
+        // address to a session and nothing to filter.
         String replayFrom = lastEventIdHeader != null ? lastEventIdHeader : lastEventId;
         if (replayFrom != null) {
             for (var frame : replay.after(eventId, replayFrom)) {
-                if (frame.isBroadcast() || session.value().equals(frame.sessionId())) {
-                    emitters.send(session.value(), frame.type(), frame.data(), frame.id());
-                }
+                emitters.send(session.value(), frame.type(), frame.data(), frame.id());
             }
         }
 
@@ -136,10 +149,17 @@ public class QueueController {
         // exhausted and therefore has no position frame to send.
         emitters.comment(session.value(), "connected");
 
-        // Send the current position immediately when one exists: an empty stream for the first two
-        // seconds looks like a failure to connect.
+        // Then this session's own state, which is derived rather than replayed. An empty stream for
+        // the first two seconds looks like a failure to connect.
         var state = queue.getQueueState(session.value(), eventId);
-        if (state.position() != null) {
+        if (state.phase() == QueuePhase.PROMOTED && state.passToken() != null) {
+            Long expiresInSeconds = queue.passTimeToLiveSeconds(session.value(), eventId);
+            if (expiresInSeconds != null) {
+                var promotion = QueueChannelMessage.promotion(
+                        session.value(), state.passToken(), expiresInSeconds);
+                emitters.send(session.value(), promotion.type(), promotion.data());
+            }
+        } else if (state.position() != null) {
             emitters.sendPosition(session.value(), state.position(), state.estWaitSeconds());
         }
         return emitter;
