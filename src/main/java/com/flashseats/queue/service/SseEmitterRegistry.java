@@ -83,12 +83,16 @@ public class SseEmitterRegistry {
      * closing their old one, leaving them holding a socket nothing will ever write to.
      */
     public void closeAll(long eventId, String eventName, Object data) {
+        closeAll(eventId, eventName, data, null);
+    }
+
+    public void closeAll(long eventId, String eventName, Object data, Long frameId) {
         for (String sessionId : sessionsWatching(eventId)) {
             Connection connection = connections.get(sessionId);
             if (connection == null || connection.eventId() != eventId) {
                 continue;
             }
-            send(sessionId, eventName, data);
+            send(sessionId, eventName, data, frameId);
             if (remove(sessionId, connection)) {
                 connection.emitter().complete();
             }
@@ -118,6 +122,15 @@ public class SseEmitterRegistry {
     }
 
     public boolean send(String sessionId, String eventName, Object data) {
+        return sendWithId(sessionId, eventName, data, "local-" + nextLocalId(sessionId));
+    }
+
+    public boolean send(String sessionId, String eventName, Object data, Long eventId) {
+        String id = eventId == null ? "local-" + nextLocalId(sessionId) : Long.toString(eventId);
+        return sendWithId(sessionId, eventName, data, id);
+    }
+
+    private boolean sendWithId(String sessionId, String eventName, Object data, String eventId) {
         Connection connection = connections.get(sessionId);
         if (connection == null) {
             return false;
@@ -126,7 +139,7 @@ public class SseEmitterRegistry {
             connection
                     .emitter()
                     .send(SseEmitter.event()
-                            .id(Long.toString(connection.nextId()))
+                            .id(eventId)
                             .name(eventName)
                             .data(json.writeValueAsString(data)));
             return true;
@@ -157,6 +170,15 @@ public class SseEmitterRegistry {
     /** Delivers to every local watcher of an event. Terminal frames use this. */
     public void broadcast(long eventId, String eventName, Object data) {
         sessionsWatching(eventId).forEach(sessionId -> send(sessionId, eventName, data));
+    }
+
+    public void broadcast(long eventId, String eventName, Object data, Long frameId) {
+        sessionsWatching(eventId).forEach(sessionId -> send(sessionId, eventName, data, frameId));
+    }
+
+    private long nextLocalId(String sessionId) {
+        Connection connection = connections.get(sessionId);
+        return connection == null ? 0 : connection.nextId();
     }
 
     /**

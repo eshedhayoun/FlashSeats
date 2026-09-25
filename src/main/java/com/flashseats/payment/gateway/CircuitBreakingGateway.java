@@ -5,6 +5,7 @@ import io.github.resilience4j.circuitbreaker.CircuitBreaker;
 import java.util.function.Supplier;
 import lombok.extern.slf4j.Slf4j;
 
+import io.github.resilience4j.retry.Retry;
 /**
  * A circuit breaker around whichever gateway is configured.
  *
@@ -30,10 +31,15 @@ public class CircuitBreakingGateway implements PaymentGateway {
 
     private final PaymentGateway delegate;
     private final CircuitBreaker breaker;
+    private final Retry retry;
 
-    public CircuitBreakingGateway(PaymentGateway delegate, CircuitBreaker breaker) {
+    public CircuitBreakingGateway(
+            PaymentGateway delegate,
+            CircuitBreaker breaker,
+            Retry retry) {
         this.delegate = delegate;
         this.breaker = breaker;
+        this.retry = retry;
     }
 
     @Override
@@ -53,13 +59,19 @@ public class CircuitBreakingGateway implements PaymentGateway {
 
     private GatewayResult guard(String operation, Supplier<GatewayResult> call) {
         try {
-            return breaker.executeSupplier(call);
+            return breaker.executeSupplier(
+                    () -> retry.executeSupplier(call));
         } catch (CallNotPermittedException open) {
-            log.warn("Payment gateway circuit is OPEN; refusing {} without calling the provider", operation);
+            log.warn(
+                    "Payment gateway circuit is OPEN; refusing {} without calling the provider",
+                    operation);
             return GatewayResult.error(
-                    "circuit_open", "The payment provider is unavailable. Your seats are still held.");
+                    "circuit_open",
+                    "The payment provider is unavailable. Your seats are still held.");
         } catch (GatewayTransportException transport) {
-            return GatewayResult.error(transport.code(), transport.getMessage());
+            return GatewayResult.error(
+                    transport.code(),
+                    transport.getMessage());
         }
     }
 }

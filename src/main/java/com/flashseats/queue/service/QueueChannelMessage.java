@@ -13,17 +13,22 @@ import java.util.Map;
  * That is not wasteful, it is the mechanism: the promoter has no idea which replica is holding a
  * given browser's stream (ADR-007).
  */
-public record QueueChannelMessage(String type, String sessionId, Map<String, Object> data) {
+public record QueueChannelMessage(
+        Long id, String type, String sessionId, Map<String, Object> data) {
 
     public static QueueChannelMessage toSession(String type, String sessionId, Map<String, Object> data) {
-        return new QueueChannelMessage(type, sessionId, data);
+        return new QueueChannelMessage(null, type, sessionId, data);
     }
 
     public static QueueChannelMessage toAll(String type, Map<String, Object> data) {
-        return new QueueChannelMessage(type, null, data);
+        return new QueueChannelMessage(null, type, null, data);
     }
 
     public boolean isBroadcast() {
         return sessionId == null;
+    }
+
+    QueueChannelMessage withId(long eventId) {
+        return new QueueChannelMessage(eventId, type, sessionId, data);
     }
 }

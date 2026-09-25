@@ -9,6 +9,8 @@ import com.flashseats.notification.service.NotificationLogService;
 import com.flashseats.shared.ticket.TicketDocument;
 import com.flashseats.shared.ticket.TicketPdfRenderer;
 import com.rabbitmq.client.Channel;
+import io.micrometer.core.instrument.Counter;
+import io.micrometer.core.instrument.MeterRegistry;
 import java.io.IOException;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.amqp.core.Message;
@@ -50,18 +52,29 @@ public class OrderConfirmedConsumer {
     private final EmailComposer composer;
     private final EmailDispatcher dispatcher;
     private final ObjectMapper json;
+    private final Counter ticketsSent;
+    private final Counter deliveriesFailed;
 
     public OrderConfirmedConsumer(
             NotificationLogService logs,
             TicketPdfRenderer pdf,
             EmailComposer composer,
             EmailDispatcher dispatcher,
-            ObjectMapper json) {
+            ObjectMapper json,
+            MeterRegistry meters) {
         this.logs = logs;
         this.pdf = pdf;
         this.composer = composer;
         this.dispatcher = dispatcher;
         this.json = json;
+        this.ticketsSent = Counter.builder("flashseats.notification.delivered")
+                .tag("kind", "TICKET_DELIVERY")
+                .description("Tickets successfully sent")
+                .register(meters);
+        this.deliveriesFailed = Counter.builder("flashseats.notification.failed")
+                .tag("kind", "TICKET_DELIVERY")
+                .description("Ticket delivery failures")
+                .register(meters);
     }
 
     @RabbitListener(queues = RabbitTopologyConfig.QUEUE_ORDER_CONFIRMED)
@@ -91,11 +104,13 @@ public class OrderConfirmedConsumer {
             delivered = true;
 
             logs.markSent(orderNumber, KIND);
+            ticketsSent.increment();
             channel.basicAck(deliveryTag, false);
             log.info("Sent tickets for {} to {}", orderNumber, payload.userEmail());
 
         } catch (Exception failure) {
             log.error("Could not deliver tickets for {}", orderNumber, failure);
+            deliveriesFailed.increment();
             if (orderNumber != null) {
                 recordFailure(orderNumber, delivered, failure);
             }

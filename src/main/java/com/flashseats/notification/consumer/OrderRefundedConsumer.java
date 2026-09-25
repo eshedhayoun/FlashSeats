@@ -7,6 +7,8 @@ import com.flashseats.notification.service.EmailComposer;
 import com.flashseats.notification.service.EmailDispatcher;
 import com.flashseats.notification.service.NotificationLogService;
 import com.rabbitmq.client.Channel;
+import io.micrometer.core.instrument.Counter;
+import io.micrometer.core.instrument.MeterRegistry;
 import java.io.IOException;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.amqp.core.Message;
@@ -47,16 +49,27 @@ public class OrderRefundedConsumer {
     private final EmailComposer composer;
     private final EmailDispatcher dispatcher;
     private final ObjectMapper json;
+    private final Counter refundsSent;
+    private final Counter deliveriesFailed;
 
     public OrderRefundedConsumer(
             NotificationLogService logs,
             EmailComposer composer,
             EmailDispatcher dispatcher,
-            ObjectMapper json) {
+            ObjectMapper json,
+            MeterRegistry meters) {
         this.logs = logs;
         this.composer = composer;
         this.dispatcher = dispatcher;
         this.json = json;
+        this.refundsSent = Counter.builder("flashseats.notification.delivered")
+                .tag("kind", "REFUND_NOTICE")
+                .description("Refund notices successfully sent")
+                .register(meters);
+        this.deliveriesFailed = Counter.builder("flashseats.notification.failed")
+                .tag("kind", "REFUND_NOTICE")
+                .description("Refund notice delivery failures")
+                .register(meters);
     }
 
     @RabbitListener(queues = RabbitTopologyConfig.QUEUE_ORDER_REFUNDED)
@@ -85,11 +98,13 @@ public class OrderRefundedConsumer {
             delivered = true;
 
             logs.markSent(orderNumber, KIND);
+            refundsSent.increment();
             channel.basicAck(deliveryTag, false);
             log.info("Sent refund notice for {} to {}", orderNumber, payload.userEmail());
 
         } catch (Exception failure) {
             log.error("Could not send the refund notice for {}", orderNumber, failure);
+            deliveriesFailed.increment();
             if (orderNumber != null) {
                 recordFailure(orderNumber, delivered, failure);
             }

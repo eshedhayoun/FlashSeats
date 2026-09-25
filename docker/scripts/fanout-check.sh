@@ -33,6 +33,10 @@ cd "$(dirname "$0")/../.."
 EVENT_ID="${EVENT_ID:-9001}"   # the reserved load-test sale; see docker/seed/seed.sql
 BASE_URL="${BASE_URL:-http://localhost:${HTTP_PORT:-8080}}"
 SESSIONS="${SESSIONS:-30}"
+DOCKER_CLI="docker"
+if command -v docker.exe >/dev/null 2>&1; then
+    DOCKER_CLI="docker.exe"
+fi
 # promotion-interval-ms is 1000 and promotion-batch-size is 45, so 30 sessions
 # are promoted in one tick. Waiting several gives the tick lock, the publish and
 # the fan-out room without making a failure look like impatience.

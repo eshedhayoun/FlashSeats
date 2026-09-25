@@ -4,7 +4,7 @@ import com.flashseats.order.model.OutboxEvent;
 import jakarta.persistence.LockModeType;
 import jakarta.persistence.QueryHint;
 import java.time.Instant;
-import java.util.Collection;
+
 import java.util.List;
 import java.util.Optional;
 import java.util.UUID;
@@ -17,6 +17,12 @@ import org.springframework.data.jpa.repository.QueryHints;
 import org.springframework.data.repository.query.Param;
 
 public interface OutboxEventRepository extends JpaRepository<OutboxEvent, UUID> {
+
+    @Query("""
+            SELECT MIN(e.createdAt) FROM OutboxEvent e
+             WHERE e.status <> com.flashseats.order.model.OutboxStatus.PROCESSED
+            """)
+    Optional<Instant> oldestUnprocessedCreatedAt();
 
     /**
      * The most recent message published for an order, whatever became of it.
@@ -54,24 +60,26 @@ public interface OutboxEventRepository extends JpaRepository<OutboxEvent, UUID> 
     List<OutboxEvent> claimPending(Limit limit);
 
     /**
-     * Marks a published batch done.
+     * Marks one published claim done.
      *
-     * <p>{@code AND status = PROCESSING} is not decoration. A relay that stalls past
-     * {@code stale-claim-seconds} has its rows returned to {@code PENDING} and re-published by
-     * someone else; if it then wakes up and finishes, an unguarded {@code WHERE id IN (…)} would
-     * mark rows processed that a <em>different</em> claim now owns — including one still waiting to
-     * be sent. Every other claim in this system carries its precondition in the {@code WHERE}
-     * clause; so does this one.
+     * <p>{@code status = PROCESSING} alone is not enough. A relay may publish a message, die, and
+     * have its claim returned to {@code PENDING}; another relay can then claim the same row before
+     * the first one wakes up. {@code retryCount} is the claim generation: stale-claim recovery
+     * increments it, so an old relay cannot mark the newer relay's claim as processed (ADR-009).
      */
-    @Modifying(flushAutomatically = true)
-    @Query("""
+     @Modifying(flushAutomatically = true)
+     @Query("""
             UPDATE OutboxEvent e
-               SET e.status = com.flashseats.order.model.OutboxStatus.PROCESSED,
-                   e.processedAt = :now
-             WHERE e.id IN :ids
-               AND e.status = com.flashseats.order.model.OutboxStatus.PROCESSING
-            """)
-    int markProcessed(@Param("ids") Collection<UUID> ids, @Param("now") Instant now);
+                SET e.status = com.flashseats.order.model.OutboxStatus.PROCESSED,
+                e.processedAt = :now
+                WHERE e.id = :id
+                AND e.status = com.flashseats.order.model.OutboxStatus.PROCESSING
+                AND e.retryCount = :retryCount
+                """)
+     int markProcessed(
+                @Param("id") UUID id,
+                @Param("retryCount") int retryCount,
+                @Param("now") Instant now);
 
     /**
      * Returns rows stranded in {@code PROCESSING} to {@code PENDING}.

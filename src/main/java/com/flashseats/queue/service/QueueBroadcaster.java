@@ -33,6 +33,7 @@ public class QueueBroadcaster {
     private final CatalogFacade catalog;
     private final StringRedisTemplate redis;
     private final Clock clock;
+    private final QueueReplayService replay;
     private final Map<Long, List<TierAvailability>> lastAvailability = new ConcurrentHashMap<>();
 
     public QueueBroadcaster(
@@ -41,13 +42,15 @@ public class QueueBroadcaster {
             QueueDrainRateTracker drainRate,
             CatalogFacade catalog,
             StringRedisTemplate redis,
-            Clock clock) {
+            Clock clock,
+            QueueReplayService replay) {
         this.emitters = emitters;
         this.queue = queue;
         this.drainRate = drainRate;
         this.catalog = catalog;
         this.redis = redis;
         this.clock = clock;
+        this.replay = replay;
     }
 
     /**
@@ -83,8 +86,9 @@ public class QueueBroadcaster {
 
         if (window == EventWindowStatus.CLOSED) {
             lastAvailability.remove(eventId);
-            emitters.closeAll(
-                    eventId, "sale-closed", Map.of("closedAt", clock.instant().toString()));
+            replay.publishAndFanOut(
+                    eventId, QueueChannelMessage.toAll(
+                            "sale-closed", Map.of("closedAt", clock.instant().toString())));
             return;
         }
 
@@ -97,7 +101,8 @@ public class QueueBroadcaster {
             if (state.phase() == QueuePhase.EXHAUSTED) {
                 // Derived from live stock, so it is not terminal for the connection: if seats come
                 // back the marker clears and this buyer's position is still theirs (ADR-035).
-                emitters.send(sessionId, "sale-exhausted", Map.of("soldOutAt", clock.instant().toString()));
+                emitters.send(
+                        sessionId, "sale-exhausted", Map.of("soldOutAt", clock.instant().toString()));
             } else if (state.position() != null) {
                 emitters.sendPosition(sessionId, state.position(), state.estWaitSeconds());
             }
@@ -108,7 +113,9 @@ public class QueueBroadcaster {
         List<TierAvailability> current = catalog.getTierAvailability(eventId);
         List<TierAvailability> previous = lastAvailability.put(eventId, current);
         if (!current.equals(previous)) {
-            emitters.broadcast(eventId, "tier-availability", Map.of("tiers", current));
+            replay.publishAndFanOut(
+                    eventId, QueueChannelMessage.toAll(
+                            "tier-availability", Map.of("tiers", current)));
         }
     }
 
