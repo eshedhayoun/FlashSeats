@@ -169,17 +169,22 @@ public class PaymentService implements PaymentFacade {
     public RefundResult refund(String transactionReference, long amountCents, String reason) {
         PaymentTransaction transaction = store.require(transactionReference);
         /*
-        * Refunds are full-refund operations in FlashSeats.
-        *
-        * If the durable payment ledger already says this transaction has been
-        * refunded for the requested amount, do NOT call the provider again.
-        *
-        * This protects us from:
-        * - webhook redelivery
-        * - application retry
-        * - a crash after Stripe refunded but before our DB update
-        */
-        if (transaction.getRefundedAmountCents() >= amountCents) {
+         * Refunds here are full-refund operations, so a ledger that already records
+         * this amount means the work is done and the provider round trip is waste.
+         * Webhook redelivery and application retry both arrive this way.
+         *
+         * What this does NOT protect against is the interesting case: a crash after
+         * the provider refunded but before our DB recorded it. There
+         * refundedAmountCents is still zero, so this guard does not fire at all —
+         * and it must not, because we genuinely do not know the money moved. That
+         * case is covered one layer down, by the idempotency key
+         * StripePaymentGateway.refund sets over (intent, amount): the retried
+         * request returns the provider's original result instead of refunding twice.
+         *
+         * Stated explicitly because a guard whose comment claims a guarantee it does
+         * not hold is how the layer that actually holds it gets removed later.
+         */
+        if (amountCents > 0 && transaction.getRefundedAmountCents() >= amountCents) {
             log.info(
                     "Refund for {} already recorded ({} cents); not calling provider again",
                     transactionReference,
