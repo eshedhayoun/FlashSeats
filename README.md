@@ -176,8 +176,27 @@ the card selector on the checkout screen to drive the interesting branches: `pm_
 declines and **keeps your seats**, `pm_card_error` fails the provider. The email lands in Mailpit at
 [localhost:8025](http://localhost:8025).
 
+### The React client
+
+A second client implements [`FE_SPEC.md`](FE_SPEC.md) in full. It runs against the same backend and
+is **development-only** — nginx serves no static root and the cluster still serves the demo client.
+
 ```bash
-./mvnw test                         # 25 tests, including the concurrency and journey suites
+cd frontend
+npm install
+cp .env.example .env.local          # leave the Stripe key BLANK to drive the stub gateway
+npm run dev                         # http://localhost:5173, /api proxied to :8080
+npm test                            # vitest
+```
+
+With no `VITE_STRIPE_PUBLISHABLE_KEY` the checkout offers the stub's outcomes directly — succeed,
+decline, gateway outage, 3-D Secure — which is the easiest way to walk the failure branches in a
+browser. Set a `pk_test_` key, and start the backend with `STRIPE_ENABLED=true`, to drive the real
+provider.
+
+```bash
+./mvnw test                         # 210 tests. See docs/06-mvp-overview.md §9: ten of them
+                                    # currently fail in the full suite and pass in isolation
 ```
 
 | Service | Where | Credentials |
