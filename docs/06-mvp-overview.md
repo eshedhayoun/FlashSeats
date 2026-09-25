@@ -770,10 +770,25 @@ them. 5 sales × 500 seats, 2,000 VUs, three replicas.
 | **E** | **300** | same as D | **10** | 1,414 | 1,904 / 2,500 — 76 % | 9.3 s |
 | **F** | **300** | **allowance 45/tick** | **0** | **2,002** | **2,496 / 2,500 — 99.8 %** | 10.0 s |
 | **G** | **300** | + one-round-trip queue read | **2** | — | **2,500 / 2,500 — 100 %** | 4.8 s |
+| **H** | **300** | **+ Sentinel topology** (Pass 12) | **0** | — | **2,499 / 2,500 — 99.96 %** | **129 ms** |
 
 **Runs F and G are the answer: five sales open at once sell out, and nothing oversells.** Run G took
 every seat — 500 of 500 on all five tiers — with `sold + held + redis == 500` throughout and
 `hikaricp_connections_pending` never above 2 of 90.
+
+**Run H (Pass 12) is the first measured through Sentinel**, and answers the question the topology
+change raised: it does not regress. 2,499 of 2,500 across the five tiers, `sold + held + redis == 500`
+exact on every one, zero inventory 503s, zero rate-limited requests, and
+`hikaricp_connections_pending` **0** across 54 samples on three replicas with drift `0.0` on every
+sample. The single unsold seat is an artefact of the run, not the build: the failover test earlier in
+the same session rebuilt 9001's counter, and one seat was still held when the drill started.
+
+**Read H's 129 ms against G's 4.8 s with care — the host is most of that difference, not the code.**
+G was measured with other work on the same laptop; H ran with nothing but the cluster. It is
+nonetheless the first time the **200 ms checkout p99 exit criterion has been met at all**, and the
+first evidence that the criterion is reachable on this design rather than only on a bigger machine.
+One run, one host: treat it as a data point, not as the criterion being closed. Sampling covered the
+ramp and steady state; the last ~45 s of ramp-down was not sampled.
 
 Run F's table below is kept because it is the one that exposed the tail-of-sale edge, four seats short:
 
@@ -1794,3 +1809,52 @@ merge that adds four capabilities and no documentation is indistinguishable, a w
 merge that added nothing — and the repo's own instructions then actively mislead. The cost is not
 paid by the author, who knows what they built; it is paid by whoever reads `04` next and starts
 building Stripe again.
+
+### Pass 12 — establishing the base
+
+- **Scope:** make the suite's verdict trustworthy, read PR #16's backend against the ADRs it must
+  honour, and verify the cluster on the Sentinel topology it now ships. Fix-as-you-go: every finding
+  got a test and its doc update in the same commit.
+
+- **The finding that reframes the merge.** Pass 11 fixed what reading the *code* exposed. This pass
+  ran it, and that is a different instrument: **the Sentinel cluster had never started, on any
+  machine.** All three shell scripts PR #16 added were committed mode 644, and one of them is a
+  container `entrypoint`, so the sentinels restart-looped on `permission denied` and every app
+  replica depends on them. Nothing said so, because the topology is only reachable through
+  `--profile cluster` and no test goes there. **The drill's own instrument was in the same state** —
+  `declare -A` on a bash macOS does not ship, and a hardcoded `docker.exe` that would have reported
+  a clean PASS having measured nothing. Code review would not have found either; running it did.
+
+**Built:**
+
+| Change | Effect |
+| :--- | :--- |
+| **Surefire `runOrder` pinned** | The default is filesystem order, so two machines could disagree about whether the suite passed. 213/213 twice from cold containers. **Pinned, not fixed** — the order dependence in §9 stays open, and the pom says so |
+| **The fulfilment-lag gauge stopped scanning its own table** | `MIN(created_at) WHERE status <> PROCESSED` matched neither partial index, so it sequentially scanned `outbox_events` — processed rows included — every 10 s per replica. Asked one status at a time it is two bounded reads. No new index: that table is written once per checkout |
+| **`payment.decline.ratio` → `payment.attempts{outcome}`** | A ratio cumulative since process start is the one shape that cannot show a spike, which `03` §7 says is why it exists. Counters leave the windowing to the query and delete state rather than adding it |
+| **Three script modes, and an entrypoint that no longer depends on one** | See above. `CLAUDE.md` carries the rule and the one-line audit |
+| **`pool-pressure.sh` runs, and measures** | bash 3.2 compatible, and `docker.exe` detected rather than assumed |
+| **The `UPCOMING` dev event restored** | `prewarm` refuses any other window, so with every dev event `OPEN` the seeding path ADR-004 protects could not be exercised on `dev` at all |
+| **Two payment comments corrected** | Both claimed guarantees they do not hold. The refund short-circuit does not cover the crash case its comment described — the gateway's idempotency key does — and `charge` had lost the reason it constrains payment methods |
+
+**Verified on the cluster, for the first time through Sentinel:**
+
+- `fanout-check.sh` — 30/30 promoted, 10/10/10 across three replicas.
+- `hold-expiry-check.sh` — restored exactly once, 669 ms, across three replicas.
+- `sentinel-failover-check.sh` — replica promoted, old primary rejoined as a replica.
+- **The half that script deliberately skips, done by hand and now the highest-value claim in the
+  system that is no longer merely argued.** After a failover all three replicas independently refused
+  to sell event 9001 — the vouched `run_id` no longer matched the promoted primary's — a buyer's hold
+  answered **`503 INVENTORY_UNAVAILABLE`, retryable**, and not "sold out"; `rebuild-stock` on **one**
+  replica resumed selling on **all three**. That is ADR-046's derived-never-consumed design observed
+  end to end against a failover rather than a restart.
+- Run **H** of the concurrent-sales drill; see §11.
+
+**Worth carrying forward.** Only the replica that serves `rebuild-stock` logs "vouched for again";
+the other two release silently on their next tick. An operator reading logs sees the refusal three
+times and the recovery once. Correct by design and mildly unhelpful during an incident.
+
+**The transferable lesson.** Pass 11's was that undocumented work is invisible. This pass's is
+narrower and sharper: **a path no test and no script exercises is not "probably fine", it is
+unknown.** Every defect here lived in exactly such a path — a profile the suite never starts, a shell
+the author never ran — and each was found in the first minute of trying to use it.
