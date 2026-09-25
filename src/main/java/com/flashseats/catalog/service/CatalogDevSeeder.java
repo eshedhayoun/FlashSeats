@@ -7,8 +7,11 @@ import com.flashseats.catalog.repository.EventRepository;
 import com.flashseats.catalog.repository.StockCounterRepository;
 import com.flashseats.catalog.repository.TicketTierRepository;
 import java.time.Clock;
-import java.time.Duration;
 import java.time.Instant;
+import java.time.LocalDate;
+import java.time.Month;
+import java.time.ZoneOffset;
+import java.time.Year;
 import java.util.ArrayList;
 import java.util.List;
 import lombok.extern.slf4j.Slf4j;
@@ -27,8 +30,8 @@ import org.springframework.transaction.support.TransactionTemplate;
  *   <li><strong>An OPEN sale</strong> with its counters written directly. Pre-warm cannot be used
  *       here: it refuses on anything but an {@code UPCOMING} window (ADR-004), so a demo event that
  *       is open on startup would otherwise have no counters and every hold would answer 503.
- *   <li><strong>An UPCOMING sale</strong> with no counters, so the countdown and the admin pre-warm
- *       path stay demonstrable.
+ *   <li><strong>A second OPEN sale</strong> with its counter written directly, so both seeded
+ *       frontend journeys are usable after a normal development restart.
  * </ul>
  *
  * <p>Runs only when the database is empty, so a restart never duplicates or resets a sale in
@@ -74,33 +77,39 @@ public class CatalogDevSeeder implements ApplicationRunner {
 
     private List<StockSeed> seedDatabase() {
         Instant now = clock.instant();
+        LocalDate octoberThirtieth = LocalDate.of(
+                Year.from(now.atZone(ZoneOffset.UTC)).getValue(), Month.OCTOBER, 30);
+        if (octoberThirtieth.atStartOfDay(ZoneOffset.UTC).toInstant().isBefore(now)) {
+            octoberThirtieth = octoberThirtieth.plusYears(1);
+        }
+        Instant eventDate = octoberThirtieth.atTime(20, 0).toInstant(ZoneOffset.UTC);
+        Instant saleEnd = octoberThirtieth.plusDays(1).atStartOfDay(ZoneOffset.UTC).toInstant();
 
         Event live = saveEvent(
                 "Aurora Fest 2026",
                 "Three stages, one night, under the northern lights.",
                 "Riverside Arena",
-                now.plus(Duration.ofDays(60)),
-                now.minus(Duration.ofMinutes(1)), // already open, so the demo starts immediately
-                now.plus(Duration.ofHours(8)));
+                eventDate,
+                now.minusSeconds(1), // already open, so the demo starts immediately
+                saleEnd);
         List<StockSeed> counters = new ArrayList<>();
         counters.add(seedTier(live, "VIP", 7_500, 50, 6));
         counters.add(seedTier(live, "Floor", 4_500, 150, 6));
         counters.add(seedTier(live, "General Admission", 2_500, 500, 6));
 
-        Event upcoming = saveEvent(
+        Event secondLive = saveEvent(
                 "Midnight Sessions",
                 "An intimate late set. Sale opens shortly.",
                 "The Vault",
-                now.plus(Duration.ofDays(90)),
-                now.plus(Duration.ofMinutes(30)), // still UPCOMING, so pre-warm is demonstrable
-                now.plus(Duration.ofDays(2)));
-        // Deliberately no counter: POST /api/v1/admin/events/{id}/prewarm creates it.
-        tier(upcoming, "General Admission", 3_000, 200, 4);
+                eventDate,
+                now.plusSeconds(30),
+                saleEnd);
+        counters.add(seedTier(secondLive, "General Admission", 3_000, 200, 4));
 
         log.info(
-                "Seeded dev catalog: event {} is OPEN with 700 seats, event {} is UPCOMING and un-warmed",
+                "Seeded dev catalog: event {} is OPEN with 700 seats, event {} is OPEN with 200 seats",
                 live.getId(),
-                upcoming.getId());
+                secondLive.getId());
         return counters;
     }
 

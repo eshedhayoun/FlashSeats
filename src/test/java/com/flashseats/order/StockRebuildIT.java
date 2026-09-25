@@ -99,6 +99,23 @@ class StockRebuildIT extends IntegrationTest {
 
         assertThat(fixture.stockCounter(eventId, tierId)).isEqualTo(CAPACITY - HELD);
     }
+    //added here
+    @Test
+    @DisplayName("Rebuild counts confirmed sales and active holds together")
+    void rebuildUsesConfirmedSalesAndActiveHolds() {
+        int sold = 2;
+        // First create a real confirmed sale through the checkout flow.
+        purchaseSeats(sold);
+        // Then create a separate live hold.
+        holdSeats();
+        // Simulate Redis containing a completely wrong value.
+        fixture.setStockCounter(eventId, tierId, CAPACITY);
+        rebuild();
+        // 20 capacity - 2 sold - 3 held = 15 remaining.
+        assertThat(fixture.stockCounter(eventId, tierId)).isEqualTo(CAPACITY - sold - HELD);
+        // The complete ledger invariant must hold after the repair.
+        assertThat(fixture.stockInvariantHolds(tierId)).isTrue();
+    }
 
     @Test
     @DisplayName("Drift reads zero when the counter agrees with the ledger")
@@ -167,5 +184,39 @@ class StockRebuildIT extends IntegrationTest {
                 Map.of("eventId", eventId, "tierId", tierId, "quantity", HELD),
                 Map.of("X-Admission-Token", admissionToken));
         assertThat(hold.status()).isEqualTo(201);
+    }
+    //helper method
+    private void purchaseSeats(int quantity) {
+        BuyerSession buyer = new BuyerSession(port);
+        buyer.get("/events/" + eventId);
+        buyer.post("/queue/join", Map.of("eventId", eventId));
+
+        String passToken = await().atMost(Duration.ofSeconds(15))
+                .until(
+                        () -> buyer.get("/queue/status?eventId=" + eventId).text("passToken"),
+                        token -> token != null);
+
+        String admissionToken = buyer.post(
+                        "/queue/admit",
+                        Map.of("eventId", eventId),
+                        Map.of("X-Queue-Pass-Token", passToken))
+                .text("admissionToken");
+
+        String holdToken = buyer.post(
+                        "/holds",
+                        Map.of("eventId", eventId, "tierId", tierId, "quantity", quantity),
+                        Map.of("X-Admission-Token", admissionToken))
+                .text("holdToken");
+
+        var checkout = buyer.post(
+                "/orders/checkout",
+                Map.of(
+                        "holdToken", holdToken,
+                        "userEmail", "buyer@example.com",
+                        "paymentMethodId", "pm_card_visa",
+                        "idempotencyKey", "rebuild-" + holdToken));
+
+        assertThat(checkout.status()).isEqualTo(201);
+        assertThat(checkout.text("status")).isEqualTo("CONFIRMED");
     }
 }

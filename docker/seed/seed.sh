@@ -24,6 +24,7 @@
 set -euo pipefail
 
 cd "$(dirname "$0")/../.."
+REDIS_CLI="./docker/scripts/redis-master-cli.sh"
 
 # A reserved id, so the load-test sale never collides with — or silently
 # defers to — the dev seeder's events 1 and 2 sitting in a persisted volume.
@@ -104,8 +105,9 @@ for pattern in "catalog:stock:${EVENT_ID}:*" "catalog:vouch:${EVENT_ID}" \
                "queue:admissions:${EVENT_ID}" "queue:exhausted:${EVENT_ID}" \
                "queue:pass:${EVENT_ID}:*" "queue:admit:${EVENT_ID}:*"; do
     # shellcheck disable=SC2016
-    docker compose exec -T redis sh -c \
-        "redis-cli --scan --pattern '${pattern}' | xargs -r redis-cli DEL" >/dev/null
+    "$REDIS_CLI" --scan --pattern "$pattern" | while IFS= read -r key; do
+        [[ -n "$key" ]] && "$REDIS_CLI" DEL "$key" >/dev/null
+    done
 done
 
 # --- 3. pre-warm -------------------------------------------------------------

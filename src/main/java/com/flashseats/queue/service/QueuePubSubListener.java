@@ -37,9 +37,13 @@ public class QueuePubSubListener implements MessageListener {
                     json.readValue(message.getBody(), QueueChannelMessage.class);
 
             if (frame.isBroadcast()) {
-                emitters.broadcast(eventIdOf(channel), frame.type(), frame.data());
+                if ("sale-closed".equals(frame.type())) {
+                    emitters.closeAll(eventIdOf(channel), frame.type(), frame.data(), frame.id());
+                } else {
+                    emitters.broadcast(eventIdOf(channel), frame.type(), frame.data(), frame.id());
+                }
             } else {
-                emitters.send(frame.sessionId(), frame.type(), frame.data());
+                emitters.send(frame.sessionId(), frame.type(), frame.data(), frame.id());
             }
         } catch (Exception malformed) {
             log.warn("Ignoring unreadable queue frame on {}", channel, malformed);

@@ -3,11 +3,13 @@ package com.flashseats.bot.filter;
 import com.flashseats.bot.model.BotOutcome;
 import com.flashseats.bot.model.IpRuleAction;
 import com.flashseats.bot.service.BotAuditService;
+import com.flashseats.bot.service.BotMetrics;
 import com.flashseats.bot.service.IpRuleService;
 import com.flashseats.bot.service.RateLimitService;
 import com.flashseats.shared.error.ErrorCode;
 import com.flashseats.shared.error.ProblemDetails;
 import com.flashseats.shared.identity.SessionId;
+import com.flashseats.shared.identity.SessionIdentityFilter;
 import com.flashseats.shared.web.ClientAddress;
 import jakarta.servlet.FilterChain;
 import jakarta.servlet.ServletException;
@@ -43,16 +45,19 @@ public class RateLimitFilter extends OncePerRequestFilter {
     private final IpRuleService ipRules;
     private final BotAuditService audit;
     private final ObjectMapper json;
+    private final BotMetrics metrics;
 
     public RateLimitFilter(
-            RateLimitService rateLimits,
-            IpRuleService ipRules,
-            BotAuditService audit,
-            ObjectMapper json) {
+        RateLimitService rateLimits,
+        IpRuleService ipRules,
+        BotAuditService audit,
+        BotMetrics metrics,
+        ObjectMapper json) {
         this.rateLimits = rateLimits;
         this.ipRules = ipRules;
         this.audit = audit;
         this.json = json;
+        this.metrics = metrics;
     }
 
     /**
@@ -86,6 +91,7 @@ public class RateLimitFilter extends OncePerRequestFilter {
         IpRuleAction rule = ipRules.actionFor(clientIp);
 
         if (rule == IpRuleAction.DENY) {
+            metrics.recordRefusal(BotOutcome.IP_BLOCKED);
             audit.record(
                     sessionId == null ? null : sessionId.toString(),
                     clientIp,
@@ -109,6 +115,7 @@ public class RateLimitFilter extends OncePerRequestFilter {
         boolean allowed = sessionOk && (rule == IpRuleAction.ALLOW || rateLimits.allowIp(clientIp));
 
         if (!allowed) {
+            metrics.recordRefusal(BotOutcome.RATE_LIMITED);
             audit.record(
                     sessionId == null ? null : sessionId.toString(),
                     clientIp,

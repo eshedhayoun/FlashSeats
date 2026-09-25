@@ -42,3 +42,10 @@ build/
 
 # Load-test output
 docker/k6/summary.json
+
+# Frontend local dependencies and TypeScript build metadata
+frontend/node_modules/
+frontend/tsconfig.*.tsbuildinfo
+frontend/.vite/
+frontend/.env.local
+frontend/.env.*.local

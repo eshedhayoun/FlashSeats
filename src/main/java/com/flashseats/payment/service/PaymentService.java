@@ -11,7 +11,10 @@ import com.flashseats.payment.gateway.GatewayCharge;
 import com.flashseats.payment.gateway.GatewayResult;
 import com.flashseats.payment.gateway.PaymentGateway;
 import com.flashseats.payment.model.PaymentTransaction;
+import io.micrometer.core.instrument.Gauge;
+import io.micrometer.core.instrument.MeterRegistry;
 import java.time.Duration;
+import java.util.concurrent.atomic.AtomicLong;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.stereotype.Service;
@@ -39,16 +42,25 @@ public class PaymentService implements PaymentFacade {
     private final PaymentTransactionStore store;
     private final StringRedisTemplate redis;
     private final PaymentProperties properties;
+    private final AtomicLong gatewayAttempts = new AtomicLong();
+    private final AtomicLong declines = new AtomicLong();
 
     public PaymentService(
             PaymentGateway gateway,
             PaymentTransactionStore store,
             StringRedisTemplate redis,
-            PaymentProperties properties) {
+            PaymentProperties properties,
+            MeterRegistry meters) {
         this.gateway = gateway;
         this.store = store;
         this.redis = redis;
         this.properties = properties;
+        Gauge.builder(
+                        "flashseats.payment.decline.ratio",
+                        this,
+                        service -> service.declines.get() / (double) Math.max(1, service.gatewayAttempts.get()))
+                .description("Declined provider attempts divided by all provider attempts")
+                .register(meters);
     }
 
     /**
@@ -86,6 +98,7 @@ public class PaymentService implements PaymentFacade {
             // open a second intent and risk billing twice for one authentication.
             ChargeAttempt attempt = store.beginAttempt(command); // tx1
 
+            gatewayAttempts.incrementAndGet();
             GatewayResult result = attempt.isResume() // no transaction open
                     ? gateway.retrieve(attempt.resumableGatewayReference())
                     : gateway.charge(new GatewayCharge(
@@ -97,6 +110,9 @@ public class PaymentService implements PaymentFacade {
                             command.clientIdempotencyKey()));
 
             store.recordOutcome(attempt.transactionReference(), result); // tx2
+            if (result.outcome() == GatewayResult.Outcome.DECLINED) {
+                declines.incrementAndGet();
+            }
 
             if (result.outcome() == GatewayResult.Outcome.ERROR) {
                 log.warn("Gateway error for order {}: {}", command.orderNumber(), result.failureReason());
@@ -133,25 +149,61 @@ public class PaymentService implements PaymentFacade {
         }
     }
 
-    /** Compensation for a charge that settled against seats we could not deliver (ADR-012). */
     @Override
     public RefundResult refund(String transactionReference, long amountCents, String reason) {
         PaymentTransaction transaction = store.require(transactionReference);
+        /*
+        * Refunds are full-refund operations in FlashSeats.
+        *
+        * If the durable payment ledger already says this transaction has been
+        * refunded for the requested amount, do NOT call the provider again.
+        *
+        * This protects us from:
+        * - webhook redelivery
+        * - application retry
+        * - a crash after Stripe refunded but before our DB update
+        */
+        if (transaction.getRefundedAmountCents() >= amountCents) {
+            log.info(
+                    "Refund for {} already recorded ({} cents); not calling provider again",
+                    transactionReference,
+                    transaction.getRefundedAmountCents());
+
+            return new RefundResult(
+                    transactionReference,
+                    true,
+                    amountCents,
+                    null);
+        }
 
         GatewayResult result =
-                gateway.refund(transaction.getGatewayReference(), amountCents, reason);
+                gateway.refund(
+                        transaction.getGatewayReference(),
+                        amountCents,
+                        reason);
 
         if (result.isSuccess()) {
             store.recordRefund(transactionReference, amountCents);
-            return new RefundResult(transactionReference, true, amountCents, null);
+
+            return new RefundResult(
+                    transactionReference,
+                    true,
+                    amountCents,
+                    null);
         }
 
-        // A failed refund is money we hold and should not. It cannot be resolved automatically.
+        // A failed refund is money we hold and should not. It cannot be
+        // resolved automatically yet, so keep it visible for reconciliation.
         log.error(
                 "REFUND FAILED for {} ({} cents): {} — manual reconciliation required",
                 transactionReference,
                 amountCents,
                 result.failureReason());
-        return new RefundResult(transactionReference, false, 0, result.failureReason());
+
+        return new RefundResult(
+                transactionReference,
+                false,
+                0,
+                result.failureReason());
     }
 }

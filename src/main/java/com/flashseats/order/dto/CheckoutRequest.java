@@ -21,4 +21,4 @@ public record CheckoutRequest(
         @NotBlank String holdToken,
         @NotBlank @Email String userEmail,
         @NotBlank String paymentMethodId,
-        String idempotencyKey) {}
+        @NotBlank String idempotencyKey) {}

@@ -28,11 +28,16 @@
 set -euo pipefail
 
 cd "$(dirname "$0")/../.."
+REDIS_CLI="./docker/scripts/redis-master-cli.sh"
 
 EVENTS="${EVENTS:-5}"
 FIRST_ID="${FIRST_ID:-9001}"
 LAST_ID=$((FIRST_ID + EVENTS - 1))
 BASE_URL="${BASE_URL:-http://localhost:${HTTP_PORT:-8080}}"
+DOCKER_CLI="docker"
+if command -v docker.exe >/dev/null 2>&1; then
+    DOCKER_CLI="docker.exe"
+fi
 
 if [[ ! -f .env ]]; then
     echo "error: .env not found. Run docker/secrets/gen-env.sh first." >&2
@@ -69,7 +74,7 @@ echo "Seeding ${EVENTS} simultaneous sales (${FIRST_ID}..${LAST_ID})..."
 POSTGRES_USER_VALUE="$(grep -E '^POSTGRES_USER=' .env | head -1 | cut -d= -f2-)"
 POSTGRES_DB_VALUE="$(grep -E '^POSTGRES_DB=' .env | head -1 | cut -d= -f2-)"
 
-docker compose exec -T postgres \
+"$DOCKER_CLI" compose exec -T postgres \
     psql -q -v ON_ERROR_STOP=1 \
          -v events="${EVENTS}" -v first_id="${FIRST_ID}" \
          -U "${POSTGRES_USER_VALUE:-flashseats}" \
@@ -86,9 +91,9 @@ for id in $(seq "$FIRST_ID" "$LAST_ID"); do
                    "queue:admissions:${id}" "queue:exhausted:${id}" \
                    "queue:promote:${id}" \
                    "queue:pass:${id}:*" "queue:admit:${id}:*"; do
-        # shellcheck disable=SC2016
-        docker compose exec -T redis sh -c \
-            "redis-cli --scan --pattern '${pattern}' | xargs -r redis-cli DEL" >/dev/null
+        "$REDIS_CLI" --scan --pattern "$pattern" | while IFS= read -r key; do
+            [[ -n "$key" ]] && "$REDIS_CLI" DEL "$key" >/dev/null
+        done
     done
 done
 

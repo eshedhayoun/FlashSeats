@@ -23,8 +23,11 @@ x-app: &app
     SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/${POSTGRES_DB:-flashseats}
     SPRING_DATASOURCE_USERNAME: ${POSTGRES_USER:-flashseats}
     SPRING_DATASOURCE_PASSWORD: ${POSTGRES_PASSWORD:-flashseats}
-    SPRING_DATA_REDIS_HOST: redis
-    SPRING_DATA_REDIS_PORT: 6379
+    # The docker profile discovers the primary through Sentinel. Keeping the
+    # standalone settings in application.properties preserves the local/dev
+    # stack, while this profile exercises the failover topology.
+    SPRING_DATA_REDIS_SENTINEL_MASTER: flashseats
+    SPRING_DATA_REDIS_SENTINEL_NODES: redis-sentinel-1:26379,redis-sentinel-2:26379,redis-sentinel-3:26379
     SPRING_RABBITMQ_HOST: rabbitmq
     SPRING_RABBITMQ_PORT: 5672
     SPRING_RABBITMQ_USERNAME: ${RABBITMQ_USER:-flashseats}
@@ -67,7 +70,9 @@ x-app: &app
     JAVA_TOOL_OPTIONS: "-XX:MaxRAMPercentage=75"
   depends_on:
     postgres: { condition: service_healthy }
-    redis:    { condition: service_healthy }
+    redis-sentinel-1: { condition: service_healthy }
+    redis-sentinel-2: { condition: service_healthy }
+    redis-sentinel-3: { condition: service_healthy }
     rabbitmq: { condition: service_healthy }
   healthcheck:
     test: ["CMD", "wget", "-qO-", "http://localhost:8080/actuator/health"]
@@ -122,13 +127,121 @@ services:
     volumes:
       - ./docker/redis/redis.conf:/usr/local/etc/redis/redis.conf:ro
       - redis-data:/data
+    networks:
+      flashseats:
+        ipv4_address: 172.28.0.11
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s
       timeout: 3s
       retries: 12
       start_period: 5s
-    networks: [flashseats]
+
+  redis-replica-1:
+    image: redis:7-alpine
+    profiles: ["cluster"]
+    restart: unless-stopped
+    command: ["redis-server", "/usr/local/etc/redis/redis.conf", "--replicaof", "redis", "6379"]
+    volumes:
+      - ./docker/redis/redis.conf:/usr/local/etc/redis/redis.conf:ro
+      - redis-replica-1-data:/data
+    depends_on:
+      redis: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 5s
+    networks:
+      flashseats:
+        ipv4_address: 172.28.0.12
+
+  redis-replica-2:
+    image: redis:7-alpine
+    profiles: ["cluster"]
+    restart: unless-stopped
+    command: ["redis-server", "/usr/local/etc/redis/redis.conf", "--replicaof", "redis", "6379"]
+    volumes:
+      - ./docker/redis/redis.conf:/usr/local/etc/redis/redis.conf:ro
+      - redis-replica-2-data:/data
+    depends_on:
+      redis: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 5s
+    networks:
+      flashseats:
+        ipv4_address: 172.28.0.13
+
+  redis-sentinel-1:
+    image: redis:7-alpine
+    profiles: ["cluster"]
+    restart: unless-stopped
+    entrypoint: ["/usr/local/bin/sentinel-entrypoint.sh"]
+    volumes:
+      - ./docker/redis/sentinel-entrypoint.sh:/usr/local/bin/sentinel-entrypoint.sh:ro
+      - redis-sentinel-1-data:/data
+    depends_on:
+      redis: { condition: service_healthy }
+      redis-replica-1: { condition: service_healthy }
+      redis-replica-2: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD", "redis-cli", "-p", "26379", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 5s
+    networks:
+      flashseats:
+        ipv4_address: 172.28.0.14
+
+  redis-sentinel-2:
+    image: redis:7-alpine
+    profiles: ["cluster"]
+    restart: unless-stopped
+    entrypoint: ["/usr/local/bin/sentinel-entrypoint.sh"]
+    volumes:
+      - ./docker/redis/sentinel-entrypoint.sh:/usr/local/bin/sentinel-entrypoint.sh:ro
+      - redis-sentinel-2-data:/data
+    depends_on:
+      redis: { condition: service_healthy }
+      redis-replica-1: { condition: service_healthy }
+      redis-replica-2: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD", "redis-cli", "-p", "26379", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 5s
+    networks:
+      flashseats:
+        ipv4_address: 172.28.0.15
+
+  redis-sentinel-3:
+    image: redis:7-alpine
+    profiles: ["cluster"]
+    restart: unless-stopped
+    entrypoint: ["/usr/local/bin/sentinel-entrypoint.sh"]
+    volumes:
+      - ./docker/redis/sentinel-entrypoint.sh:/usr/local/bin/sentinel-entrypoint.sh:ro
+      - redis-sentinel-3-data:/data
+    depends_on:
+      redis: { condition: service_healthy }
+      redis-replica-1: { condition: service_healthy }
+      redis-replica-2: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD", "redis-cli", "-p", "26379", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 5s
+    networks:
+      flashseats:
+        ipv4_address: 172.28.0.16
 
   # ===================================================================
   # Phase 4 — asynchronous fulfilment
@@ -299,6 +412,11 @@ services:
 volumes:
   postgres-data:
   redis-data:
+  redis-replica-1-data:
+  redis-replica-2-data:
+  redis-sentinel-1-data:
+  redis-sentinel-2-data:
+  redis-sentinel-3-data:
   rabbitmq-data:
 
 networks:

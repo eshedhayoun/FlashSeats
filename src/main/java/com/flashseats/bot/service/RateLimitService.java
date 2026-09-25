@@ -28,12 +28,18 @@ public class RateLimitService {
     private final ProxyManager<byte[]> buckets;
     private final Supplier<BucketConfiguration> sessionConfig;
     private final Supplier<BucketConfiguration> ipConfig;
+    private final String sessionKeyPrefix;
+    private final String ipKeyPrefix;
     private final Set<String> trustedProxies;
 
     public RateLimitService(ProxyManager<byte[]> buckets, BotProperties properties) {
         this.buckets = buckets;
-        this.sessionConfig = configFor(properties.getSessionBucket());
-        this.ipConfig = configFor(properties.getIpBucket());
+        BotProperties.Bucket sessionBucket = properties.getSessionBucket();
+        BotProperties.Bucket ipBucket = properties.getIpBucket();
+        this.sessionConfig = configFor(sessionBucket);
+        this.ipConfig = configFor(ipBucket);
+        this.sessionKeyPrefix = versionedPrefix(SESSION_PREFIX, sessionBucket);
+        this.ipKeyPrefix = versionedPrefix(IP_PREFIX, ipBucket);
         this.trustedProxies = Set.copyOf(properties.getTrustedProxies());
     }
 
@@ -49,11 +55,15 @@ public class RateLimitService {
     }
 
     public boolean allowSession(String sessionId) {
-        return tryConsume(SESSION_PREFIX + sessionId, sessionConfig);
+        return tryConsume(sessionKeyPrefix + sessionId, sessionConfig);
     }
 
     public boolean allowIp(String ip) {
-        return tryConsume(IP_PREFIX + ip, ipConfig);
+        return tryConsume(ipKeyPrefix + ip, ipConfig);
+    }
+
+    private String versionedPrefix(String prefix, BotProperties.Bucket bucket) {
+        return prefix + "v" + bucket.getCapacity() + "-" + bucket.getRefillPerSecond() + ":";
     }
 
     private boolean tryConsume(String key, Supplier<BucketConfiguration> configuration) {

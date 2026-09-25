@@ -6,6 +6,7 @@ import com.flashseats.queue.dto.AdmitResponse;
 import com.flashseats.queue.dto.JoinQueueRequest;
 import com.flashseats.queue.dto.QueueStatusResponse;
 import com.flashseats.queue.service.QueueService;
+import com.flashseats.queue.service.QueueReplayService;
 import com.flashseats.queue.service.SseEmitterRegistry;
 import com.flashseats.shared.identity.SessionId;
 import com.flashseats.shared.web.ClientAddress;
@@ -38,11 +39,14 @@ public class QueueController {
 
     private final QueueService queue;
     private final SseEmitterRegistry emitters;
+    private final QueueReplayService replay;
     private final BotFacade bots;
 
-    public QueueController(QueueService queue, SseEmitterRegistry emitters, BotFacade bots) {
+    public QueueController(
+            QueueService queue, SseEmitterRegistry emitters, QueueReplayService replay, BotFacade bots) {
         this.queue = queue;
         this.emitters = emitters;
+        this.replay = replay;
         this.bots = bots;
     }
 
@@ -112,8 +116,21 @@ public class QueueController {
      * returns the same information — the buyer should never have to care which transport is live.
      */
     @GetMapping(value = "/stream", produces = MediaType.TEXT_EVENT_STREAM_VALUE)
-    public SseEmitter stream(@RequestParam long eventId, SessionId session) {
+    public SseEmitter stream(
+            @RequestParam long eventId,
+            @RequestParam(value = "lastEventId", required = false) String lastEventId,
+            @RequestHeader(value = "Last-Event-ID", required = false) String lastEventIdHeader,
+            SessionId session) {
         SseEmitter emitter = emitters.register(session.value(), eventId, STREAM_TIMEOUT_MS);
+
+        String replayFrom = lastEventIdHeader != null ? lastEventIdHeader : lastEventId;
+        if (replayFrom != null) {
+            for (var frame : replay.after(eventId, replayFrom)) {
+                if (frame.isBroadcast() || session.value().equals(frame.sessionId())) {
+                    emitters.send(session.value(), frame.type(), frame.data(), frame.id());
+                }
+            }
+        }
 
         // Flush the stream immediately even if this buyer is already promoted, admitted or
         // exhausted and therefore has no position frame to send.

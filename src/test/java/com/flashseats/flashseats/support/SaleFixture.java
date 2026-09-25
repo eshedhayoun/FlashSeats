@@ -8,7 +8,8 @@ import java.util.List;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.stereotype.Component;
-
+import java.time.Duration;
+import java.util.UUID;
 /**
  * Builds sale fixtures by writing rows directly.
  *
@@ -215,6 +216,19 @@ public class SaleFixture {
         return jdbc.queryForObject(
                 "SELECT count(*) FROM outbox_events WHERE status = ?", Integer.class, status);
     }
+    //overloaded method to count outbox events by event type and status
+    public int countOutbox(String eventType, String status) {
+        return jdbc.queryForObject(
+                """
+                SELECT count(*)
+                FROM outbox_events
+                WHERE event_type = ?
+                AND status = ?
+                """,
+                Integer.class,
+                eventType,
+                status);
+    }
 
     /**
      * Leaves an order row {@code PENDING} for a hold, as a process killed mid-checkout would.
@@ -223,21 +237,42 @@ public class SaleFixture {
      * that reaches {@code PENDING} also resolves it. Only a crash between the commit and the charge
      * leaves this behind, and that is precisely the state ADR-034's staleness rule exists for.
      */
-    public void strandPendingOrder(String holdToken) {
+    public void strandPendingOrder(String holdToken, long amountCents) {
         jdbc.update(
                 """
-                INSERT INTO orders (order_number, hold_token, user_session_id, user_email,
-                                    receipt_token, event_id, total_amount_cents, currency, status,
-                                    payment_attempts, created_at, updated_at)
-                SELECT 'TK-STRANDED', ?, h.user_session_id, 'stranded@example.com', 'tok', h.event_id,
-                       1, 'USD', 'PENDING', 0, now(), now()
-                  FROM ticket_holds h
-                 WHERE h.hold_token = ?
+                INSERT INTO orders (
+                    order_number,
+                    hold_token,
+                    user_session_id,
+                    user_email,
+                    receipt_token,
+                    event_id,
+                    total_amount_cents,
+                    currency,
+                    status,
+                    payment_attempts,
+                    created_at,
+                    updated_at
+                )
+                SELECT 'TK-STRANDED',
+                    ?,
+                    h.user_session_id,
+                    'stranded@example.com',
+                    'tok',
+                    h.event_id,
+                    ?,
+                    'USD',
+                    'PENDING',
+                    0,
+                    now(),
+                    now()
+                FROM ticket_holds h
+                WHERE h.hold_token = ?
                 """,
                 holdToken,
+                amountCents,
                 holdToken);
     }
-
     /** The order number written against a hold, whoever wrote it. */
     public String orderNumberFor(String holdToken) {
         return jdbc.queryForObject(
@@ -251,6 +286,18 @@ public class SaleFixture {
                 Timestamp.from(Instant.now().minus(by)),
                 Timestamp.from(Instant.now().minus(by)),
                 holdToken);
+    }
+    public void ageHold(String holdToken, Duration age, Duration remaining) {
+        Instant createdAt = Instant.now().minus(age);
+        Instant expiresAt = Instant.now().plus(remaining);
+
+        jdbc.update(
+                "UPDATE ticket_holds SET created_at = ?, expires_at = ? WHERE hold_token = ?",
+                Timestamp.from(createdAt),
+                Timestamp.from(expiresAt),
+                holdToken);
+
+        caches.forEach(DerivedStateCache::invalidateAll);
     }
 
     /** Pushes a hold's expiry into the past so the sweeper will reclaim it on its next pass. */
@@ -400,5 +447,90 @@ public class SaleFixture {
                 Timestamp.from(Instant.now().plus(60, ChronoUnit.DAYS)),
                 Timestamp.from(saleStart),
                 Timestamp.from(saleEnd));
+    }
+    /**
+     * Creates the durable payment record that would exist if the provider
+     * accepted the charge but the application died before committing the order.
+     *
+     * <p>This is the critical state for the "tab closed / response lost" path:
+     *
+     * <pre>
+     *   order = PENDING
+     *   payment = SUCCEEDED
+     *   hold = ACTIVE or later EXPIRED
+     * </pre>
+     *
+     * <p>The fixture writes the ledger directly rather than calling the payment
+     * service, because a fixture must be able to manufacture crash states that
+     * normal API execution cannot reach deterministically.
+     */
+    public String seedSettledPayment(
+            String holdToken,
+            String gatewayReference,
+            long amountCents) {
+
+        String transactionReference =
+                "pt_test_" + UUID.randomUUID().toString().replace("-", "");
+
+        int inserted =
+                jdbc.update(
+                        """
+                        INSERT INTO payment_transactions
+                            (transaction_reference,
+                                order_number,
+                                hold_token,
+                                user_session_id,
+                                stripe_payment_intent_id,
+                                amount_cents,
+                                currency,
+                                status,
+                                attempt_number,
+                                refunded_amount_cents,
+                                created_at,
+                                updated_at)
+                        SELECT
+                                ?,
+                                o.order_number,
+                                o.hold_token,
+                                o.user_session_id,
+                                ?,
+                                ?,
+                                o.currency,
+                                'SUCCEEDED',
+                                1,
+                                0,
+                                now(),
+                                now()
+                        FROM orders o
+                        WHERE o.hold_token = ?
+                        """,
+                        transactionReference,
+                        gatewayReference,
+                        amountCents,
+                        holdToken);
+
+        if (inserted != 1) {
+            throw new IllegalStateException(
+                    "Could not seed settled payment for hold " + holdToken);
+        }
+
+        return transactionReference;
+    }
+    /**
+     * Returns how much money the payment ledger says was refunded
+     * for this hold.
+     */
+    public long refundedAmountFor(String holdToken) {
+        Long amount =
+                jdbc.queryForObject(
+                        """
+                        SELECT COALESCE(MAX(refunded_amount_cents), 0)
+                        FROM payment_transactions
+                        WHERE hold_token = ?
+                        """,
+                        Long.class,
+                        holdToken);
+
+        return amount == null ? 0L : amount;
     }
 }
