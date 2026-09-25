@@ -213,7 +213,11 @@ below.
       cores, with the whole stack plus the load generator on one laptop. Re-measure on a host where
       the generator is not competing with the system under test. **Update (Pass 12, run H): 129 ms
       at 300 VUs across five concurrent sales**, on the same laptop with nothing else running. That
-      is one run, so it is recorded as a data point and not ticked; `06` §11 has the Pass 13 sweep.
+      is one run, so it is recorded as a data point and not ticked. **Pass 13 sweep:** the criterion
+      holds up to about 600 VUs across five sales (145 ms), sits at the line for 300 VUs across ten
+      and for 1,000 across five, and fails at 2,000 (6.1 s). The limiting resource was host CPU
+      throughout; the pool never queued (`06` §11). Left unticked: "at peak" means 10,000, and
+      no run here reaches that.
 - [x] **`stock.drift` zero for the entire run.** `flashseats_stock_drift` read `0.0` on all three
       replicas after every run.
 - [x] **Every SSE client receives its promotion across all 3 replicas.** 30/30, spread 10/10/10 over

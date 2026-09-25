@@ -6,13 +6,13 @@ Guidance for Claude Code when working in this repository.
 
 FlashSeats — a high-concurrency ticket flash-sale engine. Modular monolith, Java 21, Spring Boot
 4.1.1. The **MVP is built and running**: all nine modules, the full journey from landing page to emailed
-PDF ticket, 112 tests green. **Inventory lives in Redis** (Stage 1, ADR-046): `catalog:stock:{e}:{t}`
+PDF ticket, 228 tests green in any class order. **Inventory lives in Redis** (Stage 1, ADR-046): `catalog:stock:{e}:{t}`
 is the live count and PostgreSQL keeps no copy of it. **Payment is real** (Stage 2, ADR-052-054) —
 but `flashseats.payment.stripe.enabled` is **false by default**, so `dev`, `test`, the load harness
 and every drill still run the in-process stub through the complete journey, 3-D Secure included.
 
 **Read [`docs/00-architecture-decisions.md`](docs/00-architecture-decisions.md) before changing
-anything.** It contains 58 ADRs. Most record a defect and its fix — 034-039 come from the first
+anything.** It contains 62 ADRs. Most record a defect and its fix — 034-039 come from the first
 review pass over the built code, 040-042 from the second — and several look like over-engineering
 until you read the failure they prevent. 043-045 are the exception: forward-looking decisions about
 the operator surface, buyer accounts and what health should report, with nothing built against them
@@ -21,14 +21,19 @@ yet. **046 is Stage 1** — Redis as the counter, and the five places it departs
 allowance and the metadata cache that had to come before it. **050 is ticket retrieval**, built. **052-055 are Stage 2**, all built: Stripe behind the
 existing seam with a circuit breaker, the webhook as a released-on-failure claim, 3-D Secure with no
 resume endpoint, and bot defence that fails open. **056 is Stage 2's own review** — the four defects
-that only appear under a rollback, a dropped connection or real load.
+that only appear under a rollback, a dropped connection or real load. **059-062 are Pass 13**: a
+pool timeout answers `503 SERVICE_BUSY` rather than `500`, `/session/reset` accepts JSON only,
+cached test contexts are never paused (the cause of the order-dependent suite), and each replica
+has a memory limit with the JVM flags owned by the image alone.
 
 **The operating envelope is 3–10 concurrent sales**, not one
 ([`03-end-to-end-flow.md`](docs/03-end-to-end-flow.md) §2). Every capacity number written before
 ADR-049 silently assumed a single sale. Check which assumption a limit rests on before trusting it.
-**Five concurrent sales now sell out** — 2,497 of 2,500, no oversell, `hikaricp_connections_pending` at
-zero (`06-mvp-overview.md` §11). Checkout p99 is the one number still open: Pass 9's review took it
-from 9.3 s to **6.4 s** by removing a transaction, against a 200 ms criterion.
+**Ten concurrent sales sell out** — 4,997 of 5,000 at 300 VUs, no oversell, and
+`hikaricp_connections_pending` at zero on every sample up to 2,000 VUs (`06-mvp-overview.md` §11,
+Pass 13). Checkout p99 meets its 200 ms criterion up to about 600 VUs across five sales on the dev
+laptop, and it collapses to 6 s at 2,000. **The limit there is host CPU, not the pool**: k6 shares
+the ten cores with the system it measures.
 
 **For what is actually built**, read [`docs/06-mvp-overview.md`](docs/06-mvp-overview.md) — scope,
 security posture, next stages, and the review-pass log. It is the doc to update after every pass.
@@ -36,7 +41,7 @@ security posture, next stages, and the review-pass log. It is the doc to update 
 ## Document precedence
 
 ```
-00-architecture-decisions.md      ← highest authority (58 ADRs)
+00-architecture-decisions.md      ← highest authority (62 ADRs)
 05-global-standards.md            ← cross-cutting contract; module docs conform to it
 FE_SPEC.md                        ← client contract (repo root)
 03-end-to-end-flow.md             ← the authoritative user journey AND the operating envelope
@@ -98,6 +103,11 @@ describing superseded designs. That is the failure mode this rule exists to stop
   deferral). `dev`, `test` and the plain `docker compose up -d` stack stay standalone. **A failover
   stops every sale**: the promoted replica is a new process with a new `run_id`, so `StockEpoch`
   distrusts every managed event until an operator rebuilds it. That is ADR-046 working, not a bug.
+  **Failover state survives `down`**: it lives in the sentinel volumes. After
+  `sentinel-failover-check.sh`, the next `up` can leave every app replica connected to a node that
+  Sentinel then demotes, and every request answers a bare `500` with `READONLY` in the logs.
+  `docker compose --profile cluster restart app-1 app-2 app-3` fixes it (`06` §9, not yet fixed in
+  code).
 - The **transactional outbox is hand-rolled** in `order`. The Spring Modulith event-publication
   starters were deliberately removed; only `spring-modulith-starter-core` and `-starter-test`
   remain, purely for `ApplicationModules.verify()` (ADR-009). Do not re-add them casually.
@@ -265,6 +275,12 @@ Do not reintroduce these — each cost a real defect in the first pass:
 | **Retaining a bearer capability in a log that outlives it** | The promotion frame carries a `passToken` whose own key expires in 120 s, and the reconnect log is one ZSET per *event*, kept until sale end plus retention. Writing it there files a spent single-use capability next to the session id it belongs to, for hours. Replay the *fact* and re-read the authority — the `hold:{token}` idiom — or, better, derive the frame from live state on connect, which also works with no `Last-Event-ID` at all (ADR-058) |
 | **A client that cannot run the configuration the server defaults to** | `stripe.ts` threw at module load without `VITE_STRIPE_PUBLISHABLE_KEY`, while `flashseats.payment.stripe.enabled` is **false by default** — so the only gateway the SPA could drive was the one nobody runs locally, and a clean checkout was a white screen. Mirror the server's seam on the client (ADR-058) |
 | **Adding ignore rules in the same commit that tracks the files** | `.gitignore` never applies to a path git already tracks, so `frontend/node_modules/` sat in the rules while 7,805 of its files sat in the index. The rule reads as protection and is inert; `git check-ignore -v` is how you find out (ADR-058) |
+| **A JVM in a container with no memory limit** | `MaxRAMPercentage` is a percentage of the *limit*. With no limit it is a percentage of the whole VM, so three replicas each sized themselves to ~5.7 GiB inside 7.65. It passed at 300–600 VUs and was SIGKILLed by the VM's kernel at 2,000. `dmesg` inside the VM names it; the container's `OOMKilled` flag stays `false` (ADR-062) |
+| **Trusting a JVM flag you read in a Dockerfile** | `compose.yaml`'s `JAVA_TOOL_OPTIONS` replaced the image's and dropped `ExitOnOutOfMemoryError` and ZGC, for every run ever measured. Adding a 1.5 GiB limit then made ergonomics pick SerialGC. Read the *effective* flags with `java -XX:+PrintFlagsFinal -version` inside the container (ADR-062) |
+| **Reading a periodic gauge more often than it is computed** | `flashseats.stock.drift` is recomputed every 60 s. `pool-pressure.sh` reached a loaded replica every ~24 s and called two reads of *one* computation "sustained drift". The ledger was exact. Sustained means across computations |
+| **A psql `\set` in a script that is also given `-v`** | `\set events 5` ran after `-v events=10` and won, so `EVENTS=10` silently seeded five sales while the script pre-warmed ten. Defaults go under `\if :{?var}` |
+| **Letting Spring Framework 7 pause cached test contexts** | When a class switches to another context, the cached one is paused and later restarted. The resumed shared context answered every `/queue` request with a bare `500` that never reached its own filters, so no application log showed anything. It looked like pollution *inside* the app for a whole pass. `spring.test.context.cache.pause=never` in `src/test/resources/spring.properties` (ADR-061). If a failure depends on how many contexts the suite has, suspect the framework's context lifecycle first |
+| **Classifying a failure by its Spring wrapper** | `CannotCreateTransactionException` means "the pool is busy" *and* "the database is down". Only the first should tell a client to retry in a second. Look for `SQLTransientConnectionException` in the cause chain (ADR-059) |
 
 ## Implementation order
 
@@ -373,14 +389,17 @@ docker/scripts/sse-cadence.sh 60                 # run DURING a load run: is Que
 
 # The ADR-049 drill: E sales at once. Every OTHER instrument here runs one
 # event, and so did every measurement the capacity numbers rest on.
-docker/seed/seed-concurrent.sh                   # seeds 9001..9005, pre-warms all five
+docker/seed/seed-concurrent.sh                   # seeds 9001..9005, pre-warms all five.
+                                                 # EVENTS=10 seeds ten -- it silently seeded five
+                                                 # before Pass 13
 docker/scripts/pool-pressure.sh 300 &            # THE instrument. Without it the drill
                                                  # proves nothing: the failure is latency,
                                                  # not an error, so k6 sees a green run.
                                                  # Needs FLASHSEATS_ADMIN_PLAINTEXT exported.
-                                                 # Drift fails only on CONSECUTIVE samples for
-                                                 # one replica -- ADR-046 says sustained, and a
-                                                 # single sample is the measurement's own gap
+                                                 # Drift fails only when one replica stays
+                                                 # non-zero for a whole drift interval (60 s):
+                                                 # two samples inside one interval are the SAME
+                                                 # computation read twice (ADR-046: sustained)
 docker compose --profile loadtest run --rm -e VUS=300 k6-concurrent
 docker/scripts/sold-count.sh                     # what was ACTUALLY sold, and the invariant per tier.
                                                  # k6's count is what the CLIENT saw: it abandons
@@ -431,6 +450,11 @@ either with stock images or defaults:
 - `proxy_buffering off` + `proxy_read_timeout 3600s` on `/api/v1/queue/stream` — buffered SSE makes
   the waiting room look frozen and delays the time-critical promotion frame (ADR-007).
 - `worker_connections 20480` — SSE connections are long-lived; the 1024 default dies at ~500 users.
+- `mem_limit` on each app replica, plus `-XX:+UseG1GC` in the Dockerfile (ADR-062). Without the
+  limit, `MaxRAMPercentage` sizes each heap against the whole Docker VM, and the VM's OOM killer
+  took replicas down mid-sale at 2,000 VUs. With the limit and no explicit collector, the JVM
+  drops to SerialGC. **Do not set `JAVA_TOOL_OPTIONS` in `compose.yaml`**: it replaces the
+  image's value, and one did.
 
 **Always test multi-replica.** `docker compose --profile cluster` runs three. Promotion pub/sub
 fan-out and settle-once restoration are both correct on one instance and broken on three if
