@@ -12,17 +12,9 @@ import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
 import tools.jackson.databind.ObjectMapper;
 
 /**
- * The live SSE connections held by <strong>this replica</strong>.
- *
- * <p>An emitter is the one piece of state a stateless application cannot avoid keeping in memory,
- * and it is the reason promotions fan out over Redis Pub/Sub: the promotion worker runs on one
- * replica while a given buyer's connection lives in another's heap. Delivering only to local
- * emitters is correct precisely <em>because</em> every replica subscribes and does the same
- * (ADR-007).
- *
- * <p>Positions are clamped <strong>monotonic non-increasing</strong> per connection. A raw rank can
- * jump backwards when entries ahead are removed, and a queue position that goes <em>up</em> reads as
- * a broken system even when nothing is wrong.
+ * The live SSE connections held by <strong>this replica</strong>. It delivers only locally, which is
+ * correct because every replica subscribes to the Pub/Sub fan-out (ADR-007). Positions are clamped
+ * monotonic non-increasing per connection, because a position that goes up reads as broken.
  */
 @Slf4j
 @Component
@@ -61,25 +53,17 @@ public class SseEmitterRegistry {
     }
 
     /**
-     * The events this replica is actually holding connections for.
-     *
-     * <p>Drives {@link QueueBroadcaster}, which used to sweep <em>open</em> events instead — so the
-     * moment a sale closed it stopped sweeping the very connections that most needed telling
-     * (ADR-036).
+     * The events this replica holds connections for. The broadcaster sweeps these rather than open
+     * events, so a closing sale still reaches its streams (ADR-036).
      */
     public Set<Long> watchedEventIds() {
         return Set.copyOf(sessionsByEvent.keySet());
     }
 
     /**
-     * Delivers a final frame to every local watcher and closes the stream.
-     *
-     * <p>Completing is what makes a terminal frame terminal: the connection leaves the registry, so
-     * the next sweep does not find it and send the same news again every two seconds.
-     *
-     * <p>Removal is keyed on <em>this</em> connection, not just the session id. A buyer reconnecting
-     * in the same instant would otherwise have their fresh emitter evicted by the sweep that was
-     * closing their old one, leaving them holding a socket nothing will ever write to.
+     * Delivers a final frame to every local watcher and closes the stream, so the next sweep does not
+     * repeat it. Removal is keyed on this connection, not the session, so a reconnect in the same
+     * instant keeps its fresh emitter.
      */
     public void closeAll(long eventId, String eventName, Object data) {
         closeAll(eventId, eventName, data, null);
@@ -121,17 +105,9 @@ public class SseEmitterRegistry {
     }
 
     /**
-     * A live frame, deliberately carrying <strong>no</strong> {@code id}.
-     *
-     * <p>The SSE specification leaves a client's last-event-id untouched by an event with no
-     * {@code id} field, so a position update does not overwrite the sequence a reconnect must send
-     * back. That is the whole mechanism: only replayable frames are numbered
-     * ({@link QueueReplayService}), everything else is derived from live state on connect, and the
-     * {@code Last-Event-ID} a browser returns is therefore always a sequence the replay log knows.
-     *
-     * <p>An earlier cut gave these frames a per-connection {@code "local-N"} id. Positions arrive
-     * every two seconds, so a reconnect almost always quoted one — and the replay log, which parses
-     * the id as a number, answered every one of them with nothing. The feature could not fire.
+     * A live frame, deliberately carrying <strong>no</strong> {@code id}. The SSE spec leaves a
+     * client's last-event-id untouched by such a frame, so the {@code Last-Event-ID} a reconnect sends
+     * is always a sequence the replay log minted ({@link QueueReplayService}, ADR-058).
      */
     public boolean send(String sessionId, String eventName, Object data) {
         return sendWithId(sessionId, eventName, data, null);
@@ -207,14 +183,9 @@ public class SseEmitterRegistry {
     }
 
     /**
-     * Both halves of the per-event index go through {@code compute}, so they hold the same per-key
-     * lock.
-     *
-     * <p>Read and written separately, they raced: the last session of an event unindexing would see
-     * the set empty and remove it, while a connect arriving in between had already added itself to
-     * that same instance. The two-argument {@code remove} matches on identity and dropped it anyway,
-     * leaving a live connection indexed in a map nothing iterates — no position frames and no
-     * {@code sale-closed} until its one-hour timeout.
+     * Both halves of the per-event index go through {@code compute}, under one per-key lock. Done
+     * separately, an unindex and a concurrent connect raced, leaving a live connection that no sweep
+     * reaches.
      */
     private void index(String sessionId, long eventId) {
         sessionsByEvent.compute(eventId, (ignored, sessions) -> {

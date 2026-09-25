@@ -15,32 +15,18 @@ import org.springframework.stereotype.Service;
 import io.micrometer.core.instrument.Counter;
 import io.micrometer.core.instrument.MeterRegistry;
 /**
- * Verifies a provider delivery, claims it once, and lets {@code order} settle it.
+ * Verifies a provider delivery, claims it once, and lets {@code order} settle it: the path for a
+ * charge whose response the buyer never saw.
  *
- * <p>This is the path that exists because the synchronous one can be cut: the charge succeeded and
- * the buyer never saw the response — a dropped connection, a killed replica, a closed laptop. The
- * money moved and nothing in this system knows it.
- *
- * <p><strong>Not {@code @Transactional}.</strong> The claim and its release are short transactions
- * on {@link WebhookEventStore}; the settlement between them is {@code order}'s own transaction,
- * reached by an event. One transaction spanning all three would put another module's work — and, on
- * the refund arm, a network round trip to the provider — inside a SQL transaction (ADR-023).
- *
- * <p>The sequence, and why each step is where it is:
+ * <p>Not {@code @Transactional}: the claim and release are short transactions on
+ * {@link WebhookEventStore}, and settlement is {@code order}'s own (ADR-023). The sequence:
  *
  * <ol>
- *   <li><strong>Verify the signature over the raw bytes.</strong> The endpoint is unauthenticated by
- *       necessity — the provider cannot hold a session — so this is the only gate, and it has to
- *       happen before anything reads the body as anything but bytes.
- *   <li><strong>Ignore every other event type, with a {@code 200}.</strong> A non-2xx would ask the
- *       provider to redeliver something we will go on ignoring.
- *   <li><strong>Claim it.</strong> {@code ON CONFLICT DO NOTHING}; the rowcount is the answer. Zero
- *       means another replica, or an earlier delivery of the same event, already has it.
- *   <li><strong>Publish synchronously.</strong> The contract of this method is that a failed
- *       settlement becomes a non-2xx, and an asynchronous listener's failure cannot be reported.
- *   <li><strong>Release on failure.</strong> A claim must not survive the failure of the work it
- *       guarded (ADR-038): otherwise the redelivery is dismissed as a duplicate and the buyer's
- *       charge never reaches an order.
+ *   <li>verify the signature over the raw bytes, the only gate on an unauthenticated endpoint
+ *   <li>ignore other event types with {@code 200}, so the provider does not redeliver them
+ *   <li>claim with {@code ON CONFLICT DO NOTHING}; rowcount 0 means someone already has it
+ *   <li>publish synchronously, so a failed settlement becomes a non-2xx
+ *   <li>release the claim on failure, so the redelivery is not dismissed as a duplicate (ADR-053)
  * </ol>
  */
 @Slf4j

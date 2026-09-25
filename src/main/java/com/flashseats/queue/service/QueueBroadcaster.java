@@ -100,16 +100,9 @@ public class QueueBroadcaster {
     }
 
     /**
-     * Sweeps this replica's own connections.
-     *
-     * <p><strong>Driven by the emitters, not by the open-event list</strong> (ADR-036). Sweeping
-     * open events meant a sale that closed on the clock fell out of the loop entirely: nothing sent
-     * another frame, nothing closed the stream, and everyone still waiting watched a frozen counter
-     * until they thought to reload. The connections are what need serving, so they are what the
-     * sweep iterates.
-     *
-     * <p>The window is resolved once per event and handed down, so adding it costs one read per
-     * event rather than one per waiting buyer.
+     * Sweeps this replica's own connections, driven by the emitters rather than the open-event list, so
+     * a sale that closes on the clock still reaches its streams (ADR-036). The window is resolved once
+     * per event.
      */
     @Scheduled(
             fixedDelayString = "${flashseats.queue.sse-position-interval-ms}",

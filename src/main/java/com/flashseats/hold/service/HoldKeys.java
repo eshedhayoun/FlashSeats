@@ -1,14 +1,9 @@
 package com.flashseats.hold.service;
 
 /**
- * The only Redis key this module owns.
- *
- * <p>{@code hold:{token}} is an <strong>expiry timer and nothing else</strong>. It carries no state:
- * {@code ticket_holds} is the authority for a hold's lifecycle, and if every key here vanished the
- * table would still describe the truth — the sweeper would simply reclaim seconds later instead of
- * milliseconds. That is the whole design (ADR-019): an earlier draft kept the settle-once claim in
- * Redis, which meant consuming a hold mutated Redis inside the order's SQL transaction, and a failed
- * commit left the claim spent and the seats permanently unsellable.
+ * The only Redis key this module owns. {@code hold:{token}} is an <strong>expiry timer and nothing
+ * else</strong>: {@code ticket_holds} is the authority, and if every key vanished the sweeper would
+ * simply reclaim seconds later (ADR-019).
  */
 final class HoldKeys {
 

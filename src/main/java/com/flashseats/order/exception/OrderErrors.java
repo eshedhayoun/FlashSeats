@@ -54,16 +54,10 @@ public final class OrderErrors {
     }
 
     /**
-     * A resend was asked for, but the message it would replay no longer exists.
-     *
-     * <p>{@code outbox_events} keeps payloads for {@code flashseats.outbox.purge-after-days} and the
-     * nightly purge has removed this one. The ticket is not recoverable by replay: the snapshot it was
-     * rendered from is gone, and rebuilding one from the current catalog would produce a ticket for
-     * the event as it is <em>now</em> rather than as it was sold.
-     *
-     * <p>{@code 410 Gone} rather than {@code 404}, and the distinction is the useful part of the
-     * answer: the order existed and its message existed, they have simply aged out. A {@code 404}
-     * would send an operator looking for a typo in the order number.
+     * A resend was asked for, but the outbox payload has passed
+     * {@code flashseats.outbox.purge-after-days}. It is not reconstructed from the current catalog,
+     * which would print the event as it is now, not as it was sold. {@code 410 Gone}, not {@code 404}:
+     * the order exists, its message aged out.
      */
     public static FlashSeatsException notificationPayloadUnavailable(String orderNumber) {
         return new FlashSeatsException(

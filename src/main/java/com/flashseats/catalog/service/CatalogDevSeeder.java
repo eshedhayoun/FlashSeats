@@ -23,26 +23,10 @@ import org.springframework.stereotype.Component;
 import org.springframework.transaction.support.TransactionTemplate;
 
 /**
- * Seeds a demonstrable sale on the {@code dev} profile so the app is walkable the moment it starts.
- *
- * <p>Three events, each earning its place:
- *
- * <ul>
- *   <li><strong>An OPEN sale</strong> with its counters written directly. Pre-warm cannot be used
- *       here: it refuses on anything but an {@code UPCOMING} window (ADR-004), so a demo event that
- *       is open on startup would otherwise have no counters and every hold would answer 503.
- *   <li><strong>A second OPEN sale</strong>, also counter-seeded, so two independent frontend
- *       journeys are walkable at once — which is what rule 5 of {@code FE_SPEC} (concurrent sales)
- *       needs in order to be exercised by hand at all.
- *   <li><strong>An UPCOMING sale with no counter</strong>, which is the only way to reach two things.
- *       {@code POST /admin/events/&#123;id&#125;/prewarm} refuses any other window, so without an
- *       {@code UPCOMING} event on dev it cannot be demonstrated or tried; and the client's countdown
- *       view has nothing to render. Both were lost when this seeder briefly made every event
- *       {@code OPEN}, and neither failed a test, because nothing tests a development affordance.
- * </ul>
- *
- * <p>Runs only when the database is empty, so a restart never duplicates or resets a sale in
- * progress.
+ * Seeds a walkable sale on the {@code dev} profile: two OPEN events with counters written directly
+ * (pre-warm refuses an open window, ADR-004), so two journeys can run at once, and one UPCOMING
+ * event with no counter, so pre-warm and the countdown can be exercised. Runs only on an empty
+ * database, so a restart never resets a sale in progress.
  */
 @Slf4j
 @Component

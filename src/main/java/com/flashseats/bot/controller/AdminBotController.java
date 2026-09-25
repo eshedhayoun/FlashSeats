@@ -20,17 +20,10 @@ import org.springframework.web.bind.annotation.ResponseStatus;
 import org.springframework.web.bind.annotation.RestController;
 
 /**
- * The manual override, and the record of what was refused.
- *
- * <p>Until Stage 2 this module had no operator surface at all, which meant an address flooding a
- * sale could be answered only by changing a property and restarting three replicas — during the
- * sale. ADR-043 calls the operator surface a correctness dependency; this is the bot half of it.
- *
- * <p><strong>A change takes effect cluster-wide within {@code ip-rule-cache-ttl-ms}</strong> (10 s),
- * not instantly. The replica that serves the call drops its snapshot immediately; the others pick it
- * up when theirs expires. That is the design, not a limitation of it — the alternative is reading
- * {@code ip_rules} per request, which would put this list inside the connection pool the rate
- * limiter exists to protect (ADR-051, ADR-055).
+ * The manual override, and the record of what was refused (ADR-043). A change applies cluster-wide
+ * within {@code ip-rule-cache-ttl-ms} (10 s): the serving replica drops its snapshot at once, and the
+ * others when theirs expires. Reading {@code ip_rules} per request instead would put the rate
+ * limiter inside the pool it protects (ADR-055).
  *
  * <p>Guarded by {@code ROLE_ADMIN} in {@link com.flashseats.app.SecurityConfig}.
  */

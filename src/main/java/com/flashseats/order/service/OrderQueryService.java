@@ -52,14 +52,9 @@ public class OrderQueryService implements OrderFacade {
     }
 
     /**
-     * An order read by an operator, who has neither the buyer's cookie nor their receipt token.
-     *
-     * <p>{@link #readAuthorised} cannot serve this: its whole job is to refuse a caller presenting
-     * neither, so for an operator it always throws. The authorisation happens one layer up instead,
-     * at {@code ROLE_ADMIN} on {@code /api/v1/admin/**} — which is the right place for it, since
-     * "this person operates the system" is not a fact about the order.
-     *
-     * <p>Returns {@link AdminOrderResponse}, which withholds the receipt token. See that record.
+     * An order read by an operator, who holds neither the cookie nor the receipt token. It is
+     * authorised one layer up by {@code ROLE_ADMIN}, and returns {@link AdminOrderResponse}, which
+     * withholds the receipt token.
      */
     @Transactional(readOnly = true)
     public AdminOrderResponse readForOperator(String orderNumber) {
@@ -106,14 +101,8 @@ public class OrderQueryService implements OrderFacade {
     }
 
     /**
-     * This session's most recent order for an event, whatever its status.
-     *
-     * <p>Feeds rehydration, which needs to answer "where is this buyer?" — and "they already bought"
-     * is one of the answers (ADR-037). Restricting it to {@code PENDING} made a confirmed purchase
-     * invisible the moment the page reloaded.
-     *
-     * <p>The status crosses as a string: {@code OrderStatus} is this module's business, not a shared
-     * type.
+     * This session's most recent order for an event, whatever its status, because "they already bought"
+     * is one answer rehydration needs (ADR-037). The status crosses as a string.
      */
     @Override
     @Transactional(readOnly = true)
@@ -157,22 +146,10 @@ public class OrderQueryService implements OrderFacade {
     }
 
     /**
-     * Everything the ticket renderer needs, once the caller has proved the order is theirs (ADR-050).
-     *
-     * <p><strong>Authorisation is the same two ways in as {@link #readAuthorised}</strong> — a
-     * matching session cookie or a valid receipt token — and it sits beside it deliberately, so the
-     * two cannot drift. An unauthorised caller gets {@code 404}, never {@code 403}: confirming the
-     * order exists is itself a leak and would make order numbers enumerable.
-     *
-     * <p><strong>Only a {@code CONFIRMED} order has a ticket.</strong> Rendering for any other status
-     * would mint a document indistinguishable from a real ticket for a purchase that did not
-     * complete. {@code REFUNDED} is the sharp case: the money has already gone back, so a PDF that
-     * still admits someone at a door is worse than none.
-     *
-     * <p>Returns the document rather than the bytes because <strong>rendering must not happen inside
-     * this transaction</strong> (ADR-023). PDFBox builds a document in memory — CPU work, not SQL —
-     * and holding a pooled connection across it puts a page render in front of the pool that
-     * checkout is competing for.
+     * What the ticket renderer needs, once the caller has proved the order is theirs (ADR-050).
+     * Authorised exactly like {@link #readAuthorised}; an unauthorised caller gets {@code 404}, never
+     * {@code 403}, so order numbers cannot be enumerated. Only a {@code CONFIRMED} order has a ticket.
+     * Returns the document, not the bytes: rendering must not happen inside this transaction (ADR-023).
      */
     @Transactional(readOnly = true)
     public TicketDocument ticketDocumentFor(

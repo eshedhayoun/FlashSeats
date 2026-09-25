@@ -19,20 +19,10 @@ import org.springframework.data.repository.query.Param;
 public interface OutboxEventRepository extends JpaRepository<OutboxEvent, UUID> {
 
     /**
-     * The oldest row in one status, for the fulfilment-lag gauge.
-     *
-     * <p><strong>By status, not by {@code <> PROCESSED}</strong>, and that is the whole point. The
-     * two indexes this table has are partial — `(created_at) WHERE status = 'PENDING'` and
-     * `(claimed_at) WHERE status = 'PROCESSING'` (`V3`) — and PostgreSQL cannot prove that
-     * {@code status <> 'PROCESSED'} implies either predicate. Asked that way the gauge sequentially
-     * scanned the whole table, <em>including</em> every processed row not yet purged, every ten
-     * seconds, on every replica: an observer putting load on the pool it exists to observe, which is
-     * ADR-051's trap reached through a metric.
-     *
-     * <p>Two bounded reads instead of one unbounded one. {@code PENDING} is served by its index
-     * directly; {@code PROCESSING} holds only in-flight claims — a batch per replica — so scanning
-     * its partial index costs nothing. Deliberately **no new index**: this table is written on every
-     * checkout, and `V12` has already had to drop indexes nothing queried.
+     * The oldest row in one status, for the fulfilment-lag gauge. Asked per status, never as
+     * {@code <> PROCESSED}: only the per-status form can use the partial indexes from {@code V3}, and the
+     * other form scanned the whole table on every replica every ten seconds (ADR-051's trap, via a
+     * metric). No new index: this table is written on every checkout.
      */
     @Query("SELECT MIN(e.createdAt) FROM OutboxEvent e WHERE e.status = :status")
     Optional<Instant> oldestCreatedAtWithStatus(@Param("status") OutboxStatus status);

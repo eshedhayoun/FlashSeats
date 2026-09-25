@@ -19,37 +19,16 @@ import org.springframework.amqp.rabbit.core.RabbitTemplate;
 /**
  * Publishes outbox rows to the broker, and reports only what the broker <strong>kept</strong>.
  *
- * <p>The exchange and routing keys are repeated here rather than imported from {@code notification},
- * on purpose. The two modules are coupled by the <strong>wire format</strong>, not by a Java type:
- * importing a constant would create a compile-time dependency across an asynchronous boundary and
- * make one module's redeploy the other's problem. Two short strings are the honest price of that
- * independence.
+ * <p>The exchange and routing keys are repeated rather than imported from {@code notification}: the
+ * modules share a wire format, not a Java type. Called with no transaction open; messages are
+ * persistent.
  *
- * <p>Called from {@link OutboxRelay} with no transaction open. Messages are persistent, so an order
- * confirmed while the broker restarts still has its ticket queued when it returns.
- *
- * <h2>Why this waits, and what it waits for</h2>
- *
- * <p>{@code RabbitTemplate.send} is fire-and-forget: it returns once the frame is written to the
- * socket. The relay used to mark a row {@code PROCESSED} on that basis, which means a broker that
- * accepted the bytes and died before persisting them lost the message <em>with the outbox row
- * already burned</em> — precisely the failure an outbox exists to prevent.
- *
- * <p>So every message carries a {@link CorrelationData} and this class waits for the publisher
- * confirm. <strong>Two independent things can go wrong and only one of them is an ack</strong>:
- *
- * <ul>
- *   <li>A <strong>nack</strong> means the broker refused it.
- *   <li>A <strong>return</strong> means the broker accepted it and had nowhere to put it. A confirm
- *       says "I have this message", not "a queue has this message" — an exchange with no matching
- *       binding acks happily and discards. That is not hypothetical here: the whole topology lives
- *       behind {@code flashseats.notification.enabled}, so a deployment with notification switched
- *       off everywhere has an exchange bound to nothing, and every ticket would be confirmed into
- *       the void. {@code mandatory} plus publisher-returns is what turns that into a failure.
- * </ul>
- *
- * <p>Both are treated the same way: the id is left out of the result, the row stays
- * {@code PROCESSING}, and the stale-claim sweep retries it.
+ * <p>Each message carries {@link CorrelationData} and this waits for the publisher confirm, because
+ * {@code send} alone returns once bytes hit the socket (ADR-048). Two outcomes are failures: a
+ * <strong>nack</strong> (refused) and a <strong>return</strong> (accepted, but routed to no queue;
+ * a confirm means the broker has the message, not a queue). {@code mandatory} plus publisher-returns
+ * catches the second. Either way the id is left out, the row stays {@code PROCESSING}, and the
+ * stale-claim sweep retries it.
  */
 @Slf4j
 public class RabbitOutboxPublisher implements OutboxPublisher {

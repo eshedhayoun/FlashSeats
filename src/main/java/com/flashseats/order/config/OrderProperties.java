@@ -26,29 +26,15 @@ public class OrderProperties {
     private int minRemainingSecondsForRetry = 45;
 
     /**
-     * How long a {@code PENDING} order is presumed to have a charge in flight (ADR-034).
-     *
-     * <p>Past this, the row is treated as stranded and a retry resumes it on the same order number.
-     * It mirrors {@code flashseats.payment.inflight-ttl-seconds} — the duplicate-click guard whose
-     * expiry means no charge can still be running — but is declared here rather than read across
-     * the module boundary.
-     *
-     * <p><strong>Never zero.</strong> A value below the gateway timeout would let a second request
-     * start a charge while the first is still live.
+     * How long a {@code PENDING} order is presumed to have a charge in flight (ADR-034); past it, a
+     * retry resumes the order. It mirrors {@code flashseats.payment.inflight-ttl-seconds}. Never below
+     * the gateway timeout, or a second charge could start while the first is live.
      */
     private int stalePendingSeconds = 90;
 
     /**
-     * How long a rebuild waits between its two ledger snapshots.
-     *
-     * <p>A reserve decrements Redis a moment before its {@code ticket_holds} row commits, so a single
-     * snapshot can miss a hold that is seconds from existing and compute a count that is too high —
-     * an oversell written by the very procedure meant to repair one. Two snapshots a settling window
-     * apart, and the smaller of the two, make that impossible: an in-flight hold has landed by the
-     * second read, while seats genuinely abandoned read the same both times and are correctly
-     * returned.
-     *
-     * <p>Must comfortably exceed the reserve-to-insert window, which is one local INSERT.
+     * How long a rebuild waits between its two ledger snapshots, so a reserve whose hold row has not
+     * yet committed is caught by the second read. Must comfortably exceed one local INSERT.
      */
     private int rebuildSettleMillis = 1_000;
 

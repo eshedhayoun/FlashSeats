@@ -9,22 +9,13 @@ import org.springframework.data.redis.listener.ChannelTopic;
 import org.springframework.data.redis.listener.RedisMessageListenerContainer;
 
 /**
- * Subscribes this replica to Redis key-expiry events.
+ * Subscribes this replica to Redis key-expiry events. It has its own listener container, because
+ * reusing {@code queue}'s would reach into another module's {@code config}. It uses a
+ * {@link ChannelTopic}: {@code __keyevent@<db>__:expired} is one channel for every key, filtered by
+ * prefix in {@link HoldExpiryListener}.
  *
- * <p><strong>Its own container, not {@code queue}'s.</strong> {@code QueuePubSubConfig} declares one
- * for promotion fan-out, and reusing it would mean this module reaching into another's
- * {@code config} package — a boundary violation {@code ApplicationModules.verify()} exists to catch.
- * A second container is a handful of connections, which is the correct price.
- *
- * <p>A {@link ChannelTopic}, not a pattern. {@code __keyevent@<db>__:expired} is a single channel
- * carrying every expiring key in the database, so there is nothing to pattern-match on — the
- * filtering happens in {@link HoldExpiryListener}, by key prefix, because Redis offers no way to do
- * it server-side.
- *
- * <p>This requires {@code notify-keyspace-events Ex} on the server, which
- * {@code docker/redis/redis.conf} sets. Without it the subscription succeeds, no event ever arrives,
- * and expiry silently falls back to the sweeper — correct, just slower. That is the right failure
- * mode for a component whose entire job is speed, and it is why nothing here asserts the setting.
+ * <p>Needs {@code notify-keyspace-events Ex} (set in {@code redis.conf}). Without it nothing arrives
+ * and expiry falls back to the sweeper: correct, only slower.
  */
 @Configuration
 public class HoldExpiryConfig {

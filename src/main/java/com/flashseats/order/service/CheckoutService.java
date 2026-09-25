@@ -22,33 +22,23 @@ import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
 
 /**
- * The single checkout entry point, and the riskiest code in the system.
- *
- * <p>The sequence below is ADR-001 in order, and the order is the design:
+ * The single checkout entry point. The sequence is ADR-001 in order:
  *
  * <ol>
- *   <li>validate the hold — nothing happens without live, owned seats
- *   <li>price it <strong>server-side</strong>; no client value reaches the amount
+ *   <li>validate the hold
+ *   <li>price it <strong>server-side</strong>
  *   <li>check the sale window
- *   <li>find-or-create the order row on {@code UNIQUE(hold_token)}
- *   <li>grant the single grace extension — <strong>and abort if it cannot be granted</strong>
+ *   <li>find-or-create the order on {@code UNIQUE(hold_token)}
+ *   <li>grant the single grace extension, and abort if it cannot be granted
  *   <li>charge, <strong>outside every transaction</strong>
- *   <li>in one transaction: consume the hold, confirm the order, write the items and the outbox row
- *   <li>after commit: best-effort cleanup that is safe to lose
- *   <li>if the commit failed after money moved: refund, and tell the buyer
+ *   <li>in one transaction: consume the hold, confirm, write items and the outbox row
+ *   <li>after commit: best-effort cleanup
+ *   <li>if the commit failed after money moved: refund, and say so
  * </ol>
  *
- * <p><strong>Every exit past step 4 leaves the order resumable</strong> (ADR-034). The row is
- * committed as {@code PENDING} before the charge, so an exit that recorded no outcome — a gateway
- * outage, a hold settled underneath us, too little time left — would otherwise strand the buyer
- * holding seats they can no longer buy, being told by a {@code 409} that a charge they never made
- * is still running.
- *
- * <p><strong>This class is deliberately not {@code @Transactional}.</strong> It calls an external
- * provider; a transaction spanning that call would hold a pooled connection across a network round
- * trip, and under virtual threads the pool — not the thread count — is the system's real concurrency
- * limit, so one slow gateway would throttle checkout for everyone (ADR-023). The transactional work
- * lives in {@link OrderCommitService}.
+ * <p>Every exit past step 4 leaves the order resumable (ADR-034). Not {@code @Transactional}: it
+ * calls the provider, and a pooled connection held across that call throttles every checkout
+ * (ADR-023). The transactional steps are in {@link OrderCommitService}.
  */
 @Slf4j
 @Service

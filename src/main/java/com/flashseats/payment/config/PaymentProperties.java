@@ -11,10 +11,8 @@ import org.springframework.boot.context.properties.ConfigurationProperties;
 public class PaymentProperties {
 
     /**
-     * How long the duplicate-click guard holds a hold token, roughly one gateway timeout (ADR-014).
-     *
-     * <p>Deliberately short. An earlier design used 24 hours, which meant a crash mid-charge locked
-     * that buyer out for a day.
+     * How long the duplicate-click guard holds a hold token: about one gateway timeout (ADR-014). It is
+     * short so a crash mid-charge does not lock a buyer out.
      */
     private int inflightTtlSeconds = 90;
 
@@ -23,17 +21,9 @@ public class PaymentProperties {
     private final Breaker breaker = new Breaker();
 
     /**
-     * The real provider.
-     *
-     * <p>{@code enabled} defaults to <strong>false</strong>, which is what keeps a clean checkout
-     * working with no configuration: {@code dev}, {@code test} and the load harness run the stub,
-     * which drives every branch of the checkout sequence — decline, outage, 3-D Secure — without
-     * keys or network.
-     *
-     * <p>{@code webhookSecret} is read on <em>every</em> profile, independently of {@code enabled}.
-     * Signature verification is the webhook receiver's front door and the integration tests sign
-     * their own payloads with this value, so gating it on {@code enabled} would leave the endpoint
-     * untested on exactly the configuration the tests run.
+     * The real provider. {@code enabled} defaults to <strong>false</strong>, so {@code dev}, {@code test}
+     * and the load harness run the stub. {@code webhookSecret} is read on every profile, because the
+     * tests sign their own webhook payloads with it.
      */
     @Getter
     @Setter

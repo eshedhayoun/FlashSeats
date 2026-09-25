@@ -8,15 +8,9 @@ import org.springframework.transaction.event.TransactionPhase;
 import org.springframework.transaction.event.TransactionalEventListener;
 
 /**
- * Side effects that must not be inside the order transaction.
- *
- * <p>Everything here is <strong>best-effort and safe to lose</strong>, which is the condition for
- * living in {@code AFTER_COMMIT} at all (ADR-023). If none of it runs, the system is still correct:
- * the hold is already {@code CONSUMED}, so its timer expiring changes nothing, and the buyer's
- * admission lapses on its own.
- *
- * <p>Failures are logged and swallowed deliberately. Throwing here would achieve nothing — the
- * transaction has already committed and the buyer already has their tickets.
+ * Side effects kept out of the order transaction, all <strong>best-effort and safe to lose</strong>
+ * (ADR-023): the hold is already {@code CONSUMED}, and the admission lapses on its own. Failures are
+ * logged and swallowed; the transaction has already committed.
  */
 @Slf4j
 @Component
