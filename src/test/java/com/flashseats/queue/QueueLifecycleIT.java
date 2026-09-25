@@ -3,9 +3,9 @@ package com.flashseats.queue;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.awaitility.Awaitility.await;
 
-import com.flashseats.flashseats.support.BuyerSession;
-import com.flashseats.flashseats.support.IntegrationTest;
-import com.flashseats.flashseats.support.SaleFixture;
+import com.flashseats.app.support.BuyerSession;
+import com.flashseats.app.support.IntegrationTest;
+import com.flashseats.app.support.SaleFixture;
 import com.flashseats.queue.config.QueueOrdering;
 import com.flashseats.queue.config.QueueProperties;
 import com.flashseats.queue.service.QueueBroadcaster;

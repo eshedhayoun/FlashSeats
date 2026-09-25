@@ -32,7 +32,7 @@ import org.springframework.web.bind.annotation.RestController;
  * {@code ip_rules} per request, which would put this list inside the connection pool the rate
  * limiter exists to protect (ADR-051, ADR-055).
  *
- * <p>Guarded by {@code ROLE_ADMIN} in {@link com.flashseats.flashseats.config.SecurityConfig}.
+ * <p>Guarded by {@code ROLE_ADMIN} in {@link com.flashseats.app.SecurityConfig}.
  */
 @RestController
 @RequestMapping("/api/v1/admin/bot")

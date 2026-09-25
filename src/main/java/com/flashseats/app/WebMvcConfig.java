@@ -1,4 +1,4 @@
-package com.flashseats.flashseats.config;
+package com.flashseats.app;
 
 import com.flashseats.shared.identity.SessionIdArgumentResolver;
 import java.util.List;

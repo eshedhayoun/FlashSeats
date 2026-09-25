@@ -1,4 +1,4 @@
-package com.flashseats.flashseats.config;
+package com.flashseats.app;
 
 import com.flashseats.shared.error.ErrorCode;
 import com.flashseats.shared.error.ProblemDetails;

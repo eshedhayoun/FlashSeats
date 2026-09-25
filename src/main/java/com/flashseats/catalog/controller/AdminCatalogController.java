@@ -9,7 +9,7 @@ import org.springframework.web.bind.annotation.RestController;
 
 /**
  * Operator endpoints. Guarded by {@code ROLE_ADMIN} in
- * {@link com.flashseats.flashseats.config.SecurityConfig} — "admin only" is an enforced role here,
+ * {@link com.flashseats.app.SecurityConfig} — "admin only" is an enforced role here,
  * not a comment.
  */
 @RestController

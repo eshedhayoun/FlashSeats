@@ -1,4 +1,4 @@
-package com.flashseats.flashseats;
+package com.flashseats.app;
 
 import org.junit.jupiter.api.Test;
 import org.springframework.modulith.core.ApplicationModules;

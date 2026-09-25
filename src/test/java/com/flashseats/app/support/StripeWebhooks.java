@@ -1,4 +1,4 @@
-package com.flashseats.flashseats.support;
+package com.flashseats.app.support;
 
 import java.nio.charset.StandardCharsets;
 import java.time.Instant;

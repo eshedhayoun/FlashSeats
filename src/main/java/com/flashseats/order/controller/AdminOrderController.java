@@ -18,7 +18,7 @@ import org.springframework.web.bind.annotation.RestController;
  * notifications, because that is what the operator is thinking about; the same split
  * {@code AdminStockController} makes, for the same reason.
  *
- * <p>Guarded by {@code ROLE_ADMIN} in {@link com.flashseats.flashseats.config.SecurityConfig}.
+ * <p>Guarded by {@code ROLE_ADMIN} in {@link com.flashseats.app.SecurityConfig}.
  */
 @RestController
 @RequestMapping("/api/v1/admin")
