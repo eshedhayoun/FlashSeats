@@ -2422,3 +2422,42 @@ the pack becomes a problem.
 - The replay log is now safe to read by anyone who can read Redis, which is what lets it stay a
   per-event key rather than a per-session one.
 - A reader can tell what is built by reading the documents again.
+
+---
+
+## ADR-059 — A connection-pool timeout is back-pressure: `503 SERVICE_BUSY`, not `500`
+
+**Context.** Under virtual threads the HikariCP pool is the system's real concurrency ceiling, and a
+request that waits `connection-timeout` (3 s) for it throws `SQLTransientConnectionException`,
+wrapped by Spring as `CannotCreateTransactionException` or `CannotGetJdbcConnectionException`.
+Nothing named either, so both fell to `GlobalExceptionHandler`'s `Exception` backstop and a buyer
+mid-checkout was told **`500 INTERNAL_ERROR`** — 1,218 times across three replicas in the 2,000-VU
+run (`06` §11). The recovery was already correct: checkout is find-or-create, so re-POSTing the same
+body resumes the same order. The *answer* was wrong — the least actionable code in the registry, at
+exactly the moment a buyer most needed to be told "retry".
+
+**Decision.** A new registry code, `SERVICE_BUSY` (`503`, `shared`), carrying a `Retry-After: 1`
+header and `retryable: true, retryAfterSeconds: 1` — the extension members `RATE_LIMITED` and
+`PAYMENT_GATEWAY_UNAVAILABLE` already use. The handler classifies by **cause, not by wrapper**: only
+an `SQLTransientConnectionException` somewhere in the chain is busy. `CannotCreateTransactionException`
+also means "the database is down" and "the credentials are wrong", and telling a client to retry either
+in one second would be a lie — those still reach the backstop and answer `500`. Logged at `WARN`:
+back-pressure under a spike is expected, and an `ERROR` per rejected request buries real faults.
+
+**What it deliberately does not change.** `CheckoutService` refunds when `commit.confirm` throws after
+a successful charge. A pool timeout there is a transaction that never *began*, which is a definite
+failure, so the refund is right (ADR-056) and the buyer still gets `409 ORDER_REFUNDED`. The new
+handler only sees pool timeouts that happen before money moves, which the `unresolved` catch already
+rethrows unchanged after marking the order resumable (ADR-034).
+
+**Why one second.** A pool of 30 turning over millisecond transactions frees hundreds of connections a
+second when it is merely saturated; a longer hint would idle a buyer whose retry would have worked.
+`FE_SPEC` caps client retries at a handful and then asks the human, so a pool that stays exhausted does
+not become a retry storm above the API.
+
+**Consequences.**
+
+- The client contract gains one code, on any endpoint, with "Try again" enabled and seats untouched
+  (`FE_SPEC` §2 and the checkout error table).
+- Filters run before `DispatcherServlet`; a pool timeout inside one (the `ip_rules` snapshot reload)
+  still answers whatever that filter answers. ADR-055/056 already keep the request path off the pool.

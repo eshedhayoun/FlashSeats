@@ -265,7 +265,10 @@ Honest list. None of these is hidden behind a passing test.
   in the run that sold 76 % of capacity. **The 300-VU five-sale number is the real open one**: 682 ms →
   9.3 s for the same VU count spread over five sales is a 13× cost that the pool does not explain, and
   finding what does is the next latency question. It needs a host where k6 is not competing for cores.
-- **A pool timeout surfaces to a buyer as `500 INTERNAL_ERROR` mid-checkout.** Not seen in the runs that
+- ~~**A pool timeout surfaces to a buyer as `500 INTERNAL_ERROR` mid-checkout.**~~ **Fixed (Pass 13,
+  ADR-059):** it is now `503 SERVICE_BUSY` with `Retry-After: 1`, classified by HikariCP's own
+  `SQLTransientConnectionException` in the cause chain so a database that is genuinely down still
+  answers `500`. The original finding, kept for the record: not seen in the runs that
   sell out — `pending` stays at zero there — but with `connection-timeout=3000`, CPU starvation produced
   1,218 of them across three replicas in the 2,000-VU run; one order was left `FAILED`. The compensation held — that tier's `sold + held + redis` was still
   exactly 500, so no seats were stranded — and a buyer's documented recovery (re-POST the same body)
