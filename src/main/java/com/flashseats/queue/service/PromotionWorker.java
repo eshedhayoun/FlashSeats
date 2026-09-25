@@ -255,7 +255,7 @@ public class PromotionWorker {
     }
 
     private void expireWithSale(String key, Instant now, Instant saleEndTime) {
-        QueueKeyLifetimes.expireWithSale(
+        QueueKeys.expireWithSale(
                 redis, key, now, saleEndTime, properties.getKeyRetentionAfterSaleSeconds());
     }
 

@@ -1,8 +1,6 @@
 package com.flashseats.hold.service;
 
 import com.flashseats.catalog.facade.CatalogFacade;
-import com.flashseats.hold.event.TicketHeldEvent;
-import com.flashseats.hold.event.TicketHoldSettledEvent;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Component;
 import org.springframework.transaction.event.TransactionPhase;

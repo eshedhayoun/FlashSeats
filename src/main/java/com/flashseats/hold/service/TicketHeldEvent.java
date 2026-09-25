@@ -1,4 +1,4 @@
-package com.flashseats.hold.event;
+package com.flashseats.hold.service;
 
 import java.time.Instant;
 

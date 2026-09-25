@@ -1,4 +1,4 @@
-package com.flashseats.hold.event;
+package com.flashseats.hold.service;
 
 import com.flashseats.hold.model.HoldStatus;
 import com.flashseats.hold.model.SettleReason;

@@ -118,7 +118,7 @@ public class QueueService implements QueueFacade {
     }
 
     private void expireWithSale(String key, Instant saleEndTime) {
-        QueueKeyLifetimes.expireWithSale(
+        QueueKeys.expireWithSale(
                 redis, key, clock.instant(), saleEndTime, properties.getKeyRetentionAfterSaleSeconds());
     }
 

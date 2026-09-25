@@ -6,7 +6,6 @@ import com.flashseats.hold.facade.HoldSummary;
 import com.flashseats.order.config.OrderProperties;
 import com.flashseats.order.dto.OrderItemResponse;
 import com.flashseats.order.dto.OrderReceiptResponse;
-import com.flashseats.order.event.OrderConfirmedEvent;
 import com.flashseats.order.exception.OrderErrors;
 import com.flashseats.order.model.Order;
 import com.flashseats.order.model.OrderItem;

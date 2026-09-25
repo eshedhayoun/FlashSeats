@@ -32,7 +32,7 @@ public class AdminCatalogController {
      * Halts a live sale.
      *
      * <p>Every gate closes immediately — the queue admits nobody, no hold can be taken, no checkout
-     * starts — because a paused event is not {@code PUBLISHED} and {@code SaleWindows} already reads
+     * starts — because a paused event is not {@code PUBLISHED} and {@link com.flashseats.catalog.service.EventRow#windowStatus} already reads
      * the window as {@code CLOSED}.
      *
      * <p><strong>Nothing is destroyed.</strong> The waiting room keeps every position, live passes

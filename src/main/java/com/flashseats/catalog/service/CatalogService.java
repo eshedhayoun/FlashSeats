@@ -79,7 +79,7 @@ public class CatalogService implements CatalogFacade {
                         event.venueName(),
                         event.eventStartTime(),
                         event.saleStartTime(),
-                        SaleWindows.statusOf(event, now)))
+                        event.windowStatus(now)))
                 .toList();
     }
 
@@ -114,7 +114,7 @@ public class CatalogService implements CatalogFacade {
                 event.eventStartTime(),
                 event.saleStartTime(),
                 event.saleEndTime(),
-                SaleWindows.statusOf(event, now),
+                event.windowStatus(now),
                 now,
                 tierResponses);
     }
@@ -140,7 +140,7 @@ public class CatalogService implements CatalogFacade {
                 event.venueName(),
                 event.eventStartTime(),
                 event.saleEndTime(),
-                SaleWindows.statusOf(event, clock.instant()));
+                event.windowStatus(clock.instant()));
     }
 
     @Override
@@ -153,12 +153,12 @@ public class CatalogService implements CatalogFacade {
                 event.eventStartTime(),
                 event.saleStartTime(),
                 event.saleEndTime(),
-                SaleWindows.statusOf(event, clock.instant()));
+                event.windowStatus(clock.instant()));
     }
 
     @Override
     public EventWindowStatus getWindowStatus(long eventId) {
-        return SaleWindows.statusOf(metadata.event(eventId), clock.instant());
+        return metadata.event(eventId).windowStatus(clock.instant());
     }
 
     /**
@@ -382,7 +382,7 @@ public class CatalogService implements CatalogFacade {
      */
     public int prewarm(long eventId) {
         EventRow event = EventRow.of(requireEvent(eventId));
-        if (SaleWindows.statusOf(event, clock.instant()) != EventWindowStatus.UPCOMING) {
+        if (event.windowStatus(clock.instant()) != EventWindowStatus.UPCOMING) {
             throw CatalogErrors.prewarmWindowClosed(eventId);
         }
 
@@ -486,7 +486,7 @@ public class CatalogService implements CatalogFacade {
     }
 
     private AvailabilityLevel bucketOf(TierRow tier, Map<Long, Integer> remainingByTier) {
-        return AvailabilityBuckets.of(
+        return AvailabilityLevel.of(
                 remainingByTier.getOrDefault(tier.id(), COUNTER_UNAVAILABLE),
                 tier.totalCapacity(),
                 properties.getLimitedThresholdPercent());

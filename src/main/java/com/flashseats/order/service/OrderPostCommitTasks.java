@@ -1,7 +1,6 @@
 package com.flashseats.order.service;
 
 import com.flashseats.hold.facade.HoldFacade;
-import com.flashseats.order.event.OrderConfirmedEvent;
 import com.flashseats.queue.facade.QueueFacade;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Component;
