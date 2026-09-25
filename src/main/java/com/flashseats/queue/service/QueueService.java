@@ -1,5 +1,6 @@
 package com.flashseats.queue.service;
 
+import com.flashseats.bot.facade.BotFacade;
 import com.flashseats.catalog.exception.CatalogErrors;
 import com.flashseats.catalog.facade.CatalogFacade;
 import com.flashseats.catalog.facade.EventSummary;
@@ -43,6 +44,7 @@ public class QueueService implements QueueFacade {
     private final QueueDrainRateTracker drainRate;
     private final QueueProperties properties;
     private final Clock clock;
+    private final BotFacade bots;
 
     public QueueService(
             StringRedisTemplate redis,
@@ -50,13 +52,15 @@ public class QueueService implements QueueFacade {
             QueueTokens tokens,
             QueueDrainRateTracker drainRate,
             QueueProperties properties,
-            Clock clock) {
+            Clock clock,
+            BotFacade bots) {
         this.redis = redis;
         this.catalog = catalog;
         this.tokens = tokens;
         this.drainRate = drainRate;
         this.properties = properties;
         this.clock = clock;
+        this.bots = bots;
     }
 
     // -------------------------------------------------------------------- join
@@ -77,7 +81,12 @@ public class QueueService implements QueueFacade {
      * offline until it held a low draw and walk to the front deterministically, which is the exact
      * advantage a random draw exists to remove.
      */
-    public QueueStatusResponse join(String sessionId, long eventId) {
+    public QueueStatusResponse join(
+            String sessionId, long eventId, String recaptchaToken, String clientAddress) {
+        // The one place a challenge is worth its cost: join is the front of the line, cheap to
+        // repeat, and session ids are free to mint (ADR-011). It fails open (ADR-055).
+        bots.verifyHuman(sessionId, recaptchaToken, clientAddress);
+
         EventSummary event = catalog.getEventSummary(eventId);
         if (event.windowStatus() != EventWindowStatus.OPEN) {
             throw CatalogErrors.saleNotOpen(eventId, event.windowStatus());

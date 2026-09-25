@@ -201,11 +201,11 @@ class QueueLifecycleIT extends IntegrationTest {
         String first = "session-first";
         String second = "session-second";
 
-        queue.join(first, eventId);
+        queue.join(first, eventId, null, "127.0.0.1");
         Double firstDraw = redis.opsForZSet().score(QueueKeys.waiting(eventId), first);
-        queue.join(second, eventId);
+        queue.join(second, eventId, null, "127.0.0.1");
         Double secondDraw = redis.opsForZSet().score(QueueKeys.waiting(eventId), second);
-        queue.join(first, eventId);
+        queue.join(first, eventId, null, "127.0.0.1");
 
         assertThat(redis.opsForZSet().score(QueueKeys.waiting(eventId), first)).isEqualTo(firstDraw);
         assertThat(firstDraw).isNotEqualTo(secondDraw);
