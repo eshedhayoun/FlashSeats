@@ -1,5 +1,7 @@
 package com.flashseats.hold.config;
 
+import lombok.Getter;
+import lombok.Setter;
 import org.springframework.boot.context.properties.ConfigurationProperties;
 
 /**
@@ -10,6 +12,8 @@ import org.springframework.boot.context.properties.ConfigurationProperties;
  * a two-repository deploy.
  */
 @ConfigurationProperties(prefix = "flashseats.hold")
+@Getter
+@Setter
 public class HoldProperties {
 
     /** Initial reservation window. */
@@ -28,52 +32,4 @@ public class HoldProperties {
 
     /** Rows the sweeper claims per pass; bounds its transaction size under a large expiry burst. */
     private int sweeperBatchSize = 500;
-
-    public int getTtlSeconds() {
-        return ttlSeconds;
-    }
-
-    public void setTtlSeconds(int ttlSeconds) {
-        this.ttlSeconds = ttlSeconds;
-    }
-
-    public int getGraceSeconds() {
-        return graceSeconds;
-    }
-
-    public void setGraceSeconds(int graceSeconds) {
-        this.graceSeconds = graceSeconds;
-    }
-
-    public int getMaxTtlSeconds() {
-        return maxTtlSeconds;
-    }
-
-    public void setMaxTtlSeconds(int maxTtlSeconds) {
-        this.maxTtlSeconds = maxTtlSeconds;
-    }
-
-    public int getMaxQuantity() {
-        return maxQuantity;
-    }
-
-    public void setMaxQuantity(int maxQuantity) {
-        this.maxQuantity = maxQuantity;
-    }
-
-    public long getSweeperIntervalMs() {
-        return sweeperIntervalMs;
-    }
-
-    public void setSweeperIntervalMs(long sweeperIntervalMs) {
-        this.sweeperIntervalMs = sweeperIntervalMs;
-    }
-
-    public int getSweeperBatchSize() {
-        return sweeperBatchSize;
-    }
-
-    public void setSweeperBatchSize(int sweeperBatchSize) {
-        this.sweeperBatchSize = sweeperBatchSize;
-    }
 }

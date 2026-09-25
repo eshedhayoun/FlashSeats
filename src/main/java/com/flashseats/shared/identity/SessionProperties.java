@@ -1,5 +1,7 @@
 package com.flashseats.shared.identity;
 
+import lombok.Getter;
+import lombok.Setter;
 import org.springframework.boot.context.properties.ConfigurationProperties;
 
 /**
@@ -18,23 +20,15 @@ import org.springframework.boot.context.properties.ConfigurationProperties;
  * <p>Rotating {@code secret} invalidates every live session, so it must not be rotated mid-sale.
  */
 @ConfigurationProperties(prefix = "flashseats.session")
+@Getter
+@Setter
 public class SessionProperties {
 
     private String secret = "dev-only-change-me";
     private final Cookie cookie = new Cookie();
 
-    public String getSecret() {
-        return secret;
-    }
-
-    public void setSecret(String secret) {
-        this.secret = secret;
-    }
-
-    public Cookie getCookie() {
-        return cookie;
-    }
-
+    @Getter
+    @Setter
     public static class Cookie {
         private String name = "fsid";
 
@@ -47,37 +41,5 @@ public class SessionProperties {
 
         private String sameSite = "Lax";
         private int maxAgeSeconds = 86_400;
-
-        public String getName() {
-            return name;
-        }
-
-        public void setName(String name) {
-            this.name = name;
-        }
-
-        public boolean isSecure() {
-            return secure;
-        }
-
-        public void setSecure(boolean secure) {
-            this.secure = secure;
-        }
-
-        public String getSameSite() {
-            return sameSite;
-        }
-
-        public void setSameSite(String sameSite) {
-            this.sameSite = sameSite;
-        }
-
-        public int getMaxAgeSeconds() {
-            return maxAgeSeconds;
-        }
-
-        public void setMaxAgeSeconds(int maxAgeSeconds) {
-            this.maxAgeSeconds = maxAgeSeconds;
-        }
     }
 }
