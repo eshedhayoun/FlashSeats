@@ -16,7 +16,7 @@ Read in this order:
 | Document | What it covers |
 | :--- | :--- |
 | [`REFACTORING_BLUEPRINT.md`](REFACTORING_BLUEPRINT.md) | **Start here.** The whole system on one page — journey, module graph, where each concept lives, and what looks removable but is not. Then the staged refactor that makes the code match it |
-| [`docs/00-architecture-decisions.md`](docs/00-architecture-decisions.md) | 60 ADRs — every non-obvious decision and the failure it prevents. Read before changing a decision |
+| [`docs/00-architecture-decisions.md`](docs/00-architecture-decisions.md) | 62 ADRs — every non-obvious decision and the failure it prevents. Read before changing a decision |
 | [`docs/01-system-architecture.md`](docs/01-system-architecture.md) | Stack, module map, dependency graph, deployment |
 | [`docs/02-high-level-design.md`](docs/02-high-level-design.md) | Infrastructure and the concurrency model |
 | [`docs/03-end-to-end-flow.md`](docs/03-end-to-end-flow.md) | **The authoritative user journey**, step by step |
@@ -275,6 +275,10 @@ provider.
 docker compose --profile cluster up -d --build     # Nginx + 3 app replicas on :8080
 docker compose --profile loadtest run --rm k6      # 10k virtual buyers
 ```
+
+Each replica has a 1.5 GiB memory limit (`APP_MEM_LIMIT` to change it). Without a limit, the JVMs
+size their heaps against the whole Docker VM and get OOM-killed under load (ADR-062). The load
+drill and what it measured are in [`docs/06-mvp-overview.md`](docs/06-mvp-overview.md) §11.
 
 **Test with three replicas, not one.** Promotion pub/sub fan-out (ADR-007) and settle-once stock
 restoration (ADR-003) both behave perfectly on a single instance and break on three if implemented

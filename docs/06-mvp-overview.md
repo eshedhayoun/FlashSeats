@@ -263,14 +263,13 @@ Honest list. None of these is hidden behind a passing test.
   them, while each sits at **114–142 % of one core** with a 2,000-VU k6 competing for the same ten.
   2,000 VUs is still the ceiling here, but a 32 GB machine would not move it — a machine where the
   load generator is not sharing cores with the system under test would.
-- **Checkout p99 is 129 ms at 300 VUs across five sales (run H, Pass 12). That is the first run to
-  meet the 200 ms exit criterion.** It is one run on one host, with nothing else running on it
-  (§11), so it is a data point and does not close the criterion. The earlier five-sale figures —
-  9.3 s, then 6.4 s after Pass 9 removed a checkout transaction, then 4.8 s in run G — were measured
-  with other work on the same laptop. Most of the gap is the host, not the code. **At 2,000 VUs p99
-  is still ~30–45 s**, and that is the host too: ten cores shared between three JVMs and the load
-  generator, with `connections_pending` peaking at 10 of 90 in the run that sold 76 % of capacity.
-  Where this turns over between 300 and 2,000 VUs is the Pass 13 sweep in §11.
+- **Checkout p99 meets the 200 ms criterion up to about 600 VUs across five sales, on this
+  laptop.** The Pass 13 sweep (§11) measured 145 ms at 600, 201 ms at 300 VUs across *ten* sales,
+  207 ms at 1,000 across five, and 6.1 s at 2,000. Each is a single run with visible variance.
+  **The limit is host CPU, not the pool**: `hikaricp_connections_pending` was 0 on every sample of
+  every run, while the three replicas and k6 took all ten cores. The earlier five-sale figures —
+  9.3 s, 6.4 s and 4.8 s — were measured with other work on the same machine. Finding the pool's
+  own edge needs a host where the load generator is not competing with the system under test.
 - ~~**A pool timeout surfaces to a buyer as `500 INTERNAL_ERROR` mid-checkout.**~~ **Fixed (Pass 13,
   ADR-059):** it is now `503 SERVICE_BUSY` with `Retry-After: 1`, classified by HikariCP's own
   `SQLTransientConnectionException` in the cause chain so a database that is genuinely down still
@@ -402,6 +401,25 @@ Honest list. None of these is hidden behind a passing test.
   now only for a stable order. **Not established:** *why* a resumed context's embedded Tomcat
   answers without running its filters. The fix does not depend on the answer, and it is recorded
   as open in ADR-061.
+- ~~**Replicas were OOM-killed at 2,000 VUs.**~~ **Fixed (Pass 13, ADR-062).** No container memory
+  limit meant each JVM sized its heap against the whole Docker VM, so at 2,000 VUs the VM's kernel
+  killed three of them mid-sale. Seats in flight were under-counted, never oversold, and a rebuild
+  recovered them exactly (§11). Now each replica has a 1.5 GiB limit, and G1 and
+  `ExitOnOutOfMemoryError` are set explicitly. The same load then ran with zero restarts.
+- **An app replica can keep writing to a Redis node that Sentinel demoted while it was still up.**
+  Found in Pass 13 when rebuilding the cluster for the drill. The Pass 12 failover check had left
+  `redis-replica-2` as primary, and that state lives in the sentinel volumes, so it survives
+  `docker compose down`. On the next `up`, `redis` briefly started as a primary, the app replicas
+  connected to it, and Sentinel then made it a replica again. Lettuce looks up the primary through
+  Sentinel only when it opens a connection, and Redis does not close clients when a node becomes a
+  replica. So every write failed with `READONLY`, and every request answered a bare `500`: the rate
+  limiter's filter writes to Redis before Spring MVC is reached. Nothing sold, and nothing
+  oversold, because every Redis write failed. That is the fail-safe direction, but it is a total
+  outage. `docker compose --profile cluster restart app-1 app-2 app-3` recovers it, and so does
+  wiping the sentinel volumes. A real failover, where the old primary actually goes *down*, drops
+  the connections and does not hit this, which matches Pass 12's result. **Not fixed.** The fix
+  would be a Lettuce topology refresh or a reconnect on `READONLY`, and it deserves its own test on
+  the cluster profile.
 - ~~**SSE reconnect replay never fired.**~~ **Fixed** (ADR-058). Live frames carried a
   per-connection `"local-N"` id, retained frames carried a Redis sequence, and the replay parsed the
   header as a number — so the normal case, where the last frame received was a two-second position
@@ -780,6 +798,73 @@ nonetheless the first time the **200 ms checkout p99 exit criterion has been met
 first evidence that the criterion is reachable on this design rather than only on a bigger machine.
 One run, one host: treat it as a data point, not as the criterion being closed. Sampling covered the
 ramp and steady state; the last ~45 s of ramp-down was not sampled.
+
+#### Pass 13 — finding the edge (25 Sept 2026)
+
+Runs A–H all *passed*, and a drill that only passes has not found its edge. This sweep went looking
+for it on the same laptop, with nothing else running. The host has 10 cores and a 7.65 GiB Docker VM.
+Each run used the same runner: seed, then `pool-pressure.sh`, a `docker stats` sampler every 10 s,
+`k6-concurrent`, and finally `sold-count.sh`, with replica restart counts recorded before and after.
+The pass criteria were fixed before the first run:
+- `pending` sustained above 0
+- ledger sellout below 99 %
+- checkout p99 above 200 ms
+- any drift or oversell stops the sweep as a correctness failure
+
+**On the final configuration** (per-replica memory limit and explicit G1, ADR-062):
+
+| Run | E × VUs | peak `pending` | **seats sold (ledger)** | checkout p99 | replica CPU peak | restarts |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+| **I′** | **10 × 300** | **0** | **4,997 / 5,000** | 201 ms | 2.6–2.8 cores | 0 |
+| **K′** | 5 × 600 | **0** | 2,498 / 2,500 | **145 ms** | 3.0–3.7 cores | 0 |
+| **J′** | 5 × 1,000 | **0** | 2,499 / 2,500 | 207 ms | 3.1–3.4 cores | 0 |
+| **L′** | 5 × 2,000 | **0** | **2,500 / 2,500** | **6,059 ms** | 2.8–3.0 cores | 0 |
+
+`sold + held + redis == capacity` on every tier of every run, zero inventory `503`s and zero
+rate-limited requests.
+
+**The stated ceiling, for this host:**
+- **Correctness holds at every load tried.** No oversell, no drift and no lost seat, up to 2,000 VUs
+  across five sales. Ten concurrent sales, the top of the operating envelope in `03` §2, sell out.
+  That had never been measured before.
+- **The 200 ms latency criterion holds up to about 600 VUs across five sales.** It is at the line
+  at 300 VUs across ten sales and at 1,000 across five (201 and 207 ms), and it collapses by
+  2,000 (6.1 s).
+- **The limit is CPU, not the connection pool.** `hikaricp_connections_pending` read 0 on every
+  sample of every run, including the one with a 6 s p99. Meanwhile each replica peaked at around
+  3 cores and k6 took 1.4–2.1 more, which is the whole machine. So the pool's own edge (ADR-049)
+  is **beyond what this laptop can generate**. The load generator saturates the host before the
+  pool saturates. A host where k6 runs elsewhere is the only way to find the pool's edge. §9
+  already said that, and now there is a number behind it.
+- Single runs, with visible run-to-run variance: I′ measured 201 ms here and 106 ms on the
+  configuration below. Treat each figure as ± tens of ms, not as exact.
+
+**What the first attempt found, before that configuration existed.** The same sweep, run first
+with the replicas as they were, went wrong at 2,000 VUs in two separate ways:
+
+| Run | E × VUs | peak `pending` | seats sold (ledger) | p99 | what happened |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| I | 10 × 300 | 0 | 4,997 / 5,000 | 106 ms | clean |
+| J | 5 × 1,000 | 7 (one sample) | 2,500 / 2,500 | 390 ms | clean |
+| K | 5 × 600 | 0 | 2,499 / 2,500 | 147 ms | clean |
+| L | 5 × 2,000 | 0 | 2,500 / 2,500 | 6,130 ms | the instrument reported sustained drift; the ledger was exact |
+| L2 | 5 × 2,000 | 0 | **1,765 / 2,500** | 7,992 ms | **replicas OOM-killed mid-sale**; the ledger showed 3 seats under-counted |
+
+1. **L's "sustained drift" was the instrument, not the system.** The drift gauge is recomputed
+   every 60 s, and under load `pool-pressure.sh` reached app-3 every ~24 s. So it read the **same
+   computation twice** and called that sustained. The next computation read 0, and the ledger was
+   exact. The instrument now requires non-zero drift across a whole drift interval, which means two
+   separate computations. This is ADR-047's trap again, "an instrument stricter than the ADR it
+   cites", this time in the time dimension.
+2. **L2 was real, and it shows the design doing what it claims.** The Docker VM's kernel log shows
+   the OOM killer taking three `java` processes, with RSS of 4.0, 2.5 and 2.7 GiB. The replicas had
+   no memory limit, so `MaxRAMPercentage=75` sized each heap against the whole VM (ADR-062). A
+   replica killed between the Redis decrement and the hold insert loses exactly those seats.
+   `sold-count.sh` showed tiers 9003 and 9004 at 499 and 498. They were **under-counted, never
+   over**, which is invariant 12's promised direction under an ambiguous failure. `rebuild-stock`
+   on each event restored both to exactly 500. That makes it the first time the crash-recovery
+   path has been exercised by a *real* crash under load rather than argued for. The 70 % sellout
+   is the outage: whatever was in flight on a killed replica was lost.
 
 Run F's table below is kept because it is the one that exposed the tail-of-sale edge, four seats short:
 
@@ -1849,3 +1934,44 @@ times and the recovery once. Correct by design and mildly unhelpful during an in
 narrower and sharper: **a path no test and no script exercises is not "probably fine", it is
 unknown.** Every defect here lived in exactly such a path — a profile the suite never starts, a shell
 the author never ran — and each was found in the first minute of trying to use it.
+
+### Pass 13 — evidence, back-pressure, and finding the edge
+
+- **Scope:** close the largest coverage hole (fulfilment was never driven through a listener), make
+  two error paths honest, close S13, find the load edge instead of passing again, and tidy the
+  repository's setup story. Each fix got a test that failed before it, and its docs in the same
+  commit.
+
+**Built:**
+
+| Change | Effect |
+| :--- | :--- |
+| **`NotificationListenerIT`** | Fulfilment through a real RabbitMQ with both real listeners and the production topology. Only SMTP is faked. It proves dedupe on redelivery, dead-letter after one attempt (ADR-029), exactly-once replay (ADR-038), and that a delivered-but-unrecorded message stays `SENT` (ADR-042). Checked by mutation: removing the ADR-042 guard fails it |
+| **`503 SERVICE_BUSY`** (ADR-059) | A HikariCP timeout was `500 INTERNAL_ERROR`. It is back-pressure, so it now gets `Retry-After: 1`. It is classified by the cause chain, so a database that is down is still `500` |
+| **`/session/reset` accepts JSON only** (ADR-060) | S13 closed: a cross-site form can no longer expire a buyer's session. No client change was needed |
+| **The order-dependent suite, root-caused** (ADR-061) | Spring Framework 7 pauses cached test contexts, and the resumed context answered every `/queue` request before its own filters ran. Pass 12 had ruled out everything inside the application; the cause was outside it. **228 tests, green in alphabetical, reverse and filesystem order** |
+| **Replica memory limit, explicit G1** (ADR-062) | Replicas were OOM-killed by the Docker VM at 2,000 VUs. The same load now runs with zero restarts |
+| **Drill instruments corrected** | `seed-concurrent.sh` could not seed anything but five sales (a psql `\set` overrode `-v`), and its per-key Redis clean-up outran the pre-warm window. `pool-pressure.sh` read one drift computation twice and called it sustained |
+| **README** | The environment files in the order a new developer creates them, and a repository-layout section |
+
+**Measured** (§11): ten concurrent sales sell out, and correctness held at every load up to 2,000
+VUs. p99 meets 200 ms to about 600 VUs across five sales, and the limit is host CPU, not the pool.
+The run that crashed became the best evidence in the pass: a real mid-sale crash left 3 seats
+under-counted and none oversold, and `rebuild-stock` recovered them exactly.
+
+**Found and not fixed, recorded in §9:** a Redis node demoted by Sentinel while still up keeps the
+replicas' connections, so every write fails `READONLY` until the replicas restart. It was hit on
+this pass's first cluster boot because the Pass 12 failover test had left its state in the sentinel
+volumes.
+
+**Considered and declined: moving the backend into `backend/`.** It would change about fifty paths
+across the Dockerfile, compose, the drill scripts and the docs, and it would conflict with both
+teammates' branches, all for no change in behaviour, late in the project and on a cluster that has
+only just started working. The README explains the layout instead.
+
+**The transferable lesson.** Pass 12 learned that an unexercised path is unknown. This pass learned
+the version of that for *instruments*: **every number here was wrong at least once because of the
+thing measuring it, not the thing measured.** A test harness paused its own context, a seed script
+could not seed what it claimed, a sampler read one computation twice, and a Dockerfile flag was
+cancelled by a compose file. Each was found by distrusting a result that looked either too good or
+too bad, and by asking which layer produced it.
