@@ -396,6 +396,18 @@ Changing the compose network's `ipam` recreates the network, and containers crea
 `NXDOMAIN` and the replicas restart-loop on `Unable to connect to redis`. `docker compose down`
 first; a plain `up -d` is not enough.
 
+**And `down` needs the profile too.** `docker compose down` without `--profile cluster` leaves every
+profiled container — nginx, the replicas, the sentinels — running or stopped but *present*, still
+holding a reference to the network it just deleted. The next `up` then fails with
+`failed to set up container networking: network <id> not found` for exactly those services, which
+reads like a Docker bug and is not one. Use `docker compose --profile cluster down`.
+
+**Every script under `docker/` must be mode 755.** All three that PR #16 added were committed 644,
+and `sentinel-entrypoint.sh` is a container `entrypoint` — so the sentinels restart-looped on
+`exec …: permission denied`, and because every app replica `depends_on` them, **the cluster had
+never once started**. `git ls-files -s 'docker/**/*.sh'` shows the modes; a checkout on a filesystem
+without POSIX permissions is how a 644 gets in.
+
 Metrics are scraped **per replica**, not through nginx, and nginx deliberately routes only
 `/actuator/health`. `hikaricp_connections_pending` and `flashseats_stock_drift` are per-instance
 gauges; through a load balancer you get one replica at random.
