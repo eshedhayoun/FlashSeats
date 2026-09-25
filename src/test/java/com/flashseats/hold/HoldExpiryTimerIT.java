@@ -147,7 +147,13 @@ class HoldExpiryTimerIT extends IntegrationTest {
     private String newHold(int quantity) {
         BuyerSession buyer = new BuyerSession(port);
         buyer.get("/events/" + eventId);
-        buyer.post("/queue/join", Map.of("eventId", eventId));
+
+        // Asserted, not discarded. A refused join makes every later step fail as a 15 s timeout
+        // waiting for a pass that was never going to come, which says nothing about why.
+        var join = buyer.post("/queue/join", Map.of("eventId", eventId));
+        assertThat(join.ok())
+                .describedAs("join refused: %s %s", join.status(), join.rawBody())
+                .isTrue();
 
         String passToken = await().atMost(Duration.ofSeconds(15))
                 .until(

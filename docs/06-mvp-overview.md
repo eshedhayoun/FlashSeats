@@ -377,16 +377,38 @@ Honest list. None of these is hidden behind a passing test.
 
 **Found in Pass 11, reading the frontend merge (PR #16):**
 
-- **`./mvnw test` does not pass on `preview`, and has not since the merge.** 210 tests, **10 errors**,
-  all of them `HoldLifecycleIT` and `HoldExpiryTimerIT` timing out in `admittedBuyer` waiting 15 s for
-  a promotion pass. **Both classes pass in isolation and fail in the suite**, so it is test isolation
-  rather than a product defect — and it was reproduced at the merge commit itself, unmodified, so it
-  is not Pass 11's doing. What is known: ids are not the cause (making them unique across classes
-  changed nothing), neither is the bot rate limiter (running `BotDefenceIT` immediately before is
-  green), Surefire is not parallel, and the two classes emit **no application log output whatsoever**
-  for their 150 s — no context start, no promoter tick, nothing. That silence is the lead worth
-  following: it points at the scheduler in a **cached Spring context**, not at the fixture. Until it
-  is fixed, every claim of the form "the suite is green" in this document refers to a targeted run.
+- **`./mvnw test` does not pass in the default order, and has not since the merge.** 213 tests,
+  **10 failures**, all in `HoldLifecycleIT` and `HoldExpiryTimerIT`. Reproduced at the merge commit
+  unmodified, so it is not Pass 11's or Pass 12's doing.
+
+  **The symptom, now that the fixtures assert instead of waiting.** `POST /api/v1/queue/join` answers
+  **`500`** with Spring's bare four-field error body — `timestamp/status/error/path`, **no registry
+  `code`**. The classes used to spend 150 s timing out on a pass that was never coming; they now fail
+  in **0.1 s** naming the status, which is what made everything below possible.
+
+  **The decisive fact: `-Dsurefire.runOrder=reversealphabetical` is 213/213 green.** The suite is
+  order-dependent, and the default *filesystem* order — which is not even stable across machines — is
+  the unlucky one. That is a usable workaround today and an argument for pinning the order regardless.
+
+  **Ruled out by experiment, not by reasoning.** Machine contention (reproduced idle, twice). Event-id
+  collision (unique ids changed nothing). The bot rate limiter — `RateLimitService` versions its bucket
+  keys by capacity/refill, so `BotDefenceIT`'s deliberately tiny buckets cannot collide with anyone
+  else's. `BotMetrics` (null-safe). The refusal path (writes a proper coded `429`). Surefire
+  parallelism (none configured). Context accumulation — `@DirtiesContext(AFTER_CLASS)` on both classes
+  that fork a context changed nothing. And **no pairwise combination reproduces it**: order+payment,
+  catalog+queue, notification+shared+flashseats, both forking bot ITs, and the five bot unit tests that
+  run between them are each green with the hold ITs appended. It needs most of the suite to have run.
+
+  **Where the next attempt should start.** The throw is **outside Spring MVC**: `GlobalExceptionHandler`
+  has an `@ExceptionHandler(Exception.class)` backstop that logs "Unhandled exception", and it is never
+  invoked for these. Nothing in the app calls `sendError`, there is no custom `ErrorController`, and
+  `server.error.include-message=always` does **not** add a `message` to the body — so the response is
+  not `BasicErrorController`'s either, which is the most interesting unexplained detail. A throw in a
+  servlet filter fits the escape path; what does not fit is that Tomcat's container logger records
+  nothing. Instrument the filter chain itself rather than the application.
+
+  Until it is fixed, every claim of the form "the suite is green" in this document means a targeted run
+  or a reverse-order run.
 - ~~**SSE reconnect replay never fired.**~~ **Fixed** (ADR-058). Live frames carried a
   per-connection `"local-N"` id, retained frames carried a Redis sequence, and the replay parsed the
   header as a number — so the normal case, where the last frame received was a two-second position
