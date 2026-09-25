@@ -2537,3 +2537,53 @@ context exists.
 - Surefire stays pinned to `alphabetical`, now only because a stable order is worth having.
 - The lesson for this repo: when an intermittent failure depends on the number of Spring contexts,
   suspect the test framework's context lifecycle before the application.
+
+---
+
+## ADR-062 — Each replica has a memory limit, and the image alone owns the JVM flags
+
+**Context.** Pass 13's load sweep at 2,000 VUs across five sales saw app replicas SIGKILLed mid-sale.
+The Docker VM's kernel log recorded `Out of memory: Killed process … (java)` three times, with RSS of
+4.0, 2.5 and 2.7 GiB. Three defects combined to cause it, and each was invisible on its own:
+
+1. **No container memory limit.** The Dockerfile set `-XX:MaxRAMPercentage=75`, and its comment
+   said this sizes the heap "from the container limit". There was no limit, so each JVM sized
+   itself against the whole 7.65 GiB VM. Three replicas could claim about 17 GiB between them. G1
+   grows the heap lazily, so this passed every run at 300–600 VUs, where each replica settled at
+   1.1–1.5 GiB, and only failed once the load pushed the heaps past what the VM could hold.
+2. **`compose.yaml` replaced the image's `JAVA_TOOL_OPTIONS`.** It set the variable to
+   `-XX:MaxRAMPercentage=75` alone, which silently dropped the image's `-XX:+ExitOnOutOfMemoryError`
+   and `-XX:+UseZGC`. Every cluster measurement ever recorded therefore ran on G1, not ZGC.
+3. **The JVM's collector choice depends on the limit.** Setting a 1.5 GiB limit on its own made
+   the JVM stop treating the container as a "server-class machine" (that needs ≥ 1,792 MB). It
+   silently switched to **SerialGC**, a single-threaded stop-the-world collector, on a server
+   carrying thousands of virtual threads. `-XX:+PrintFlagsFinal` inside the container showed this
+   before any run did.
+
+**Decision.**
+
+- `mem_limit: ${APP_MEM_LIMIT:-1536m}` on every app replica. This covers the 1.1–1.5 GiB they reach
+  at the load this host can serve, and it keeps three replicas plus the infrastructure and k6
+  inside the VM.
+- The Dockerfile is the **only** place `JAVA_TOOL_OPTIONS` is set:
+  `-XX:MaxRAMPercentage=70 -XX:+UseG1GC -XX:+ExitOnOutOfMemoryError`. 70 % leaves about 460 MiB of
+  the limit for metaspace, thread stacks and Lettuce/Tomcat's off-heap buffers. **G1 is named**,
+  so ergonomics cannot swap it for SerialGC. G1 rather than ZGC because G1 is what every number in
+  `06` §11 was measured on. `compose.yaml` now says in a comment why it does not set the variable.
+
+**Verified.** On the new configuration the same four runs, from 300 to 2,000 VUs, completed with
+**zero restarts**, zero unreadable metric samples and an exact ledger. At 2,000 VUs each replica
+peaked at 1.48–1.50 GiB against its 1.5 GiB limit. That is tight, but `ExitOnOutOfMemoryError`
+never fired, and the p99 there (6.1 s) is set by CPU, not by GC.
+
+**Consequences.**
+
+- A replica that genuinely runs out of heap now exits cleanly and restarts, instead of being
+  killed at random by the VM with a neighbour's memory. Either way the Redis-first ordering loses
+  only in-flight reservations, and only toward under-count (ADR-046). Pass 13 watched a rebuild
+  recover exactly those seats.
+- 2,000 VUs runs replicas at their limit on this host. Raising `APP_MEM_LIMIT` is the lever for a
+  bigger machine, but not on this 7.65 GiB VM.
+- The lesson for this repo: a flag that reads correctly in one file can be cancelled by another,
+  and a JVM decides things about itself from the container it finds. Check effective settings with
+  `java -XX:+PrintFlagsFinal -version` inside the container, not by reading the Dockerfile.
