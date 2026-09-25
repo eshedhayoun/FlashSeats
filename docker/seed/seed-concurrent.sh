@@ -84,17 +84,30 @@ POSTGRES_DB_VALUE="$(grep -E '^POSTGRES_DB=' .env | head -1 | cut -d= -f2-)"
 # --- 2b. clear each event's Redis keys ---------------------------------------
 # Never FLUSHALL. The stock counter is the one thing in this system that cannot
 # be recovered from a cache, and this Redis is shared with whatever else runs.
+# One server-side SCAN + DEL per event, not one `docker exec` per key. A previous
+# run leaves thousands of queue:pass / queue:admit keys, and deleting them one exec
+# at a time took longer than the two minutes the sale stays UPCOMING -- so the
+# pre-warm below was refused (ADR-004) and the seed failed on the SECOND run.
+CLEAR_LUA='local n = 0
+for _, pattern in ipairs(ARGV) do
+  local cursor = "0"
+  repeat
+    local page = redis.call("SCAN", cursor, "MATCH", pattern, "COUNT", 1000)
+    cursor = page[1]
+    for _, key in ipairs(page[2]) do redis.call("DEL", key); n = n + 1 end
+  until cursor == "0"
+end
+return n'
+
 echo "Clearing Redis keys for events ${FIRST_ID}..${LAST_ID}..."
 for id in $(seq "$FIRST_ID" "$LAST_ID"); do
-    for pattern in "catalog:stock:${id}:*" "catalog:vouch:${id}" \
-                   "queue:waiting:${id}" "queue:passes:${id}" \
-                   "queue:admissions:${id}" "queue:exhausted:${id}" \
-                   "queue:promote:${id}" \
-                   "queue:pass:${id}:*" "queue:admit:${id}:*"; do
-        "$REDIS_CLI" --scan --pattern "$pattern" | while IFS= read -r key; do
-            [[ -n "$key" ]] && "$REDIS_CLI" DEL "$key" >/dev/null
-        done
-    done
+    CLEARED="$("$REDIS_CLI" EVAL "$CLEAR_LUA" 0 \
+        "catalog:stock:${id}:*" "catalog:vouch:${id}" \
+        "queue:waiting:${id}" "queue:passes:${id}" \
+        "queue:admissions:${id}" "queue:exhausted:${id}" \
+        "queue:promote:${id}" \
+        "queue:pass:${id}:*" "queue:admit:${id}:*" | tr -d '\r')"
+    echo "  ${id}: ${CLEARED} keys"
 done
 
 # --- 3. pre-warm every event -------------------------------------------------
