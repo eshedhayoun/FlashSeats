@@ -316,13 +316,13 @@
 						two developers can legitimately disagree about whether the suite passes.
 						Pinning it is worth doing for that reason alone.
 
-						But be clear about what this does NOT do. The suite is order-DEPENDENT right
-						now: in filesystem order ten tests in HoldLifecycleIT and HoldExpiryTimerIT
-						fail because POST /queue/join answers 500 with no registry code, while both
-						`alphabetical` and `reversealphabetical` pass all 213. `alphabetical` is
-						pinned because it is VERIFIED GREEN, not because it is correct: the
-						pollution is still there and still open in 06-mvp-overview.md section 9.
-						Do not read a green suite as evidence that it was fixed.
+						It used to be pinned for a second reason, and that reason is now gone. The
+						suite was order-dependent: in some orders every /queue request in the shared
+						context answered a bare 500. The cause was Spring Framework 7 pausing a
+						cached test context when another class switched to a different context
+						(ADR-061). src/test/resources/spring.properties turns that pausing off, and
+						the suite now passes in alphabetical, reversealphabetical and filesystem
+						order. The pin stays because a stable order is worth having anyway.
 					-->
 					<runOrder>alphabetical</runOrder>
 					<systemPropertyVariables>

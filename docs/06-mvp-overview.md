@@ -212,9 +212,11 @@ Findings that cost real time and would cost it again.
 ## 8. Verification
 
 ```bash
-./mvnw test        # 112 tests: unit, modularity, concurrency, journey, recovery, queue lifecycle,
+./mvnw test        # 228 tests: unit, modularity, concurrency, journey, recovery, queue lifecycle,
                    #             pre-warm, stock rebuild, drift, Redis-restart guard, the metadata
-                   #             cache's five rules, and the cluster admission allowance
+                   #             cache's five rules, the cluster admission allowance, payment and
+                   #             webhooks, bot defence, and fulfilment through a real broker.
+                   #             Green in alphabetical, reverse and filesystem order (ADR-061)
 ```
 
 | Test | What it proves |
@@ -228,6 +230,9 @@ Findings that cost real time and would cost it again.
 | `CheckoutRecoveryIT` | A gateway outage keeps the seats **and** the ability to pay for them; it costs none of the three card attempts; a charge genuinely in flight is still refused; an order stranded by a crash resumes once no charge can still be running. |
 | `QueueLifecycleIT` | An un-warmed event pauses promotion rather than selling out; a closed sale ends the wait instead of freezing it; a pass for one sale is never offered to another; exhaustion reverses when seats return. |
 | `NotificationClaimIT` | The claim blocks a duplicate, is terminal once sent, and releases a dead letter for replay. |
+| `NotificationListenerIT` | **Fulfilment through a real RabbitMQ and both real listeners**, the one thing the test profile's `notification.enabled=false` had left unexercised. One ticket per order even when the message is redelivered; a malformed message or a failed send goes to the DLQ after **one** attempt (ADR-029); a replay after the outage sends exactly once (ADR-038); and mail that was sent but not recorded stays `SENT`, so a replay cannot send a second ticket (ADR-042). Checked by mutation: removing that guard fails the test. |
+| `BackPressureResponseTest` | A HikariCP timeout is `503 SERVICE_BUSY` with `Retry-After`; any other transaction failure is still `500` (ADR-059). |
+| `SessionResetIT` | `POST /session/reset` refuses form and `text/plain` bodies with `415` and expires nothing; a JSON POST still works (ADR-060). |
 | `CatalogAvailabilityIT` | A tier with no counter reads `UNKNOWN`, a drained tier still reads `SOLD_OUT`, and the two are never the same answer (ADR-040). |
 | `ProblemResponseIT` | Spring's own binding failures are `400` with a registry `code`, not `500` (ADR-041). |
 | `RemainingForEventTest` | "Nothing known" is never "nothing left", at the method every admission decision reads: no tiers, a missing counter, genuinely drained and live are four distinct answers (ADR-004, ADR-035, ADR-040). |
@@ -258,13 +263,14 @@ Honest list. None of these is hidden behind a passing test.
   them, while each sits at **114–142 % of one core** with a 2,000-VU k6 competing for the same ten.
   2,000 VUs is still the ceiling here, but a 32 GB machine would not move it — a machine where the
   load generator is not sharing cores with the system under test would.
-- **Checkout p99 is 682 ms at 300 VUs on one sale, 6.4 s at 300 VUs across five — 9.3 s before
-  Pass 9's review removed a checkout transaction — and ~30–45 s at
-  2,000 VUs across five** — against a 200 ms exit criterion. The 2,000-VU figures are the host: ten
-  cores shared between three JVMs and the load generator, with `connections_pending` peaking at 10 of 90
-  in the run that sold 76 % of capacity. **The 300-VU five-sale number is the real open one**: 682 ms →
-  9.3 s for the same VU count spread over five sales is a 13× cost that the pool does not explain, and
-  finding what does is the next latency question. It needs a host where k6 is not competing for cores.
+- **Checkout p99 is 129 ms at 300 VUs across five sales (run H, Pass 12). That is the first run to
+  meet the 200 ms exit criterion.** It is one run on one host, with nothing else running on it
+  (§11), so it is a data point and does not close the criterion. The earlier five-sale figures —
+  9.3 s, then 6.4 s after Pass 9 removed a checkout transaction, then 4.8 s in run G — were measured
+  with other work on the same laptop. Most of the gap is the host, not the code. **At 2,000 VUs p99
+  is still ~30–45 s**, and that is the host too: ten cores shared between three JVMs and the load
+  generator, with `connections_pending` peaking at 10 of 90 in the run that sold 76 % of capacity.
+  Where this turns over between 300 and 2,000 VUs is the Pass 13 sweep in §11.
 - ~~**A pool timeout surfaces to a buyer as `500 INTERNAL_ERROR` mid-checkout.**~~ **Fixed (Pass 13,
   ADR-059):** it is now `503 SERVICE_BUSY` with `Retry-After: 1`, classified by HikariCP's own
   `SQLTransientConnectionException` in the cause chain so a database that is genuinely down still
@@ -380,40 +386,22 @@ Honest list. None of these is hidden behind a passing test.
 
 **Found in Pass 11, reading the frontend merge (PR #16):**
 
-- **`./mvnw test` does not pass in the default order, and has not since the merge.** 213 tests,
-  **10 failures**, all in `HoldLifecycleIT` and `HoldExpiryTimerIT`. Reproduced at the merge commit
-  unmodified, so it is not Pass 11's or Pass 12's doing.
-
-  **The symptom, now that the fixtures assert instead of waiting.** `POST /api/v1/queue/join` answers
-  **`500`** with Spring's bare four-field error body — `timestamp/status/error/path`, **no registry
-  `code`**. The classes used to spend 150 s timing out on a pass that was never coming; they now fail
-  in **0.1 s** naming the status, which is what made everything below possible.
-
-  **The decisive fact: `-Dsurefire.runOrder=reversealphabetical` is 213/213 green.** The suite is
-  order-dependent, and the default *filesystem* order — which is not even stable across machines — is
-  the unlucky one. That is a usable workaround today and an argument for pinning the order regardless.
-
-  **Ruled out by experiment, not by reasoning.** Machine contention (reproduced idle, twice). Event-id
-  collision (unique ids changed nothing). The bot rate limiter — `RateLimitService` versions its bucket
-  keys by capacity/refill, so `BotDefenceIT`'s deliberately tiny buckets cannot collide with anyone
-  else's. `BotMetrics` (null-safe). The refusal path (writes a proper coded `429`). Surefire
-  parallelism (none configured). Context accumulation — `@DirtiesContext(AFTER_CLASS)` on both classes
-  that fork a context changed nothing. And **no pairwise combination reproduces it**: order+payment,
-  catalog+queue, notification+shared+flashseats, both forking bot ITs, and the five bot unit tests that
-  run between them are each green with the hold ITs appended. It needs most of the suite to have run.
-
-  **Where the next attempt should start.** The throw is **outside Spring MVC**: `GlobalExceptionHandler`
-  has an `@ExceptionHandler(Exception.class)` backstop that logs "Unhandled exception", and it is never
-  invoked for these. Nothing in the app calls `sendError`, there is no custom `ErrorController`, and
-  `server.error.include-message=always` does **not** add a `message` to the body — so the response is
-  not `BasicErrorController`'s either, which is the most interesting unexplained detail. A throw in a
-  servlet filter fits the escape path; what does not fit is that Tomcat's container logger records
-  nothing. Instrument the filter chain itself rather than the application.
-
-  **Pinned, not fixed.** `pom.xml` now sets Surefire's `runOrder` to `alphabetical`, which is verified
-  green twice from cold containers. That is worth doing regardless — the default is *filesystem* order,
-  so two machines can disagree about whether the suite passes — but it is a workaround, and this item
-  stays open. A green suite is no longer evidence that the pollution went away.
+- ~~**`./mvnw test` does not pass in the default order.**~~ **Fixed, root cause found (Pass 13,
+  ADR-061).** The symptom was that, in some class orders, every `/queue` request in the shared test
+  context answered a bare `500` (`timestamp/status/error/path`, no registry `code`). Pass 12 ruled
+  out everything inside the application. The cause was outside it: **Spring Framework 7 pauses a
+  cached test context whenever a test class switches to a different context**, and restarts it when
+  a later class uses it again. The contexts that `BotDefenceIT` and `RecaptchaFailOpenIT` create
+  caused that switch. Adding `NotificationListenerIT`, a third such context, turned "needs most of the
+  suite" into a three-class reproduction: `HoldLifecycleIT` → `NotificationListenerIT` →
+  `CheckoutRecoveryIT`. A temporary highest-precedence servlet filter then showed that the failing
+  requests **never reached the resumed context's filter chain**, which matches Pass 12's finding
+  that `GlobalExceptionHandler` never saw them. `spring.test.context.cache.pause=never` in
+  `src/test/resources/spring.properties` fixes the reproduction. The full suite is green in
+  `alphabetical`, `reversealphabetical` and `filesystem` order. The pom keeps `alphabetical` pinned,
+  now only for a stable order. **Not established:** *why* a resumed context's embedded Tomcat
+  answers without running its filters. The fix does not depend on the answer, and it is recorded
+  as open in ADR-061.
 - ~~**SSE reconnect replay never fired.**~~ **Fixed** (ADR-058). Live frames carried a
   per-connection `"local-N"` id, retained frames carried a Redis sequence, and the replay parsed the
   header as a number — so the normal case, where the last frame received was a two-second position
