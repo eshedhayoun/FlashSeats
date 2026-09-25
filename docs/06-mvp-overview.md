@@ -1975,3 +1975,58 @@ thing measuring it, not the thing measured.** A test harness paused its own cont
 could not seed what it claimed, a sampler read one computation twice, and a Dockerfile flag was
 cancelled by a compose file. Each was found by distrusting a result that looked either too good or
 too bad, and by asking which layer produced it.
+
+### Pass 14 — structure review: one set of patterns, applied everywhere
+
+- **Scope:** an in-depth review of the backend's structure, flow and patterns, with the goal of a
+  codebase that is simple, clear and minimal. No behaviour change; the wire format is
+  byte-identical.
+
+- **The verdict that framed it.** The architecture was already sound. Module boundaries are
+  enforced and acyclic, facades are implemented by their services, every module has the same
+  package layout, and no dead code was found: every public method referenced once is a framework
+  entry point. The separate transactional beans (`*Store`, `OrderCommitService`) look like
+  duplication but are required, because Spring's proxy ignores self-invocation. What needed work was
+  **consistency**: the repo had rules it applied in some places and not others, because nobody had
+  written them down in one place.
+
+**Changed:**
+
+| Change | Effect |
+| :--- | :--- |
+| **App class at the root package**; app config in `com.flashseats.app` | Four scan-widening annotations gone. `app` is a leaf module with no inbound edges |
+| **Properties classes use Lombok accessors** | 528 lines of hand-written getters and setters removed; binding unchanged |
+| **An exception class only where a `catch` names it** (ADR-063) | Seven classes become factories on `PaymentErrors`, `OrderErrors` and `BotErrors`. Same codes and extensions, in the same order |
+| **One notification delivery flow** | The two consumers were copies; ADR-042's guard now exists once. The mutation check still fails the test when the guard is disabled |
+| **Controllers only map** | `QueueController.stream`'s connect flow moved to `QueueBroadcaster.connect`, and join's bot check into `QueueService.join` |
+| **Behaviour next to its data** | `EventRow.windowStatus`, `AvailabilityLevel.of` (which also removes a model → service dependency), `QueueKeys.expireWithSale` |
+| **`event` packages mean "published"** | `hold/event` and `order/event` held only in-module triggers; they moved beside their listeners |
+| **Comments say why, briefly** | 5,389 → 3,721 comment lines. The pass found **eleven comments that had become false**: a code "with no throw site", a filter in the wrong module, a table that no longer exists, a transaction requirement stated backwards. Stale comments are instructions, the same way stale specs are |
+| **The conventions, written down** | `05-global-standards.md` §11. A reviewer now has a list to check against |
+
+**Size:** 239 → 230 files, 15,924 → 13,608 lines (−15%); executable code about −490 lines.
+
+**Declined, with reasons:**
+- **Sub-packages inside `order`** (checkout / outbox / stock): it would break the one layout every
+  other module follows. `StockReconciliationService` stays in `order` because only `order` reaches
+  the ledger, holds and counters without a cycle.
+- **Lombok `@RequiredArgsConstructor` across 56 classes:** cosmetic churn, and several constructors
+  do real work.
+- **Properties as records:** ITs adjust the live beans to avoid forking contexts (ADR-061).
+
+**Verified:**
+- 228/228 after every step, and in reverse order at the end.
+- Every commit compiles on its own.
+- `ModularityTests` passes with `app` as a leaf.
+- On the rebuilt cluster: `fanout-check.sh` 30/30 across three replicas (it exercises the new
+  `connect` path), and `hold-expiry-check.sh` restored exactly once in 749 ms.
+- Two 5 × 300 VU drill runs, both with an exact ledger, pending 0 and zero restarts: 2,499 and
+  2,498 of 2,500 sold. Checkout p99 was **513 ms** on the first run and **64 ms** on the second,
+  the best of any run so far. The first run started minutes after the replicas were rebuilt, so it
+  measured JIT warm-up (app-1 peaked at four cores). **Discard the first drill run after any replica
+  restart**; Pass 13's I′ (201 ms) was the same effect.
+
+**The transferable lesson.** A convention that exists only as a pattern in the code is copied
+unevenly. Pass 9's ADR-057 was right, and branches that forked before it re-added exactly what it
+removed. Writing the rules as a checklist (§11) is what makes the next reviewer's job a comparison
+rather than an archaeology.
