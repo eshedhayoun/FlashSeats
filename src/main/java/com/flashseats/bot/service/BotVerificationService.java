@@ -1,6 +1,6 @@
 package com.flashseats.bot.service;
 
-import com.flashseats.bot.exception.BotVerificationFailedException;
+import com.flashseats.bot.exception.BotErrors;
 import com.flashseats.bot.facade.BotFacade;
 import com.flashseats.bot.model.BotOutcome;
 import lombok.extern.slf4j.Slf4j;
@@ -47,7 +47,7 @@ public class BotVerificationService implements BotFacade {
                         JOIN_PATH,
                         BotOutcome.VERIFICATION_FAILED,
                         null);
-                throw new BotVerificationFailedException();
+                throw BotErrors.verificationFailed();
             }
             // Audited precisely because it is allowed. Failing open is invisible from the outside,
             // and "our bot defence was off for three hours" must not be learned from an absence.

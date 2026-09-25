@@ -6,7 +6,6 @@ import com.flashseats.order.dto.AdminOrderResponse;
 import com.flashseats.order.dto.OrderItemResponse;
 import com.flashseats.order.dto.OrderReceiptResponse;
 import com.flashseats.order.exception.OrderErrors;
-import com.flashseats.order.exception.TicketNotAvailableException;
 import com.flashseats.order.facade.OrderFacade;
 import com.flashseats.order.facade.OrderSummary;
 import com.flashseats.order.model.Order;
@@ -188,7 +187,7 @@ public class OrderQueryService implements OrderFacade {
             throw OrderErrors.orderNotFound(orderNumber);
         }
         if (order.getStatus() != OrderStatus.CONFIRMED) {
-            throw new TicketNotAvailableException(orderNumber, order.getStatus());
+            throw OrderErrors.ticketNotAvailable(order.getStatus());
         }
 
         // `order_items` snapshots tier_name at purchase, so renaming a tier later cannot rewrite an

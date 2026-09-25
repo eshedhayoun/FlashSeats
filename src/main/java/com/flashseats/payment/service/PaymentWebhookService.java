@@ -2,7 +2,7 @@ package com.flashseats.payment.service;
 
 import com.flashseats.payment.config.PaymentProperties;
 import com.flashseats.payment.event.PaymentSettledEvent;
-import com.flashseats.payment.exception.WebhookSignatureInvalidException;
+import com.flashseats.payment.exception.PaymentErrors;
 import com.stripe.exception.SignatureVerificationException;
 import com.stripe.model.Event;
 import com.stripe.model.EventDataObjectDeserializer;
@@ -126,7 +126,7 @@ public class PaymentWebhookService {
         try {
             return Webhook.constructEvent(rawBody, signature, properties.getStripe().getWebhookSecret());
         } catch (SignatureVerificationException | IllegalArgumentException rejected) {
-            throw new WebhookSignatureInvalidException(rejected);
+            throw PaymentErrors.webhookSignatureInvalid(rejected);
         }
     }
 

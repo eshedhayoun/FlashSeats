@@ -2,7 +2,7 @@ package com.flashseats.payment.service;
 
 import com.flashseats.payment.config.PaymentProperties;
 import com.flashseats.payment.exception.DuplicatePaymentException;
-import com.flashseats.payment.exception.PaymentGatewayUnavailableException;
+import com.flashseats.payment.exception.PaymentErrors;
 import com.flashseats.payment.facade.AuthorizeCommand;
 import com.flashseats.payment.facade.PaymentFacade;
 import com.flashseats.payment.facade.PaymentResult;
@@ -132,7 +132,7 @@ public class PaymentService implements PaymentFacade {
 
             if (result.outcome() == GatewayResult.Outcome.ERROR) {
                 log.warn("Gateway error for order {}: {}", command.orderNumber(), result.failureReason());
-                throw new PaymentGatewayUnavailableException(result.failureReason());
+                throw PaymentErrors.gatewayUnavailable();
             }
 
             return new PaymentResult(
