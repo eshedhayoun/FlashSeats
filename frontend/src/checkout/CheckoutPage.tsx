@@ -1,16 +1,11 @@
-import {
-  memo,
-  useEffect,
-  useMemo,
-  useRef,
-  useState
-} from "react";
+import { useMemo } from "react";
 import Alert from "@mui/material/Alert";
 import Button from "@mui/material/Button";
 import Card from "@mui/material/Card";
 import CardContent from "@mui/material/CardContent";
 import CircularProgress from "@mui/material/CircularProgress";
 import Container from "@mui/material/Container";
+import MenuItem from "@mui/material/MenuItem";
 import Stack from "@mui/material/Stack";
 import TextField from "@mui/material/TextField";
 import Typography from "@mui/material/Typography";
@@ -22,37 +17,24 @@ import {
   useStripe
 } from "@stripe/react-stripe-js";
 
-import { stripePromise } from "../stripe";
-import { checkout, releaseHold } from "../api/endpoints";
-import { ApiError } from "../api/errors";
+import { stripeEnabled, stripePromise } from "../stripe";
 import type { EventDetails, ActiveHold } from "../api/types";
 import { Countdown } from "../shared/Countdown";
-import { serverClock } from "../clock/serverClock";
-import { useClockTick } from "../clock/useClockTick";
-import { decideTimerZero } from "./checkoutTimer";
-import { checkoutErrorState } from "./checkoutErrorState";
-import {
-  clearHoldStorage,
-  getIdempotencyKey,
-  getHoldToken
-} from "../sale/storage";
 import { HomeButton } from "../shared/HomeButton";
+import { useCheckoutSubmit, type PaymentDriver } from "./useCheckoutSubmit";
+import { useState } from "react";
 
-export function CheckoutPage({
-  event,
-  eventId,
-  hold,
-  onRefresh,
-  onCompleted
-}: {
+type CheckoutProps = {
   event: EventDetails;
   eventId: number;
   hold: ActiveHold;
   onRefresh: () => void;
   onCompleted: (orderNumber: string) => void;
-}) {
-  const tier = event.tiers.find(
-    (candidate) => candidate.tierId === hold.tierId
+};
+
+export function CheckoutPage(props: CheckoutProps) {
+  const tier = props.event.tiers.find(
+    (candidate) => candidate.tierId === props.hold.tierId
   );
 
   if (!tier) {
@@ -68,18 +50,21 @@ export function CheckoutPage({
     );
   }
 
-  const amount = tier.priceCents * hold.quantity;
-  const currency = tier.currency.toLowerCase();
+  /*
+   * Which gateway is live is a server decision, and the client follows it.
+   * With no publishable key configured the backend's default stub is what is
+   * answering, so offering a card form would be a lie about where the money
+   * goes. See ../stripe.ts and ADR-058.
+   */
+  if (!stripeEnabled) {
+    return <StubCheckout {...props} />;
+  }
 
   return (
     <StripeCheckout
-      amount={amount}
-      currency={currency}
-      event={event}
-      eventId={eventId}
-      hold={hold}
-      onRefresh={onRefresh}
-      onCompleted={onCompleted}
+      {...props}
+      amount={tier.priceCents * props.hold.quantity}
+      currency={tier.currency.toLowerCase()}
     />
   );
 }
@@ -87,20 +72,8 @@ export function CheckoutPage({
 function StripeCheckout({
   amount,
   currency,
-  event,
-  eventId,
-  hold,
-  onRefresh,
-  onCompleted
-}: {
-  amount: number;
-  currency: string;
-  event: EventDetails;
-  eventId: number;
-  hold: ActiveHold;
-  onRefresh: () => void;
-  onCompleted: (orderNumber: string) => void;
-}) {
+  ...props
+}: CheckoutProps & { amount: number; currency: string }) {
   const elementsOptions = useMemo(
     () => ({
       mode: "payment" as const,
@@ -111,299 +84,162 @@ function StripeCheckout({
     }),
     [amount, currency]
   );
+
   return (
-    <Elements
-      stripe={stripePromise}
-      options={elementsOptions}
-    >
-      <CheckoutForm
-        event={event}
-        eventId={eventId}
-        hold={hold}
-        onRefresh={onRefresh}
-        onCompleted={onCompleted}
-      />
+    <Elements stripe={stripePromise} options={elementsOptions}>
+      <StripeCheckoutForm {...props} />
     </Elements>
   );
 }
 
-function CheckoutForm({
-  event,
-  eventId,
-  hold,
-  onRefresh,
-  onCompleted
-}: {
-  event: EventDetails;
-  eventId: number;
-  hold: ActiveHold;
-  onRefresh: () => void;
-  onCompleted: (orderNumber: string) => void;
-}) {
-  useClockTick();
-
+function StripeCheckoutForm(props: CheckoutProps) {
   const stripe = useStripe();
   const elements = useElements();
 
-  const tier = event.tiers.find(
-    (candidate) => candidate.tierId === hold.tierId
-  );
+  const driver: PaymentDriver = {
+    ready: Boolean(stripe && elements),
 
-  const [email, setEmail] = useState("");
-  const [submitting, setSubmitting] = useState(false);
-  const [message, setMessage] = useState<string | null>(null);
-  const [messageSeverity, setMessageSeverity] = useState<"error" | "info">(
-    "error"
-  );
-  const [payDisabled, setPayDisabled] = useState(false);
-  const [duplicatePayment, setDuplicatePayment] = useState(false);
+    async createPaymentMethod(email) {
+      if (!stripe || !elements) {
+        return { error: "The payment form is still loading." };
+      }
 
-  const timerCheckForHold = useRef<string | null>(null);
-
-  const total = useMemo(
-    () => (tier ? (tier.priceCents * hold.quantity) / 100 : null),
-    [hold.quantity, tier]
-  );
-
-  useEffect(() => {
-    if (!duplicatePayment) return;
-
-    const timer = window.setInterval(onRefresh, 2000);
-
-    return () => window.clearInterval(timer);
-  }, [duplicatePayment, onRefresh]);
-
-  useEffect(() => {
-    if (serverClock.remainingMs(hold.expiresAt) > 0) {
-      timerCheckForHold.current = null;
-      return;
-    }
-
-    const paymentInFlight = submitting || duplicatePayment;
-
-    if (decideTimerZero(paymentInFlight) === "complete-payment") {
-      setMessage("Completing your purchase…");
-      setMessageSeverity("info");
-      setPayDisabled(true);
-      return;
-    }
-
-    if (timerCheckForHold.current === hold.holdToken) return;
-
-    timerCheckForHold.current = hold.holdToken;
-    setMessage("Checking your reservation…");
-    setMessageSeverity("info");
-
-    void onRefresh();
-  }, [
-    duplicatePayment,
-    hold.expiresAt,
-    hold.holdToken,
-    onRefresh,
-    submitting
-  ]);
-
-  const submit = async () => {
-    const holdToken = getHoldToken(eventId) ?? hold.holdToken;
-
-    if (!holdToken || !email.trim()) {
-      setMessage("Enter the email address for your tickets.");
-      setMessageSeverity("error");
-      return;
-    }
-
-    if (!stripe || !elements) {
-      setMessage("The payment form is still loading. Please try again.");
-      setMessageSeverity("error");
-      return;
-    }
-
-    setSubmitting(true);
-    setPayDisabled(true);
-    setDuplicatePayment(false);
-    setMessage(null);
-    setMessageSeverity("error");
-
-    try {
-      /*
-      * Validate the Stripe PaymentElement first.
-      */
+      // Validate the PaymentElement before asking for a payment method.
       const { error: submitError } = await elements.submit();
 
       if (submitError) {
-        setMessage(
-          submitError.message ?? "Please check your payment details."
-        );
-        setPayDisabled(false);
-        return;
+        return {
+          error: submitError.message ?? "Please check your payment details."
+        };
       }
 
-      /*
-      * Create the PaymentMethod from the current card details.
-      */
-      const {
-        error: paymentMethodError,
-        paymentMethod
-      } = await stripe.createPaymentMethod({
+      const { error, paymentMethod } = await stripe.createPaymentMethod({
         elements,
-        params: {
-          billing_details: {
-            email: email.trim()
-          }
-        }
+        params: { billing_details: { email } }
       });
 
-      if (paymentMethodError) {
-        setMessage(
-          paymentMethodError.message ??
-            "Your payment details could not be processed."
-        );
-        setPayDisabled(false);
-        return;
+      if (error) {
+        return {
+          error: error.message ?? "Your payment details could not be processed."
+        };
       }
 
       if (!paymentMethod) {
-        setMessage("Stripe did not create a payment method.");
-        setPayDisabled(false);
-        return;
+        return { error: "Stripe did not create a payment method." };
       }
 
-      /*
-      * IMPORTANT:
-      *
-      * Generate ONE idempotency key for THIS payment attempt.
-      *
-      * If this attempt enters 3-D Secure, the exact same request
-      * (including this key) is re-posted after authentication.
-      *
-      * If the buyer later tries again, submit() runs again and
-      * generates a NEW key.
-      */
-      const idempotencyKey = crypto.randomUUID();
+      return { paymentMethodId: paymentMethod.id };
+    },
 
-      const checkoutRequest = {
-        holdToken,
-        userEmail: email.trim(),
-        paymentMethodId: paymentMethod.id,
-        idempotencyKey
-      };
+    async authenticate(clientSecret) {
+      if (!stripe) {
+        return { error: "The payment form is still loading." };
+      }
 
-      let receipt;
+      const { error } = await stripe.handleNextAction({ clientSecret });
 
-      try {
-        /*
-        * First checkout attempt.
-        */
-        receipt = await checkout(checkoutRequest);
-      } catch (cause) {
-        /*
-        * The backend says the bank requires authentication.
-        */
-        if (
-          !(cause instanceof ApiError) ||
-          cause.code !== "PAYMENT_ACTION_REQUIRED"
-        ) {
-          throw cause;
-        }
-
-        const clientSecret = cause.problem.clientSecret;
-
-        if (!clientSecret) {
-          setMessage(
-            "Your bank requires verification, but the payment could not continue."
-          );
-          setPayDisabled(false);
-          return;
-        }
-
-        /*
-        * Keep payment disabled while the bank challenge is active.
-        */
-        setMessage("Your bank is verifying the payment…");
-        setMessageSeverity("info");
-        setPayDisabled(true);
-        setSubmitting(true);
-
-        /*
-        * Run 3-D Secure.
-        */
-        const { error: actionError } =
-          await stripe.handleNextAction({
-            clientSecret
-          });
-
-        if (actionError) {
-          setMessage(
-            actionError.message ??
+      return error
+        ? {
+            error:
+              error.message ??
               "Your bank could not verify the payment. Please try again."
-          );
-          setMessageSeverity("error");
-          setPayDisabled(false);
-          return;
-        }
-
-        /*
-        * Re-post the EXACT SAME checkout request.
-        *
-        * Same:
-        *   - holdToken
-        *   - userEmail
-        *   - paymentMethodId
-        *   - idempotencyKey
-        *
-        * The backend sees the existing PROCESSING PaymentIntent
-        * and retrieves it instead of creating another charge.
-        */
-        receipt = await checkout(checkoutRequest);
-      }
-
-      clearHoldStorage(eventId, holdToken);
-      onCompleted(receipt.orderNumber);
-    } catch (cause) {
-      if (!(cause instanceof ApiError)) {
-        setMessage("That payment could not be completed. Please try again.");
-        setMessageSeverity("error");
-        setPayDisabled(false);
-        return;
-      }
-
-      const next = checkoutErrorState(cause);
-
-      setMessage(next.message);
-      setMessageSeverity(next.severity);
-      setPayDisabled(next.payDisabled);
-      setDuplicatePayment(next.duplicatePayment);
-
-      if (next.clearHold) {
-        clearHoldStorage(eventId, hold.holdToken);
-      }
-
-      if (next.refreshSale) {
-        onRefresh();
-      }
-    } finally {
-      setSubmitting(false);
+          }
+        : {};
     }
   };
 
-  const release = async () => {
-    const holdToken = getHoldToken(eventId) ?? hold.holdToken;
+  return <CheckoutLayout {...props} driver={driver} payment={<PaymentElement options={{ layout: "tabs" }} />} />;
+}
 
-    try {
-      await releaseHold(holdToken);
-    } catch (cause) {
-      if (
-        !(cause instanceof ApiError) ||
-        cause.code !== "HOLD_NOT_FOUND"
-      ) {
-        setMessage("The seats could not be released. Please try again.");
-        return;
-      }
+/**
+ * The stub gateway's documented outcomes, spelled exactly as it switches on
+ * them (StubPaymentGateway). This is the only way to walk a decline, a gateway
+ * outage or a 3-D Secure challenge in a browser without a Stripe account.
+ */
+const STUB_PAYMENT_METHODS = [
+  { id: "pm_card_ok", label: "Succeeds" },
+  { id: "pm_card_declined", label: "Declined — seats kept, retry allowed" },
+  { id: "pm_card_error", label: "Gateway unreachable — 503, seats kept" },
+  {
+    id: "pm_card_authenticationRequired",
+    label: "3-D Secure — authenticates, then settles"
+  }
+];
+
+function StubCheckout(props: CheckoutProps) {
+  const [paymentMethodId, setPaymentMethodId] = useState(
+    STUB_PAYMENT_METHODS[0].id
+  );
+
+  const driver: PaymentDriver = {
+    ready: true,
+    async createPaymentMethod() {
+      return { paymentMethodId };
+    },
+    async authenticate() {
+      // No bank page to show. Re-posting the same body is the whole retry, and
+      // the server settles the parked intent (ADR-054).
+      return {};
     }
-
-    clearHoldStorage(eventId, holdToken);
-    onRefresh();
   };
+
+  return (
+    <CheckoutLayout
+      {...props}
+      driver={driver}
+      payment={
+        <Stack spacing={1}>
+          <TextField
+            select
+            label="Test card outcome"
+            value={paymentMethodId}
+            onChange={(event) => setPaymentMethodId(event.target.value)}
+            fullWidth
+          >
+            {STUB_PAYMENT_METHODS.map((method) => (
+              <MenuItem key={method.id} value={method.id}>
+                {method.label}
+              </MenuItem>
+            ))}
+          </TextField>
+          <Typography variant="caption" color="text.secondary">
+            No card is charged. The server is running its stub gateway because
+            no Stripe key is configured.
+          </Typography>
+        </Stack>
+      }
+    />
+  );
+}
+
+function CheckoutLayout({
+  event,
+  eventId,
+  hold,
+  driver,
+  payment,
+  onRefresh,
+  onCompleted
+}: CheckoutProps & { driver: PaymentDriver; payment: React.ReactNode }) {
+  const {
+    tier,
+    total,
+    email,
+    setEmail,
+    message,
+    messageSeverity,
+    submitting,
+    payDisabled,
+    submit,
+    release
+  } = useCheckoutSubmit({
+    event,
+    eventId,
+    hold,
+    driver,
+    onRefresh,
+    onCompleted
+  });
 
   return (
     <Container maxWidth="sm" sx={{ py: 6 }}>
@@ -423,24 +259,17 @@ function CheckoutForm({
 
               <Typography color="text.secondary">
                 Total:{" "}
-                {total == null
-                  ? "—"
-                  : `${total.toFixed(2)} ${tier?.currency}`}
+                {total == null ? "—" : `${total.toFixed(2)} ${tier?.currency}`}
               </Typography>
 
               <Typography>
-                Reservation expires in{" "}
-                <Countdown expiresAt={hold.expiresAt} />
+                Reservation expires in <Countdown expiresAt={hold.expiresAt} />
               </Typography>
             </Stack>
           </CardContent>
         </Card>
 
-        {message && (
-          <Alert severity={messageSeverity}>
-            {message}
-          </Alert>
-        )}
+        {message && <Alert severity={messageSeverity}>{message}</Alert>}
 
         <TextField
           label="Email for your tickets"
@@ -451,25 +280,14 @@ function CheckoutForm({
           fullWidth
         />
 
-        <Typography variant="h6">
-          Payment
-        </Typography>
+        <Typography variant="h6">Payment</Typography>
 
-        <PaymentElement
-          options={{
-            layout: "tabs"
-          }}
-        />
+        {payment}
 
         <Button
           variant="contained"
           size="large"
-          disabled={
-            submitting ||
-            payDisabled ||
-            !stripe ||
-            !elements
-          }
+          disabled={submitting || payDisabled || !driver.ready}
           onClick={() => void submit()}
         >
           {submitting ? (

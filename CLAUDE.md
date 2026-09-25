@@ -12,7 +12,7 @@ but `flashseats.payment.stripe.enabled` is **false by default**, so `dev`, `test
 and every drill still run the in-process stub through the complete journey, 3-D Secure included.
 
 **Read [`docs/00-architecture-decisions.md`](docs/00-architecture-decisions.md) before changing
-anything.** It contains 57 ADRs. Most record a defect and its fix — 034-039 come from the first
+anything.** It contains 58 ADRs. Most record a defect and its fix — 034-039 come from the first
 review pass over the built code, 040-042 from the second — and several look like over-engineering
 until you read the failure they prevent. 043-045 are the exception: forward-looking decisions about
 the operator surface, buyer accounts and what health should report, with nothing built against them
@@ -36,7 +36,7 @@ security posture, next stages, and the review-pass log. It is the doc to update 
 ## Document precedence
 
 ```
-00-architecture-decisions.md      ← highest authority (57 ADRs)
+00-architecture-decisions.md      ← highest authority (58 ADRs)
 05-global-standards.md            ← cross-cutting contract; module docs conform to it
 FE_SPEC.md                        ← client contract (repo root)
 03-end-to-end-flow.md             ← the authoritative user journey AND the operating envelope
@@ -93,12 +93,18 @@ describing superseded designs. That is the failure mode this rule exists to stop
 - Redis is a **single primary + Sentinel**, not Cluster (ADR-018). The `CROSSSLOT` argument that
   originally motivated this is moot — `stock_reserve.lua` now touches one key — but keyspace
   notifications are still per-node and a handful of keys is nowhere near a single primary's ceiling.
+  **Sentinel is now actually built** in the `cluster` profile — one primary, two replicas, three
+  sentinels, discovered through `application-docker.properties` (ADR-058, superseding ADR-047's
+  deferral). `dev`, `test` and the plain `docker compose up -d` stack stay standalone. **A failover
+  stops every sale**: the promoted replica is a new process with a new `run_id`, so `StockEpoch`
+  distrusts every managed event until an operator rebuilds it. That is ADR-046 working, not a bug.
 - The **transactional outbox is hand-rolled** in `order`. The Spring Modulith event-publication
   starters were deliberately removed; only `spring-modulith-starter-core` and `-starter-test`
   remain, purely for `ApplicationModules.verify()` (ADR-009). Do not re-add them casually.
 - `spring.threads.virtual.enabled=true` is load-bearing, not decoration.
 - **Resilience4j is the plain artifacts, never the starter** — `resilience4j-spring-boot3` targets
-  Boot 3. One `CircuitBreaker` bean is declared by hand in `payment`'s gateway config (ADR-052).
+  Boot 3. **Two** `CircuitBreaker` beans are declared by hand: `payment`'s gateway config (ADR-052)
+  and `bot`'s reCAPTCHA config (ADR-058).
 - **Stripe is on the classpath unconditionally but used conditionally.** Signature verification
   (`com.stripe.net.Webhook`) is needed on every profile, because that is how the tests sign their own
   payloads; the *gateway* is chosen by `flashseats.payment.stripe.enabled`.
@@ -255,6 +261,10 @@ Do not reintroduce these — each cost a real defect in the first pass:
 | **Binding a webhook body to a DTO before verifying its signature** | The signature is over the *bytes*, not the meaning. Jackson round-tripping an equivalent object changes key order and whitespace, so every legitimate delivery fails verification — and the fix looks like a provider bug for as long as you believe the JSON is the same |
 | **Counting declines against a circuit breaker** | A refused card is a *correct answer*. During a flash sale a burst of expired cards is the normal state of the world, so a breaker that counted them opens on a healthy provider and takes the whole sale's payments down. Count only what a transport failure throws (ADR-052) |
 | **Making a `@Transactional` claim a private method on the class that calls it** | Spring's proxy does not intercept self-invocation, so it runs with **no transaction at all**, silently. For a webhook claim that is not style: the claim must be *committed* before the settlement it guards begins, or all three replicas settle the same charge |
+| **Two authorities for one id space** | SSE reconnect replay numbered its retained frames from a Redis sequence and gave every *other* frame a per-connection `"local-N"`. Positions arrive every two seconds, so a reconnect almost always quoted a `local-N`, which the replay parsed as a number, failed, and answered with an empty list — **the feature could not fire on the normal path**, and nothing failed because nothing tested it. Number only what is replayable and send the rest with **no `id`**: the SSE spec then leaves the client's last-event-id alone (ADR-058) |
+| **Retaining a bearer capability in a log that outlives it** | The promotion frame carries a `passToken` whose own key expires in 120 s, and the reconnect log is one ZSET per *event*, kept until sale end plus retention. Writing it there files a spent single-use capability next to the session id it belongs to, for hours. Replay the *fact* and re-read the authority — the `hold:{token}` idiom — or, better, derive the frame from live state on connect, which also works with no `Last-Event-ID` at all (ADR-058) |
+| **A client that cannot run the configuration the server defaults to** | `stripe.ts` threw at module load without `VITE_STRIPE_PUBLISHABLE_KEY`, while `flashseats.payment.stripe.enabled` is **false by default** — so the only gateway the SPA could drive was the one nobody runs locally, and a clean checkout was a white screen. Mirror the server's seam on the client (ADR-058) |
+| **Adding ignore rules in the same commit that tracks the files** | `.gitignore` never applies to a path git already tracks, so `frontend/node_modules/` sat in the rules while 7,805 of its files sat in the index. The rule reads as protection and is inert; `git check-ignore -v` is how you find out (ADR-058) |
 
 ## Implementation order
 
@@ -278,6 +288,8 @@ rather than one module's corner:
 | `queue:admit:{e}:{sid}` | `queue` | String | 600 s | proof of admission into the sale (ADR-020) |
 | `queue:admissions:{e}` | `queue` | ZSET | sale end | live admissions, same trick as `passes` |
 | `queue:events:{e}` | `queue` | Pub/Sub | — | promotion fan-out to whichever replica holds the SSE connection (ADR-007) |
+| `queue:replay:{e}` | `queue` | ZSET | sale end | the last 256 **broadcast** frames, scored by sequence, so a reconnect can be handed what it missed. A session-targeted frame is **never** retained here — the one that exists carries a pass token (ADR-058) |
+| `queue:replay-seq:{e}` | `queue` | String | sale end | the monotonic sequence behind those frames; it is the only SSE `id` the system issues |
 | `queue:promote:{e}` | `queue` | String | 900 ms | makes the promotion tick a singleton across replicas (ADR-032) |
 | `queue:budget` | `queue` | String | one tick | **the cluster-wide admission allowance**, shared by every open sale. The one key here deliberately *not* scoped by event; its TTL is the window, so replicas need not agree on the time (ADR-049) |
 | `queue:exhausted:{e}` | `queue` | String | sale end | derived sold-out marker; deleted the moment stock returns (ADR-035) |
@@ -294,6 +306,16 @@ that is what makes `noeviction` a correctness setting rather than a tuning one.
 
 ```bash
 cp .env.example .env
+docker/scripts/dev-up.sh                         # THE local dev entry point. Use this, not a bare
+                                                 # `docker compose up -d`. It refuses to continue on
+                                                 # a port conflict (naming the process), stops any
+                                                 # cluster replicas -- they share this Redis and
+                                                 # PostgreSQL but sign queue passes with DIFFERENT
+                                                 # secrets, so a pass minted by one is a 401 at the
+                                                 # other -- and guarantees one sale is actually OPEN,
+                                                 # which CatalogDevSeeder cannot do once the volume
+                                                 # holds anything. `--reset` wipes the volumes.
+                                                 # It NEVER writes a stock counter (ADR-004).
 docker compose up -d                             # PostgreSQL, Redis, RabbitMQ, Mailpit
 docker compose up -d postgres                    # strictly-minimal Phase 1
 
@@ -322,6 +344,20 @@ docker/scripts/fanout-check.sh                   # PROVE promotion fan-out acros
                                                  # that a fan-out failure. Re-seed first
 docker/scripts/hold-expiry-check.sh              # PROVE the expiry listener restores seats exactly
                                                  # once, and faster than the sweeper (ADR-048)
+docker/scripts/sentinel-failover-check.sh        # PROVE Sentinel promotes a replica and the old
+                                                 # primary rejoins. TOPOLOGY ONLY -- it deliberately
+                                                 # does not check inventory, and after a failover
+                                                 # every event is distrusted until rebuilt (ADR-058)
+docker/scripts/redis-master-cli.sh               # redis-cli against whichever node Sentinel calls
+                                                 # the primary right now
+
+# The SPA. Dev-only: nginx serves no static root and there is no compose
+# service, so the cluster still serves src/main/resources/static (ADR-058).
+cd frontend && npm install && npm run dev        # :5173, proxies /api to :8080.
+                                                 # cp .env.example .env.local and LEAVE THE STRIPE
+                                                 # KEY BLANK to drive the stub gateway, which is
+                                                 # what the backend runs by default
+cd frontend && npm test                          # vitest unit tests
 
 # Stage 2, the REAL provider. Everything else here runs the stub, deliberately
 # -- so none of it can tell you whether Stripe agrees (ADR-052).
@@ -359,6 +395,18 @@ Changing the compose network's `ipam` recreates the network, and containers crea
 **old** one get reattached without their service-name DNS aliases — every service name then resolves
 `NXDOMAIN` and the replicas restart-loop on `Unable to connect to redis`. `docker compose down`
 first; a plain `up -d` is not enough.
+
+**And `down` needs the profile too.** `docker compose down` without `--profile cluster` leaves every
+profiled container — nginx, the replicas, the sentinels — running or stopped but *present*, still
+holding a reference to the network it just deleted. The next `up` then fails with
+`failed to set up container networking: network <id> not found` for exactly those services, which
+reads like a Docker bug and is not one. Use `docker compose --profile cluster down`.
+
+**Every script under `docker/` must be mode 755.** All three that PR #16 added were committed 644,
+and `sentinel-entrypoint.sh` is a container `entrypoint` — so the sentinels restart-looped on
+`exec …: permission denied`, and because every app replica `depends_on` them, **the cluster had
+never once started**. `git ls-files -s 'docker/**/*.sh'` shows the modes; a checkout on a filesystem
+without POSIX permissions is how a 644 gets in.
 
 Metrics are scraped **per replica**, not through nginx, and nginx deliberately routes only
 `/actuator/health`. `hikaricp_connections_pending` and `flashseats_stock_drift` are per-instance

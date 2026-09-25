@@ -43,9 +43,22 @@ build/
 # Load-test output
 docker/k6/summary.json
 
-# Frontend local dependencies and TypeScript build metadata
+# Frontend local dependencies, build output and TypeScript build metadata.
+# All of it was committed once — 7,805 files and 57 MB of node_modules — because
+# these rules were added in the same merge that tracked the files, and an ignore
+# rule does not apply to a path git already tracks.
 frontend/node_modules/
+frontend/dist/
 frontend/tsconfig.*.tsbuildinfo
+frontend/vite.config.js
+frontend/vite.config.d.ts
+frontend/vitest.config.js
+frontend/vitest.config.d.ts
 frontend/.vite/
 frontend/.env.local
 frontend/.env.*.local
+
+# Scratch probes and classpath dumps. The merge that added the frontend also
+# carried Probe.java, its .class file and a Windows `cp.txt` into the repo root.
+*.class
+cp.txt

@@ -181,7 +181,13 @@ services:
     image: redis:7-alpine
     profiles: ["cluster"]
     restart: unless-stopped
-    entrypoint: ["/usr/local/bin/sentinel-entrypoint.sh"]
+    # Invoked through `sh` rather than executed directly. The file is mounted from
+    # the host, so its mode is whatever the checkout produced -- and a checkout on a
+    # filesystem without POSIX permissions produces 0644, which fails as
+    # "exec /usr/local/bin/sentinel-entrypoint.sh: permission denied" and takes the
+    # whole cluster with it, because every app replica depends on the sentinels.
+    # The exec bit is also set in git; this makes it not matter.
+    entrypoint: ["sh", "/usr/local/bin/sentinel-entrypoint.sh"]
     volumes:
       - ./docker/redis/sentinel-entrypoint.sh:/usr/local/bin/sentinel-entrypoint.sh:ro
       - redis-sentinel-1-data:/data
@@ -203,7 +209,13 @@ services:
     image: redis:7-alpine
     profiles: ["cluster"]
     restart: unless-stopped
-    entrypoint: ["/usr/local/bin/sentinel-entrypoint.sh"]
+    # Invoked through `sh` rather than executed directly. The file is mounted from
+    # the host, so its mode is whatever the checkout produced -- and a checkout on a
+    # filesystem without POSIX permissions produces 0644, which fails as
+    # "exec /usr/local/bin/sentinel-entrypoint.sh: permission denied" and takes the
+    # whole cluster with it, because every app replica depends on the sentinels.
+    # The exec bit is also set in git; this makes it not matter.
+    entrypoint: ["sh", "/usr/local/bin/sentinel-entrypoint.sh"]
     volumes:
       - ./docker/redis/sentinel-entrypoint.sh:/usr/local/bin/sentinel-entrypoint.sh:ro
       - redis-sentinel-2-data:/data
@@ -225,7 +237,13 @@ services:
     image: redis:7-alpine
     profiles: ["cluster"]
     restart: unless-stopped
-    entrypoint: ["/usr/local/bin/sentinel-entrypoint.sh"]
+    # Invoked through `sh` rather than executed directly. The file is mounted from
+    # the host, so its mode is whatever the checkout produced -- and a checkout on a
+    # filesystem without POSIX permissions produces 0644, which fails as
+    # "exec /usr/local/bin/sentinel-entrypoint.sh: permission denied" and takes the
+    # whole cluster with it, because every app replica depends on the sentinels.
+    # The exec bit is also set in git; this makes it not matter.
+    entrypoint: ["sh", "/usr/local/bin/sentinel-entrypoint.sh"]
     volumes:
       - ./docker/redis/sentinel-entrypoint.sh:/usr/local/bin/sentinel-entrypoint.sh:ro
       - redis-sentinel-3-data:/data

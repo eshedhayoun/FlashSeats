@@ -11,10 +11,11 @@ import com.flashseats.payment.gateway.GatewayCharge;
 import com.flashseats.payment.gateway.GatewayResult;
 import com.flashseats.payment.gateway.PaymentGateway;
 import com.flashseats.payment.model.PaymentTransaction;
-import io.micrometer.core.instrument.Gauge;
+import io.micrometer.core.instrument.Counter;
 import io.micrometer.core.instrument.MeterRegistry;
 import java.time.Duration;
-import java.util.concurrent.atomic.AtomicLong;
+import java.util.EnumMap;
+import java.util.Map;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.stereotype.Service;
@@ -42,8 +43,8 @@ public class PaymentService implements PaymentFacade {
     private final PaymentTransactionStore store;
     private final StringRedisTemplate redis;
     private final PaymentProperties properties;
-    private final AtomicLong gatewayAttempts = new AtomicLong();
-    private final AtomicLong declines = new AtomicLong();
+    private final Map<GatewayResult.Outcome, Counter> attemptsByOutcome =
+            new EnumMap<>(GatewayResult.Outcome.class);
 
     public PaymentService(
             PaymentGateway gateway,
@@ -55,12 +56,30 @@ public class PaymentService implements PaymentFacade {
         this.store = store;
         this.redis = redis;
         this.properties = properties;
-        Gauge.builder(
-                        "flashseats.payment.decline.ratio",
-                        this,
-                        service -> service.declines.get() / (double) Math.max(1, service.gatewayAttempts.get()))
-                .description("Declined provider attempts divided by all provider attempts")
-                .register(meters);
+        /*
+         * One counter, tagged by outcome, rather than a decline RATIO.
+         *
+         * The ratio this replaced was cumulative since JVM start -- declines divided
+         * by all attempts, for the life of the process. 03 section 7 says the metric
+         * exists because "a spike is either a provider incident or a fraud rule
+         * mis-firing", and a lifetime ratio is the one shape that cannot show a
+         * spike: every sample dilutes the next, so an outage at hour six barely
+         * moves a number six hours of healthy traffic have flattened.
+         *
+         * Counters leave the windowing to whoever is asking, which is where it
+         * belongs: rate(attempts{outcome="declined"}[5m]) / rate(attempts[5m]) is
+         * the decline ratio over any window, and the same series answers "are we
+         * reaching the provider at all" without a second metric. Outcome is a
+         * four-value enum, so the tag cannot explode.
+         */
+        for (GatewayResult.Outcome outcome : GatewayResult.Outcome.values()) {
+            attemptsByOutcome.put(
+                    outcome,
+                    Counter.builder("flashseats.payment.attempts")
+                            .description("Provider charge attempts by outcome")
+                            .tag("outcome", outcome.name().toLowerCase())
+                            .register(meters));
+        }
     }
 
     /**
@@ -98,7 +117,6 @@ public class PaymentService implements PaymentFacade {
             // open a second intent and risk billing twice for one authentication.
             ChargeAttempt attempt = store.beginAttempt(command); // tx1
 
-            gatewayAttempts.incrementAndGet();
             GatewayResult result = attempt.isResume() // no transaction open
                     ? gateway.retrieve(attempt.resumableGatewayReference())
                     : gateway.charge(new GatewayCharge(
@@ -110,9 +128,7 @@ public class PaymentService implements PaymentFacade {
                             command.clientIdempotencyKey()));
 
             store.recordOutcome(attempt.transactionReference(), result); // tx2
-            if (result.outcome() == GatewayResult.Outcome.DECLINED) {
-                declines.incrementAndGet();
-            }
+            attemptsByOutcome.get(result.outcome()).increment();
 
             if (result.outcome() == GatewayResult.Outcome.ERROR) {
                 log.warn("Gateway error for order {}: {}", command.orderNumber(), result.failureReason());
@@ -153,17 +169,22 @@ public class PaymentService implements PaymentFacade {
     public RefundResult refund(String transactionReference, long amountCents, String reason) {
         PaymentTransaction transaction = store.require(transactionReference);
         /*
-        * Refunds are full-refund operations in FlashSeats.
-        *
-        * If the durable payment ledger already says this transaction has been
-        * refunded for the requested amount, do NOT call the provider again.
-        *
-        * This protects us from:
-        * - webhook redelivery
-        * - application retry
-        * - a crash after Stripe refunded but before our DB update
-        */
-        if (transaction.getRefundedAmountCents() >= amountCents) {
+         * Refunds here are full-refund operations, so a ledger that already records
+         * this amount means the work is done and the provider round trip is waste.
+         * Webhook redelivery and application retry both arrive this way.
+         *
+         * What this does NOT protect against is the interesting case: a crash after
+         * the provider refunded but before our DB recorded it. There
+         * refundedAmountCents is still zero, so this guard does not fire at all —
+         * and it must not, because we genuinely do not know the money moved. That
+         * case is covered one layer down, by the idempotency key
+         * StripePaymentGateway.refund sets over (intent, amount): the retried
+         * request returns the provider's original result instead of refunding twice.
+         *
+         * Stated explicitly because a guard whose comment claims a guarantee it does
+         * not hold is how the layer that actually holds it gets removed later.
+         */
+        if (amountCents > 0 && transaction.getRefundedAmountCents() >= amountCents) {
             log.info(
                     "Refund for {} already recorded ({} cents); not calling provider again",
                     transactionReference,

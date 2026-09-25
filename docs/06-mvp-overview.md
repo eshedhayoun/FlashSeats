@@ -111,12 +111,12 @@ it, so if anything fails the hold returns to `ACTIVE` and expires normally.
 | Module | Ships now | Deferred |
 | :--- | :--- | :--- |
 | `shared` | `ErrorCode` (42 codes), `ProblemDetails`, one global advice, `SessionId`, `Money`, `Clock`, `SignedToken`, `TraceIdFilter` | — |
-| `bot` | Redis-backed Bucket4j session + IP buckets (SSE **counted once**, not exempt); reCAPTCHA v3 on join, failing open; cached `ip_rules`; async `bot_audit_logs`; operator surface | Rate-limit **metrics**; CIDR ranges; audit retention. The `fsid` cookie moved to `shared` in Pass 7 |
+| `bot` | Redis-backed Bucket4j session + IP buckets (SSE **counted once**, not exempt); reCAPTCHA v3 on join, failing open behind its own circuit breaker; cached `ip_rules`; async `bot_audit_logs`; operator surface; **`flashseats.bot.refusals{outcome}`** | CIDR ranges; audit retention. The `fsid` cookie moved to `shared` in Pass 7 |
 | `catalog` | Events, tiers, window derivation, metadata cache, `serverTime`, bucketed availability, **Redis counters + Lua, the `-2` fault path, pre-warm, pause/resume, the Redis-restart guard** | create-event endpoint, `TierAvailabilityChangedEvent` |
-| `queue` | `ZADD NX` join, `FIFO`/`RANDOM` ordering, SSE with heartbeats, HMAC passes, admission sessions, promotion worker, **pub/sub fan-out**, measured drain-rate estimates, `tier-availability` frame | `Last-Event-ID` replay |
+| `queue` | `ZADD NX` join, `FIFO`/`RANDOM` ordering, SSE with heartbeats, HMAC passes, admission sessions, promotion worker, **pub/sub fan-out**, measured drain-rate estimates, `tier-availability` frame, **`Last-Event-ID` replay of broadcast frames** | per-event queue metrics |
 | `hold` | `ticket_holds` authority, the settle-once claim, atomic reserve **with compensation**, **after-commit restore**, bounded grace, sweeper, all three endpoints, `hold:{token}` Redis timers and the keyspace listener | — |
-| `payment` | Real `PaymentFacade`, `payment_transactions`, three idempotency layers, stub gateway behind the final interface | Stripe, webhooks, 3-D Secure, Resilience4j |
-| `order` | Full orchestration, find-or-create, server-side pricing, receipt tokens, outbox relay with `SKIP LOCKED`, compensating refund, **the stock rebuild and the drift gauge** | `PaymentSettledEvent` listener, `/checkout/resume` |
+| `payment` | Real `PaymentFacade`, `payment_transactions`, three idempotency layers, **Stripe behind the same seam, the webhook receiver, 3-D Secure, a hand-declared circuit breaker**, stub gateway as the default | — |
+| `order` | Full orchestration, find-or-create, server-side pricing, receipt tokens, outbox relay with `SKIP LOCKED`, compensating refund, **the stock rebuild, the drift gauge and the `PaymentSettledEvent` listener** | — (there is deliberately no `/checkout/resume`; re-POSTing is the retry, ADR-054) |
 | `notification` | Rabbit topology + DLX, insert-then-send consumers, PDFBox tickets, HTML email, refund notices, Mailpit | Failure classification |
 | `saleflow` | `GET /sale/{id}/state`, failing soft per section | — |
 
@@ -375,6 +375,60 @@ Honest list. None of these is hidden behind a passing test.
 - **The operator surface is curl-only.** ADR-043 calls it a correctness dependency; one that can only
   be driven by hand-written Basic-auth curl during an incident is half-built.
 
+**Found in Pass 11, reading the frontend merge (PR #16):**
+
+- **`./mvnw test` does not pass in the default order, and has not since the merge.** 213 tests,
+  **10 failures**, all in `HoldLifecycleIT` and `HoldExpiryTimerIT`. Reproduced at the merge commit
+  unmodified, so it is not Pass 11's or Pass 12's doing.
+
+  **The symptom, now that the fixtures assert instead of waiting.** `POST /api/v1/queue/join` answers
+  **`500`** with Spring's bare four-field error body — `timestamp/status/error/path`, **no registry
+  `code`**. The classes used to spend 150 s timing out on a pass that was never coming; they now fail
+  in **0.1 s** naming the status, which is what made everything below possible.
+
+  **The decisive fact: `-Dsurefire.runOrder=reversealphabetical` is 213/213 green.** The suite is
+  order-dependent, and the default *filesystem* order — which is not even stable across machines — is
+  the unlucky one. That is a usable workaround today and an argument for pinning the order regardless.
+
+  **Ruled out by experiment, not by reasoning.** Machine contention (reproduced idle, twice). Event-id
+  collision (unique ids changed nothing). The bot rate limiter — `RateLimitService` versions its bucket
+  keys by capacity/refill, so `BotDefenceIT`'s deliberately tiny buckets cannot collide with anyone
+  else's. `BotMetrics` (null-safe). The refusal path (writes a proper coded `429`). Surefire
+  parallelism (none configured). Context accumulation — `@DirtiesContext(AFTER_CLASS)` on both classes
+  that fork a context changed nothing. And **no pairwise combination reproduces it**: order+payment,
+  catalog+queue, notification+shared+flashseats, both forking bot ITs, and the five bot unit tests that
+  run between them are each green with the hold ITs appended. It needs most of the suite to have run.
+
+  **Where the next attempt should start.** The throw is **outside Spring MVC**: `GlobalExceptionHandler`
+  has an `@ExceptionHandler(Exception.class)` backstop that logs "Unhandled exception", and it is never
+  invoked for these. Nothing in the app calls `sendError`, there is no custom `ErrorController`, and
+  `server.error.include-message=always` does **not** add a `message` to the body — so the response is
+  not `BasicErrorController`'s either, which is the most interesting unexplained detail. A throw in a
+  servlet filter fits the escape path; what does not fit is that Tomcat's container logger records
+  nothing. Instrument the filter chain itself rather than the application.
+
+  **Pinned, not fixed.** `pom.xml` now sets Surefire's `runOrder` to `alphabetical`, which is verified
+  green twice from cold containers. That is worth doing regardless — the default is *filesystem* order,
+  so two machines can disagree about whether the suite passes — but it is a workaround, and this item
+  stays open. A green suite is no longer evidence that the pollution went away.
+- ~~**SSE reconnect replay never fired.**~~ **Fixed** (ADR-058). Live frames carried a
+  per-connection `"local-N"` id, retained frames carried a Redis sequence, and the replay parsed the
+  header as a number — so the normal case, where the last frame received was a two-second position
+  update, replayed nothing. Only replayable frames carry an `id` now.
+- ~~**The replay log retained promotion frames, and they carry a `passToken`.**~~ **Fixed**
+  (ADR-058). A single-use 120 s capability was being written into a per-event ZSET that outlives the
+  sale. Broadcasts only are retained; a promoted buyer's reconnect re-reads the live pass instead.
+- ~~**The SPA could not start without a Stripe publishable key**~~ — while the backend defaults to
+  the stub gateway, so the configuration everyone actually runs was the one the client could not
+  drive. **Fixed** (ADR-058): no key means stub mode, with the stub's magic tokens offered in the UI.
+- **The committed `node_modules` was not a working install.** Beyond the 57 MB, git had dropped the
+  `.bin` exec bits and at least one package file (`vite/dist/node/module-runner.js`), so `npm test`
+  failed on a fresh clone with a module-not-found error. `rm -rf node_modules && npm install` is the
+  fix, and the directory is untracked now.
+- **The SPA is dev-only.** `npm run dev` on `:5173` proxying to `:8080`. There is no compose service
+  and nginx serves no static root, so the cluster still serves the demo client at
+  `src/main/resources/static`. Wiring it is a separate stage (ADR-058).
+
 ---
 
 ## 10. Security posture
@@ -499,14 +553,23 @@ to run, and would have rate-limited its own load harness to nothing.
 
 **Carried forward, deliberately:**
 
-- **Redis Sentinel**, deferred in ADR-047. No exit criterion needs failover, and it works against the
-  Redis-restart criterion, which is cleanest against a standalone instance that simply stops.
+- ~~**Redis Sentinel**, deferred in ADR-047.~~ **Built in Pass 11** (ADR-058): one primary, two
+  replicas, three sentinels in the `cluster` profile, with `sentinel-failover-check.sh` proving
+  promotion and rejoin. **The topology is proven and the inventory half is not** — a failover changes
+  Redis's `run_id`, so `StockEpoch` distrusts every managed event and the sale stops until an
+  operator rebuilds. That is ADR-046 working as designed, and it is untested end to end.
+  **No capacity number in this document has been re-measured through Sentinel.**
 - **The 10,000-VU run and the p99 number.** Both need a host where the load generator is not
   competing with the system under test; see §9.
 - ~~The `hold:{token}` timer and the `__keyevent@0__:expired` listener.~~ **Built in Stage 4**, and
   proven on the rig Stage 3 left behind: restored exactly once, in 339 ms, across three replicas.
-- The rest of the metric set and its alarms: `outbox.lag.seconds`, `dlq.depth`,
-  `queue.promotion.rate`, `payment.decline.ratio`, `jvm.threads.pinned`. `stock.drift` and
+- ~~The rest of the metric set and its alarms: `outbox.lag.seconds`, `dlq.depth`,
+  `queue.promotion.rate`, `payment.decline.ratio`, `jvm.threads.pinned`.~~ **Mostly built in
+  Pass 11** (ADR-058): `outbox.lag.seconds`, `dlq.depth`, `payment.decline.ratio`,
+  `payment.webhook.received{type}`, `bot.refusals{outcome}` and `notification.delivered` / `.failed`
+  all emit; `queue.promotion.rate` shipped earlier as the untagged `queue.admissions`. What is left
+  is `queue.depth{event}`, `hold.conversion.ratio{event}` and `sse.connections.active` — all
+  per-event or per-connection shapes — plus `jvm.threads.pinned`. `stock.drift` and
   `hikaricp_connections_pending` are exported and were read per replica throughout.
 
 ### Stage 4 — The operator surface (ADR-043) — **done**
@@ -554,7 +617,13 @@ A console is presentation and can wait. The endpoints are the capability.
   deterministic ones already skip it.
 - `tier-availability` frames in the waiting room (ADR-027) and `RANDOM` queue ordering (ADR-024) are
   built; keep the next UI work focused on browser coverage rather than another API-only proof.
-- The React SPA against `FE_SPEC.md`, if the demo client is outgrown.
+- ~~The React SPA against `FE_SPEC.md`, if the demo client is outgrown.~~ **Built** (PR #16), and
+  **dev-only**: `cd frontend && npm install && npm run dev` serves it on `:5173` with `/api` proxied
+  to `:8080`. All six views, per-event namespaced storage, `serverTime`-derived countdowns and a
+  keyless stub-payment mode so decline, outage and 3-D Secure are walkable in a browser (ADR-058).
+  **It is not wired into the cluster** — no compose service, no nginx static root — so
+  `--profile cluster` still serves the demo client. Wiring it, and checking it against §9's recovery
+  matrix in a real browser, is the next client stage.
 - **The Playwright suite specified in `FE_SPEC.md` §8.** Every one of the four client rules is a
   browser behaviour — a skewed clock, a real reload, a live `EventSource` — so none of them is
   reachable from the API suite, and the twelve reload points are checked by hand today. Two of the
@@ -701,10 +770,25 @@ them. 5 sales × 500 seats, 2,000 VUs, three replicas.
 | **E** | **300** | same as D | **10** | 1,414 | 1,904 / 2,500 — 76 % | 9.3 s |
 | **F** | **300** | **allowance 45/tick** | **0** | **2,002** | **2,496 / 2,500 — 99.8 %** | 10.0 s |
 | **G** | **300** | + one-round-trip queue read | **2** | — | **2,500 / 2,500 — 100 %** | 4.8 s |
+| **H** | **300** | **+ Sentinel topology** (Pass 12) | **0** | — | **2,499 / 2,500 — 99.96 %** | **129 ms** |
 
 **Runs F and G are the answer: five sales open at once sell out, and nothing oversells.** Run G took
 every seat — 500 of 500 on all five tiers — with `sold + held + redis == 500` throughout and
 `hikaricp_connections_pending` never above 2 of 90.
+
+**Run H (Pass 12) is the first measured through Sentinel**, and answers the question the topology
+change raised: it does not regress. 2,499 of 2,500 across the five tiers, `sold + held + redis == 500`
+exact on every one, zero inventory 503s, zero rate-limited requests, and
+`hikaricp_connections_pending` **0** across 54 samples on three replicas with drift `0.0` on every
+sample. The single unsold seat is an artefact of the run, not the build: the failover test earlier in
+the same session rebuilt 9001's counter, and one seat was still held when the drill started.
+
+**Read H's 129 ms against G's 4.8 s with care — the host is most of that difference, not the code.**
+G was measured with other work on the same laptop; H ran with nothing but the cluster. It is
+nonetheless the first time the **200 ms checkout p99 exit criterion has been met at all**, and the
+first evidence that the criterion is reachable on this design rather than only on a bigger machine.
+One run, one host: treat it as a data point, not as the criterion being closed. Sampling covered the
+ramp and steady state; the last ~45 s of ramp-down was not sampled.
 
 Run F's table below is kept because it is the one that exposed the tail-of-sale edge, four seats short:
 
@@ -1679,3 +1763,98 @@ passes"*, and its own prescribed fix applies: give the fixture a seam.
 **Also noticed, not fixed:** `README.md` §"Architecture at a glance" is materially stale — it
 describes `tier_inventory`, dropped in `V7`, and a `filter ──► bot` module edge that does not exist.
 It predates ADR-046 and was not in this pass's scope.
+
+### Pass 11 — reconciling the frontend merge
+
+- **Scope:** PR #16 (`shoham-phase4-imp`), 7,943 files, merged to `preview` with **no document change
+  at all**. The pass read the merge, wrote down what it actually did, fixed what it broke, and took
+  the dependencies back out of git. No new capability was added.
+
+- **The finding that shaped it, and it is not a defect.** The merge contains four pieces of real
+  work — Redis Sentinel, SSE reconnect replay, most of the "specified, not built" metric set, and a
+  React SPA implementing `FE_SPEC` — and **none of it was discoverable.** `04` still said Stripe was
+  unbuilt, `06` §11 still said Sentinel was deferred, and `03` §7 still listed six live metrics as
+  aspirational. In a repo whose first rule is that a stale spec is fixed rather than the code, that is
+  not untidiness: it is six standing orders to rebuild what exists. The rule in `CLAUDE.md` is now
+  demonstrably load-bearing rather than stylistic, and **ADR-058 is what should have been in the
+  merge.**
+
+**Built:**
+
+| Change | Effect |
+| :--- | :--- |
+| **One SSE id space** (ADR-058) | Only replayable frames carry an `id`; everything else is sent with none, which the SSE spec defines as leaving the client's last-event-id alone. As merged, position frames stamped a `"local-N"` over it every two seconds and the replay parsed ids as numbers — **so the feature returned nothing on the normal path** |
+| **The replay log holds broadcasts only** (ADR-058) | The promotion frame carries a `passToken`, single-use with a 120 s TTL, and was being written to a per-event ZSET that outlives the sale. A promoted buyer's reconnect now re-reads the live pass and rebuilds the frame — which also works with no `Last-Event-ID`, in a fresh tab |
+| **`QueueReplayIT`** | The feature shipped with no test; both defects above are the kind a first test catches. Three now: the log holds no capability, broadcasts replay in order from a sequence, and an unretained frame does not burn one |
+| **The client mirrors the payment seam** (ADR-058) | `stripe.ts` threw at module load without `VITE_STRIPE_PUBLISHABLE_KEY`, so a clean checkout was a white screen — against a backend whose default is the stub. No key now means stub mode with the stub's magic tokens in the UI. `frontend/.env.example` added |
+| **One idempotency key per hold** | The merged client minted a fresh UUID per attempt, which opens a *second* PaymentIntent — the failure ADR-054 exists to prevent. `getIdempotencyKey` already existed, was imported, and was unused. `FE_SPEC` §3 has always specified once-per-hold |
+| **`useCheckoutSubmit`** | The POST, the 3-D Secure re-post and the `problem.code` table are one hook; the Stripe and stub paths differ only in how a payment method is obtained. Written to add the second path without duplicating 120 lines of error handling |
+| **7,858 tracked frontend files → 47** | `node_modules` (57 MB), `dist`, four `tsc` outputs, and five scratch files including a Windows classpath dump. The `.gitignore` rules for them were added *in the same merge that tracked them*, so they were inert |
+
+**Deliberately not done:**
+
+- **The history rewrite.** The pack is 24 MB; `filter-repo` costs every collaborator a re-clone and
+  every open branch a rebase. Revisit if it becomes a problem.
+- **Wiring the SPA into nginx and compose.** It touches `nginx.conf`, which is correctness rather
+  than tuning, and it wants its own pass and its own browser-level verification.
+- **The ten failing tests.** See §9. Reproduced unmodified at the merge commit, so it is not this
+  pass's regression, and two hypotheses were tested and disproved rather than guessed at. Everything
+  this pass touched was verified by targeted run: `QueueLifecycleIT`, `QueueBroadcasterTest`,
+  `UserJourneyIT`, `ModularityTests`, `SaleflowRehydrationIT`, both hold ITs and the new
+  `QueueReplayIT` — 29 tests, green — plus the frontend's 18 vitest tests and a production build.
+
+**The transferable lesson, and it is the opposite of Pass 10's.** Pass 10 learned that deleting on
+"nothing references this" has a time horizon. This pass learned the same thing about *writing*: a
+merge that adds four capabilities and no documentation is indistinguishable, a week later, from a
+merge that added nothing — and the repo's own instructions then actively mislead. The cost is not
+paid by the author, who knows what they built; it is paid by whoever reads `04` next and starts
+building Stripe again.
+
+### Pass 12 — establishing the base
+
+- **Scope:** make the suite's verdict trustworthy, read PR #16's backend against the ADRs it must
+  honour, and verify the cluster on the Sentinel topology it now ships. Fix-as-you-go: every finding
+  got a test and its doc update in the same commit.
+
+- **The finding that reframes the merge.** Pass 11 fixed what reading the *code* exposed. This pass
+  ran it, and that is a different instrument: **the Sentinel cluster had never started, on any
+  machine.** All three shell scripts PR #16 added were committed mode 644, and one of them is a
+  container `entrypoint`, so the sentinels restart-looped on `permission denied` and every app
+  replica depends on them. Nothing said so, because the topology is only reachable through
+  `--profile cluster` and no test goes there. **The drill's own instrument was in the same state** —
+  `declare -A` on a bash macOS does not ship, and a hardcoded `docker.exe` that would have reported
+  a clean PASS having measured nothing. Code review would not have found either; running it did.
+
+**Built:**
+
+| Change | Effect |
+| :--- | :--- |
+| **Surefire `runOrder` pinned** | The default is filesystem order, so two machines could disagree about whether the suite passed. 213/213 twice from cold containers. **Pinned, not fixed** — the order dependence in §9 stays open, and the pom says so |
+| **The fulfilment-lag gauge stopped scanning its own table** | `MIN(created_at) WHERE status <> PROCESSED` matched neither partial index, so it sequentially scanned `outbox_events` — processed rows included — every 10 s per replica. Asked one status at a time it is two bounded reads. No new index: that table is written once per checkout |
+| **`payment.decline.ratio` → `payment.attempts{outcome}`** | A ratio cumulative since process start is the one shape that cannot show a spike, which `03` §7 says is why it exists. Counters leave the windowing to the query and delete state rather than adding it |
+| **Three script modes, and an entrypoint that no longer depends on one** | See above. `CLAUDE.md` carries the rule and the one-line audit |
+| **`pool-pressure.sh` runs, and measures** | bash 3.2 compatible, and `docker.exe` detected rather than assumed |
+| **The `UPCOMING` dev event restored** | `prewarm` refuses any other window, so with every dev event `OPEN` the seeding path ADR-004 protects could not be exercised on `dev` at all |
+| **Two payment comments corrected** | Both claimed guarantees they do not hold. The refund short-circuit does not cover the crash case its comment described — the gateway's idempotency key does — and `charge` had lost the reason it constrains payment methods |
+
+**Verified on the cluster, for the first time through Sentinel:**
+
+- `fanout-check.sh` — 30/30 promoted, 10/10/10 across three replicas.
+- `hold-expiry-check.sh` — restored exactly once, 669 ms, across three replicas.
+- `sentinel-failover-check.sh` — replica promoted, old primary rejoined as a replica.
+- **The half that script deliberately skips, done by hand and now the highest-value claim in the
+  system that is no longer merely argued.** After a failover all three replicas independently refused
+  to sell event 9001 — the vouched `run_id` no longer matched the promoted primary's — a buyer's hold
+  answered **`503 INVENTORY_UNAVAILABLE`, retryable**, and not "sold out"; `rebuild-stock` on **one**
+  replica resumed selling on **all three**. That is ADR-046's derived-never-consumed design observed
+  end to end against a failover rather than a restart.
+- Run **H** of the concurrent-sales drill; see §11.
+
+**Worth carrying forward.** Only the replica that serves `rebuild-stock` logs "vouched for again";
+the other two release silently on their next tick. An operator reading logs sees the refusal three
+times and the recovery once. Correct by design and mildly unhelpful during an incident.
+
+**The transferable lesson.** Pass 11's was that undocumented work is invisible. This pass's is
+narrower and sharper: **a path no test and no script exercises is not "probably fine", it is
+unknown.** Every defect here lived in exactly such a path — a profile the suite never starts, a shell
+the author never ran — and each was found in the first minute of trying to use it.

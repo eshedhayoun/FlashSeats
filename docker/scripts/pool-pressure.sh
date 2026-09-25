@@ -70,11 +70,22 @@ if [[ -z "$ADMIN_PASS" ]]; then
     exit 1
 fi
 
+# `docker.exe` exists only on Windows. Hardcoding it here — as this script did —
+# does not fail loudly on macOS or Linux: read_gauge swallows the error, every
+# gauge prints "-", and the run finishes reporting worst-pending 0 and PASS having
+# measured NOTHING. That is this script's own header ("an instrument that measures
+# the wrong thing is worse than no instrument") coming true in the instrument.
+# sold-count.sh and hold-expiry-check.sh already detect it; so does this now.
+DOCKER_CLI="docker"
+if command -v docker.exe >/dev/null 2>&1; then
+    DOCKER_CLI="docker.exe"
+fi
+
 # Reads one gauge from one replica, from INSIDE the compose network — these
 # ports are not published, and going through nginx would defeat the purpose.
 read_gauge() {
     local replica="$1" metric="$2"
-    docker.exe compose exec -T "$replica" sh -c \
+    "$DOCKER_CLI" compose exec -T "$replica" sh -c \
         "curl -fsS -u '${ADMIN_USER}:${ADMIN_PASS}' 'http://localhost:8080/actuator/metrics/${metric}'" \
         < /dev/null \
         2>/dev/null | tr ',' '\n' | grep -A1 '"VALUE"' | grep '"value"' \
@@ -96,7 +107,14 @@ SAMPLES=0
 # authority, which reads the ledger — reported `sold + held + redis == capacity`
 # on every tier. An instrument that measures the wrong thing is worse than no
 # instrument, because its answer is specific (ADR-047).
-declare -A DRIFT_RUN=()
+# "Sustained" means the SAME replica drifted on two CONSECUTIVE sweeps, so all
+# this needs to remember is which replicas drifted on the previous one. A space-
+# delimited list says that directly, and — unlike the associative array this
+# replaced — runs on the bash macOS actually ships. `declare -A` is bash 4; macOS
+# is still on 3.2, so the instrument this drill depends on exited immediately with
+# `declare: -A: invalid option` on any stock Mac.
+DRIFTED_PREVIOUS=""
+DRIFTED_THIS_SWEEP=""
 SUSTAINED_DRIFT=0
 TRANSIENT_DRIFT=0
 
@@ -129,16 +147,14 @@ while [[ $(date +%s) -lt $DEADLINE ]]; do
         fi
         if [[ "$DRIFT" != "-" && "${DRIFT%%.*}" -ne 0 ]]; then
             SAW_DRIFT=1
-            DRIFT_RUN[$replica]=$(( ${DRIFT_RUN[$replica]:-0} + 1 ))
-            if [[ "${DRIFT_RUN[$replica]}" -ge 2 ]]; then
+            DRIFTED_THIS_SWEEP="$DRIFTED_THIS_SWEEP $replica"
+            if [[ " $DRIFTED_PREVIOUS " == *" $replica "* ]]; then
                 SUSTAINED_DRIFT=1
                 FLAG="  <-- DRIFT, SUSTAINED — this is a correctness failure"
             else
                 TRANSIENT_DRIFT=$((TRANSIENT_DRIFT + 1))
                 FLAG="  <-- drift on one sample; transient unless the next one repeats"
             fi
-        elif [[ "$DRIFT" != "-" ]]; then
-            DRIFT_RUN[$replica]=0
         fi
         [[ "$MISSING" != "-" && "${MISSING%%.*}" -ne 0 ]] && SAW_MISSING=1
 
@@ -146,6 +162,8 @@ while [[ $(date +%s) -lt $DEADLINE ]]; do
             "$(date +%H:%M:%S)" "$replica" "$PENDING" "$ACTIVE" "$DRIFT" "$MISSING" "$FLAG"
         SAMPLES=$((SAMPLES + 1))
     done
+    DRIFTED_PREVIOUS="$DRIFTED_THIS_SWEEP"
+    DRIFTED_THIS_SWEEP=""
     sleep "$EVERY"
 done
 
