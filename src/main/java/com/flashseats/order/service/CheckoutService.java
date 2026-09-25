@@ -9,10 +9,8 @@ import com.flashseats.order.config.OrderProperties;
 import com.flashseats.order.dto.CheckoutRequest;
 import com.flashseats.order.dto.OrderReceiptResponse;
 import com.flashseats.order.exception.OrderErrors;
-import com.flashseats.order.exception.OrderRefundedException;
 import com.flashseats.payment.exception.DuplicatePaymentException;
-import com.flashseats.payment.exception.PaymentActionRequiredException;
-import com.flashseats.payment.exception.PaymentDeclinedException;
+import com.flashseats.payment.exception.PaymentErrors;
 import com.flashseats.payment.facade.AuthorizeCommand;
 import com.flashseats.payment.facade.PaymentFacade;
 import com.flashseats.payment.facade.PaymentResult;
@@ -140,14 +138,14 @@ public class CheckoutService {
             // would be a second retry mechanism (FE_SPEC §2). The grace extension granted at step 5
             // is what pays for the challenge window (ADR-030).
             if (payment.requiresAction()) {
-                throw new PaymentActionRequiredException(payment.clientSecret(), expiresAt);
+                throw PaymentErrors.actionRequired(payment.clientSecret(), expiresAt);
             }
 
             if (!payment.succeeded()) {
                 // The hold stays ACTIVE. The buyer was promised they could try another card.
                 int attemptsRemaining =
                         commit.recordFailedAttempt(order.orderNumber(), payment.failureReason());
-                throw new PaymentDeclinedException(payment.failureReason(), attemptsRemaining, expiresAt);
+                throw PaymentErrors.declined(payment.failureReason(), attemptsRemaining, expiresAt);
             }
 
             // 7. One transaction: consume, confirm, items, outbox. 8. Post-commit cleanup hangs off it.
@@ -159,7 +157,7 @@ public class CheckoutService {
             } catch (RuntimeException commitFailed) {
                 // 9. Money moved but the seats did not. Give it back and say so.
                 compensate(order.orderNumber(), payment, amountCents, commitFailed);
-                throw new OrderRefundedException(order.orderNumber());
+                throw OrderErrors.refunded();
             }
         } catch (DuplicatePaymentException concurrent) {
             // Another request owns this order right now. Leave its state entirely alone — deciding

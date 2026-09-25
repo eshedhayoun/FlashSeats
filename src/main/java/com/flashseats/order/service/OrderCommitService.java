@@ -7,7 +7,7 @@ import com.flashseats.order.config.OrderProperties;
 import com.flashseats.order.dto.OrderItemResponse;
 import com.flashseats.order.dto.OrderReceiptResponse;
 import com.flashseats.order.event.OrderConfirmedEvent;
-import com.flashseats.order.exception.OrderRefundedException;
+import com.flashseats.order.exception.OrderErrors;
 import com.flashseats.order.model.Order;
 import com.flashseats.order.model.OrderItem;
 import com.flashseats.order.model.OrderStatus;
@@ -16,7 +16,7 @@ import com.flashseats.order.repository.OrderItemRepository;
 import com.flashseats.order.repository.OrderRepository;
 import com.flashseats.order.repository.OutboxEventRepository;
 import com.flashseats.payment.exception.DuplicatePaymentException;
-import com.flashseats.payment.exception.PaymentDeclinedException;
+import com.flashseats.payment.exception.PaymentErrors;
 import com.flashseats.payment.facade.PaymentResult;
 import java.time.Clock;
 import java.time.Instant;
@@ -118,7 +118,7 @@ public class OrderCommitService {
             return switch (existing.getStatus()) {
                 case CONFIRMED -> new CheckoutOrder(existing.getOrderNumber(), existing.getPaymentAttempts(), true);
                 case PENDING -> resumeIfStranded(existing, holdToken);
-                case REFUNDED -> throw new OrderRefundedException(existing.getOrderNumber());
+                case REFUNDED -> throw OrderErrors.refunded();
                 case FAILED -> resumeFailed(existing);
             };
         }
@@ -306,7 +306,7 @@ public class OrderCommitService {
 
     private CheckoutOrder resumeFailed(Order order) {
         if (order.getPaymentAttempts() >= properties.getMaxPaymentAttempts()) {
-            throw new PaymentDeclinedException(
+            throw PaymentErrors.declined(
                     "No payment attempts remain for this reservation.", 0, null);
         }
         order.setStatus(OrderStatus.PENDING);

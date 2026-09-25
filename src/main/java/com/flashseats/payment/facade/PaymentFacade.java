@@ -19,8 +19,8 @@ public interface PaymentFacade {
      *
      * @throws com.flashseats.payment.exception.DuplicatePaymentException if a charge for this hold is
      *     already in flight
-     * @throws com.flashseats.payment.exception.PaymentGatewayUnavailableException if the provider
-     *     could not be reached. The buyer's seats are retained.
+     * @throws com.flashseats.shared.error.FlashSeatsException {@code PAYMENT_GATEWAY_UNAVAILABLE} if
+     *     the provider could not be reached. The buyer's seats are retained.
      */
     PaymentResult authorize(AuthorizeCommand command);
 

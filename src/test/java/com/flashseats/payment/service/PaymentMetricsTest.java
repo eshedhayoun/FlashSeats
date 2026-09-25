@@ -17,7 +17,8 @@ import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.data.redis.core.ValueOperations;
 import static org.mockito.ArgumentMatchers.anyString;
 import com.flashseats.payment.exception.DuplicatePaymentException;
-import com.flashseats.payment.exception.PaymentGatewayUnavailableException;
+import com.flashseats.shared.error.ErrorCode;
+import com.flashseats.shared.error.FlashSeatsException;
 
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
@@ -153,7 +154,8 @@ class PaymentMetricsTest {
 
         assertThatThrownBy(
                 () -> payments.authorize(command("order-1", "hold-1")))
-                .isInstanceOf(PaymentGatewayUnavailableException.class);
+                .isInstanceOfSatisfying(FlashSeatsException.class, failure ->
+                        assertThat(failure.code()).isEqualTo(ErrorCode.PAYMENT_GATEWAY_UNAVAILABLE));
 
         verify(gateway).retrieve("pi_existing");
         verify(gateway, never()).charge(any());
