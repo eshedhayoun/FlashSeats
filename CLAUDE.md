@@ -12,7 +12,7 @@ but `flashseats.payment.stripe.enabled` is **false by default**, so `dev`, `test
 and every drill still run the in-process stub through the complete journey, 3-D Secure included.
 
 **Read [`docs/00-architecture-decisions.md`](docs/00-architecture-decisions.md) before changing
-anything.** It contains 62 ADRs. Most record a defect and its fix — 034-039 come from the first
+anything.** It contains 63 ADRs. Most record a defect and its fix — 034-039 come from the first
 review pass over the built code, 040-042 from the second — and several look like over-engineering
 until you read the failure they prevent. 043-045 are the exception: forward-looking decisions about
 the operator surface, buyer accounts and what health should report, with nothing built against them
@@ -24,7 +24,9 @@ resume endpoint, and bot defence that fails open. **056 is Stage 2's own review*
 that only appear under a rollback, a dropped connection or real load. **059-062 are Pass 13**: a
 pool timeout answers `503 SERVICE_BUSY` rather than `500`, `/session/reset` accepts JSON only,
 cached test contexts are never paused (the cause of the order-dependent suite), and each replica
-has a memory limit with the JVM flags owned by the image alone.
+has a memory limit with the JVM flags owned by the image alone. **063 is Pass 14**: an exception
+class only where a `catch` names it. Pass 14 also wrote the code conventions down —
+[`05-global-standards.md`](docs/05-global-standards.md) §11 — read that before adding a class.
 
 **The operating envelope is 3–10 concurrent sales**, not one
 ([`03-end-to-end-flow.md`](docs/03-end-to-end-flow.md) §2). Every capacity number written before
@@ -41,7 +43,7 @@ security posture, next stages, and the review-pass log. It is the doc to update 
 ## Document precedence
 
 ```
-00-architecture-decisions.md      ← highest authority (62 ADRs)
+00-architecture-decisions.md      ← highest authority (63 ADRs)
 05-global-standards.md            ← cross-cutting contract; module docs conform to it
 FE_SPEC.md                        ← client contract (repo root)
 03-end-to-end-flow.md             ← the authoritative user journey AND the operating envelope
@@ -404,6 +406,9 @@ docker/scripts/pool-pressure.sh 300 &            # THE instrument. Without it th
                                                  # two samples inside one interval are the SAME
                                                  # computation read twice (ADR-046: sustained)
 docker compose --profile loadtest run --rm -e VUS=300 k6-concurrent
+                                                 # The FIRST run after a replica restart measures
+                                                 # JIT warm-up: 513 ms p99 cold vs 64 ms warm, same
+                                                 # build (Pass 14). Discard it, or warm up first
 docker/scripts/sold-count.sh                     # what was ACTUALLY sold, and the invariant per tier.
                                                  # k6's count is what the CLIENT saw: it abandons
                                                  # in-flight requests at 60s and at ramp-down, and
@@ -465,6 +470,9 @@ implemented naively — a single-instance test cannot see either bug.
 
 ## Working style for this repo
 
+- New code follows `05-global-standards.md` §11: the package layout, a facade implemented by its
+  service, an exception class only where a `catch` names it, controllers that only map, a
+  separate bean only for a separate transaction, comments that say why and cite the ADR.
 - Doc changes: update the ADR **and** every document the change touches. Docs drifting apart is
   what created most of the defects in the first pass.
 - New concurrency-sensitive code: state the failure mode you are guarding against, and which
