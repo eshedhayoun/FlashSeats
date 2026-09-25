@@ -4,21 +4,24 @@ import CardContent from "@mui/material/CardContent";
 import Container from "@mui/material/Container";
 import Stack from "@mui/material/Stack";
 import Typography from "@mui/material/Typography";
-import type { Availability, SaleQueueState } from "../api/types";
+import type { Availability, EventTier, SaleQueueState } from "../api/types";
 import { useQueueStream } from "./useQueueStream";
 import { HomeButton } from "../shared/HomeButton";
 
 export function QueuePage({
   eventId,
+  tiers,
   queue,
   onRefresh
 }: {
   eventId: number;
+  tiers: EventTier[];
   queue: SaleQueueState;
   onRefresh: () => void;
 }) {
   const stream = useQueueStream(eventId, onRefresh);
   const availability = stream.availability?.tiers ?? [];
+  const tierMap = new Map(tiers.map((t) => [t.tierId, t.tierName]));
 
   return (
     <Container maxWidth="sm" sx={{ py: 8 }}>
@@ -36,8 +39,7 @@ export function QueuePage({
               {stream.position ?? queue.position ?? "—"}
             </Typography>
             <Typography color="text.secondary" aria-live="polite">
-              {stream.estWaitSeconds ?? queue.estWaitSeconds ?? 0} seconds estimated
-              wait
+              {formatWaitTime(stream.estWaitSeconds ?? queue.estWaitSeconds)}
             </Typography>
             <Typography color="text.secondary">
               {stream.connection === "open"
@@ -49,7 +51,8 @@ export function QueuePage({
                 <Typography variant="subtitle2">Live availability</Typography>
                 {availability.map((tier) => (
                   <Typography key={tier.tierId} color={availabilityColor(tier.level)}>
-                    Tier {tier.tierId}: {availabilityLabel(tier.level)}
+                    {tierMap.get(tier.tierId) || `Tier ${tier.tierId}`}:{" "}
+                    {availabilityLabel(tier.level)}
                   </Typography>
                 ))}
               </Stack>
@@ -62,6 +65,25 @@ export function QueuePage({
       </Card>
     </Container>
   );
+}
+
+function formatWaitTime(seconds: number | null | undefined): string {
+  if (seconds === null || seconds === undefined) {
+    return "About 2 minutes estimated wait";
+  }
+  if (seconds < 60) {
+    return "Less than a minute estimated wait";
+  }
+  if (seconds < 300) {
+    return "About 2 minutes estimated wait";
+  }
+  if (seconds < 600) {
+    return "About 5 minutes estimated wait";
+  }
+  if (seconds < 1200) {
+    return "About 10 minutes estimated wait";
+  }
+  return "About 15 minutes estimated wait";
 }
 
 function availabilityLabel(level: Availability): string {
