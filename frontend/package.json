@@ -7,9 +7,10 @@
     "dev": "vite",
     "build": "tsc -b && vite build",
     "test": "vitest run",
-    "test:e2e": "playwright test",
-    "test:e2e:ui": "playwright test --ui",
-    "test:e2e:debug": "playwright test --debug",
+    "clean:playwright": "node scripts/cleanup-playwright.cjs",
+    "test:e2e": "npm run clean:playwright && playwright test",
+    "test:e2e:ui": "npm run clean:playwright && playwright test --ui",
+    "test:e2e:debug": "npm run clean:playwright && playwright test --debug",
     "preview": "vite preview"
   },
   "dependencies": {

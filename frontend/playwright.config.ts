@@ -45,4 +45,13 @@ export default defineConfig({
     reuseExistingServer: !process.env.CI,
     timeout: 120 * 1000,
   },
+  
+  /* Output directory for test results */
+  outputDir: 'test-results',
+  
+  /* Timeout settings */
+  timeout: 30 * 1000,
+  expect: {
+    timeout: 5 * 1000,
+  },
 });

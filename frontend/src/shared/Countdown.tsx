@@ -1,6 +1,7 @@
 import { serverClock } from "../clock/serverClock";
 import { useClockTick } from "../clock/useClockTick";
 import { describeDuration, formatDuration } from "./formatDuration";
+import { useTheme } from "@mui/material/styles";
 
 export type CountdownTone = "neutral" | "warning" | "critical";
 
@@ -16,6 +17,7 @@ export function Countdown({
   announce = true
 }: CountdownProps) {
   useClockTick();
+  const theme = useTheme();
 
   const remainingMs = serverClock.remainingMs(expiresAt);
   const tone: CountdownTone =
@@ -25,20 +27,47 @@ export function Countdown({
         ? "warning"
         : "neutral";
 
+  const toneColor =
+    tone === "critical"
+      ? theme.palette.error.main
+      : tone === "warning"
+        ? theme.palette.warning.main
+        : "inherit";
+
+  // Apply pulse animation for critical tone
+  const keyframes = `
+    @keyframes pulse {
+      0%, 100% { opacity: 1; }
+      50% { opacity: 0.7; }
+    }
+  `;
+
+  const style = {
+    fontVariantNumeric: "tabular-nums" as const,
+    minWidth: "5ch",
+    display: "inline-block" as const,
+    color: toneColor,
+    ...(tone === "critical" && {
+      animation: "pulse 1s ease-in-out infinite",
+      "@media (prefers-reduced-motion: reduce)": {
+        animation: "none"
+      }
+    })
+  };
+
   return (
-    <span
-      className={className}
-      data-tone={tone}
-      role="timer"
-      aria-live={announce ? "polite" : "off"}
-      aria-label={describeDuration(remainingMs)}
-      style={{
-        fontVariantNumeric: "tabular-nums",
-        minWidth: "5ch",
-        display: "inline-block"
-      }}
-    >
-      {formatDuration(remainingMs)}
-    </span>
+    <>
+      <style>{keyframes}</style>
+      <span
+        className={className}
+        data-tone={tone}
+        role="timer"
+        aria-live={announce ? "polite" : "off"}
+        aria-label={describeDuration(remainingMs)}
+        style={style}
+      >
+        {formatDuration(remainingMs)}
+      </span>
+    </>
   );
 }
