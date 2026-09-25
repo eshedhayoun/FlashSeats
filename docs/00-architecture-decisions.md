@@ -2461,3 +2461,32 @@ not become a retry storm above the API.
   (`FE_SPEC` §2 and the checkout error table).
 - Filters run before `DispatcherServlet`; a pool timeout inside one (the `ip_rules` snapshot reload)
   still answers whatever that filter answers. ADR-055/056 already keep the request path off the pool.
+
+---
+
+## ADR-060 — `POST /session/reset` accepts only `application/json`
+
+**Context.** The endpoint expires the `fsid` cookie so the bundled demo page can start over as a new
+visitor. The session *is* the buyer's queue position and their only authority over their hold, and
+CSRF is disabled (`06` §10 S6), so a hidden form on any site could POST to it and throw a buyer out of
+the line they were waiting in. `06` §10 recorded it as S13 and offered two fixes: scope it to the demo
+profile, or require something a form post cannot send.
+
+**Decision.** `@PostMapping(value = "/reset", consumes = "application/json")`. An HTML form can send
+only `application/x-www-form-urlencoded`, `multipart/form-data` or `text/plain`; a cross-origin
+`fetch` carrying `application/json` is not a CORS-safelisted request and needs a preflight, and no
+CORS mapping here grants one. Anything else answers `415` through the existing handler, before the
+method runs, so no expiring cookie is written.
+
+**Why not the profile.** The cluster runs the `docker` profile and serves the demo page that calls
+this endpoint, so scoping it to `dev` would break the demo exactly where it is shown. The demo page's
+`api()` helper already sent `Content-Type: application/json`, and the React client never calls it —
+the fix needed no client change at all.
+
+**Consequences.**
+
+- S13 is closed. **S6 is not**: `POST /queue/join` and `POST /holds` still accept a cross-site
+  request. The same one-line control would apply to them, but both are on the buyer path and each
+  deserves its own check that every client sends JSON; it is left as recorded.
+- This relies on no CORS configuration being added. A future `CorsConfigurationSource` that allows
+  credentials from another origin reopens S13, and should be read against this ADR.
