@@ -407,8 +407,10 @@ Honest list. None of these is hidden behind a passing test.
   servlet filter fits the escape path; what does not fit is that Tomcat's container logger records
   nothing. Instrument the filter chain itself rather than the application.
 
-  Until it is fixed, every claim of the form "the suite is green" in this document means a targeted run
-  or a reverse-order run.
+  **Pinned, not fixed.** `pom.xml` now sets Surefire's `runOrder` to `alphabetical`, which is verified
+  green twice from cold containers. That is worth doing regardless — the default is *filesystem* order,
+  so two machines can disagree about whether the suite passes — but it is a workaround, and this item
+  stays open. A green suite is no longer evidence that the pollution went away.
 - ~~**SSE reconnect replay never fired.**~~ **Fixed** (ADR-058). Live frames carried a
   per-connection `"local-N"` id, retained frames carried a Redis sequence, and the replay parsed the
   header as a number — so the normal case, where the last frame received was a two-second position
