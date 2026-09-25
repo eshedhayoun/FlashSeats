@@ -166,18 +166,51 @@ Prerequisites: JDK 21 and Docker.
 
 ```bash
 cp .env.example .env
-docker compose up -d                # PostgreSQL, Redis, RabbitMQ, Mailpit
-./mvnw spring-boot:run              # seeds a sale that is already open
+docker/scripts/dev-up.sh            # preflight + infrastructure + a sale that is actually open
+./mvnw spring-boot:run
 open http://localhost:8080          # walk the whole journey in a browser
 ```
+
+**Use `dev-up.sh` rather than a bare `docker compose up -d`.** The bare form works on a clean
+machine and has three ways to fail later that all present as "the backend is broken":
+
+| Symptom | Cause |
+| :--- | :--- |
+| `Port 8080 was already in use` | Another process — often this project's own nginx or a replica, in which case the browser shows a working app that is *not* your code |
+| `401 QUEUE_PASS_INVALID` mid-journey | A `--profile cluster` stack left running. Those replicas share this Redis and PostgreSQL but sign queue passes with the real secrets from `.env`, while a local run falls back to `dev-only-change-me`. Whichever app mints the pass, the other rejects it |
+| Every event reads `CLOSED` | `CatalogDevSeeder` seeds **only when the database is empty**, deliberately, so a restart never resets a live sale. Once the volume holds anything, nothing reopens the windows |
+
+The script checks all three, fixes the two that are safe to fix, and refuses to continue on a port
+conflict rather than killing a process that might not be ours. `--reset` wipes the volumes for a
+clean seeded sale. It never writes a stock counter — seeding one from `total_capacity` resurrects
+every sold ticket (ADR-004).
 
 The demo client at `/` takes you from the event page through the waiting room to a PDF ticket. Use
 the card selector on the checkout screen to drive the interesting branches: `pm_card_declined`
 declines and **keeps your seats**, `pm_card_error` fails the provider. The email lands in Mailpit at
 [localhost:8025](http://localhost:8025).
 
+### The React client
+
+A second client implements [`FE_SPEC.md`](FE_SPEC.md) in full. It runs against the same backend and
+is **development-only** — nginx serves no static root and the cluster still serves the demo client.
+
 ```bash
-./mvnw test                         # 25 tests, including the concurrency and journey suites
+cd frontend
+npm install
+cp .env.example .env.local          # leave the Stripe key BLANK to drive the stub gateway
+npm run dev                         # http://localhost:5173, /api proxied to :8080
+npm test                            # vitest
+```
+
+With no `VITE_STRIPE_PUBLISHABLE_KEY` the checkout offers the stub's outcomes directly — succeed,
+decline, gateway outage, 3-D Secure — which is the easiest way to walk the failure branches in a
+browser. Set a `pk_test_` key, and start the backend with `STRIPE_ENABLED=true`, to drive the real
+provider.
+
+```bash
+./mvnw test                         # 210 tests. See docs/06-mvp-overview.md §9: ten of them
+                                    # currently fail in the full suite and pass in isolation
 ```
 
 | Service | Where | Credentials |

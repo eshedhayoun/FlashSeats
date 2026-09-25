@@ -289,7 +289,10 @@ setPaymentInFlight(true);                   // disables CTA and freezes the expi
 ```
 
 The key is generated **once per hold** and reused across retries. Regenerating it per attempt defeats
-the gateway-level guard (ADR-014).
+the gateway-level guard (ADR-014) and opens a *second* PaymentIntent, so a buyer can authenticate one
+payment and be billed for two — the failure ADR-054 exists to prevent. The server now enforces the
+field's presence (`@NotBlank`), so omitting it is `400 VALIDATION_FAILED` rather than a silent
+downgrade to no gateway-level guard at all.
 
 **Outcome handling:**
 
@@ -394,7 +397,7 @@ Base `/api/v1`. `fsid` is an `HttpOnly` cookie — **JavaScript never reads or s
 | V1 | `GET` | `/events/{eventId}` | — | — | `200` | `EVENT_NOT_FOUND` |
 | all | `GET` | `/sale/{eventId}/state` | — | — | `200` | `EVENT_NOT_FOUND` |
 | V1→V2 | `POST` | `/queue/join` | — | `{eventId}` | `202` | `SALE_NOT_OPEN`, `SALE_PAUSED`, `RATE_LIMITED` |
-| V2 | `GET` | `/queue/stream?eventId=` | `Accept: text/event-stream` | — | SSE | — |
+| V2 | `GET` | `/queue/stream?eventId=&lastEventId=` | `Accept: text/event-stream`, `Last-Event-ID` | — | SSE | — |
 | V2 | `GET` | `/queue/status?eventId=` | — | — | `200` | — (a session that never joined is `phase: NOT_JOINED`, not an error) |
 | V2→V3 | `POST` | `/queue/admit` | `X-Queue-Pass-Token` | `{eventId}` | `200` | `QUEUE_PASS_INVALID`, `VALIDATION_FAILED` |
 | V3 | `POST` | `/holds` | `X-Admission-Token` | `{eventId, tierId, quantity}` | `201` | `INSUFFICIENT_STOCK`, `QUANTITY_EXCEEDS_LIMIT`, `HOLD_LIMIT_EXCEEDED`, `ADMISSION_EXPIRED`, `INVENTORY_UNAVAILABLE` |
@@ -614,6 +617,18 @@ function connect(eventId: number) {
   return es;
 }
 ```
+
+**Reconnect replay.** `EventSource` re-sends the last id it saw as a `Last-Event-ID` header by
+itself; a client that cannot set headers may pass `?lastEventId=` instead. The server replays the
+**broadcast** frames minted after that sequence — `tier-availability`, `sale-exhausted`,
+`sale-closed`.
+
+**Only those frames carry an `id`.** Position updates and `queue-promoted` are sent with none, which
+the SSE specification defines as leaving the client's last-event-id unchanged — so storing
+`e.lastEventId` on *every* frame, as the snippet above does, is correct and always records a sequence
+the server can replay from. A promotion is never replayed: the server re-reads the live pass on
+connect and re-sends `queue-promoted` if one is still valid, so a promoted buyer recovers even in a
+fresh tab that has no `Last-Event-ID` at all (ADR-058).
 
 **Backoff** — full jitter, capped, with a polling fallback:
 

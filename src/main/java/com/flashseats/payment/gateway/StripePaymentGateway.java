@@ -55,16 +55,37 @@ public class StripePaymentGateway implements PaymentGateway {
     }
 
     @Override
+    /**
+     * A server-confirmed, card-only intent.
+     *
+     * <p><strong>Card only, and that is a requirement rather than a preference.</strong> A
+     * redirect-based payment method sends the buyer to another origin and expects them to come back to
+     * a URL we own — and there is no resume endpoint to come back to, deliberately: the retry is
+     * re-POSTing the same checkout body, and the server retrieves the pending intent (ADR-054). A
+     * method that needed a return URL would strand a buyer holding live seats. Naming the type
+     * explicitly also turns off automatic payment methods, which is where such a method would
+     * otherwise arrive from without anyone choosing it.
+     *
+     * <p>Card 3-D Secure still happens and is wanted: it surfaces as {@code requires_action}, which
+     * {@code PaymentStatus.PROCESSING} parks and the next identical POST settles.
+     *
+     * <p>{@code setConfirm(true)} is what makes this one round trip rather than create-then-confirm,
+     * so ADR-001's ordering — charge, then consume the hold inside the commit — holds with one
+     * provider call in the middle of the checkout transaction boundary.
+     *
+     * <p>The order number and hold token go into metadata because they are what reconciliation reads
+     * when the two ledgers disagree; the webhook path finds its order by {@code holdToken}.
+     */
     public GatewayResult charge(GatewayCharge charge) {
         PaymentIntentCreateParams params = PaymentIntentCreateParams.builder()
-            .setAmount(charge.amountCents())
-            .setCurrency(charge.currency().toLowerCase())
-            .setPaymentMethod(charge.paymentMethodId())
-            .setConfirm(true)
-            .addPaymentMethodType("card")
-            .putMetadata("orderNumber", charge.orderNumber())
-            .putMetadata("holdToken", charge.holdToken())
-            .build();
+                .setAmount(charge.amountCents())
+                .setCurrency(charge.currency().toLowerCase())
+                .setPaymentMethod(charge.paymentMethodId())
+                .setConfirm(true)
+                .addPaymentMethodType("card")
+                .putMetadata("orderNumber", charge.orderNumber())
+                .putMetadata("holdToken", charge.holdToken())
+                .build();
         RequestOptions options = charge.clientIdempotencyKey() == null
                         || charge.clientIdempotencyKey().isBlank()
                 ? baseOptions

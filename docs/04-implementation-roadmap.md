@@ -14,8 +14,8 @@
 | :--- | :--- | :--- | :--- |
 | **1** | Correct single-user transaction | catalog, hold, mock payment, order, outbox rows | Two parallel requests for the last ticket → exactly one succeeds — **done, and tested** |
 | **2** | Move the hot path to RAM | Redis stock + Lua, ZSET queue, SSE, pass tokens | Same guarantee at 1,000 concurrent requests — **done** (ADR-046), bar the `hold:{token}` timer, deferred to Phase 4 |
-| **3** | Defence and real money | bot, Stripe, webhooks, Resilience4j | Payments survive tab closure; floods are throttled — **cookie identity and rate limits done; Stripe and reCAPTCHA are not** |
-| **4** | Async fulfilment and scale | RabbitMQ, PDFBox, email, Nginx, k6 | 10,000 users / 500 tickets / zero overbooking / 500 emails — **fulfilment done on one replica; the cluster and load runs are not** |
+| **3** | Defence and real money | bot, Stripe, webhooks, Resilience4j | Payments survive tab closure; floods are throttled — **done** in Pass 9 (ADR-052-055): Stripe, the webhook receiver, 3-D Secure, two circuit breakers, reCAPTCHA failing open |
+| **4** | Async fulfilment and scale | RabbitMQ, PDFBox, email, Nginx, k6 | 10,000 users / 500 tickets / zero overbooking / 500 emails — **done bar two**: the cluster, the load runs and Sentinel (ADR-058) are built; the 10,000-VU run and the p99 number need a host where k6 is not competing for cores |
 | **5** | Operate it, and let buyers return | The operator surface (ADR-043); buyer accounts as an overlay (ADR-044) | A dead-lettered ticket can be replayed by a human; a lost counter can be rebuilt without SQL; a buyer finds their order more than 24 h later |
 
 ---
@@ -218,7 +218,9 @@ below.
       the three upstreams, repeatable via `docker/scripts/fanout-check.sh`. **This was the point of
       the stage** — ADR-007's Pub/Sub fan-out is now verified rather than asserted.
 
-**Not built:** Redis Sentinel, deferred with reasons in ADR-047. Four blockers found and fixed
+**Since built:** Redis Sentinel — deferred with reasons in ADR-047, delivered in PR #16 and recorded in ADR-058. A failover distrusts every event's counters until rebuilt, which is ADR-046 working rather than a regression, and is the half `sentinel-failover-check.sh` deliberately does not test.
+
+**Originally listed as not built:** Sentinel. Four blockers found and fixed
 before any of the above could run are recorded there too; one of them — nginx dropping `Host` and
 `X-Forwarded-For` in every location that set a header of its own — meant *every* proxied API request
 answered a bare HTTP 400.

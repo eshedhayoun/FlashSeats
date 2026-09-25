@@ -101,7 +101,7 @@ public class BotProperties {
          * connection has already proved what there is to prove, and re-challenging them mid-sale is
          * a cost paid entirely by the legitimate.
          */
-        private long verifiedTtlSeconds = 1800;
+        private long verifiedTtlSeconds = 900;
 
         public String getSecret() {
             return secret;

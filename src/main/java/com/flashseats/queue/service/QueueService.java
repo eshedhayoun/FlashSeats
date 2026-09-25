@@ -19,6 +19,7 @@ import java.time.Instant;
 import java.util.List;
 import java.util.OptionalDouble;
 import java.util.concurrent.ThreadLocalRandom;
+import java.util.concurrent.TimeUnit;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.data.redis.core.RedisCallback;
 import org.springframework.data.redis.core.StringRedisTemplate;
@@ -139,6 +140,20 @@ public class QueueService implements QueueFacade {
 
     boolean isExhausted(long eventId) {
         return Boolean.TRUE.equals(redis.hasKey(QueueKeys.exhausted(eventId)));
+    }
+
+    /**
+     * Seconds left on this session's promotion pass, or {@code null} when it holds none.
+     *
+     * <p>Deliberately not folded into the pipelined read behind {@link #getQueueState}. That read
+     * serves {@code GET /queue/status}, which is the single largest consumer of the cluster's CPU at
+     * roughly 90,000 calls per replica per run; this answer is wanted only when a buyer reconnects
+     * already promoted, so it costs one round trip on a rare path rather than a command on the
+     * hottest one.
+     */
+    public Long passTimeToLiveSeconds(String sessionId, long eventId) {
+        Long remaining = redis.getExpire(QueueKeys.pass(eventId, sessionId), TimeUnit.SECONDS);
+        return remaining == null || remaining < 0 ? null : remaining;
     }
 
     /**
