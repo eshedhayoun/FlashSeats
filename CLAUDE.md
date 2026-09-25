@@ -306,6 +306,16 @@ that is what makes `noeviction` a correctness setting rather than a tuning one.
 
 ```bash
 cp .env.example .env
+docker/scripts/dev-up.sh                         # THE local dev entry point. Use this, not a bare
+                                                 # `docker compose up -d`. It refuses to continue on
+                                                 # a port conflict (naming the process), stops any
+                                                 # cluster replicas -- they share this Redis and
+                                                 # PostgreSQL but sign queue passes with DIFFERENT
+                                                 # secrets, so a pass minted by one is a 401 at the
+                                                 # other -- and guarantees one sale is actually OPEN,
+                                                 # which CatalogDevSeeder cannot do once the volume
+                                                 # holds anything. `--reset` wipes the volumes.
+                                                 # It NEVER writes a stock counter (ADR-004).
 docker compose up -d                             # PostgreSQL, Redis, RabbitMQ, Mailpit
 docker compose up -d postgres                    # strictly-minimal Phase 1
 
