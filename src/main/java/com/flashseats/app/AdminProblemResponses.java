@@ -11,23 +11,10 @@ import org.springframework.stereotype.Component;
 import tools.jackson.databind.ObjectMapper;
 
 /**
- * Makes the admin surface answer like the rest of the API.
- *
- * <p><strong>Why this class has to exist.</strong> Every deliberate failure in every module arrives
- * at {@code GlobalExceptionHandler} as a {@code FlashSeatsException} carrying an {@link ErrorCode},
- * and comes back as RFC 7807 with a {@code code} the client can switch on. Authentication and
- * authorisation failures do not: Spring Security throws them inside the filter chain, which runs
- * before {@code DispatcherServlet} ever dispatches, so no {@code @RestControllerAdvice} can see
- * them. The result was Boot's stock error body — no {@code code}, no {@code type}, no
- * {@code traceId} — on the only endpoints in the system that can pause a sale.
- *
- * <p>That was tolerable while the admin surface was one pre-warm endpoint nobody scripted against.
- * It is not tolerable now that an operator tool has to tell "your credentials are wrong" apart from
- * "this order has no dead letter", and global standards §1 says every problem carries a code without
- * carving out an exception.
- *
- * <p>Both responses are written here rather than delegated, for the same reason
- * {@code RateLimitFilter} writes its own: a filter runs where the exception handlers cannot reach.
+ * Makes the admin surface answer like the rest of the API. Spring Security rejects inside the
+ * filter chain, before any {@code @RestControllerAdvice}, so without this the endpoints that can
+ * pause a sale answered Boot's body with no {@code code} (global standards §1). Written here for the
+ * same reason {@code RateLimitFilter} writes its own.
  */
 @Component
 public class AdminProblemResponses {

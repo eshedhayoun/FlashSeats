@@ -17,31 +17,13 @@ import org.apache.pdfbox.pdmodel.font.Standard14Fonts;
 import org.springframework.stereotype.Component;
 
 /**
- * Renders the ticket PDF in memory.
+ * Renders the ticket PDF in memory, one page per line item (ADR-015). It is in the kernel because it
+ * is a pure function (ADR-050): {@code notification} emails it and {@code order} serves it as a
+ * download, byte-identical by construction.
  *
- * <p><strong>One page per line item</strong>, because a ticket is a thing a person holds at a door.
- * An earlier payload design carried a single flat tier and quantity, which would have produced one
- * wrong page for any multi-tier order (ADR-015).
- *
- * <p><strong>It lives in the kernel because it is a pure function</strong> — bytes in, bytes out, no
- * repository, no facade, no state (ADR-050). It was in {@code notification}, which made the ticket
- * reachable only as an email attachment: a buyer who mistyped their address could never obtain what
- * they had paid for, and the operator resend replayed to the same wrong address. Serving a download
- * from {@code order} would otherwise have meant the first synchronous edge into {@code notification},
- * for a page render. Here both modules render from one implementation, so a downloaded ticket is
- * byte-identical to the emailed one by construction rather than by coincidence.
- *
- * <p>Uses the standard-14 fonts only — no font loading, no glyph lookups, nothing that can fail
- * differently on a different machine. A render failure here is deterministic and must not be
- * retried: it would fail identically three times and reach the same dead-letter queue 2.5 minutes
- * later (ADR-029).
- *
- * <p><strong>Which is exactly why every string is sanitised before it is drawn.</strong> The
- * standard-14 fonts encode WinAnsi, and {@code showText} throws on any character outside it — so a
- * Hebrew, Cyrillic, CJK or emoji event title turned a <em>paid</em> order into a dead letter with no
- * retry and, in this MVP, no admin replay endpoint to recover it. The buyer simply never received
- * the ticket they had been charged for. Degrading the glyph is strictly better than losing the
- * ticket; carrying a Unicode TTF is the real fix and belongs with the rest of the Stage 4 work.
+ * <p>Standard-14 fonts only, so a render failure is deterministic and never retried (ADR-029).
+ * Those fonts encode WinAnsi and {@code showText} throws outside it, so every string is sanitised
+ * first. A Hebrew title must not cost a paid buyer their ticket. A Unicode TTF is the real fix.
  */
 @Slf4j
 @Component
@@ -114,18 +96,10 @@ public class TicketPdfRenderer {
     }
 
     /**
-     * Reduces operator-supplied text to something the standard-14 fonts can actually draw.
-     *
-     * <p>Two steps, in order. Normalising to NFD and dropping the combining marks turns {@code "é"}
-     * into {@code "e"} and {@code "Ø"} into {@code "O"} — an accent lost, but the word still
-     * readable, which is what matters on a ticket someone holds at a door. Whatever still cannot be
-     * encoded becomes {@code '?'}.
-     *
-     * <p><strong>It never throws.</strong> That is the whole point: {@code showText} does, and
-     * because a font failure is deterministic, ADR-029 correctly sends it straight to the DLQ with
-     * no retry — so one unrenderable character in an event title used to cost a paying buyer their
-     * ticket outright, with no automated path back. A degraded glyph is a cosmetic loss; an
-     * undelivered ticket is not.
+     * Reduces operator-supplied text to what the standard-14 fonts can draw: NFD-normalise and drop
+     * combining marks ({@code "é"} → {@code "e"}), then {@code '?'} for anything left. <strong>It never
+     * throws</strong>, because a font failure is deterministic and would dead-letter a paid ticket
+     * (ADR-029). A degraded glyph is cosmetic; a lost ticket is not.
      */
     public static String drawable(String text) {
         if (text == null || text.isEmpty()) {

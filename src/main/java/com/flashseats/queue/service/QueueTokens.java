@@ -8,20 +8,11 @@ import java.util.UUID;
 import org.springframework.stereotype.Component;
 
 /**
- * Mints and verifies the two capability tokens the waiting room issues.
- *
- * <p>Payload is {@code kind:eventId:sessionId:expiryEpochSecond:nonce}. Every field earns its place:
- *
- * <ul>
- *   <li><strong>kind</strong> — so a 120 s pass can never be presented as a 600 s admission session
- *   <li><strong>eventId</strong> — so a pass for one sale cannot open another
- *   <li><strong>sessionId</strong> — so a token is useless to anyone who intercepts it
- *   <li><strong>expiry</strong> — so a forged-but-stale token fails without a Redis round trip
- *   <li><strong>nonce</strong> — so two passes minted in the same second are distinguishable
- * </ul>
- *
- * <p>The signature proves authenticity; the matching Redis key proves the token has not been spent
- * or revoked. Both checks are needed — neither is sufficient alone.
+ * Mints and verifies the waiting room's two capability tokens. Payload
+ * {@code kind:eventId:sessionId:expiryEpochSecond:nonce}: the kind stops a pass posing as an
+ * admission, the event and session bind it, the expiry fails stale tokens without Redis, and the nonce
+ * separates same-second tokens. The signature proves authenticity; the Redis key proves the token is
+ * unspent. Both checks are needed.
  */
 @Component
 public class QueueTokens {

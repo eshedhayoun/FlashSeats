@@ -7,14 +7,9 @@ import org.springframework.transaction.event.TransactionPhase;
 import org.springframework.transaction.event.TransactionalEventListener;
 
 /**
- * Returns a settled hold's seats to the live counter, once the claim that won them has committed.
- *
- * <p><strong>Why it is not done inline.</strong> The claim is a SQL {@code UPDATE} and the counter
- * is in Redis. A rollback undoes the first and not the second, so an inline increment would put
- * seats back on sale while the hold that owns them returns to {@code ACTIVE} — an oversell, and the
- * one outcome this design never accepts. Waiting for the commit inverts the risk: if this never
- * runs, the seats are merely invisible, which {@code flashseats.stock.drift} reports and a rebuild
- * repairs.
+ * Returns a settled hold's seats to the live counter once the claim that won them has committed.
+ * Inline, a rollback would undo the claim but not the Redis increment, which is an oversell. After
+ * commit, the worst case is invisible seats that drift reports and a rebuild repairs (ADR-046).
  */
 @Slf4j
 @Component
@@ -42,17 +37,10 @@ class HoldPostCommitTasks {
     }
 
     /**
-     * {@code fallbackExecution} is not decoration: without it, a settle that ever runs outside a
-     * transaction would publish this event into nothing and lose its restore silently — no error, no
-     * log, just seats that stop existing.
-     *
-     * <p>This method must never throw. Spring invokes after-commit synchronizations in a loop with
-     * no {@code try/catch} of its own, so one failed increment would abandon every event still
-     * queued behind it — and {@code sweepExpired} can queue a full batch of them from a single
-     * transaction.
-     *
-     * <p>It must also stay synchronous. A caller that releases a hold and immediately reads the
-     * counter — which is exactly what the journey tests do — would otherwise race the restore.
+     * {@code fallbackExecution} so a settle outside a transaction still restores rather than vanishing.
+     * Must never throw: after-commit callbacks run in a loop with no {@code try/catch}, and one failure
+     * would abandon every restore queued behind it in a sweep batch. Synchronous, so a release is
+     * visible to the next read.
      */
     @TransactionalEventListener(phase = TransactionPhase.AFTER_COMMIT, fallbackExecution = true)
     void onHoldSettled(TicketHoldSettledEvent event) {

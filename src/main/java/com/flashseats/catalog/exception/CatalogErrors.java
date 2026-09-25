@@ -6,14 +6,8 @@ import com.flashseats.shared.error.ErrorCode;
 import com.flashseats.shared.error.FlashSeatsException;
 
 /**
- * Everything {@code catalog} can refuse, in one place.
- *
- * <p>These were five classes, one per message, none of them ever caught by type. A reader had to
- * open a directory to learn what this module could fail with; now it is one file, and the reasoning
- * that used to sit in five class-level javadocs sits on the five methods.
- *
- * <p>Public because {@code hold} raises {@link #saleNotOpen} — the window rule is catalog's, and a
- * caller enforcing it with its own exception would be a second copy of the rule.
+ * Everything {@code catalog} can refuse, in one place (ADR-057). Public because {@code hold} raises
+ * {@link #saleNotOpen}: the window rule is catalog's, so hold must not keep a second copy of it.
  */
 public final class CatalogErrors {
 

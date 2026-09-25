@@ -8,28 +8,12 @@ import org.springframework.context.annotation.Profile;
 import org.springframework.core.env.Environment;
 
 /**
- * Refuses to start with development secrets in a non-development environment.
+ * Refuses to start with development secrets outside {@code dev}/{@code test} (ADR-039). The default
+ * strings would let anyone forge every capability token and the admin login. A default secret breaks
+ * nothing visible, so a startup that stops is the only signal nobody scrolls past.
  *
- * <p>Four values sign every capability in the system: the {@code fsid} cookie, the queue pass, the
- * admission session, and the receipt token. Anyone holding the default string can forge all four —
- * which is not "weak authentication" but total impersonation of any buyer, plus the ability to read
- * any order. The admin password guards pre-warm and the metrics endpoints on the same terms.
- *
- * <p><strong>A warning would not have been enough</strong> (ADR-039). This failure is silent by
- * nature: everything works perfectly with a default secret, so nothing about a running system
- * reveals the problem until someone exploits it. A startup that stops is the only signal that
- * cannot be scrolled past.
- *
- * <p>Not active on {@code dev} or {@code test}, where the defaults are the point: the stack has to
- * run from a clean checkout with no configuration, and the tests need deterministic secrets so a
- * token minted in one place verifies in another.
- *
- * <p>Reads the {@link Environment} rather than the modules' {@code *Properties} beans on purpose.
- * A {@code config} package is module-internal, and reaching into three of them from the bootstrap
- * package is a boundary violation {@code ModularityTests} correctly rejects. Resolved property
- * values are configuration, not another module's API — and checking them is also closer to what
- * this class actually means: whatever the deployment ended up with, is it still the published
- * default?
+ * <p>It reads the {@link Environment}, not the modules' {@code *Properties}, which are
+ * module-internal.
  */
 @Configuration
 @Profile("!dev & !test")
@@ -38,13 +22,8 @@ public class SecretsGuard {
     private static final String DEFAULT_SECRET = "dev-only-change-me";
 
     /**
-     * Spring Security's marker for "this password is not hashed".
-     *
-     * <p>The admin password is checked for <strong>this prefix</strong> rather than for the literal
-     * string {@code admin} it used to carry. That is a strictly stronger test and the reason for the
-     * change: the old check refused exactly one known value, so {@code hunter2} sailed through and
-     * was stored and compared in plaintext. Rejecting the encoding instead means every plaintext
-     * password is refused, whether or not anyone thought to list it.
+     * Spring Security's marker for "this password is not hashed". The guard refuses the
+     * <strong>encoding</strong>, not a known value, so every plaintext password is rejected (ADR-048).
      */
     private static final String PLAINTEXT_PREFIX = "{noop}";
 
@@ -69,15 +48,9 @@ public class SecretsGuard {
             new Secret("flashseats.admin.password", "FLASHSEATS_ADMIN_PASSWORD", null));
 
     /**
-     * Guarded only once the real provider is switched on.
-     *
-     * <p>Unconditional would be wrong in both directions. A deployment running the stub has no
-     * Stripe account and nothing to set, so demanding keys would refuse to start a perfectly
-     * coherent configuration. A deployment running Stripe with the published webhook secret is worse
-     * than one with none: every real delivery fails its signature check, so a charge whose response
-     * was lost never reaches an order, and the symptom is silence that looks exactly like a quiet
-     * day. Both values are checked, because an API key with no usable webhook secret is a system
-     * that can take money and cannot finish the sale.
+     * Guarded only once the real provider is switched on: the stub needs no keys. With Stripe on, both
+     * values matter, because a published webhook secret fails every real delivery and a lost charge
+     * response then never reaches an order.
      */
     private static final List<Secret> GUARDED_WITH_STRIPE = List.of(
             new Secret("flashseats.payment.stripe.api-key", "STRIPE_API_KEY", "sk_test_..."),

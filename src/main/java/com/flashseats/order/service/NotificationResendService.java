@@ -8,35 +8,13 @@ import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
 /**
- * Re-queues a fulfilment message for an order whose ticket never arrived.
+ * Re-queues the fulfilment message for an order whose ticket never arrived.
  *
- * <h2>Why this lives in {@code order} and not in {@code notification}</h2>
- *
- * <p>A resend needs the original <strong>payload</strong> — the event's title and venue, every line
- * item, the receipt token — and {@code notification_logs} does not carry it. It records that a
- * delivery was attempted and how it failed, never what was in it. The durable copy is
- * {@code outbox_events.payload}, and {@code order} owns that table.
- *
- * <p>So the endpoint sits where the state is (ADR-043), exactly as {@code rebuild-stock} does, and
- * the path still names what the operator is thinking about. The alternative designs were both
- * worse: draining the AMQP dead-letter queue to find one message means re-enqueueing everything that
- * does not match, and having {@code notification} ask {@code order} for the payload would add a
- * facade edge across an asynchronous boundary that exists precisely so the two can be deployed
- * independently.
- *
- * <h2>Why it is only three lines of work</h2>
- *
- * <p>Writing a new outbox row is the <em>whole</em> mechanism. The relay publishes it like any
- * other, and on the far side {@code NotificationLogService.claim} already falls through from
- * {@code claimIfAbsent} to {@code reclaimDeadLettered} — the conditional {@code UPDATE ... WHERE
- * status = 'DLQ'} ADR-038 added so that a replay would actually send. Nothing new is needed on
- * either side; the capability was built and had no trigger.
- *
- * <p><strong>Resending something that already worked is safe by construction</strong>, which is the
- * property that makes this endpoint usable under pressure. A {@code SENT} row is not {@code DLQ}, so
- * the re-claim matches nothing, the claim returns false, and the consumer acknowledges without
- * sending. An operator who cannot tell whether the first attempt landed can press this without
- * risking a second ticket.
+ * <p>It lives in {@code order} because the payload does: {@code notification_logs} records attempts,
+ * while the durable copy is {@code outbox_events.payload} (ADR-043). Writing a new outbox row is the
+ * whole mechanism: the relay publishes it, and {@code NotificationLogService.claim} re-claims a
+ * {@code DLQ} row (ADR-038). Resending a delivered ticket is safe by construction, because a
+ * {@code SENT} row is never re-claimed, so the consumer acks without sending.
  */
 @Slf4j
 @Service

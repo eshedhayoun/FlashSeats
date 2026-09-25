@@ -7,13 +7,8 @@ import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
 
 /**
- * The challenge check {@code queue} runs on join, and the audit row each verdict earns.
- *
- * <p>This class <em>is</em> {@link BotFacade} (ADR-057). It was a {@code BotFacadeImpl} in the
- * {@code facade} package, written in the shape the other five modules used before that ADR removed
- * them — but it was never the pure delegation those were: it decides what a verdict means and
- * orchestrates two services to act on it. Global standards §5 rule 6 puts orchestration in a
- * service, and rule 7 says the service implements the facade, so it belongs here under both.
+ * The challenge check {@code queue} runs on join, and the audit row each verdict earns. It
+ * implements {@link BotFacade} (ADR-057) and orchestrates the verdict (global standards §5).
  */
 @Slf4j
 @Service

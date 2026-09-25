@@ -27,16 +27,8 @@ import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
 /**
- * Event metadata, sale windows, and every movement of the inventory counter.
- *
- * <p>This class <em>is</em> {@link CatalogFacade}. Other modules see only that interface, because
- * this package is internal to the module and they may not name it. There is no separate delegating
- * implementation: one existed, held no logic, and only added a hop between the contract and the code
- * that honours it.
- *
- * <p>{@code COUNTER_UNAVAILABLE} is inherited from the interface rather than redeclared here. It
- * used to be mirrored, with a comment noting that the two had to agree — two constants that must
- * hold the same value are one constant with a way to disagree.
+ * Event metadata, sale windows, and every movement of the inventory counter. This class implements
+ * {@link CatalogFacade} (ADR-057); other modules see only the interface.
  */
 @Slf4j
 @Service
@@ -162,15 +154,9 @@ public class CatalogService implements CatalogFacade {
     }
 
     /**
-     * Ids of events inside their sale window right now — what the promotion worker ticks over.
-     *
-     * <p><strong>Served from the metadata cache, and that is a correctness choice rather than a
-     * performance one.</strong> This was a query per tick per replica — trivial in cost and fatal in
-     * dependency: under pool pressure the promoter queued for a connection behind the very buyers it
-     * existed to admit, one wait measured at 16 seconds inside a one-second tick. Nobody promoted means
-     * the waiting room does not drain, which means the buyers keep polling (ADR-051).
-     *
-     * <p>The window is still compared against the live clock; only the rows are remembered.
+     * Ids of events inside their sale window now, which the promotion worker ticks over. Served from the
+     * metadata cache as a correctness choice, so the promoter never queues for a connection behind the
+     * buyers it admits (ADR-051). The window is still compared against the live clock.
      */
     @Override
     public List<Long> findOpenEventIds() {
@@ -202,26 +188,13 @@ public class CatalogService implements CatalogFacade {
     }
 
     /**
-     * Halts a live sale, or resumes it.
+     * Halts a live sale, or resumes it. Nothing is torn down: the waiting room, passes, admissions and
+     * stock stay as they are, so resuming returns every buyer to where they were (ADR-035's reasoning).
+     * Idempotent. The cache eviction is published {@code AFTER_COMMIT}, so a concurrent reader cannot
+     * re-cache the row before this change lands.
      *
-     * <p>Nothing is torn down and nothing is lost. The waiting room's ZSET is untouched, every
-     * position survives, live passes and admissions run out their own clocks, and stock stays exactly
-     * where it is — so resuming returns every buyer to precisely where they were. That is the same
-     * reasoning as ADR-035's refusal to delete a waiting room on a sold-out reading: the state an
-     * operator can destroy in a moment takes a sale to rebuild.
-     *
-     * <p>Idempotent, so a second click is not an error.
-     *
-     * <p><strong>The eviction is published, not performed.</strong> It runs {@code AFTER_COMMIT}
-     * (see {@link CatalogMetadata}), because evicting inline leaves a window in which a concurrent
-     * reader re-caches the row this transaction is about to change — and the entry it writes would
-     * be fresh, so an operator's pause could fail on the replica that served it. Published
-     * unconditionally, including on the no-op branch, because a cache that is already correct loses
-     * nothing by being told twice.
-     *
-     * @throws com.flashseats.shared.error.FlashSeatsException {@code SALE_PAUSED} — see
-     *     {@link CatalogErrors} — if the event is {@code DRAFT} or {@code CANCELLED}, where
-     *     "paused" would mean nothing and un-pausing would publish something nobody published
+     * @throws com.flashseats.shared.error.FlashSeatsException {@code SALE_PAUSED} if the event is
+     *     {@code DRAFT} or {@code CANCELLED}
      */
     @Transactional
     public EventStatus setPaused(long eventId, boolean paused) {
@@ -242,17 +215,10 @@ public class CatalogService implements CatalogFacade {
     }
 
     /**
-     * Total remaining across an event's tiers — the promoter's admission bound.
-     *
-     * <p><strong>"No counter" is never "zero"</strong> (ADR-035). Summing the counters that do exist
-     * would make an un-warmed event report {@code 0} and be indistinguishable from a sold-out one,
-     * and the caller would tell an entire waiting room the sale had ended because a key was missing —
-     * ADR-004's failure, one module over. If any tier is missing its counter the whole answer is a
-     * fault.
-     *
-     * <p>The tier list comes from {@code ticket_tiers}, not from the counters. That is the whole
-     * guard: asking the counters which tiers exist would make a wholly evicted event look like an
-     * event with no tiers, whose remaining stock sums to zero.
+     * Total remaining across an event's tiers: the promoter's admission bound. <strong>"No counter" is
+     * never "zero"</strong> (ADR-035). One missing counter makes the whole answer a fault, and the tier
+     * list comes from {@code ticket_tiers}, not from the counters, so an evicted event cannot look
+     * empty.
      *
      * @return remaining seats across the event, or {@link #COUNTER_UNAVAILABLE} if any tier has no
      *     counter
@@ -304,18 +270,9 @@ public class CatalogService implements CatalogFacade {
     // ------------------------------------------------------ inventory movement
 
     /**
-     * Atomically takes {@code quantity} seats from a tier.
-     *
-     * <p>One Lua script, so the read, the comparison and the decrement cannot interleave. The
-     * three-way answer is the point: whether the counter was <em>readable</em> is decided in the same
-     * atomic step as whether it was <em>sufficient</em>. Recovering that distinction afterwards, by
-     * re-reading the counter, raced — a concurrent restore between the two calls turned a fault into
-     * an ordinary "sold out".
-     *
-     * <p><strong>Not transactional, and it must not be called from inside a transaction.</strong>
-     * Redis cannot roll back, so a decrement inside a SQL transaction that later fails would leak
-     * the seats for good (ADR-023). The caller writes its hold row next and calls {@link #restore}
-     * if it cannot.
+     * Atomically takes seats: one Lua script decides <em>readable</em> and <em>sufficient</em> in the
+     * same step (ADR-004). Must not be called inside a transaction, because Redis cannot roll back
+     * (ADR-023); the caller writes its hold next and {@link #restore}s on a definite rejection.
      */
     @Override
     public ReserveResult tryReserve(long eventId, long tierId, int quantity) {
@@ -341,16 +298,9 @@ public class CatalogService implements CatalogFacade {
     }
 
     /**
-     * Returns {@code quantity} seats to a tier.
-     *
-     * <p>Callers must have won the settle-once claim on the hold first, and that claim must already
-     * have committed — the claim, not this call, is what guarantees a hold's seats come back exactly
-     * once (ADR-019), and incrementing before the commit would return seats that a rollback then
-     * puts back on hold.
-     *
-     * <p>A missing counter is left missing. Creating one here would rebuild inventory out of
-     * whichever hold happened to expire next, which is ADR-004's prohibition; the seats are reported
-     * by {@code flashseats.stock.drift} and returned by a rebuild.
+     * Returns seats to a tier. Only after winning the settle-once claim, and only once it has committed
+     * (ADR-019, ADR-046). A missing counter stays missing: creating one would conjure inventory
+     * (ADR-004), so the drift gauge and a rebuild handle it.
      */
     @Override
     public void restore(long eventId, long tierId, int quantity) {
@@ -367,18 +317,11 @@ public class CatalogService implements CatalogFacade {
     // ---------------------------------------------------------------- pre-warm
 
     /**
-     * Seeds inventory from {@code total_capacity}, and only while the sale is {@code UPCOMING}.
+     * Seeds inventory from {@code total_capacity}, only while the sale is {@code UPCOMING}: seeding an
+     * open sale would resurrect every sold ticket (ADR-004). The tier list is read uncached, so no tier
+     * is left without a counter.
      *
-     * <p>The window check is the whole point. Seeding an open sale from capacity would silently
-     * resurrect every ticket already sold — the highest-severity defect the design review found
-     * (ADR-004). Recovery during a live sale is a rebuild from the ledger, never a reseed.
-     *
-     * <p><strong>The tier list is read uncached.</strong> Events and tiers are inserted straight
-     * into PostgreSQL by the seed scripts, so a cached list could be a subset — and a tier left
-     * without a counter answers {@code 503} for the rest of the sale.
-     *
-     * @return how many tier counters this call created. A repeat pre-warm returns 0 and changes
-     *     nothing.
+     * @return how many tier counters this call created; a repeat returns 0 and changes nothing
      */
     public int prewarm(long eventId) {
         EventRow event = EventRow.of(requireEvent(eventId));
@@ -460,14 +403,8 @@ public class CatalogService implements CatalogFacade {
     }
 
     /**
-     * One tier as the public API exposes it.
-     *
-     * <p>A missing counter becomes {@link com.flashseats.catalog.model.AvailabilityLevel#UNKNOWN},
-     * <strong>not</strong> {@code SOLD_OUT} (ADR-040). The previous code clamped
-     * {@link #COUNTER_UNAVAILABLE} to zero with {@code Math.max}, which published "we cannot read
-     * our own inventory" to every visitor as "this tier is gone" — ADR-004's failure mode reaching
-     * the landing page. An un-warmed event announced itself sold out before its sale had even
-     * started, and the client rendered that tier unselectable with no way to retry.
+     * One tier as the public API exposes it. A missing counter becomes {@code UNKNOWN}, never
+     * {@code SOLD_OUT} (ADR-040).
      */
     private TierResponse toTierResponse(TierRow tier, Map<Long, Integer> remainingByTier) {
         if (remainingByTier.getOrDefault(tier.id(), COUNTER_UNAVAILABLE) == COUNTER_UNAVAILABLE) {

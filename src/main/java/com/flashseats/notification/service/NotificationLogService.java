@@ -33,31 +33,16 @@ public class NotificationLogService {
     }
 
     /**
-     * Claims the right to send this message, by inserting the row that makes a second attempt
-     * impossible.
-     *
-     * <p><strong>Insert first, send second.</strong> The unique constraint — not a preceding
-     * {@code SELECT} — is the guard, because the constraint is atomic and a read is not. Two workers
-     * handling the same redelivered message would both pass a {@code SELECT} and both send, and the
-     * buyer would get two tickets (ADR-015).
-     *
-     * <p>{@code REQUIRES_NEW} so the claim commits on its own, independently of anything the caller
-     * does afterwards.
-     *
-     * <p><strong>A dead-lettered row is re-claimable</strong> (ADR-038). The claim guards a send in
-     * progress, so it has to be released when the send did not happen — otherwise an SMTP outage
-     * dead-letters the message and permanently consumes its own guard, and replaying it from the
-     * DLQ silently acknowledges without sending. The re-claim is itself a conditional {@code UPDATE}
-     * on {@code status = 'DLQ'}, so a {@code PENDING} or {@code SENT} row is never disturbed and
-     * this can never authorise a second delivery of a message that worked.
+     * Claims the right to send, by inserting the row that makes a second send impossible. The unique
+     * constraint is the guard, never a preceding {@code SELECT} (ADR-015). {@code REQUIRES_NEW}, so the
+     * claim commits on its own. A {@code DLQ} row is re-claimable, so a replay sends (ADR-038).
      *
      * @return true if this caller may send; false if someone already has, or is doing so now
      */
     @Transactional(propagation = Propagation.REQUIRES_NEW)
     public boolean claim(String orderNumber, NotificationKind kind, String recipientEmail) {
-        // Two conditional statements, each answering with a rowcount. Neither can throw, so neither
-        // can leave this transaction rollback-only — which is what the earlier insert-and-catch did,
-        // making "already handled, acknowledge quietly" impossible to actually return.
+        // Two conditional statements answering with rowcounts. Neither throws, so neither can leave
+        // this transaction rollback-only (ADR-038).
         if (logs.claimIfAbsent(orderNumber, kind.name(), recipientEmail) == 1) {
             return true;
         }

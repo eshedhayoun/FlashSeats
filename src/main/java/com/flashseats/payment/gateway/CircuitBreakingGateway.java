@@ -7,24 +7,13 @@ import lombok.extern.slf4j.Slf4j;
 
 import io.github.resilience4j.retry.Retry;
 /**
- * A circuit breaker around whichever gateway is configured.
- *
- * <p>A decorator rather than an annotation, for two reasons. Resilience4j's Spring Boot starter
- * targets Boot 3 and is not on the classpath (this application declares the plain artifacts and one
- * {@link CircuitBreaker} bean by hand), and an AOP-driven breaker would have to decide what counts
- * as a failure from a <em>return value</em> — see below.
+ * A circuit breaker around whichever gateway is configured (ADR-052). It is a decorator, because
+ * Resilience4j's starter targets Boot 3, so the plain artifacts are used.
  *
  * <p><strong>Only {@link GatewayTransportException} is counted.</strong> A decline is a returned
- * {@link GatewayResult}, not a throw, and that asymmetry is the whole design: a breaker that counted
- * declines would open during an ordinary burst of expired cards and take a healthy sale's payments
- * down with it. What the breaker exists to stop is every buyer in a 10,000-person queue waiting out
- * a 20-second read timeout against a provider that is already down.
- *
- * <p>Both a transport failure and an open breaker leave by the same door — {@link GatewayResult#error}
- * — which the existing {@code ERROR → PAYMENT_GATEWAY_UNAVAILABLE → 503} path already handles: the
- * seats are retained and <strong>no payment attempt is consumed</strong>, exactly as
- * {@code 05-global-standards.md} §2 promises for that code. Nothing above this class changed to
- * accommodate the breaker.
+ * {@link GatewayResult}: a breaker that counted declines would open on an ordinary burst of expired
+ * cards. Transport failures and an open breaker both leave as {@link GatewayResult#error}, which
+ * becomes {@code 503 PAYMENT_GATEWAY_UNAVAILABLE}: seats retained, no attempt consumed.
  */
 @Slf4j
 public class CircuitBreakingGateway implements PaymentGateway {

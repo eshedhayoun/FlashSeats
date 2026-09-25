@@ -26,16 +26,9 @@ import org.springframework.web.bind.annotation.RestControllerAdvice;
 import org.springframework.web.method.annotation.MethodArgumentTypeMismatchException;
 
 /**
- * The one exception handler for the whole application (ADR-033).
- *
- * <p>Global standards §1 asked for a {@code @RestControllerAdvice} per module, reasoning that a
- * single global advice would have to import every module's exception types and so break the
- * boundary Modulith enforces. Because every module exception extends {@link FlashSeatsException} and
- * carries its own {@link ErrorCode}, this handler catches the base type and imports nothing
- * module-specific — the constraint is satisfied with one class instead of seven.
- *
- * <p>Runs at {@link Ordered#LOWEST_PRECEDENCE} so a module may still add its own advice later
- * without being shadowed.
+ * The one exception handler for the whole application (ADR-033). Every module exception extends
+ * {@link FlashSeatsException} and carries its {@link ErrorCode}, so this imports nothing
+ * module-specific. Lowest precedence, so a module could still add its own advice.
  */
 @Slf4j
 @RestControllerAdvice
@@ -84,18 +77,9 @@ public class GlobalExceptionHandler {
     }
 
     /**
-     * Malformed requests that Spring MVC rejects before a handler ever runs.
-     *
-     * <p><strong>These must be listed explicitly, and that is not a formality.</strong>
-     * {@code ExceptionHandlerExceptionResolver} runs <em>before</em>
-     * {@code DefaultHandlerExceptionResolver}, so the {@code Exception.class} backstop below matches
-     * first and would answer every one of them with {@code 500 INTERNAL_ERROR} — a client error
-     * reported as a server fault, with no registry {@code code} to branch on and an
-     * {@code ERROR}-level log line for every mistyped query string. A missing {@code eventId} on
-     * {@code POST /queue/admit} did exactly that.
-     *
-     * <p>Global standards §1: {@code 400} is malformed input, {@code 500} is never a client error,
-     * and every problem carries a {@code code}.
+     * Malformed requests Spring MVC rejects before a handler runs. Listed explicitly because this
+     * advice runs before Spring's default resolver, so the backstop would answer them {@code 500} with
+     * no {@code code} (ADR-041). A client error is {@code 400}, never {@code 500}.
      */
     @ExceptionHandler({
         MissingServletRequestParameterException.class,
@@ -107,17 +91,9 @@ public class GlobalExceptionHandler {
     }
 
     /**
-     * Wrong method, wrong content type, or an {@code Accept} we cannot satisfy. Kept apart from the
-     * {@code 400}s because the status is part of the answer — {@code 405}, {@code 415} and
-     * {@code 406} each tell a client something {@code 400} does not.
-     *
-     * <p><strong>{@code HttpMediaTypeNotAcceptableException} was missing here</strong> until the
-     * ticket download (ADR-050) gave this API its first non-JSON response and immediately tripped
-     * over it. ADR-041's rule is that every exception Spring itself throws must be named before the
-     * {@code Exception} backstop, because {@code ExceptionHandlerExceptionResolver} runs first and
-     * the backstop therefore owns whatever is not listed. This one was not, so a content-negotiation
-     * failure answered {@code 500 INTERNAL_ERROR} with no registry {@code code} — the exact shape of
-     * defect ADR-041 was written to eliminate, one exception short of complete.
+     * Wrong method, wrong content type, or an {@code Accept} we cannot satisfy: {@code 405},
+     * {@code 415} and {@code 406}, each keeping its status. Every exception Spring throws must be named
+     * before the {@code Exception} backstop, or the backstop owns it (ADR-041).
      */
     @ExceptionHandler({
         HttpRequestMethodNotSupportedException.class,
@@ -133,19 +109,10 @@ public class GlobalExceptionHandler {
     }
 
     /**
-     * A request that could not get a database connection in time (ADR-059).
-     *
-     * <p>That is back-pressure, not a fault: the pool is the system's real concurrency ceiling under
-     * virtual threads, and a caller who waited {@code connection-timeout} for it will very likely get
-     * one a second later. Answered {@code 500 INTERNAL_ERROR}, it was the least actionable code in the
-     * registry at the moment a buyer most needed to be told "retry" — and checkout is find-or-create,
-     * so a retry of the same body is always safe.
-     *
-     * <p><strong>Classified by cause, not by wrapper.</strong> {@code CannotCreateTransactionException}
-     * also means "the database is down" or "the credentials are wrong", and telling a client to retry
-     * those in one second is a lie. Only HikariCP's own timeout — an
-     * {@link SQLTransientConnectionException} somewhere in the chain — is busy; everything else goes
-     * to the backstop exactly as before.
+     * A request that could not get a database connection in time: back-pressure, not a fault (ADR-059).
+     * {@code 503 SERVICE_BUSY} with {@code Retry-After}; checkout is find-or-create, so a retry is safe.
+     * Classified by cause: only HikariCP's {@link SQLTransientConnectionException} is busy, while a
+     * database that is down still reaches the backstop.
      */
     @ExceptionHandler({CannotCreateTransactionException.class, CannotGetJdbcConnectionException.class})
     public ResponseEntity<ProblemDetail> onNoConnection(Exception ex) {

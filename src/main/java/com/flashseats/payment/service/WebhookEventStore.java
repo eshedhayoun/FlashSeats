@@ -6,17 +6,10 @@ import org.springframework.transaction.annotation.Propagation;
 import org.springframework.transaction.annotation.Transactional;
 
 /**
- * The three <strong>short</strong> transactions around one webhook delivery: claim it, mark it done,
- * or give it back.
- *
- * <p>On its own bean for the same reason as {@link PaymentTransactionStore}: Spring's transaction
- * proxy does not intercept self-invocation, so a {@code @Transactional} method called from another
- * method on the same object runs with no transaction at all, silently. For a claim that is not a
- * style problem — the claim has to be <em>committed</em> before the settlement it guards begins, or
- * the other two replicas cannot see it and all three settle the same charge.
- *
- * <p>{@code REQUIRES_NEW} so each is independent of whatever the settlement does; in particular the
- * release must commit even though the settlement's transaction rolled back.
+ * The three <strong>short</strong> transactions around one webhook delivery: claim, mark done, or
+ * give back. A separate bean because the claim must be <em>committed</em> before the settlement
+ * begins, or all three replicas settle the same charge, and self-invocation would skip the proxy.
+ * {@code REQUIRES_NEW}, so a release commits even when the settlement rolled back.
  */
 @Component
 public class WebhookEventStore {

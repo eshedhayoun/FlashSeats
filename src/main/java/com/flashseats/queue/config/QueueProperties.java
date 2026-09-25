@@ -32,23 +32,10 @@ public class QueueProperties {
     private int promotionBatchSize = 45;
 
     /**
-     * Buyers the whole cluster may admit in one promotion interval, shared across every open sale
-     * (ADR-049). {@link #promotionBatchSize} stays as the per-sale cap.
-     *
-     * <p><strong>45, for the same reason as the batch size above:</strong> ADR-028's
-     * {@code hikariMax × 1.5}, re-scoped from one sale to the whole cluster. That is the arithmetic the
-     * design already justified; ADR-049's only correction is which scope it applies at.
-     *
-     * <p>It replaces a two-property derivation — cluster connections ÷ connections per buyer, 90 ÷ 8 —
-     * whose <em>units did not work</em>: dividing a concurrency by a count of transactions yields
-     * neither, and the 11 it produced was treated as a rate. Measured, 11 per tick left
-     * {@code hikaricp_connections_pending} peaking at 10 of 90 while denying ten admissions for every
-     * one it granted, and five sales of 500 seats sold 76 % instead of selling out.
-     *
-     * <p>Raise it only against the instruments, never by argument: the ceiling is where
-     * {@code hikaricp_connections_pending} stops returning to zero, and
-     * {@code flashseats.queue.admission.budget.denied} staying high while the pool sits idle means
-     * there is room.
+     * Buyers the whole cluster may admit per promotion interval, shared by every open sale (ADR-049);
+     * {@link #promotionBatchSize} stays the per-sale cap. 45 is ADR-028's {@code hikariMax × 1.5} at
+     * cluster scope. Raise it only against the instruments: the ceiling is where
+     * {@code hikaricp_connections_pending} stops returning to zero.
      */
     private int globalAdmissionBudgetPerTick = 45;
 

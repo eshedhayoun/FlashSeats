@@ -3,20 +3,10 @@ package com.flashseats.queue.service;
 import java.util.Map;
 
 /**
- * What travels on {@code queue:events:{eventId}}.
- *
- * <p>{@code sessionId} addresses one buyer — a promotion. A {@code null} {@code sessionId} means the
- * frame is for everyone watching the event, which is how terminal states such as
- * {@code sale-exhausted} reach the whole waiting room at once.
- *
- * <p>Every replica receives every message and delivers only to the connections in its own heap.
- * That is not wasteful, it is the mechanism: the promoter has no idea which replica is holding a
- * given browser's stream (ADR-007).
- *
- * <p>{@code id} is the replay sequence, and it is {@code null} on everything that is not retained —
- * which is every session-targeted frame. A frame with no sequence reaches the browser with no SSE
- * {@code id}, leaving its last-event-id pointing at the last thing it could actually ask to have
- * replayed.
+ * What travels on {@code queue:events:{eventId}}. A {@code sessionId} addresses one buyer; a
+ * {@code null} one is a broadcast. Every replica receives every message and delivers to the streams
+ * in its own heap (ADR-007). {@code id} is the replay sequence, {@code null} on anything not retained,
+ * so such frames carry no SSE {@code id} (ADR-058).
  */
 public record QueueChannelMessage(
         Long id, String type, String sessionId, Map<String, Object> data) {

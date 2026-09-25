@@ -31,22 +31,15 @@ import org.springframework.transaction.annotation.Propagation;
 import org.springframework.transaction.annotation.Transactional;
 
 /**
- * The hold lifecycle. Everything that can create, end or extend a reservation lives here.
- *
- * <p>Two rules govern every method below:
+ * The hold lifecycle: everything that creates, ends or extends a reservation. Two rules:
  *
  * <ol>
- *   <li>A reservation and the stock movement that justifies it are <strong>one transaction</strong>.
- *   <li>A hold leaves {@code ACTIVE} only via the settle-once claim, and only the winner of that
- *       claim touches stock.
+ *   <li>A reservation and the stock movement that justifies it are ordered and compensated together.
+ *   <li>A hold leaves {@code ACTIVE} only via the settle-once claim, and only its winner touches stock.
  * </ol>
  *
- * <p>This class <em>is</em> {@link HoldFacade}; the methods carrying that contract are grouped under
- * one heading at the bottom. Other modules see only the interface, because this package is internal
- * to the module and they may not name it. There is no separate delegating implementation: one
- * existed, held no logic, and only added a hop between the contract and the code that honours it.
- * The facade methods return {@link HoldSummary} records; the ones above them return the entity and
- * are this module's own.
+ * <p>This class implements {@link HoldFacade}; those methods are grouped at the bottom and return
+ * {@link HoldSummary} records, while the ones above return the entity for this module's own use.
  */
 @Slf4j
 @Service
@@ -83,25 +76,13 @@ public class HoldService implements HoldFacade {
     // ------------------------------------------------------------------ create
 
     /**
-     * Reserves seats.
+     * Reserves seats. The Redis decrement is <strong>outside any transaction</strong>, because Redis
+     * cannot roll back (ADR-023, ADR-046). It is ordered first and compensated only on a constraint
+     * rejection, the one certain failure. An ambiguous commit failure is left to drift and a rebuild,
+     * since returning seats that may still be held would oversell (invariant 12).
      *
-     * <p><strong>The decrement is deliberately outside any transaction.</strong> It is a Redis write
-     * now, and Redis does not roll back — holding it inside the transaction that writes the hold row
-     * would leak the seats of every rejected attempt permanently, which is precisely the trap
-     * ADR-023 exists to name. The two are instead ordered and compensated: take the seats, write the
-     * row that justifies them, and give them straight back if that row cannot be written.
-     *
-     * <p>The compensation runs only on a constraint rejection, because that is the one failure whose
-     * outcome is <em>certain</em>. A flush that violates
-     * {@code idx_holds_one_active_per_session} — a buyer double-clicking, the ordinary case — leaves
-     * no row, so the seats are unambiguously ours to return. A failure at commit is ambiguous: the
-     * row may exist, and returning seats that are still held would be an oversell. Those fall
-     * through to {@code flashseats.stock.drift} and a rebuild, which is the safe direction.
-     *
-     * <p>Note the two distinct failures when the reserve does not succeed. "Not enough seats" is a
-     * {@code 409} that means try another tier; "no counter at all" is a {@code 503} fault. Treating
-     * the second as the first would announce a sold-out sale to every buyer because a key was
-     * missing (ADR-004).
+     * <p>"Not enough seats" ({@code 409}) and "no counter" ({@code 503}) stay distinct; the second is
+     * never sold out (ADR-004).
      */
     public TicketHold createHold(
             String sessionId, long eventId, long tierId, int quantity, String admissionToken) {
@@ -195,16 +176,12 @@ public class HoldService implements HoldFacade {
     // ------------------------------------------------------------------ extend
 
     /**
-     * Grants the one grace extension, if this hold has not already used it (ADR-030).
-     *
-     * <p>The budget is <strong>per hold, not per attempt</strong>. A retry after a decline finds
-     * {@code extendedCount > 0} and simply gets the current expiry back — no error, no second
-     * extension. Granting one per attempt would allow 300 + 3×120 = 660 s, blowing the 420 s ceiling
-     * and making three deliberate declines a cheap way to squat on inventory.
+     * Grants the one grace extension, if unused (ADR-030). The budget is <strong>per hold, not per
+     * attempt</strong>: a retry gets the current expiry back, because one per attempt would make
+     * declines a way to squat on seats.
      *
      * @throws HoldExpiredException if the hold is no longer {@code ACTIVE}. The caller
-     *     <strong>must</strong> abort before charging: continuing would take money for seats a
-     *     concurrent expiry has already given away (ADR-023).
+     *     <strong>must</strong> abort before charging (ADR-023).
      */
     @Override
     @Transactional
@@ -233,15 +210,11 @@ public class HoldService implements HoldFacade {
     // ------------------------------------------------------------------- sweep
 
     /**
-     * Reclaims holds whose window has passed.
+     * Reclaims holds whose window has passed. This, not the expiry listener, is what makes expiry
+     * <em>correct</em>, because keyspace events are at-most-once. Safe on every replica: each row is
+     * taken by the settle-once claim.
      *
-     * <p>This — not any timer or notification — is what makes expiry <em>correct</em>. When Redis
-     * arrives it will fire keyspace events that reclaim a hold faster, but those are at-most-once
-     * pub/sub: a dropped connection loses one permanently. The sweeper has no such failure mode.
-     *
-     * <p>Safe on every replica simultaneously, because each row is taken by the settle-once claim.
-     *
-     * @return how many holds this replica actually reclaimed
+     * @return how many holds this replica reclaimed
      */
     @Transactional
     public int sweepExpired() {
@@ -259,32 +232,11 @@ public class HoldService implements HoldFacade {
     }
 
     /**
-     * Reclaims one hold whose {@code hold:{token}} timer has just fired.
-     *
-     * <p><strong>The timer is an accelerator, never an authority.</strong> This method re-reads the
-     * row and reclaims only what the sweeper would have reclaimed anyway — the key's disappearance
-     * is a hint that something may be expired, not a statement that it is. Three things make that
-     * distinction matter rather than being pedantry:
-     *
-     * <ul>
-     *   <li>{@code grantGrace} extends a hold's expiry in PostgreSQL. If the key were treated as
-     *       authoritative, the original timer would fire mid-payment and hand back seats the buyer
-     *       is actively being charged for.
-     *   <li>Redis AOF is {@code appendfsync everysec}, so a restart can resurrect or lose a key
-     *       relative to the row it describes.
-     *   <li>A key can be evicted or flushed by an operator. None of those mean a hold ended.
-     * </ul>
-     *
-     * <p>When the hold turns out to be alive and simply not expired yet, the timer is
-     * <strong>re-armed</strong> for whatever time is left. That is what keeps a grace-extended hold
-     * on the fast path instead of silently falling back to the sweeper for the rest of its life, and
-     * it costs nothing when the common case — an ordinary expiry — takes the branch above it.
-     *
-     * <p>Exactly-once across replicas is not this method's doing and needs no coordination: keyspace
-     * expiry is broadcast pub/sub, so all three replicas run this, all three reach
-     * {@code settleAndRestore}, and the conditional {@code UPDATE ... WHERE status = 'ACTIVE'} lets
-     * exactly one win. Restoring stock here directly — rather than through the claim — is how a
-     * naive listener triples a tier's inventory.
+     * Reclaims one hold whose {@code hold:{token}} timer fired. <strong>The timer is a hint, never an
+     * authority</strong> (ADR-048). The row is re-read and only a genuinely expired hold is reclaimed,
+     * because {@code grantGrace} moves expiry in PostgreSQL, and AOF, eviction or a flush can all
+     * disagree with the row. A hold that is still alive gets its timer re-armed. Exactly one replica
+     * wins via the settle-once claim.
      *
      * @return true if this replica won the claim and the seats are coming back
      */
@@ -328,12 +280,8 @@ public class HoldService implements HoldFacade {
     /**
      * {@inheritDoc}
      *
-     * <p><strong>Annotated even though {@link #requireActiveHold} already is, and that is not
-     * redundant.</strong> This delegates to it on {@code this}, and Spring's proxy does not
-     * intercept self-invocation — without the annotation here the read would run with no transaction
-     * at all, silently. It had one before: the call used to arrive from a separate
-     * {@code HoldFacadeImpl} and therefore went through the proxy. Collapsing that class into this
-     * one moved the call inside the bean, which is exactly the boundary loss ADR-023 warns about.
+     * <p>Annotated even though {@link #requireActiveHold} is: this calls it on {@code this}, and
+     * Spring's proxy does not intercept self-invocation, so without it the read runs with no transaction.
      */
     @Override
     @Transactional(readOnly = true)
@@ -351,16 +299,11 @@ public class HoldService implements HoldFacade {
     }
 
     /**
-     * Marks the hold as sold. <strong>Runs inside the caller's transaction and rolls back with
-     * it</strong> ({@link Propagation#MANDATORY} enforces that rather than assuming it).
+     * Marks the hold as sold, inside the caller's transaction ({@link Propagation#MANDATORY}). Stock is
+     * not restored: the seats were bought. If the caller rolls back, so does this claim (ADR-019).
      *
-     * <p>Stock is deliberately <em>not</em> restored: the seats were bought. If the caller's
-     * transaction later rolls back, this claim rolls back too, the hold returns to {@code ACTIVE},
-     * and it expires normally — which is exactly why the claim lives in SQL and not in Redis
-     * (ADR-019).
-     *
-     * @throws HoldAlreadySettledException when the claim is lost, meaning the seats are no longer
-     *     ours and the caller must abort and refund
+     * @throws HoldAlreadySettledException when the claim is lost: the seats are gone, so the caller
+     *     must abort and refund
      */
     @Override
     @Transactional(propagation = Propagation.MANDATORY)
@@ -433,17 +376,10 @@ public class HoldService implements HoldFacade {
     }
 
     /**
-     * Runs the settle-once claim and, if this caller won it, arranges for the seats to come back.
-     *
-     * <p>Every ending that gives seats back funnels through here, which is what makes "restored
-     * exactly once per hold" true by construction rather than by careful call-site discipline.
-     *
-     * <p><strong>The restore itself happens after this transaction commits</strong>, in
-     * {@link HoldPostCommitTasks}, because the counter now lives in Redis and Redis does not roll
-     * back. Incrementing inline would hand the seats out and then let a rollback put the hold
-     * straight back to {@code ACTIVE} — both on sale and still held. {@link #sweepExpired} makes the
-     * danger concrete: it settles a whole batch in one transaction, so a single failure part-way
-     * through would return every earlier hold's seats while leaving those holds live.
+     * Runs the settle-once claim and, if this caller won, arranges for the seats to come back. Every
+     * ending funnels through here, so "restored exactly once" holds by construction. The restore runs
+     * after commit ({@link HoldPostCommitTasks}); inline, one failure in a sweep batch would return seats
+     * for holds that roll back to {@code ACTIVE} (ADR-046).
      */
     private boolean settleAndRestore(TicketHold hold, HoldStatus status, SettleReason reason) {
         boolean won = holds.settle(hold.getHoldToken(), status, reason, clock.instant()) == 1;
