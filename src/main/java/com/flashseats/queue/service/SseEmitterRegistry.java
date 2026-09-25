@@ -6,7 +6,6 @@ import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicInteger;
-import java.util.concurrent.atomic.AtomicLong;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Component;
 import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
@@ -121,27 +120,40 @@ public class SseEmitterRegistry {
         return send(sessionId, "position-update", frame);
     }
 
+    /**
+     * A live frame, deliberately carrying <strong>no</strong> {@code id}.
+     *
+     * <p>The SSE specification leaves a client's last-event-id untouched by an event with no
+     * {@code id} field, so a position update does not overwrite the sequence a reconnect must send
+     * back. That is the whole mechanism: only replayable frames are numbered
+     * ({@link QueueReplayService}), everything else is derived from live state on connect, and the
+     * {@code Last-Event-ID} a browser returns is therefore always a sequence the replay log knows.
+     *
+     * <p>An earlier cut gave these frames a per-connection {@code "local-N"} id. Positions arrive
+     * every two seconds, so a reconnect almost always quoted one — and the replay log, which parses
+     * the id as a number, answered every one of them with nothing. The feature could not fire.
+     */
     public boolean send(String sessionId, String eventName, Object data) {
-        return sendWithId(sessionId, eventName, data, "local-" + nextLocalId(sessionId));
+        return sendWithId(sessionId, eventName, data, null);
     }
 
-    public boolean send(String sessionId, String eventName, Object data, Long eventId) {
-        String id = eventId == null ? "local-" + nextLocalId(sessionId) : Long.toString(eventId);
-        return sendWithId(sessionId, eventName, data, id);
+    /** A replayable frame, identified by its position in the event's replay log. */
+    public boolean send(String sessionId, String eventName, Object data, Long sequence) {
+        return sendWithId(sessionId, eventName, data, sequence);
     }
 
-    private boolean sendWithId(String sessionId, String eventName, Object data, String eventId) {
+    private boolean sendWithId(String sessionId, String eventName, Object data, Long sequence) {
         Connection connection = connections.get(sessionId);
         if (connection == null) {
             return false;
         }
         try {
-            connection
-                    .emitter()
-                    .send(SseEmitter.event()
-                            .id(eventId)
-                            .name(eventName)
-                            .data(json.writeValueAsString(data)));
+            SseEmitter.SseEventBuilder frame =
+                    SseEmitter.event().name(eventName).data(json.writeValueAsString(data));
+            if (sequence != null) {
+                frame = frame.id(Long.toString(sequence));
+            }
+            connection.emitter().send(frame);
             return true;
         } catch (IOException | IllegalStateException disconnected) {
             // Routine: browsers close streams constantly. Not worth a stack trace.
@@ -172,13 +184,8 @@ public class SseEmitterRegistry {
         sessionsWatching(eventId).forEach(sessionId -> send(sessionId, eventName, data));
     }
 
-    public void broadcast(long eventId, String eventName, Object data, Long frameId) {
-        sessionsWatching(eventId).forEach(sessionId -> send(sessionId, eventName, data, frameId));
-    }
-
-    private long nextLocalId(String sessionId) {
-        Connection connection = connections.get(sessionId);
-        return connection == null ? 0 : connection.nextId();
+    public void broadcast(long eventId, String eventName, Object data, Long sequence) {
+        sessionsWatching(eventId).forEach(sessionId -> send(sessionId, eventName, data, sequence));
     }
 
     /**
@@ -230,19 +237,15 @@ public class SseEmitterRegistry {
     /**
      * One browser's stream, plus the state needed to keep its frames coherent.
      *
-     * <p>Both fields are atomics rather than guarded by a lock. On JDK 21 a virtual thread that
+     * <p>The clamp is an atomic rather than guarded by a lock. On JDK 21 a virtual thread that
      * blocks inside {@code synchronized} pins its carrier, and under a flash-sale spike that presents
      * as a throughput collapse which looks like a Redis outage (global standards §7). Lock-free is
      * simpler here anyway.
      */
-    private record Connection(long eventId, SseEmitter emitter, AtomicLong ids, AtomicInteger lastPosition) {
+    private record Connection(long eventId, SseEmitter emitter, AtomicInteger lastPosition) {
 
         Connection(long eventId, SseEmitter emitter) {
-            this(eventId, emitter, new AtomicLong(), new AtomicInteger(Integer.MAX_VALUE));
-        }
-
-        long nextId() {
-            return ids.incrementAndGet();
+            this(eventId, emitter, new AtomicInteger(Integer.MAX_VALUE));
         }
 
         int clampPosition(int incoming) {

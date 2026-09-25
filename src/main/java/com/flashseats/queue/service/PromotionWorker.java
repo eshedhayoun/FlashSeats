@@ -216,12 +216,8 @@ public class PromotionWorker {
 
         publish(
                 eventId,
-                QueueChannelMessage.toSession(
-                        "queue-promoted",
-                        sessionId,
-                        Map.of(
-                                "passToken", passToken,
-                                "expiresInSeconds", properties.getPassTtlSeconds())));
+                QueueChannelMessage.promotion(
+                        sessionId, passToken, properties.getPassTtlSeconds()));
     }
 
     /**
