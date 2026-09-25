@@ -26,9 +26,21 @@
 -- and waits for every one of them to open.
 -- ============================================================================
 
-\set events    5
-\set capacity  500
-\set first_id  9001
+-- Defaults ONLY. seed-concurrent.sh passes `-v events=... -v first_id=...`, and a
+-- bare `\set` here used to overwrite them: EVENTS=10 silently seeded five sales
+-- while the script went on to pre-warm ten, so no run with E != 5 was possible.
+\if :{?events}
+\else
+    \set events 5
+\endif
+\if :{?capacity}
+\else
+    \set capacity 500
+\endif
+\if :{?first_id}
+\else
+    \set first_id 9001
+\endif
 
 -- --- reset ------------------------------------------------------------------
 -- Scoped to the reserved range, never a truncate. A load run has to be

@@ -32,6 +32,12 @@ public enum ErrorCode {
     VALIDATION_FAILED(HttpStatus.BAD_REQUEST),
     /** Anything unhandled. Carries a traceId and never any internal detail. */
     INTERNAL_ERROR(HttpStatus.INTERNAL_SERVER_ERROR),
+    /**
+     * Back-pressure, not a fault: no database connection became free inside
+     * {@code connection-timeout} (ADR-059). Carries {@code retryAfterSeconds} and a
+     * {@code Retry-After} header. Checkout is find-or-create, so re-POSTing the same body is safe.
+     */
+    SERVICE_BUSY(HttpStatus.SERVICE_UNAVAILABLE),
 
     // --- bot ----------------------------------------------------------------
     RATE_LIMITED(HttpStatus.TOO_MANY_REQUESTS),

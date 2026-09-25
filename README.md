@@ -16,7 +16,7 @@ Read in this order:
 | Document | What it covers |
 | :--- | :--- |
 | [`REFACTORING_BLUEPRINT.md`](REFACTORING_BLUEPRINT.md) | **Start here.** The whole system on one page — journey, module graph, where each concept lives, and what looks removable but is not. Then the staged refactor that makes the code match it |
-| [`docs/00-architecture-decisions.md`](docs/00-architecture-decisions.md) | 52 ADRs — every non-obvious decision and the failure it prevents. Read before changing a decision |
+| [`docs/00-architecture-decisions.md`](docs/00-architecture-decisions.md) | 62 ADRs — every non-obvious decision and the failure it prevents. Read before changing a decision |
 | [`docs/01-system-architecture.md`](docs/01-system-architecture.md) | Stack, module map, dependency graph, deployment |
 | [`docs/02-high-level-design.md`](docs/02-high-level-design.md) | Infrastructure and the concurrency model |
 | [`docs/03-end-to-end-flow.md`](docs/03-end-to-end-flow.md) | **The authoritative user journey**, step by step |
@@ -27,6 +27,23 @@ Read in this order:
 | [`docs/modules/`](docs/modules/) | Per-module specs — `catalog`, `queue`, `hold`, `bot`, `payment`, `order`, `notification`, `saleflow`, `shared` |
 
 When a module spec disagrees with an ADR, **the ADR wins** and the module spec is stale.
+
+---
+
+## Repository layout
+
+```
+pom.xml, mvnw, src/        the backend: one Maven project, at the root by Maven convention
+frontend/                  the React client (Vite + TypeScript), the one sub-package
+docker/                    infrastructure: redis/nginx config, seeds, secrets, k6, drill scripts
+docs/                      ADRs, standards, journey, per-module specs
+compose.yaml, Dockerfile   the local stack and the application image
+```
+
+The backend is not in a `backend/` folder. That was considered and left alone on purpose. Moving it
+would change about fifty paths across the Dockerfile, compose, the drill scripts and the docs, and it
+would gain nothing in behaviour. The Maven project sits at the root, and `frontend/` is the one thing
+alongside it.
 
 ---
 
@@ -171,6 +188,36 @@ docker/scripts/dev-up.sh            # preflight + infrastructure + a sale that i
 open http://localhost:8080          # walk the whole journey in a browser
 ```
 
+### Environment files
+
+There are two example files. Each is copied once to a git-ignored file that you then edit. No other
+environment files exist.
+
+| File | Committed? | Created by | Read by |
+| :--- | :--- | :--- | :--- |
+| `.env.example` | yes | — | a template, nothing reads it |
+| `.env` | **no** | `cp .env.example .env`, then `docker/secrets/gen-env.sh` | `docker compose`, which passes it to every container |
+| `frontend/.env.example` | yes | — | a template, nothing reads it |
+| `frontend/.env.local` | **no** | `cp frontend/.env.example frontend/.env.local` | Vite (`npm run dev`) |
+
+The order, once per machine:
+
+1. **`cp .env.example .env`** — enough for local development. The `dev` and `test` profiles boot on
+   the built-in `dev-only-change-me` secrets.
+2. **`docker/secrets/gen-env.sh`** — needed before `--profile cluster`. It replaces every default
+   secret in `.env` with a fresh one and prints the admin password **once**. `.env` keeps only its
+   bcrypt digest. It is idempotent and leaves any value that is already real alone. `SecretsGuard`
+   refuses to start any profile other than `dev`/`test` on a default secret (ADR-039), which is why
+   the cluster will not come up without this step.
+3. **`export FLASHSEATS_ADMIN_PLAINTEXT='…'`** — the password step 2 printed. The admin-facing
+   scripts (`seed.sh`, `seed-concurrent.sh`, `pool-pressure.sh`) read it, because `.env`
+   no longer holds anything they can log in with. Keep it in your shell, not in a file.
+4. **`cp frontend/.env.example frontend/.env.local`** — only if you run the React client. Leave the
+   Stripe key blank to use the stub gateway, which is what the backend runs by default.
+
+`.gitignore` covers `.env`, every `.env.*` variant (backups included) and `frontend/.env.local`, and
+lets both `.env.example` files through. To check a path, run `git check-ignore --no-index -v <path>`.
+
 **Use `dev-up.sh` rather than a bare `docker compose up -d`.** The bare form works on a clean
 machine and has three ways to fail later that all present as "the backend is broken":
 
@@ -209,8 +256,9 @@ browser. Set a `pk_test_` key, and start the backend with `STRIPE_ENABLED=true`,
 provider.
 
 ```bash
-./mvnw test                         # 210 tests. See docs/06-mvp-overview.md §9: ten of them
-                                    # currently fail in the full suite and pass in isolation
+./mvnw test                         # 228 tests, green in any class order (ADR-061). Needs Docker:
+                                    # every integration test runs real PostgreSQL, Redis and,
+                                    # for fulfilment, RabbitMQ containers
 ```
 
 | Service | Where | Credentials |
@@ -228,6 +276,10 @@ docker compose --profile cluster up -d --build     # Nginx + 3 app replicas on :
 docker compose --profile loadtest run --rm k6      # 10k virtual buyers
 ```
 
+Each replica has a 1.5 GiB memory limit (`APP_MEM_LIMIT` to change it). Without a limit, the JVMs
+size their heaps against the whole Docker VM and get OOM-killed under load (ADR-062). The load
+drill and what it measured are in [`docs/06-mvp-overview.md`](docs/06-mvp-overview.md) §11.
+
 **Test with three replicas, not one.** Promotion pub/sub fan-out (ADR-007) and settle-once stock
 restoration (ADR-003) both behave perfectly on a single instance and break on three if implemented
 naively. A single-instance test cannot see either bug.
@@ -235,12 +287,16 @@ naively. A single-instance test cannot see either bug.
 ### Docker layout
 
 ```
-compose.yaml                    profiles: (default) · cluster · loadtest
+compose.yaml                    profiles: (default) · cluster · loadtest · stripe
 Dockerfile                      multi-stage, JRE 21, non-root
-.env.example                    copy to .env
+.env.example                    copy to .env (see "Environment files")
+docker/secrets/gen-env.sh       real secrets into .env; prints the admin password once
 docker/redis/redis.conf         noeviction · notify-keyspace-events Ex · AOF
 docker/nginx/nginx.conf         least_conn · SSE unbuffered · X-Forwarded-For
+docker/seed/                    seed.sh (one sale) · seed-concurrent.sh (five, for the drill)
 docker/k6/flash-sale.js         load harness; asserts zero overbooking
+docker/k6/concurrent-sales.js   E sales at once (ADR-049); pair with pool-pressure.sh
+docker/scripts/                 dev-up, fan-out / expiry / failover checks, pool-pressure, sold-count
 ```
 
 Two config files carry correctness requirements, not tuning preferences:
