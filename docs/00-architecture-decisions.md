@@ -2490,3 +2490,50 @@ the fix needed no client change at all.
   deserves its own check that every client sends JSON; it is left as recorded.
 - This relies on no CORS configuration being added. A future `CorsConfigurationSource` that allows
   credentials from another origin reopens S13, and should be read against this ADR.
+
+---
+
+## ADR-061 — Cached test contexts are never paused
+
+**Context.** From the frontend merge onwards, `./mvnw test` depended on class order. In some orders,
+every `/queue` request in the shared integration-test context answered a bare `500` with no registry
+`code`. Pass 12 ruled out everything inside the application: contention, id collisions, the rate
+limiter, metrics, parallelism, context accumulation. It pinned `alphabetical` because that order was
+*verified green*, and recorded the pollution as open (`06` §9).
+
+**Finding.** Spring Framework 7 **pauses** a cached test context when a test class switches to a
+different context: it stops the paused context's `Lifecycle` beans, then restarts them on the next
+use. This suite has several contexts. `BotDefenceIT`, `RecaptchaFailOpenIT` and, from Pass 13,
+`NotificationListenerIT` each add properties, and that forces a context of their own. When a later
+class switched back to the shared context, that context had been through a pause and a resume.
+
+Adding `NotificationListenerIT` shrank the reproduction from "most of the suite" to three classes:
+`HoldLifecycleIT`, `NotificationListenerIT`, `CheckoutRecoveryIT`. With the size down to three,
+experiments became cheap:
+
+- The pair `NotificationListenerIT`, `CheckoutRecoveryIT` passes: the shared context is created
+  *after* the switch, so it has never been paused.
+- Removing `@DirtiesContext` from the new class changes nothing.
+- A temporary `HIGHEST_PRECEDENCE` servlet filter never saw the failing requests. They are answered
+  before the resumed context's filter chain runs, which is why `GlobalExceptionHandler` never logged
+  them.
+- `spring.test.context.cache.pause=never` makes the three-class run green, and makes the full suite
+  green in `alphabetical`, `reversealphabetical` and `filesystem` order.
+
+**Decision.** `src/test/resources/spring.properties` sets `spring.test.context.cache.pause=never`.
+This restores Spring 6's behaviour, which the suite was written against. It has to live in
+`spring.properties` rather than `application-test.properties`, because the cache reads it before any
+context exists.
+
+**Consequences.**
+
+- A cached context keeps its schedulers running while other classes run. Every context has its own
+  PostgreSQL and Redis, because Testcontainers reuse is not enabled on this machine
+  (`withReuse(true)` logs that it was ignored), so they cannot interfere through shared state.
+- **Open:** *why* a resumed context's embedded Tomcat answers without running its filters. It is
+  inferred to be the web server's restart, not demonstrated. It does not affect production, where
+  contexts are never paused. If Testcontainers reuse is ever enabled, reread this ADR, because the
+  contexts would then share containers.
+- Surefire stays pinned to `alphabetical`, now only because a stable order is worth having.
+- The lesson for this repo: when an intermittent failure depends on the number of Spring contexts,
+  suspect the test framework's context lifecycle before the application.
