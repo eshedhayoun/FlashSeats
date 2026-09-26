@@ -49,3 +49,5 @@ frontend/tsconfig.*.tsbuildinfo
 frontend/.vite/
 frontend/.env.local
 frontend/.env.*.local
+frontend\node_modules\.package-lock.json
+frontend/dist/index.html
