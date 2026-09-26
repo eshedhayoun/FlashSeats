@@ -311,6 +311,20 @@
 						<include>**/*Tests.java</include>
 						<include>**/*IT.java</include>
 					</includes>
+					<!--
+						Surefire's default is FILESYSTEM order, which is not stable across machines:
+						two developers can legitimately disagree about whether the suite passes.
+						Pinning it is worth doing for that reason alone.
+
+						It used to be pinned for a second reason, and that reason is now gone. The
+						suite was order-dependent: in some orders every /queue request in the shared
+						context answered a bare 500. The cause was Spring Framework 7 pausing a
+						cached test context when another class switched to a different context
+						(ADR-061). src/test/resources/spring.properties turns that pausing off, and
+						the suite now passes in alphabetical, reversealphabetical and filesystem
+						order. The pin stays because a stable order is worth having anyway.
+					-->
+					<runOrder>alphabetical</runOrder>
 					<systemPropertyVariables>
 						<!--
 							Docker Engine 29 rejects the API version docker-java negotiates by

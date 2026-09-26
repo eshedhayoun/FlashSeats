@@ -65,23 +65,12 @@ public class OrderController {
     }
 
     /**
-     * The ticket itself (ADR-050).
+     * The ticket itself (ADR-050), authorised exactly like the receipt: session cookie or
+     * {@code receiptToken}. It exists so a mistyped email address still leaves the buyer a way to their
+     * ticket. {@code inline} so a phone at the door shows it on screen.
      *
-     * <p>Authorised exactly like the receipt above — session cookie <strong>or</strong>
-     * {@code receiptToken} — because it is the same fact about the same order. Before this existed
-     * the PDF was reachable only as an email attachment, so an address typed wrong at checkout left
-     * a paying buyer with no way to obtain it and the operator resend replaying to the same wrong
-     * address.
-     *
-     * <p>{@code inline}, not {@code attachment}: a buyer on a phone at a venue door wants the ticket
-     * on screen, not in a downloads folder they then have to find.
-     *
-     * <p><strong>No {@code produces} on the mapping</strong>, deliberately. Constraining it to
-     * {@code application/pdf} also constrains the <em>error</em> responses, so a {@code 404} or a
-     * {@code TICKET_NOT_AVAILABLE} could not be rendered as {@code application/problem+json} and came
-     * back as an unnegotiable {@code 406} instead — turning every failure on this endpoint into a
-     * response with no registry {@code code}. The content type belongs on the successful body, which
-     * is where it is set.
+     * <p>No {@code produces} on the mapping: it would also constrain the error responses, turning every
+     * problem+json failure here into an uncoded {@code 406}. The content type is set on the success body.
      */
     @GetMapping("/{orderNumber}/ticket.pdf")
     public ResponseEntity<byte[]> ticket(

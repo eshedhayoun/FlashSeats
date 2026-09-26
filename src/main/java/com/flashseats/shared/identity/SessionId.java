@@ -1,16 +1,10 @@
 package com.flashseats.shared.identity;
 
 /**
- * The verified visitor identity, taken from the signed {@code fsid} cookie and nothing else.
- *
- * <p>Queue position, hold ownership and order lookup all key off this value, so it may
- * <strong>never</strong> be read from a request body, query parameter or custom header — a
+ * The verified visitor identity, from the signed {@code fsid} cookie and nothing else, because a
  * client-supplied identity would let anyone act as anyone (ADR-010).
- *
- * <p>The {@code bot} filter verifies the cookie's HMAC and publishes the id as a request attribute;
- * controllers receive it by declaring a {@code SessionId} parameter, resolved by
- * {@link SessionIdArgumentResolver}. That indirection is deliberate — no module needs to reference
- * {@code bot} to learn who is calling.
+ * {@link SessionIdentityFilter} verifies the cookie and publishes the id as a request attribute;
+ * controllers declare a {@code SessionId} parameter, resolved by {@link SessionIdArgumentResolver}.
  */
 public record SessionId(String value) {
 

@@ -11,12 +11,13 @@ import org.springframework.stereotype.Component;
 import tools.jackson.databind.ObjectMapper;
 
 /**
- * Persists the low-frequency queue frames needed to bridge an SSE reconnect.
+ * Keeps the recent <strong>broadcast</strong> frames so an SSE reconnect can be caught up, and
+ * publishes every frame through the Pub/Sub fan-out (ADR-007).
  *
- * <p>Position frames remain live-only: the controller sends the current position immediately after
- * replay, so retaining every two-second update would turn the replay log into an unbounded copy of
- * the queue. Promotion, availability, and terminal frames are retained briefly and are published
- * through the existing Redis Pub/Sub fan-out.
+ * <p>Only broadcasts are retained. The one session-targeted frame carries a single-use
+ * {@code passToken}, and this log outlives the sale (ADR-058). A promoted buyer's reconnect instead
+ * re-reads the live pass ({@link QueueBroadcaster#connect}). Position frames are live-only too:
+ * {@code connect} sends the current position.
  */
 @Slf4j
 @Component
@@ -34,13 +35,28 @@ public class QueueReplayService {
         this.properties = properties;
     }
 
-    public QueueChannelMessage publish(long eventId, QueueChannelMessage message) {
+    /**
+     * Fans a frame out to every replica, retaining it for replay only when it is a broadcast.
+     *
+     * <p>A session-targeted frame takes the pre-existing path: straight to the channel, unnumbered
+     * and unretained.
+     */
+    public void publishAndFanOut(long eventId, QueueChannelMessage message) {
+        QueueChannelMessage frame = message.isBroadcast() ? retain(eventId, message) : message;
+        try {
+            redis.convertAndSend(QueueKeys.events(eventId), json.writeValueAsString(frame));
+        } catch (Exception failure) {
+            throw new IllegalStateException("Could not publish queue frame", failure);
+        }
+    }
+
+    private QueueChannelMessage retain(long eventId, QueueChannelMessage message) {
         Long sequence = redis.opsForValue().increment(QueueKeys.replaySequence(eventId));
         if (sequence == null) {
             throw new IllegalStateException("Redis did not return a replay sequence");
         }
 
-        QueueChannelMessage persisted = message.withId(sequence);
+        QueueChannelMessage persisted = message.withSequence(sequence);
         try {
             String encoded = json.writeValueAsString(persisted);
             redis.opsForZSet().add(QueueKeys.replay(eventId), encoded, sequence);
@@ -54,20 +70,19 @@ public class QueueReplayService {
         }
     }
 
-    public void publishAndFanOut(long eventId, QueueChannelMessage message) {
-        QueueChannelMessage persisted = publish(eventId, message);
-        try {
-            redis.convertAndSend(QueueKeys.events(eventId), json.writeValueAsString(persisted));
-        } catch (Exception failure) {
-            throw new IllegalStateException("Could not publish queue frame", failure);
-        }
-    }
-
+    /**
+     * The retained frames a reconnecting client has not seen.
+     *
+     * <p>An unparseable {@code Last-Event-ID} yields nothing rather than everything. It should not
+     * happen — replayable frames are the only ones that carry an {@code id}, so a browser can only
+     * quote a sequence this log minted — but the header is client-supplied and replaying the whole
+     * window to anyone who sends a word is not a sensible reading of "I missed something".
+     */
     public List<QueueChannelMessage> after(long eventId, String lastEventId) {
         long parsed;
         try {
-            parsed = Long.parseLong(lastEventId);
-        } catch (NumberFormatException invalid) {
+            parsed = Long.parseLong(lastEventId.trim());
+        } catch (NumberFormatException | NullPointerException invalid) {
             return List.of();
         }
 

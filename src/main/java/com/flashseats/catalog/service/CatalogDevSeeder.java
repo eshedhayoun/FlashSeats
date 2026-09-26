@@ -7,6 +7,7 @@ import com.flashseats.catalog.repository.EventRepository;
 import com.flashseats.catalog.repository.StockCounterRepository;
 import com.flashseats.catalog.repository.TicketTierRepository;
 import java.time.Clock;
+import java.time.Duration;
 import java.time.Instant;
 import java.time.LocalDate;
 import java.time.Month;
@@ -22,20 +23,10 @@ import org.springframework.stereotype.Component;
 import org.springframework.transaction.support.TransactionTemplate;
 
 /**
- * Seeds a demonstrable sale on the {@code dev} profile so the app is walkable the moment it starts.
- *
- * <p>Two events, on purpose:
- *
- * <ul>
- *   <li><strong>An OPEN sale</strong> with its counters written directly. Pre-warm cannot be used
- *       here: it refuses on anything but an {@code UPCOMING} window (ADR-004), so a demo event that
- *       is open on startup would otherwise have no counters and every hold would answer 503.
- *   <li><strong>A second OPEN sale</strong> with its counter written directly, so both seeded
- *       frontend journeys are usable after a normal development restart.
- * </ul>
- *
- * <p>Runs only when the database is empty, so a restart never duplicates or resets a sale in
- * progress.
+ * Seeds a walkable sale on the {@code dev} profile: two OPEN events with counters written directly
+ * (pre-warm refuses an open window, ADR-004), so two journeys can run at once, and one UPCOMING
+ * event with no counter, so pre-warm and the countdown can be exercised. Runs only on an empty
+ * database, so a restart never resets a sale in progress.
  */
 @Slf4j
 @Component
@@ -99,17 +90,31 @@ public class CatalogDevSeeder implements ApplicationRunner {
 
         Event secondLive = saveEvent(
                 "Midnight Sessions",
-                "An intimate late set. Sale opens shortly.",
+                "An intimate late set, on sale now.",
                 "The Vault",
                 eventDate,
-                now.plusSeconds(30),
+                now.minusSeconds(1),
                 saleEnd);
         counters.add(seedTier(secondLive, "General Admission", 3_000, 200, 4));
 
+        Event upcoming = saveEvent(
+                "מופע חצות 🎵",
+                "A sale that has not opened yet, for the countdown and for pre-warm.",
+                "היכל התרבות",
+                eventDate,
+                now.plus(Duration.ofHours(2)),
+                saleEnd);
+        // Deliberately NO counter. POST /api/v1/admin/events/{id}/prewarm creates it, and that
+        // endpoint refuses any window but UPCOMING — so this event is the only place on the dev
+        // profile where ADR-004's seeding path can be exercised at all.
+        tier(upcoming, "General Admission", 3_000, 200, 4);
+
         log.info(
-                "Seeded dev catalog: event {} is OPEN with 700 seats, event {} is OPEN with 200 seats",
+                "Seeded dev catalog: event {} OPEN with 700 seats, event {} OPEN with 200 seats,"
+                        + " event {} UPCOMING and un-warmed",
                 live.getId(),
-                secondLive.getId());
+                secondLive.getId(),
+                upcoming.getId());
         return counters;
     }
 

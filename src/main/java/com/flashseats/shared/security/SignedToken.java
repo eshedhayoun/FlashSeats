@@ -9,22 +9,13 @@ import javax.crypto.Mac;
 import javax.crypto.spec.SecretKeySpec;
 
 /**
- * HMAC-SHA256 signing for the four capability tokens in the system: the {@code fsid} session cookie
- * (ADR-010), the queue pass, the admission session token (ADR-020), and the order receipt token.
+ * HMAC-SHA256 signing for the four capability tokens: the {@code fsid} cookie (ADR-010), the queue
+ * pass, the admission token (ADR-020) and the receipt token. One implementation, one constant-time
+ * comparison.
  *
- * <p>All four share the format {@code base64url(payload).base64url(hmac)}. One implementation means
- * one place for the constant-time comparison, and no risk of four hand-rolled variants drifting
- * apart.
- *
- * <p><strong>Every token declares its {@code kind}, and the kind is signed</strong> (ADR-039). The
- * kind is not stored in the token — it is mixed into the signed bytes — so a token minted as one
- * kind simply fails verification as another. Without it, two token types sharing a secret are
- * interchangeable to the verifier, and whether that is exploitable depends on payload formats
- * happening not to collide. That is a property nobody should have to re-derive after every change:
- * {@code queue} already carried a kind field for exactly this reason, and this makes it universal
- * rather than one module's good habit.
- *
- * <p>This is a crypto primitive, not a policy: each module decides what it signs and for how long.
+ * <p><strong>Every token's {@code kind} is mixed into the signed bytes</strong> (ADR-039), so a token
+ * of one kind never verifies as another, even with a shared secret. A primitive, not a policy: each
+ * module decides what it signs and for how long.
  */
 public final class SignedToken {
 

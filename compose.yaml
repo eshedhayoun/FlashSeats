@@ -18,6 +18,14 @@ x-app: &app
     dockerfile: Dockerfile
   profiles: ["cluster"]
   restart: unless-stopped
+  # A hard limit per replica, and it is correctness, not tuning. Without one the
+  # JVM sizes its heap as a percentage of the WHOLE Docker VM (7.65 GB here), so
+  # three replicas may claim ~17 GB between them. They did: at 2,000 VUs the VM's
+  # kernel OOM killer SIGKILLed replicas mid-sale (Pass 13, runs L and L2). Every
+  # hold reserved in Redis but not yet written was lost, which is the safe
+  # direction (ADR-046), and a rebuild recovered it. It is still an outage.
+  # 1.5 GiB covers the ~1.1-1.5 GiB each replica reached at 300-600 VUs.
+  mem_limit: ${APP_MEM_LIMIT:-1536m}
   environment:
     SPRING_PROFILES_ACTIVE: docker
     SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/${POSTGRES_DB:-flashseats}
@@ -67,7 +75,9 @@ x-app: &app
     #   docker compose --profile cluster up -d
     FLASHSEATS_CATALOG_METADATA_CACHE_ENABLED: ${FLASHSEATS_CATALOG_METADATA_CACHE_ENABLED:-true}
     FLASHSEATS_QUEUE_GLOBAL_ADMISSION_BUDGET_PER_TICK: ${FLASHSEATS_QUEUE_GLOBAL_ADMISSION_BUDGET_PER_TICK:-45}
-    JAVA_TOOL_OPTIONS: "-XX:MaxRAMPercentage=75"
+    # JAVA_TOOL_OPTIONS is deliberately NOT set here: the Dockerfile owns it. A
+    # value here REPLACES the image's, and one did, silently dropping
+    # -XX:+ExitOnOutOfMemoryError for every run before Pass 13.
   depends_on:
     postgres: { condition: service_healthy }
     redis-sentinel-1: { condition: service_healthy }
@@ -181,7 +191,13 @@ services:
     image: redis:7-alpine
     profiles: ["cluster"]
     restart: unless-stopped
-    entrypoint: ["/usr/local/bin/sentinel-entrypoint.sh"]
+    # Invoked through `sh` rather than executed directly. The file is mounted from
+    # the host, so its mode is whatever the checkout produced -- and a checkout on a
+    # filesystem without POSIX permissions produces 0644, which fails as
+    # "exec /usr/local/bin/sentinel-entrypoint.sh: permission denied" and takes the
+    # whole cluster with it, because every app replica depends on the sentinels.
+    # The exec bit is also set in git; this makes it not matter.
+    entrypoint: ["sh", "/usr/local/bin/sentinel-entrypoint.sh"]
     volumes:
       - ./docker/redis/sentinel-entrypoint.sh:/usr/local/bin/sentinel-entrypoint.sh:ro
       - redis-sentinel-1-data:/data
@@ -203,7 +219,13 @@ services:
     image: redis:7-alpine
     profiles: ["cluster"]
     restart: unless-stopped
-    entrypoint: ["/usr/local/bin/sentinel-entrypoint.sh"]
+    # Invoked through `sh` rather than executed directly. The file is mounted from
+    # the host, so its mode is whatever the checkout produced -- and a checkout on a
+    # filesystem without POSIX permissions produces 0644, which fails as
+    # "exec /usr/local/bin/sentinel-entrypoint.sh: permission denied" and takes the
+    # whole cluster with it, because every app replica depends on the sentinels.
+    # The exec bit is also set in git; this makes it not matter.
+    entrypoint: ["sh", "/usr/local/bin/sentinel-entrypoint.sh"]
     volumes:
       - ./docker/redis/sentinel-entrypoint.sh:/usr/local/bin/sentinel-entrypoint.sh:ro
       - redis-sentinel-2-data:/data
@@ -225,7 +247,13 @@ services:
     image: redis:7-alpine
     profiles: ["cluster"]
     restart: unless-stopped
-    entrypoint: ["/usr/local/bin/sentinel-entrypoint.sh"]
+    # Invoked through `sh` rather than executed directly. The file is mounted from
+    # the host, so its mode is whatever the checkout produced -- and a checkout on a
+    # filesystem without POSIX permissions produces 0644, which fails as
+    # "exec /usr/local/bin/sentinel-entrypoint.sh: permission denied" and takes the
+    # whole cluster with it, because every app replica depends on the sentinels.
+    # The exec bit is also set in git; this makes it not matter.
+    entrypoint: ["sh", "/usr/local/bin/sentinel-entrypoint.sh"]
     volumes:
       - ./docker/redis/sentinel-entrypoint.sh:/usr/local/bin/sentinel-entrypoint.sh:ro
       - redis-sentinel-3-data:/data

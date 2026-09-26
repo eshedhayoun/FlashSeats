@@ -4,24 +4,12 @@ import java.util.LinkedHashMap;
 import java.util.Map;
 
 /**
- * Base type for every exception any module raises to the HTTP layer.
+ * Base type for every exception raised to the HTTP layer. Carrying the {@link ErrorCode} lets one
+ * {@link GlobalExceptionHandler} serve every module without importing their types (ADR-033).
+ * {@code extensions} carries the RFC 7807 members that vary by failure (global standards §1).
  *
- * <p>Carrying the {@link ErrorCode} on the exception is what lets a <em>single</em>
- * {@link GlobalExceptionHandler} serve all nine modules without importing one module-specific type
- * (ADR-033). Global standards §1 originally asked for one {@code @RestControllerAdvice} per module
- * to stop a global handler pulling every module's exceptions into one class — a shared base type
- * satisfies that constraint with one class instead of seven.
- *
- * <p>{@code extensions} carries the RFC 7807 members that vary by failure — {@code retryable},
- * {@code attemptsRemaining}, {@code expiresAt}, {@code retryAfterSeconds}. Names and types are fixed
- * by global standards §1; the SPA switches on them.
- *
- * <p><strong>Most failures are raised through a module's {@code <Module>Errors} factory rather than
- * by a dedicated subclass.</strong> Twenty-five subclasses existed and seventeen of them were never
- * caught by type — they were a class per message, spread over a directory, so no reader could see
- * what a module could refuse without opening all of it. A subclass is now written only when
- * something catches it by type, or when two of them exist to keep a distinction visible (the
- * inventory pair in {@code hold}). The constructors are public for exactly that reason.
+ * <p>Most failures come from a module's {@code <Module>Errors} factory. A subclass exists only
+ * where a {@code catch} names it (ADR-057, ADR-063).
  */
 public class FlashSeatsException extends RuntimeException {
 

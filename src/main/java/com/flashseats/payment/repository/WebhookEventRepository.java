@@ -9,18 +9,9 @@ import org.springframework.data.repository.query.Param;
 public interface WebhookEventRepository extends JpaRepository<WebhookEvent, String> {
 
     /**
-     * <strong>The delivery claim.</strong> Inserts the row that makes a second settlement
-     * impossible, and reports whether this caller is the one that inserted it.
-     *
-     * <p>{@code ON CONFLICT DO NOTHING} rather than an insert whose exception is caught, in the same
-     * shape as {@code NotificationLogRepository.claimIfAbsent}. The constraint is still what
-     * guarantees exclusivity — a preceding {@code SELECT} would be a race that three replicas all
-     * pass — but the outcome arrives as a rowcount instead of a thrown exception, and that matters
-     * for more than style: a flush that violates a constraint marks the transaction rollback-only,
-     * so a {@code catch} block's {@code return} cannot actually return. It throws
-     * {@code UnexpectedRollbackException} at commit, which the caller would read as a failed
-     * delivery — and answer the provider with a non-2xx, asking for the replay it just refused
-     * (ADR-038).
+     * <strong>The delivery claim</strong>, as a rowcount from {@code ON CONFLICT DO NOTHING}. A caught
+     * constraint violation would mark the transaction rollback-only, so the "already claimed" return
+     * would throw at commit and ask the provider for the replay it just refused (ADR-038).
      *
      * @return 1 if this caller may settle, 0 if the delivery has already been claimed
      */
@@ -48,11 +39,8 @@ public interface WebhookEventRepository extends JpaRepository<WebhookEvent, Stri
     int markProcessed(@Param("eventId") String eventId);
 
     /**
-     * <strong>Releases a claim whose work did not happen</strong> (ADR-038).
-     *
-     * <p>Without this, a settlement that threw would leave a row saying the delivery was handled.
-     * The provider's redelivery would then be dismissed as a duplicate and the buyer's charge would
-     * never reach an order — the exact failure the DLQ replay hit in Pass 6, one layer down.
+     * <strong>Releases a claim whose work did not happen</strong> (ADR-038, ADR-053), so the provider's
+     * redelivery is settled rather than dismissed as a duplicate.
      */
     @Modifying(flushAutomatically = true)
     @Query(

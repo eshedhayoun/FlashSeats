@@ -15,18 +15,9 @@ import io.github.resilience4j.retry.Retry;
 import io.github.resilience4j.retry.RetryConfig;
 import org.springframework.beans.factory.annotation.Qualifier;
 /**
- * Chooses the payment provider and wraps it in the breaker.
- *
- * <p>One {@link PaymentGateway} bean, assembled here rather than two beans competing under
- * {@code @ConditionalOnMissingBean}: with a real gateway, a stub and a decorator all implementing
- * the interface, "whichever bean exists" stops being a seam and becomes an ambiguity.
- *
- * <p>The stub is the default. {@code flashseats.payment.stripe.enabled} is false unless a deployment
- * says otherwise, so a clean checkout, the test suite and the load harness all run the full buyer
- * journey — including decline, outage and 3-D Secure — with no keys and no network.
- *
- * <p>Resilience4j is wired as plain beans. Its Spring Boot starter targets Boot 3 and autoconfigures
- * against APIs this application does not have.
+ * Chooses the payment provider and wraps it in the breaker: one {@link PaymentGateway} bean, not
+ * competing conditional beans. The stub is the default. Resilience4j is wired as plain beans,
+ * because its starter targets Boot 3.
  */
 @Slf4j
 @Configuration

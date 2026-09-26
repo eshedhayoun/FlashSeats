@@ -1,40 +1,24 @@
 package com.flashseats.shared.identity;
 
+import lombok.Getter;
+import lombok.Setter;
 import org.springframework.boot.context.properties.ConfigurationProperties;
 
 /**
- * How the {@code fsid} cookie is minted and signed.
- *
- * <p><strong>These used to be {@code flashseats.bot.*}</strong>, because the filter that issues the
- * cookie lived in {@code bot}. That put the system's only source of identity inside the abuse-defence
- * module, and left the contract split in two: {@code bot} minted and signed, {@code shared} typed and
- * resolved, and the only thing joining them was a request-attribute string constant. Identity is not
- * abuse defence; it is the kernel, and this is where it belongs (ADR-010).
- *
- * <p>The environment variable is unchanged — {@code FLASHSEATS_SESSION_SECRET}, which is what
- * {@code .env}, {@code gen-env.sh} and {@code SecretsGuard} already name. Only the Spring property
- * path moved.
- *
- * <p>Rotating {@code secret} invalidates every live session, so it must not be rotated mid-sale.
+ * How the {@code fsid} cookie is minted and signed. Identity is the kernel, so this is
+ * {@code flashseats.session.*}; the env var stays {@code FLASHSEATS_SESSION_SECRET}. Rotating
+ * {@code secret} invalidates every live session: never mid-sale.
  */
 @ConfigurationProperties(prefix = "flashseats.session")
+@Getter
+@Setter
 public class SessionProperties {
 
     private String secret = "dev-only-change-me";
     private final Cookie cookie = new Cookie();
 
-    public String getSecret() {
-        return secret;
-    }
-
-    public void setSecret(String secret) {
-        this.secret = secret;
-    }
-
-    public Cookie getCookie() {
-        return cookie;
-    }
-
+    @Getter
+    @Setter
     public static class Cookie {
         private String name = "fsid";
 
@@ -47,37 +31,5 @@ public class SessionProperties {
 
         private String sameSite = "Lax";
         private int maxAgeSeconds = 86_400;
-
-        public String getName() {
-            return name;
-        }
-
-        public void setName(String name) {
-            this.name = name;
-        }
-
-        public boolean isSecure() {
-            return secure;
-        }
-
-        public void setSecure(boolean secure) {
-            this.secure = secure;
-        }
-
-        public String getSameSite() {
-            return sameSite;
-        }
-
-        public void setSameSite(String sameSite) {
-            this.sameSite = sameSite;
-        }
-
-        public int getMaxAgeSeconds() {
-            return maxAgeSeconds;
-        }
-
-        public void setMaxAgeSeconds(int maxAgeSeconds) {
-            this.maxAgeSeconds = maxAgeSeconds;
-        }
     }
 }

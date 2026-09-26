@@ -2285,3 +2285,336 @@ convention removed in one branch is re-added by any branch that forked before it
   refusal that needs no type should not have to invent one.
 - The temptation returns whenever someone adds a facade method and reaches for a matching `*Impl`.
   Global standards §5 rule 7 now forbids it in the place they will look.
+
+---
+
+## ADR-058 — What arrived with the frontend merge: Sentinel, a broadcast-only replay log, and the metric set
+
+**Status:** accepted, Pass 11 (25 Sept 2026). Built.
+
+> **This ADR is written after the fact, and that is the finding.** PR #16 merged 7,943 files —
+> Redis Sentinel, SSE reconnect replay, most of the metric set that three documents called
+> "specified, not built", and a React SPA — **with no document change at all.** In this repo a stale
+> spec is a standing order to build the wrong thing (`CLAUDE.md`, "Updating the docs is part of the
+> change"), so for a week `06` §11 told every reader Sentinel was deferred while three sentinels were
+> running, and `04` still said Stripe was unbuilt. The work is good; it was invisible. Nothing below
+> is a new decision — it is the record that should have been committed with the code, plus the three
+> defects that reading it that way exposed.
+
+### Decision 1 — Sentinel is built, and it supersedes ADR-047's Decision 5
+
+ADR-047 deferred Sentinel with a reason: no Phase 4 exit criterion needs failover, and the
+Redis-restart criterion reads more cleanly against a standalone instance that simply stops. That
+argument has been spent. The `cluster` profile now runs **one primary, two replicas and three
+sentinels** (`quorum 2`, `down-after 5000 ms`, `failover-timeout 60 s`), and the application
+discovers the primary through `spring.data.redis.sentinel.*` in `application-docker.properties`.
+Dev, test and the plain `docker compose up -d` stack stay standalone.
+
+**The consequence that matters is not failover, it is what failover does to inventory.** Every
+Redis process has its own `run_id`, and `StockEpoch` vouches each event's counters against the
+`run_id` that derived them. A promoted replica is a different process, so after a failover **every
+managed event is distrusted at once** and holds are refused until each is rebuilt. That is not a
+regression — AOF is `appendfsync everysec`, so a replica promoted mid-sale is a second behind and its
+counters read *high*, which is the one inventory failure no ordering of operations can prevent
+(ADR-046). ADR-047 said Sentinel "does not weaken that guard — it makes it matter more"; this is
+what that sentence costs in practice: **failover keeps the cluster up and stops the sale**, and an
+operator must run `POST /admin/events/{id}/rebuild-stock` to restart it.
+
+`docker/scripts/sentinel-failover-check.sh` proves the topology — promotion within 30 s, the old
+primary rejoining as a healthy replica — and says in its own header that it is deliberately *not* an
+inventory test. The inventory half is the manual step above, and it is listed in `06` §11.
+
+**Two operational notes.** The sentinels monitor a fixed IP rather than a service name
+(`sentinel resolve-hostnames no`), so compose now pins `172.28.0.11-16` — which makes the `ipam`
+hazard `CLAUDE.md` already documents live: change that block and `docker compose down` first, or
+containers reattach without their DNS aliases and every service name resolves `NXDOMAIN`. And the
+sentinels carry no `auth-pass`, matching the current unauthenticated Redis; both move together or
+neither does.
+
+### Decision 2 — The replay log retains broadcasts only, and a capability is never replayed
+
+`queue:replay:{e}` (ZSET, frame JSON scored by sequence, capped at 256) and
+`queue:replay-seq:{e}` (String, the monotonic sequence) bridge an SSE reconnect: a client sends
+`Last-Event-ID` and receives the frames it missed. Both expire with the sale plus
+`key-retention-after-sale-seconds`.
+
+**Only broadcast frames are retained.** The log is one ZSET per event, shared by everyone watching
+that sale and outliving the sale itself. The only session-targeted frame this system sends is
+`queue-promoted`, and it carries a `passToken` — a single-use bearer capability whose own key expires
+in 120 s. Retaining it turns a two-minute capability into a durable per-event record filed next to
+the session id it belongs to, readable by anything with Redis access long after it was spent. That
+is the shape ADR-048 already refused when it kept `receiptToken` out of an operator response, and it
+was how this shipped.
+
+**A promoted buyer's reconnect is served by re-deriving, not replaying.** `GET /queue/stream` reads
+`getQueueState` on connect and rebuilds `queue-promoted` from the live
+`queue:pass:{e}:{sid}` key. This is the `hold:{token}` idiom in a new place — the Redis hint is never
+the authority, the real thing is re-read (ADR-048) — and it is strictly better than a replay: it needs
+no `Last-Event-ID`, so it also works in a fresh tab or on another device, and it cannot hand back a
+pass that has since been spent or has expired.
+
+**One id space, and it belongs to the replay log.** Only retained frames carry an SSE `id`. Position
+updates, `sale-exhausted` and the re-derived promotion are sent with **no `id` field at all**, which
+the SSE specification defines as leaving the client's last-event-id untouched. So whatever a browser
+quotes back is always a sequence this log minted.
+
+> **The defect that made this concrete.** As merged, live frames carried a per-connection
+> `"local-N"` id while retained frames carried the sequence, and `after()` parsed the header with
+> `Long.parseLong` and returned nothing when it failed. Positions arrive every two seconds, so a
+> reconnect almost always quoted a `local-N` — and the replay answered every one of them with an
+> empty list. **The feature could not fire on the normal path**, and nothing failed, because there
+> was no test. `local-N` also restarts at zero on each connection, so those ids were not monotonic
+> either. An id space with two authorities is not an id space.
+
+### Decision 3 — The metric set is built; three gauges remain specified
+
+`flashseats.outbox.lag.seconds`, `flashseats.dlq.depth`, `flashseats.payment.decline.ratio`,
+`flashseats.payment.webhook.received{type}`, `flashseats.bot.refusals{outcome}` and
+`flashseats.notification.delivered` / `.failed` now emit. `03` §7's "specified, not built" table is
+down to `flashseats.queue.depth{event}`, `flashseats.hold.conversion.ratio{event}` and
+`flashseats.sse.connections.active`. No alarm thresholds changed.
+
+`bot` also gained a second hand-declared `CircuitBreaker`, around the reCAPTCHA call. `CLAUDE.md`
+said there was exactly one, in `payment`; there are two, and both are plain Resilience4j beans
+because the starter targets Boot 3.
+
+**One tunable was left half-changed and is now aligned.** `BotProperties.verifiedTtlSeconds`'s field
+default moved from 900 to 1800 while `application.properties` continued to ship 900 — so the
+*effective* TTL never changed, but the new unit test asserted `PT30M`, which is to say it asserted a
+default production does not use. The field default is 900 again, matching what ships and what the key
+tables say, and the test now derives its expectation from the configured value rather than a literal,
+so the two cannot drift apart again. Whether 15 minutes is the right number is a separate question
+from whether four places agree on it; `04`'s "cached per session for 30 min" is the remaining
+statement of the other view.
+
+### Decision 4 — The client mirrors the payment seam, and the dependencies leave the repository
+
+The SPA could not start without `VITE_STRIPE_PUBLISHABLE_KEY`: `stripe.ts` threw at module load and
+`CheckoutPage` imported it at the top level, so a clean checkout rendered a white screen. Meanwhile
+`flashseats.payment.stripe.enabled` is **false by default**, which means the configuration every
+developer, the load harness and every drill actually runs — the stub gateway — was the one
+configuration the client could not exercise. The client now follows the server: no key means the stub,
+and the checkout page offers the stub's documented magic tokens, so decline, gateway outage and 3-D
+Secure are walkable in a browser with no account. It also mints **one idempotency key per hold** and
+reuses it across retries, as `FE_SPEC` §3 has always specified; as merged it minted a fresh key per
+attempt, which opens a second PaymentIntent — the failure ADR-054 exists to prevent, approached from
+the other side.
+
+**The SPA is not wired into the cluster**, deliberately and for now: `npm run dev` proxies to
+`:8080`, nginx serves no static root, and the demo client at `src/main/resources/static` remains what
+the cluster serves. Wiring it touches `nginx.conf`, which is correctness rather than tuning, and it
+deserves its own pass.
+
+**57 MB of `node_modules`, `frontend/dist`, four `tsc` outputs and five scratch files** were tracked,
+because the `.gitignore` rules for them were added in the same merge that tracked the files, and an
+ignore rule never applies to a path git already tracks. They are untracked now and the rules are
+real. **The blobs stay in history on purpose** — the pack is 24 MB, and a `filter-repo` rewrite costs
+every collaborator a re-clone and every open branch a rebase. That trade is worth revisiting only if
+the pack becomes a problem.
+
+**Consequences.**
+
+- A Sentinel failover is now a *sale-stopping* event until an operator rebuilds. That is the design
+  working, and it is the strongest argument yet for the operator console `06` §9 still lists as
+  missing: the recovery is one call, and it is currently a hand-written `curl`.
+- Every capacity number in `06` §11 was measured against standalone Redis. None of them has been
+  re-measured through Sentinel.
+- The replay log is now safe to read by anyone who can read Redis, which is what lets it stay a
+  per-event key rather than a per-session one.
+- A reader can tell what is built by reading the documents again.
+
+---
+
+## ADR-059 — A connection-pool timeout is back-pressure: `503 SERVICE_BUSY`, not `500`
+
+**Context.** Under virtual threads the HikariCP pool is the system's real concurrency ceiling, and a
+request that waits `connection-timeout` (3 s) for it throws `SQLTransientConnectionException`,
+wrapped by Spring as `CannotCreateTransactionException` or `CannotGetJdbcConnectionException`.
+Nothing named either, so both fell to `GlobalExceptionHandler`'s `Exception` backstop and a buyer
+mid-checkout was told **`500 INTERNAL_ERROR`** — 1,218 times across three replicas in the 2,000-VU
+run (`06` §11). The recovery was already correct: checkout is find-or-create, so re-POSTing the same
+body resumes the same order. The *answer* was wrong — the least actionable code in the registry, at
+exactly the moment a buyer most needed to be told "retry".
+
+**Decision.** A new registry code, `SERVICE_BUSY` (`503`, `shared`), carrying a `Retry-After: 1`
+header and `retryable: true, retryAfterSeconds: 1` — the extension members `RATE_LIMITED` and
+`PAYMENT_GATEWAY_UNAVAILABLE` already use. The handler classifies by **cause, not by wrapper**: only
+an `SQLTransientConnectionException` somewhere in the chain is busy. `CannotCreateTransactionException`
+also means "the database is down" and "the credentials are wrong", and telling a client to retry either
+in one second would be a lie — those still reach the backstop and answer `500`. Logged at `WARN`:
+back-pressure under a spike is expected, and an `ERROR` per rejected request buries real faults.
+
+**What it deliberately does not change.** `CheckoutService` refunds when `commit.confirm` throws after
+a successful charge. A pool timeout there is a transaction that never *began*, which is a definite
+failure, so the refund is right (ADR-056) and the buyer still gets `409 ORDER_REFUNDED`. The new
+handler only sees pool timeouts that happen before money moves, which the `unresolved` catch already
+rethrows unchanged after marking the order resumable (ADR-034).
+
+**Why one second.** A pool of 30 turning over millisecond transactions frees hundreds of connections a
+second when it is merely saturated; a longer hint would idle a buyer whose retry would have worked.
+`FE_SPEC` caps client retries at a handful and then asks the human, so a pool that stays exhausted does
+not become a retry storm above the API.
+
+**Consequences.**
+
+- The client contract gains one code, on any endpoint, with "Try again" enabled and seats untouched
+  (`FE_SPEC` §2 and the checkout error table).
+- Filters run before `DispatcherServlet`; a pool timeout inside one (the `ip_rules` snapshot reload)
+  still answers whatever that filter answers. ADR-055/056 already keep the request path off the pool.
+
+---
+
+## ADR-060 — `POST /session/reset` accepts only `application/json`
+
+**Context.** The endpoint expires the `fsid` cookie so the bundled demo page can start over as a new
+visitor. The session *is* the buyer's queue position and their only authority over their hold, and
+CSRF is disabled (`06` §10 S6), so a hidden form on any site could POST to it and throw a buyer out of
+the line they were waiting in. `06` §10 recorded it as S13 and offered two fixes: scope it to the demo
+profile, or require something a form post cannot send.
+
+**Decision.** `@PostMapping(value = "/reset", consumes = "application/json")`. An HTML form can send
+only `application/x-www-form-urlencoded`, `multipart/form-data` or `text/plain`; a cross-origin
+`fetch` carrying `application/json` is not a CORS-safelisted request and needs a preflight, and no
+CORS mapping here grants one. Anything else answers `415` through the existing handler, before the
+method runs, so no expiring cookie is written.
+
+**Why not the profile.** The cluster runs the `docker` profile and serves the demo page that calls
+this endpoint, so scoping it to `dev` would break the demo exactly where it is shown. The demo page's
+`api()` helper already sent `Content-Type: application/json`, and the React client never calls it —
+the fix needed no client change at all.
+
+**Consequences.**
+
+- S13 is closed. **S6 is not**: `POST /queue/join` and `POST /holds` still accept a cross-site
+  request. The same one-line control would apply to them, but both are on the buyer path and each
+  deserves its own check that every client sends JSON; it is left as recorded.
+- This relies on no CORS configuration being added. A future `CorsConfigurationSource` that allows
+  credentials from another origin reopens S13, and should be read against this ADR.
+
+---
+
+## ADR-061 — Cached test contexts are never paused
+
+**Context.** From the frontend merge onwards, `./mvnw test` depended on class order. In some orders,
+every `/queue` request in the shared integration-test context answered a bare `500` with no registry
+`code`. Pass 12 ruled out everything inside the application: contention, id collisions, the rate
+limiter, metrics, parallelism, context accumulation. It pinned `alphabetical` because that order was
+*verified green*, and recorded the pollution as open (`06` §9).
+
+**Finding.** Spring Framework 7 **pauses** a cached test context when a test class switches to a
+different context: it stops the paused context's `Lifecycle` beans, then restarts them on the next
+use. This suite has several contexts. `BotDefenceIT`, `RecaptchaFailOpenIT` and, from Pass 13,
+`NotificationListenerIT` each add properties, and that forces a context of their own. When a later
+class switched back to the shared context, that context had been through a pause and a resume.
+
+Adding `NotificationListenerIT` shrank the reproduction from "most of the suite" to three classes:
+`HoldLifecycleIT`, `NotificationListenerIT`, `CheckoutRecoveryIT`. With the size down to three,
+experiments became cheap:
+
+- The pair `NotificationListenerIT`, `CheckoutRecoveryIT` passes: the shared context is created
+  *after* the switch, so it has never been paused.
+- Removing `@DirtiesContext` from the new class changes nothing.
+- A temporary `HIGHEST_PRECEDENCE` servlet filter never saw the failing requests. They are answered
+  before the resumed context's filter chain runs, which is why `GlobalExceptionHandler` never logged
+  them.
+- `spring.test.context.cache.pause=never` makes the three-class run green, and makes the full suite
+  green in `alphabetical`, `reversealphabetical` and `filesystem` order.
+
+**Decision.** `src/test/resources/spring.properties` sets `spring.test.context.cache.pause=never`.
+This restores Spring 6's behaviour, which the suite was written against. It has to live in
+`spring.properties` rather than `application-test.properties`, because the cache reads it before any
+context exists.
+
+**Consequences.**
+
+- A cached context keeps its schedulers running while other classes run. Every context has its own
+  PostgreSQL and Redis, because Testcontainers reuse is not enabled on this machine
+  (`withReuse(true)` logs that it was ignored), so they cannot interfere through shared state.
+- **Open:** *why* a resumed context's embedded Tomcat answers without running its filters. It is
+  inferred to be the web server's restart, not demonstrated. It does not affect production, where
+  contexts are never paused. If Testcontainers reuse is ever enabled, reread this ADR, because the
+  contexts would then share containers.
+- Surefire stays pinned to `alphabetical`, now only because a stable order is worth having.
+- The lesson for this repo: when an intermittent failure depends on the number of Spring contexts,
+  suspect the test framework's context lifecycle before the application.
+
+---
+
+## ADR-062 — Each replica has a memory limit, and the image alone owns the JVM flags
+
+**Context.** Pass 13's load sweep at 2,000 VUs across five sales saw app replicas SIGKILLed mid-sale.
+The Docker VM's kernel log recorded `Out of memory: Killed process … (java)` three times, with RSS of
+4.0, 2.5 and 2.7 GiB. Three defects combined to cause it, and each was invisible on its own:
+
+1. **No container memory limit.** The Dockerfile set `-XX:MaxRAMPercentage=75`, and its comment
+   said this sizes the heap "from the container limit". There was no limit, so each JVM sized
+   itself against the whole 7.65 GiB VM. Three replicas could claim about 17 GiB between them. G1
+   grows the heap lazily, so this passed every run at 300–600 VUs, where each replica settled at
+   1.1–1.5 GiB, and only failed once the load pushed the heaps past what the VM could hold.
+2. **`compose.yaml` replaced the image's `JAVA_TOOL_OPTIONS`.** It set the variable to
+   `-XX:MaxRAMPercentage=75` alone, which silently dropped the image's `-XX:+ExitOnOutOfMemoryError`
+   and `-XX:+UseZGC`. Every cluster measurement ever recorded therefore ran on G1, not ZGC.
+3. **The JVM's collector choice depends on the limit.** Setting a 1.5 GiB limit on its own made
+   the JVM stop treating the container as a "server-class machine" (that needs ≥ 1,792 MB). It
+   silently switched to **SerialGC**, a single-threaded stop-the-world collector, on a server
+   carrying thousands of virtual threads. `-XX:+PrintFlagsFinal` inside the container showed this
+   before any run did.
+
+**Decision.**
+
+- `mem_limit: ${APP_MEM_LIMIT:-1536m}` on every app replica. This covers the 1.1–1.5 GiB they reach
+  at the load this host can serve, and it keeps three replicas plus the infrastructure and k6
+  inside the VM.
+- The Dockerfile is the **only** place `JAVA_TOOL_OPTIONS` is set:
+  `-XX:MaxRAMPercentage=70 -XX:+UseG1GC -XX:+ExitOnOutOfMemoryError`. 70 % leaves about 460 MiB of
+  the limit for metaspace, thread stacks and Lettuce/Tomcat's off-heap buffers. **G1 is named**,
+  so ergonomics cannot swap it for SerialGC. G1 rather than ZGC because G1 is what every number in
+  `06` §11 was measured on. `compose.yaml` now says in a comment why it does not set the variable.
+
+**Verified.** On the new configuration the same four runs, from 300 to 2,000 VUs, completed with
+**zero restarts**, zero unreadable metric samples and an exact ledger. At 2,000 VUs each replica
+peaked at 1.48–1.50 GiB against its 1.5 GiB limit. That is tight, but `ExitOnOutOfMemoryError`
+never fired, and the p99 there (6.1 s) is set by CPU, not by GC.
+
+**Consequences.**
+
+- A replica that genuinely runs out of heap now exits cleanly and restarts, instead of being
+  killed at random by the VM with a neighbour's memory. Either way the Redis-first ordering loses
+  only in-flight reservations, and only toward under-count (ADR-046). Pass 13 watched a rebuild
+  recover exactly those seats.
+- 2,000 VUs runs replicas at their limit on this host. Raising `APP_MEM_LIMIT` is the lever for a
+  bigger machine, but not on this 7.65 GiB VM.
+- The lesson for this repo: a flag that reads correctly in one file can be cancelled by another,
+  and a JVM decides things about itself from the container it finds. Check effective settings with
+  `java -XX:+PrintFlagsFinal -version` inside the container, not by reading the Dockerfile.
+
+---
+
+## ADR-063 — ADR-057's exception rule, applied without exceptions
+
+**Status:** accepted, Pass 14. Amends ADR-057.
+
+**Context.** ADR-057 set the rule: *"a failure gets a class only when something catches it by type,
+or when two sibling types keep a distinction visible."* It then kept seven classes for other
+reasons. `PaymentDeclinedException` and `TicketNotAvailableException` "chose between two answers".
+`OrderRefundedException` "steered control flow". `PaymentGatewayUnavailableException` avoided "a
+one-method `Errors` class". `PaymentActionRequiredException`, `WebhookSignatureInvalidException` and
+`BotVerificationFailedException` arrived on branches that forked before the rule. Pass 14 checked
+all seven: **none is caught by type anywhere in `main`.** Choosing a code, a message or a
+`retryable` flag from an argument is exactly what a static factory does. And "steers control flow"
+had become untrue once `CheckoutService`'s catch-all caught `RuntimeException`.
+
+**Decision.** All seven become factories: `PaymentErrors.{declined, actionRequired,
+gatewayUnavailable, webhookSignatureInvalid}`, `OrderErrors.{refunded, ticketNotAvailable}` and
+`BotErrors.verificationFailed`. The classes that remain are the ones something catches:
+`DuplicatePaymentException`, the three `Hold*` exceptions `PaymentSettlementService` catches as a
+set, and `RecaptchaTransportException`. The `InsufficientStock`/`InventoryUnavailable` pair also
+stays, for ADR-057's distinction reason, which still holds.
+
+**What does not change.** The wire format stays byte-identical: same codes, statuses and extension
+members, in the same order. `ProblemResponseIT` and the checkout ITs pass unedited. The two unit
+tests that asserted `isInstanceOf(...)` now assert the `ErrorCode`, which is the contract a client
+actually sees.
+
+**The rule, stated so it cannot drift again.** A class only if a `catch` names it. Everything else is
+one static method on `<Module>Errors`, and a module's refusals are read from that one file.

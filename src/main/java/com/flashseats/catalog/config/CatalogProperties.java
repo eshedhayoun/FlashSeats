@@ -1,9 +1,13 @@
 package com.flashseats.catalog.config;
 
+import lombok.Getter;
+import lombok.Setter;
 import org.springframework.boot.context.properties.ConfigurationProperties;
 
 /** Tunables for how inventory is described publicly. */
 @ConfigurationProperties(prefix = "flashseats.catalog")
+@Getter
+@Setter
 public class CatalogProperties {
 
     /**
@@ -57,52 +61,4 @@ public class CatalogProperties {
      * a live one.
      */
     private int metadataCacheMaxEvents = 1_000;
-
-    public int getLimitedThresholdPercent() {
-        return limitedThresholdPercent;
-    }
-
-    public void setLimitedThresholdPercent(int limitedThresholdPercent) {
-        this.limitedThresholdPercent = limitedThresholdPercent;
-    }
-
-    public int getEpochCheckIntervalMs() {
-        return epochCheckIntervalMs;
-    }
-
-    public void setEpochCheckIntervalMs(int epochCheckIntervalMs) {
-        this.epochCheckIntervalMs = epochCheckIntervalMs;
-    }
-
-    public boolean isMetadataCacheEnabled() {
-        return metadataCacheEnabled;
-    }
-
-    public void setMetadataCacheEnabled(boolean metadataCacheEnabled) {
-        this.metadataCacheEnabled = metadataCacheEnabled;
-    }
-
-    public long getMetadataEventTtlMs() {
-        return metadataEventTtlMs;
-    }
-
-    public void setMetadataEventTtlMs(long metadataEventTtlMs) {
-        this.metadataEventTtlMs = metadataEventTtlMs;
-    }
-
-    public long getMetadataTierTtlMs() {
-        return metadataTierTtlMs;
-    }
-
-    public void setMetadataTierTtlMs(long metadataTierTtlMs) {
-        this.metadataTierTtlMs = metadataTierTtlMs;
-    }
-
-    public int getMetadataCacheMaxEvents() {
-        return metadataCacheMaxEvents;
-    }
-
-    public void setMetadataCacheMaxEvents(int metadataCacheMaxEvents) {
-        this.metadataCacheMaxEvents = metadataCacheMaxEvents;
-    }
 }

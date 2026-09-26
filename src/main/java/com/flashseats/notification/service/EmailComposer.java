@@ -34,17 +34,9 @@ public class EmailComposer {
     }
 
     /**
-     * The refund notice.
-     *
-     * <p><strong>It must not dereference {@code event} or {@code items}.</strong> The refund payload
-     * is written by {@code markRefunded}, which carries a null {@code event} and an empty item list —
-     * there were no seats to describe, which is the entire reason a refund happened. A composer that
-     * assumed the confirmation shape would throw here, and a deterministic render failure on the
-     * refund path dead-letters the one message telling a buyer their money is coming back.
-     *
-     * <p>The tone is deliberate. This email reaches someone who was charged and did not get what
-     * they paid for, so it leads with the refund, names the amount, and does not open with an
-     * apology that buries the fact.
+     * The refund notice. <strong>It must not dereference {@code event} or {@code items}</strong>: the
+     * refund payload carries neither, and a render failure here would dead-letter the message telling a
+     * buyer their money is coming back. It leads with the refund and the amount.
      */
     public String refundBodyFor(OrderConfirmedPayload payload) {
         return """

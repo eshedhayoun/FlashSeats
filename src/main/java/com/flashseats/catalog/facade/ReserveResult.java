@@ -1,17 +1,10 @@
 package com.flashseats.catalog.facade;
 
 /**
- * What happened when seats were taken from a tier.
- *
- * <p>An enum rather than a {@code boolean} because "no" has two meanings and they are not
- * interchangeable. {@link #INSUFFICIENT} is a fact about a working sale — tell the buyer to try
- * another tier. {@link #COUNTER_MISSING} means the system cannot read its own inventory, which is a
- * {@code 503} and an alarm. Answering the second with the first is ADR-004's failure: it announces a
- * sold-out sale to everyone because a key went missing.
- *
- * <p>The distinction is settled inside the reserve script, atomically. It used to be recovered
- * afterwards by re-reading the counter, which raced — a restore landing in between turned a fault
- * into "sold out".
+ * What happened when seats were taken from a tier. "No" has two meanings: {@link #INSUFFICIENT}
+ * (try another tier) and {@link #COUNTER_MISSING} (we cannot read our inventory: {@code 503} and an
+ * alarm). Confusing them announces a sold-out sale because a key is missing (ADR-004). The reserve
+ * script decides between them atomically.
  */
 public enum ReserveResult {
 

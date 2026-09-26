@@ -21,5 +21,10 @@ Dockerfile
 .env
 .env.*
 
+# The Dockerfile builds the Java app only. The SPA is served by `npm run dev`
+# during development and is not wired into the cluster (ADR-058), so shipping it
+# to the daemon only means uploading node_modules on every `--build`.
+frontend/
+
 **/*.log
 .DS_Store

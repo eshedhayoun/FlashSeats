@@ -2,7 +2,7 @@ package com.flashseats.order;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
-import com.flashseats.flashseats.support.IntegrationTest;
+import com.flashseats.app.support.IntegrationTest;
 import com.flashseats.notification.model.NotificationKind;
 import com.flashseats.notification.model.NotificationLog;
 import com.flashseats.notification.model.NotificationStatus;
@@ -124,7 +124,7 @@ class AdminNotificationEndpointsIT extends IntegrationTest {
         assertThat(eventId).isNotNull();
 
         // The consumer will receive the message again, find SENT (not DLQ), and ack silently
-        // (proven by OrderConfirmedConsumerIT#sentRowNotReclaimable)
+        // (proven by NotificationListenerIT and NotificationClaimIT#sentIsTerminal)
     }
 
     @Test

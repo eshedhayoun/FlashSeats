@@ -2,8 +2,8 @@ package com.flashseats.shared.error;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
-import com.flashseats.flashseats.support.BuyerSession;
-import com.flashseats.flashseats.support.IntegrationTest;
+import com.flashseats.app.support.BuyerSession;
+import com.flashseats.app.support.IntegrationTest;
 import java.util.Map;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;

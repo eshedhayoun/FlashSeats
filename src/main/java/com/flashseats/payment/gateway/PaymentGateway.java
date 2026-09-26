@@ -1,20 +1,12 @@
 package com.flashseats.payment.gateway;
 
 /**
- * The external payment provider, behind one interface.
+ * The external payment provider. {@link StripePaymentGateway} when
+ * {@code flashseats.payment.stripe.enabled}, otherwise {@link StubPaymentGateway}, which drives every
+ * checkout branch, 3-D Secure included, with no keys. Both are wrapped by {@link CircuitBreakingGateway}.
  *
- * <p>Two implementations ship: {@link StripePaymentGateway} when
- * {@code flashseats.payment.stripe.enabled} is set, and {@link StubPaymentGateway} otherwise — which
- * is what lets {@code dev}, {@code test} and the load harness drive every branch of the checkout
- * sequence, including 3-D Secure, with no network and no keys. Both are wrapped by
- * {@link CircuitBreakingGateway}.
- *
- * <p>Implementations must <strong>never</strong> be called inside a transaction: a network round
- * trip holding a pooled connection throttles checkout for everyone, because under virtual threads
- * the connection pool is the system's real concurrency limit (ADR-023).
- *
- * <p>Implementations signal a transport failure by throwing {@link GatewayTransportException}, never
- * by returning {@link GatewayResult#error}. The distinction is what the circuit breaker counts.
+ * <p>Never call it inside a transaction (ADR-023). Signal transport failure by throwing
+ * {@link GatewayTransportException}, never by returning an error: that is what the breaker counts.
  */
 public interface PaymentGateway {
 

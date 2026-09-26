@@ -9,7 +9,7 @@ import org.springframework.web.bind.annotation.RestController;
 
 /**
  * Operator endpoints. Guarded by {@code ROLE_ADMIN} in
- * {@link com.flashseats.flashseats.config.SecurityConfig} — "admin only" is an enforced role here,
+ * {@link com.flashseats.app.SecurityConfig} — "admin only" is an enforced role here,
  * not a comment.
  */
 @RestController
@@ -29,15 +29,9 @@ public class AdminCatalogController {
     }
 
     /**
-     * Halts a live sale.
-     *
-     * <p>Every gate closes immediately — the queue admits nobody, no hold can be taken, no checkout
-     * starts — because a paused event is not {@code PUBLISHED} and {@code SaleWindows} already reads
-     * the window as {@code CLOSED}.
-     *
-     * <p><strong>Nothing is destroyed.</strong> The waiting room keeps every position, live passes
-     * and admissions run out their own clocks, and stock stays exactly where it is, so
-     * {@code /resume} puts every buyer back where they were. Idempotent.
+     * Halts a live sale. Every gate closes at once, because a paused event is not {@code PUBLISHED}.
+     * Nothing is destroyed: positions, passes, admissions and stock stay, so {@code /resume} restores
+     * everyone. Idempotent.
      */
     @PostMapping("/{eventId}/pause")
     public Map<String, Object> pause(@PathVariable long eventId) {

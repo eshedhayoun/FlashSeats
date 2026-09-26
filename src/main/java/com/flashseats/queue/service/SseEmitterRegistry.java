@@ -6,24 +6,15 @@ import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicInteger;
-import java.util.concurrent.atomic.AtomicLong;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Component;
 import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
 import tools.jackson.databind.ObjectMapper;
 
 /**
- * The live SSE connections held by <strong>this replica</strong>.
- *
- * <p>An emitter is the one piece of state a stateless application cannot avoid keeping in memory,
- * and it is the reason promotions fan out over Redis Pub/Sub: the promotion worker runs on one
- * replica while a given buyer's connection lives in another's heap. Delivering only to local
- * emitters is correct precisely <em>because</em> every replica subscribes and does the same
- * (ADR-007).
- *
- * <p>Positions are clamped <strong>monotonic non-increasing</strong> per connection. A raw rank can
- * jump backwards when entries ahead are removed, and a queue position that goes <em>up</em> reads as
- * a broken system even when nothing is wrong.
+ * The live SSE connections held by <strong>this replica</strong>. It delivers only locally, which is
+ * correct because every replica subscribes to the Pub/Sub fan-out (ADR-007). Positions are clamped
+ * monotonic non-increasing per connection, because a position that goes up reads as broken.
  */
 @Slf4j
 @Component
@@ -62,25 +53,17 @@ public class SseEmitterRegistry {
     }
 
     /**
-     * The events this replica is actually holding connections for.
-     *
-     * <p>Drives {@link QueueBroadcaster}, which used to sweep <em>open</em> events instead — so the
-     * moment a sale closed it stopped sweeping the very connections that most needed telling
-     * (ADR-036).
+     * The events this replica holds connections for. The broadcaster sweeps these rather than open
+     * events, so a closing sale still reaches its streams (ADR-036).
      */
     public Set<Long> watchedEventIds() {
         return Set.copyOf(sessionsByEvent.keySet());
     }
 
     /**
-     * Delivers a final frame to every local watcher and closes the stream.
-     *
-     * <p>Completing is what makes a terminal frame terminal: the connection leaves the registry, so
-     * the next sweep does not find it and send the same news again every two seconds.
-     *
-     * <p>Removal is keyed on <em>this</em> connection, not just the session id. A buyer reconnecting
-     * in the same instant would otherwise have their fresh emitter evicted by the sweep that was
-     * closing their old one, leaving them holding a socket nothing will ever write to.
+     * Delivers a final frame to every local watcher and closes the stream, so the next sweep does not
+     * repeat it. Removal is keyed on this connection, not the session, so a reconnect in the same
+     * instant keeps its fresh emitter.
      */
     public void closeAll(long eventId, String eventName, Object data) {
         closeAll(eventId, eventName, data, null);
@@ -121,27 +104,32 @@ public class SseEmitterRegistry {
         return send(sessionId, "position-update", frame);
     }
 
+    /**
+     * A live frame, deliberately carrying <strong>no</strong> {@code id}. The SSE spec leaves a
+     * client's last-event-id untouched by such a frame, so the {@code Last-Event-ID} a reconnect sends
+     * is always a sequence the replay log minted ({@link QueueReplayService}, ADR-058).
+     */
     public boolean send(String sessionId, String eventName, Object data) {
-        return sendWithId(sessionId, eventName, data, "local-" + nextLocalId(sessionId));
+        return sendWithId(sessionId, eventName, data, null);
     }
 
-    public boolean send(String sessionId, String eventName, Object data, Long eventId) {
-        String id = eventId == null ? "local-" + nextLocalId(sessionId) : Long.toString(eventId);
-        return sendWithId(sessionId, eventName, data, id);
+    /** A replayable frame, identified by its position in the event's replay log. */
+    public boolean send(String sessionId, String eventName, Object data, Long sequence) {
+        return sendWithId(sessionId, eventName, data, sequence);
     }
 
-    private boolean sendWithId(String sessionId, String eventName, Object data, String eventId) {
+    private boolean sendWithId(String sessionId, String eventName, Object data, Long sequence) {
         Connection connection = connections.get(sessionId);
         if (connection == null) {
             return false;
         }
         try {
-            connection
-                    .emitter()
-                    .send(SseEmitter.event()
-                            .id(eventId)
-                            .name(eventName)
-                            .data(json.writeValueAsString(data)));
+            SseEmitter.SseEventBuilder frame =
+                    SseEmitter.event().name(eventName).data(json.writeValueAsString(data));
+            if (sequence != null) {
+                frame = frame.id(Long.toString(sequence));
+            }
+            connection.emitter().send(frame);
             return true;
         } catch (IOException | IllegalStateException disconnected) {
             // Routine: browsers close streams constantly. Not worth a stack trace.
@@ -172,13 +160,8 @@ public class SseEmitterRegistry {
         sessionsWatching(eventId).forEach(sessionId -> send(sessionId, eventName, data));
     }
 
-    public void broadcast(long eventId, String eventName, Object data, Long frameId) {
-        sessionsWatching(eventId).forEach(sessionId -> send(sessionId, eventName, data, frameId));
-    }
-
-    private long nextLocalId(String sessionId) {
-        Connection connection = connections.get(sessionId);
-        return connection == null ? 0 : connection.nextId();
+    public void broadcast(long eventId, String eventName, Object data, Long sequence) {
+        sessionsWatching(eventId).forEach(sessionId -> send(sessionId, eventName, data, sequence));
     }
 
     /**
@@ -200,14 +183,9 @@ public class SseEmitterRegistry {
     }
 
     /**
-     * Both halves of the per-event index go through {@code compute}, so they hold the same per-key
-     * lock.
-     *
-     * <p>Read and written separately, they raced: the last session of an event unindexing would see
-     * the set empty and remove it, while a connect arriving in between had already added itself to
-     * that same instance. The two-argument {@code remove} matches on identity and dropped it anyway,
-     * leaving a live connection indexed in a map nothing iterates — no position frames and no
-     * {@code sale-closed} until its one-hour timeout.
+     * Both halves of the per-event index go through {@code compute}, under one per-key lock. Done
+     * separately, an unindex and a concurrent connect raced, leaving a live connection that no sweep
+     * reaches.
      */
     private void index(String sessionId, long eventId) {
         sessionsByEvent.compute(eventId, (ignored, sessions) -> {
@@ -230,19 +208,15 @@ public class SseEmitterRegistry {
     /**
      * One browser's stream, plus the state needed to keep its frames coherent.
      *
-     * <p>Both fields are atomics rather than guarded by a lock. On JDK 21 a virtual thread that
+     * <p>The clamp is an atomic rather than guarded by a lock. On JDK 21 a virtual thread that
      * blocks inside {@code synchronized} pins its carrier, and under a flash-sale spike that presents
      * as a throughput collapse which looks like a Redis outage (global standards §7). Lock-free is
      * simpler here anyway.
      */
-    private record Connection(long eventId, SseEmitter emitter, AtomicLong ids, AtomicInteger lastPosition) {
+    private record Connection(long eventId, SseEmitter emitter, AtomicInteger lastPosition) {
 
         Connection(long eventId, SseEmitter emitter) {
-            this(eventId, emitter, new AtomicLong(), new AtomicInteger(Integer.MAX_VALUE));
-        }
-
-        long nextId() {
-            return ids.incrementAndGet();
+            this(eventId, emitter, new AtomicInteger(Integer.MAX_VALUE));
         }
 
         int clampPosition(int incoming) {

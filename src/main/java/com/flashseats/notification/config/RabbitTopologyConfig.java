@@ -22,16 +22,8 @@ import org.springframework.context.annotation.Configuration;
  *   notification.dlx.exchange (direct) ──► notification.dead-letter.queue
  * </pre>
  *
- * <p>The exchange and routing keys are the contract between {@code order} and this module. They are
- * coupled by the <em>wire format</em>, not by a shared Java type, which is what lets either be
- * changed or redeployed without the other.
- *
- * <p>Everything is durable: an order can be confirmed while the broker is restarting, and the
- * outbox will still be holding that message when it comes back.
- *
- * <p>No message converter is registered. The outbox payload is already a JSON string, so it travels
- * as the message body untouched and the consumer parses it directly — one representation end to end,
- * and no chance of a converter reshaping the contract on the way through.
+ * <p>The exchange and routing keys are the contract with {@code order}: coupled by wire format, not
+ * a Java type. Everything is durable. No message converter: the outbox payload is already JSON.
  */
 @Configuration
 @ConditionalOnProperty(

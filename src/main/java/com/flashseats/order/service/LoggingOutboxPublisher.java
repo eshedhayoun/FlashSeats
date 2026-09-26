@@ -6,15 +6,9 @@ import java.util.UUID;
 import lombok.extern.slf4j.Slf4j;
 
 /**
- * Drains the outbox to the log.
- *
- * <p>Lets the relay — claim, publish, mark, and the stale-claim sweep — be built and tested from the
- * first line of code, before a broker exists. When {@code notification} arrives it registers its own
- * {@link OutboxPublisher} bean and this one steps aside untouched.
- *
- * <p>A log line cannot fail to be durable, so every id comes back. That makes this the one
- * implementation for which partial success is impossible — worth knowing when reading a test that
- * uses it, because it exercises the relay's bookkeeping and nothing about delivery.
+ * Drains the outbox to the log ({@code flashseats.outbox.transport=log}, the test profile's
+ * choice). A log line cannot fail, so every id comes back. A test using this exercises the relay's
+ * bookkeeping, not delivery.
  */
 @Slf4j
 public class LoggingOutboxPublisher implements OutboxPublisher {

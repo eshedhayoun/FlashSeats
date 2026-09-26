@@ -6,8 +6,7 @@ import com.flashseats.hold.facade.HoldSummary;
 import com.flashseats.order.config.OrderProperties;
 import com.flashseats.order.dto.OrderItemResponse;
 import com.flashseats.order.dto.OrderReceiptResponse;
-import com.flashseats.order.event.OrderConfirmedEvent;
-import com.flashseats.order.exception.OrderRefundedException;
+import com.flashseats.order.exception.OrderErrors;
 import com.flashseats.order.model.Order;
 import com.flashseats.order.model.OrderItem;
 import com.flashseats.order.model.OrderStatus;
@@ -16,7 +15,7 @@ import com.flashseats.order.repository.OrderItemRepository;
 import com.flashseats.order.repository.OrderRepository;
 import com.flashseats.order.repository.OutboxEventRepository;
 import com.flashseats.payment.exception.DuplicatePaymentException;
-import com.flashseats.payment.exception.PaymentDeclinedException;
+import com.flashseats.payment.exception.PaymentErrors;
 import com.flashseats.payment.facade.PaymentResult;
 import java.time.Clock;
 import java.time.Instant;
@@ -29,15 +28,8 @@ import org.springframework.transaction.annotation.Transactional;
 import tools.jackson.databind.ObjectMapper;
 
 /**
- * The transactional half of checkout.
- *
- * <p>Separate from {@link CheckoutService} because Spring's transaction proxy does not intercept
- * self-invocation: a {@code @Transactional} method called from another method on the same object
- * runs with <strong>no transaction at all</strong>, silently. Splitting the class is what makes the
- * boundary real — and it puts the boundary somewhere a reader can see it.
- *
- * <p>Every method here contains SQL and nothing else. No HTTP, no Redis, no broker, no rendering
- * (ADR-023).
+ * The transactional half of checkout. A separate bean from {@link CheckoutService} because Spring's
+ * proxy does not intercept self-invocation. Every method here is SQL and nothing else (ADR-023).
  */
 @Slf4j
 @Component
@@ -82,31 +74,22 @@ public class OrderCommitService {
     }
 
     /**
-     * Find-or-create on {@code UNIQUE(hold_token)} (ADR-002).
-     *
-     * <p>The existing row's state decides what happens, and each case is a deliberate choice:
+     * Find-or-create on {@code UNIQUE(hold_token)} (ADR-002). The existing row decides:
      *
      * <table border="1">
      *   <caption>Find-or-create behaviour</caption>
      *   <tr><th>Existing row</th><th>Behaviour</th></tr>
      *   <tr><td>none</td><td>insert {@code PENDING} and proceed</td></tr>
-     *   <tr><td>{@code PENDING}, fresh</td><td>{@code 409} — a charge is already in flight</td></tr>
-     *   <tr><td>{@code PENDING}, stale</td><td>resume on the <em>same</em> order number (ADR-034)</td></tr>
-     *   <tr><td>{@code FAILED}</td><td>reset to {@code PENDING} and retry on the <em>same</em> order number</td></tr>
-     *   <tr><td>{@code CONFIRMED}</td><td>{@code 200} — replay the existing receipt</td></tr>
+     *   <tr><td>{@code PENDING}, fresh</td><td>{@code 409}: a charge is already in flight</td></tr>
+     *   <tr><td>{@code PENDING}, stale</td><td>resume on the same order number (ADR-034)</td></tr>
+     *   <tr><td>{@code FAILED}</td><td>reset to {@code PENDING}, retry on the same order number</td></tr>
+     *   <tr><td>{@code CONFIRMED}</td><td>{@code 200}: replay the receipt</td></tr>
      *   <tr><td>{@code REFUNDED}</td><td>terminal</td></tr>
      * </table>
      *
-     * <p><strong>{@code PENDING} is in-flight, never terminal</strong> (ADR-034). Treating it as
-     * terminal was a defect: a gateway error left the row {@code PENDING} for good, so every retry
-     * answered {@code 409 DUPLICATE_PAYMENT} while the buyer held live seats and had been told to
-     * try again. Two rules make it recoverable, and both are needed —
-     * {@link CheckoutService} marks the order {@code FAILED} on any thrown exit, which covers the
-     * ordinary case immediately, and the staleness check below covers the one it cannot: a process
-     * killed between the commit and the charge.
-     *
-     * <p>Reusing the order number across retries matters to the buyer: three declined attempts should
-     * not produce three references to explain to support.
+     * <p>{@code PENDING} is in flight, never terminal (ADR-034). {@link CheckoutService} marks any thrown
+     * exit {@code FAILED}; the staleness check covers a process killed between commit and charge. The
+     * same order number across retries means three declines are one reference, not three.
      */
     @Transactional
     public CheckoutOrder findOrCreate(
@@ -118,7 +101,7 @@ public class OrderCommitService {
             return switch (existing.getStatus()) {
                 case CONFIRMED -> new CheckoutOrder(existing.getOrderNumber(), existing.getPaymentAttempts(), true);
                 case PENDING -> resumeIfStranded(existing, holdToken);
-                case REFUNDED -> throw new OrderRefundedException(existing.getOrderNumber());
+                case REFUNDED -> throw OrderErrors.refunded();
                 case FAILED -> resumeFailed(existing);
             };
         }
@@ -144,22 +127,11 @@ public class OrderCommitService {
     }
 
     /**
-     * <strong>The one transaction.</strong> Consumes the hold, writes the ledger, and enqueues
-     * fulfilment — all or nothing.
-     *
-     * <p>{@code consumeHold} is a conditional {@code UPDATE} that joins this transaction, so if
-     * anything below it fails, the hold returns to {@code ACTIVE} and expires normally. That is the
-     * whole reason the claim lives in SQL rather than in Redis, which cannot roll back (ADR-019).
-     *
-     * <p>The outbox row is written here, not after: an order that is confirmed but whose ticket was
-     * never queued is not a state this system can reach.
-     *
-     * <p><strong>Returns the receipt rather than the entity.</strong> It used to return the
-     * {@code Order} and the caller threw it away, then re-read the same row and its line items
-     * through a second read-only transaction to build exactly this. Everything the receipt needs is
-     * already in hand here — the order was just written, the line item was just constructed — so
-     * that read was a whole extra pooled connection per successful checkout, on the path whose
-     * measured ceiling is the connection pool.
+     * <strong>The one transaction</strong>: consume the hold, write the ledger, enqueue fulfilment,
+     * all or nothing. {@code consumeHold} is a conditional {@code UPDATE} that joins this transaction,
+     * so a failure below returns the hold to {@code ACTIVE}; that is why the claim lives in SQL rather
+     * than Redis (ADR-019). Returns the receipt directly, so a successful checkout needs no second
+     * pooled read.
      */
     @Transactional
     public OrderReceiptResponse confirm(
@@ -235,15 +207,9 @@ public class OrderCommitService {
     }
 
     /**
-     * Ends a checkout that never reached a charge outcome (ADR-034).
-     *
-     * <p>The order becomes {@code FAILED}, which is a state {@link #findOrCreate} already knows how
-     * to resume, so the buyer's next attempt continues on the same order number. <strong>No payment
-     * attempt is consumed</strong>: a gateway outage, a hold that expired underneath us, or a
-     * database blip is not one of the buyer's three tries at their card.
-     *
-     * <p>The hold is deliberately left alone. It is still {@code ACTIVE}, the buyer still owns those
-     * seats for the rest of its window, and it expires normally if they walk away.
+     * Ends a checkout that never reached a charge outcome (ADR-034). The order becomes {@code FAILED},
+     * which {@link #findOrCreate} resumes on the same order number, and <strong>no payment attempt is
+     * consumed</strong>. The hold is left {@code ACTIVE}.
      */
     @Transactional
     public void markAbandoned(String orderNumber, String reason) {
@@ -284,14 +250,9 @@ public class OrderCommitService {
     // ----------------------------------------------------------------- helpers
 
     /**
-     * Decides whether a {@code PENDING} row is a live charge or a stranded one (ADR-034).
-     *
-     * <p>{@code updatedAt} is the last moment anything touched this checkout. Within
-     * {@code stalePendingSeconds} — which tracks the payment module's in-flight guard — a charge
-     * genuinely may still be running, and a second request must not start another: that is the
-     * ordinary double-click, and {@code 409} is the right answer (global standards §3, rule 4).
-     * Beyond it, no charge can still be in flight, so the row is a crash artefact and the buyer gets
-     * their retry rather than a permanent refusal.
+     * Decides whether a {@code PENDING} row is a live charge or a stranded one (ADR-034). Within
+     * {@code stalePendingSeconds} a charge may still be running, so a second request gets {@code 409};
+     * beyond it, the row is a crash artefact and the retry resumes it.
      */
     private CheckoutOrder resumeIfStranded(Order order, String holdToken) {
         Instant strandedBefore =
@@ -306,7 +267,7 @@ public class OrderCommitService {
 
     private CheckoutOrder resumeFailed(Order order) {
         if (order.getPaymentAttempts() >= properties.getMaxPaymentAttempts()) {
-            throw new PaymentDeclinedException(
+            throw PaymentErrors.declined(
                     "No payment attempts remain for this reservation.", 0, null);
         }
         order.setStatus(OrderStatus.PENDING);
