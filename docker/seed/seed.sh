@@ -1,3 +1,4 @@
+
 #!/usr/bin/env bash
 #
 # FlashSeats — seed the cluster's sale and pre-warm its counters.
