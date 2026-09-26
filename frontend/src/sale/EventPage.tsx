@@ -108,6 +108,7 @@ export function EventPage() {
     return (
       <QueuePage
         eventId={eventId}
+        tiers={eventResult.event.tiers}
         queue={route.queue}
         onRefresh={refreshSale}
       />
@@ -139,13 +140,15 @@ export function EventPage() {
       );
     }
 
-    return <SeatSelectionPage
-      event={eventResult.event}
-      eventId={eventId}
-      admissionExpiresAt={route.admissionExpiresAt}
-      onRefresh={refreshSale}
-      onHoldCreated={setPendingHold}
-    />;
+    return (
+      <SeatSelectionPage
+        event={eventResult.event}
+        eventId={eventId}
+        admissionExpiresAt={route.admissionExpiresAt}
+        onRefresh={refreshSale}
+        onHoldCreated={setPendingHold}
+      />
+    );
   }
   if (route.view === "checkout") {
     return (

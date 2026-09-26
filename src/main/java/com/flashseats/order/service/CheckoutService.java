@@ -191,7 +191,7 @@ public class CheckoutService {
      * confusing bank statement.
      */
     private void requireTimeToComplete(Instant expiresAt) {
-        long secondsLeft = Duration.between(clock.instant(), expiresAt).toSeconds();
+        long secondsLeft = Duration.between(clock.instant(), expiresAt).getSeconds();
         if (secondsLeft < properties.getMinRemainingSecondsForRetry()) {
             throw OrderErrors.insufficientTimeRemaining(expiresAt);
         }
