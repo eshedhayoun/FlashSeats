@@ -7,21 +7,13 @@ import java.io.UncheckedIOException;
 import org.springframework.stereotype.Service;
 
 /**
- * Hands a buyer the ticket they paid for, without going through their inbox (ADR-050).
+ * Hands a buyer the ticket they paid for, without going through their inbox (ADR-050), so a
+ * mistyped email address is recoverable.
  *
- * <p><strong>Why this exists.</strong> The PDF used to be reachable only as an email attachment. The
- * address is collected once, in the checkout body, and never verified — so a typo meant the ticket
- * went to a stranger or bounced, the buyer held a valid receipt and a 90-day token and still could
- * not obtain what they had paid for, and even the operator resend replayed the same outbox payload
- * to the same wrong address. Every other failure in this system has a recovery path; this one had
- * none, and it ended with a paying buyer holding nothing.
- *
- * <p><strong>Two beans, not one, and that is the whole shape of this class.</strong> Reading and
- * authorising is transactional and lives in {@link OrderQueryService}; rendering is CPU work and must
- * not happen with a pooled connection open (ADR-023). Putting both in one class and annotating the
- * read would have been silently wrong: Spring's transaction proxy does not intercept
- * self-invocation, so the read would have run with <em>no transaction at all</em> — the same reason
- * {@code CheckoutService} and {@code OrderCommitService} are separate types.
+ * <p>Two beans on purpose: the authorised read is transactional in {@link OrderQueryService}, and
+ * rendering is CPU work that must not hold a pooled connection (ADR-023). One class would not work,
+ * because Spring's proxy does not intercept self-invocation and the read would run with no
+ * transaction at all.
  */
 @Service
 public class TicketDownloadService {

@@ -7,29 +7,14 @@ import org.springframework.data.redis.connection.MessageListener;
 import org.springframework.stereotype.Component;
 
 /**
- * Turns a {@code hold:{token}} key expiring into an immediate reclaim.
+ * Turns a {@code hold:{token}} key expiring into an immediate reclaim. It exists for
+ * <strong>latency</strong> only. {@link HoldReconciliationSweeper} is the guarantee, because keyspace
+ * notifications are at-most-once pub/sub.
  *
- * <p>This is a <strong>latency</strong> component. {@link HoldReconciliationSweeper} already
- * reclaims every expired hold and is untouched by this class existing; what this removes is the up
- * to {@code flashseats.hold.sweeper-interval-ms} that seats spend invisible after a buyer walks
- * away — the difference between a sold-out-looking sale and one that keeps selling.
- *
- * <p>It can never be the guarantee, because keyspace notifications are <strong>at-most-once
- * pub/sub</strong>: a replica that is restarting, or whose connection drops for a moment, loses the
- * event permanently and nothing redelivers it. A design that relied on this would leak inventory
- * every time a pod restarted.
- *
- * <h2>The two traps this class is shaped around</h2>
- *
- * <p><strong>1. Every replica receives every expiry.</strong> That is not a flaw to work around —
- * it is why no coordination is needed. All three call {@link HoldService#reclaimExpired}, all three
- * reach the settle-once claim, and exactly one {@code UPDATE ... WHERE status = 'ACTIVE'} returns
- * rowcount 1. Restoring the seats here instead would restore them three times.
- *
- * <p><strong>2. {@code __keyevent@0__:expired} is one channel for the whole database.</strong> It
- * carries queue passes, admission sessions, payment in-flight guards and rate-limit buckets — during
- * a sale, thousands a second, to every replica. There is no server-side filter for it, so the prefix
- * check below is the only one there is, and it is the first thing this method does for that reason.
+ * <p>Every replica receives every expiry, and that is why no coordination is needed: all call
+ * {@link HoldService#reclaimExpired} and the settle-once claim lets exactly one win. Restoring stock
+ * here would restore it three times. The channel carries every expiring key in the database, so the
+ * prefix check comes first.
  */
 @Slf4j
 @Component

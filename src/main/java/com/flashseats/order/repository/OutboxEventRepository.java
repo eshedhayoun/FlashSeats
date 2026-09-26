@@ -1,10 +1,10 @@
 package com.flashseats.order.repository;
 
 import com.flashseats.order.model.OutboxEvent;
+import com.flashseats.order.model.OutboxStatus;
 import jakarta.persistence.LockModeType;
 import jakarta.persistence.QueryHint;
 import java.time.Instant;
-
 import java.util.List;
 import java.util.Optional;
 import java.util.UUID;
@@ -18,11 +18,14 @@ import org.springframework.data.repository.query.Param;
 
 public interface OutboxEventRepository extends JpaRepository<OutboxEvent, UUID> {
 
-    @Query("""
-            SELECT MIN(e.createdAt) FROM OutboxEvent e
-             WHERE e.status <> com.flashseats.order.model.OutboxStatus.PROCESSED
-            """)
-    Optional<Instant> oldestUnprocessedCreatedAt();
+    /**
+     * The oldest row in one status, for the fulfilment-lag gauge. Asked per status, never as
+     * {@code <> PROCESSED}: only the per-status form can use the partial indexes from {@code V3}, and the
+     * other form scanned the whole table on every replica every ten seconds (ADR-051's trap, via a
+     * metric). No new index: this table is written on every checkout.
+     */
+    @Query("SELECT MIN(e.createdAt) FROM OutboxEvent e WHERE e.status = :status")
+    Optional<Instant> oldestCreatedAtWithStatus(@Param("status") OutboxStatus status);
 
     /**
      * The most recent message published for an order, whatever became of it.
@@ -67,19 +70,19 @@ public interface OutboxEventRepository extends JpaRepository<OutboxEvent, UUID> 
      * the first one wakes up. {@code retryCount} is the claim generation: stale-claim recovery
      * increments it, so an old relay cannot mark the newer relay's claim as processed (ADR-009).
      */
-     @Modifying(flushAutomatically = true)
-     @Query("""
+    @Modifying(flushAutomatically = true)
+    @Query("""
             UPDATE OutboxEvent e
-                SET e.status = com.flashseats.order.model.OutboxStatus.PROCESSED,
-                e.processedAt = :now
-                WHERE e.id = :id
-                AND e.status = com.flashseats.order.model.OutboxStatus.PROCESSING
-                AND e.retryCount = :retryCount
-                """)
-     int markProcessed(
-                @Param("id") UUID id,
-                @Param("retryCount") int retryCount,
-                @Param("now") Instant now);
+               SET e.status = com.flashseats.order.model.OutboxStatus.PROCESSED,
+                   e.processedAt = :now
+             WHERE e.id = :id
+               AND e.status = com.flashseats.order.model.OutboxStatus.PROCESSING
+               AND e.retryCount = :retryCount
+            """)
+    int markProcessed(
+            @Param("id") UUID id,
+            @Param("retryCount") int retryCount,
+            @Param("now") Instant now);
 
     /**
      * Returns rows stranded in {@code PROCESSING} to {@code PENDING}.

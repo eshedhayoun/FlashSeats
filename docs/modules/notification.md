@@ -92,13 +92,22 @@ The ticket is a PDF. **Operator-supplied text must not reach a standard-14 font*
 on anything outside WinAnsi, deterministically, so a Hebrew event title would cost a paid buyer their
 ticket with no retry that could help (ADR-042).
 
+**Tested through the real broker.** The test profile turns `flashseats.notification.enabled` off, so
+most integration tests run without this module. `NotificationListenerIT` turns it back on in its own
+context, against its own RabbitMQ container, with the production topology and both listeners. It proves:
+duplicates send once (`UNIQUE(order_number, kind)`), a deterministic failure dead-letters after one
+attempt with no retry (ADR-029), a dead-letter replay sends exactly once (ADR-038), and a delivered but
+unrecorded message is left `SENT` so a replay cannot send twice (ADR-042). Only SMTP is faked.
+
+**The DLQ is alarmed on**: `flashseats.dlq.depth` counts `DLQ` rows per replica (`03` §7, built). The
+DLQ is also listable and resendable through the operator surface (ADR-048).
+
 ---
 
 ## 6. Known gaps
 
 | Gap | Detail |
 | :--- | :--- |
-| **No DLQ depth alarm** | The DLQ is listable by an operator; nothing alarms on it |
 | **Email is never verified** | The address is taken from the checkout body. A typo is no longer *unrecoverable* — `order` serves the same PDF as a download (ADR-050) — but nothing validates the address or lets a buyer correct it |
 
 ---

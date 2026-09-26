@@ -18,7 +18,7 @@ import org.springframework.web.bind.annotation.RestController;
  * notifications, because that is what the operator is thinking about; the same split
  * {@code AdminStockController} makes, for the same reason.
  *
- * <p>Guarded by {@code ROLE_ADMIN} in {@link com.flashseats.flashseats.config.SecurityConfig}.
+ * <p>Guarded by {@code ROLE_ADMIN} in {@link com.flashseats.app.SecurityConfig}.
  */
 @RestController
 @RequestMapping("/api/v1/admin")
@@ -45,17 +45,9 @@ public class AdminOrderController {
     }
 
     /**
-     * Queues the order's ticket email again.
-     *
-     * <p>This is the trigger ADR-038 built for and never had. A dead-lettered notification is
-     * re-claimable precisely so a replay sends; without something to start one, a deterministic
-     * render failure — a font that cannot draw a Hebrew event title, say — cost a <strong>paid</strong>
-     * buyer their ticket permanently.
-     *
-     * <p><strong>Safe to press when unsure.</strong> A notification that already succeeded is
-     * {@code SENT}, not {@code DLQ}, so the re-claim matches nothing and the consumer acknowledges
-     * the replay without sending. The answer is therefore "queued", not "delivered" — whether it
-     * delivers depends on whether it needed to.
+     * Queues the order's ticket email again: the replay trigger for ADR-038's re-claimable dead
+     * letters. Safe to press when unsure: a {@code SENT} notification is never re-claimed, so the
+     * answer is "queued", not "delivered".
      */
     @PostMapping("/notifications/resend/{orderNumber}")
     public Map<String, Object> resend(@PathVariable String orderNumber) {

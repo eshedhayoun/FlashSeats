@@ -236,15 +236,14 @@ public final class CatalogErrors {
 }
 ```
 
-Keep as classes **only** the eight that carry logic or are caught by type:
+Keep a class **only** when something catches it by type. Pass 14 applied this to the last
+survivors (ADR-063): a factory can branch its code, message and `retryable` just as a constructor
+can, so "carries logic" was never a reason for a class.
 
 | Keep | Why |
 | :--- | :--- |
-| `DuplicatePaymentException` | **caught by type** at `CheckoutService.java:148` |
-| `PaymentDeclinedException` | picks between two `ErrorCode`s on `attemptsRemaining` |
-| `TicketNotAvailableException` | branches message *and* `retryable` on `OrderStatus` |
-| `HoldExpiredException` | carries `expiresAt` |
-| `HoldAlreadySettledException`, `OrderRefundedException` | participate in control flow |
+| `DuplicatePaymentException` | **caught by type** in `CheckoutService` |
+| `HoldNotFoundException`, `HoldExpiredException`, `HoldAlreadySettledException` | caught as a set in `PaymentSettlementService` (ADR-053) |
 | `InsufficientStockException`, `InventoryUnavailableException` | the pair ADR-004 exists to keep apart — "pick another tier" is not "we cannot see our own inventory" |
 
 `FlashSeatsException`'s constructors become public. **The wire format is byte-identical**, so the

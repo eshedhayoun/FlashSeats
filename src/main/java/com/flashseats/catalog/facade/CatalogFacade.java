@@ -4,15 +4,12 @@ import java.util.List;
 import java.util.Map;
 
 /**
- * The only legal way into {@code catalog} from another module.
+ * The only way into {@code catalog} from another module. Callers: {@code hold} (tier, price,
+ * window, inventory movement), {@code queue} (window and remaining stock), {@code order} (pricing,
+ * rebuild) and {@code saleflow}. {@code catalog} depends on nothing, so every edge is acyclic.
  *
- * <p>Callers: {@code hold} (tier validity, price, window, and the inventory movement),
- * {@code queue} (window gate and remaining stock — ADR-031), {@code order} (server-side pricing),
- * {@code saleflow} (rehydration). {@code catalog} itself depends on nothing, so every one of those
- * edges is acyclic.
- *
- * <p>Per global standards §5 no method here opens a transaction of its own; the two mutating methods
- * <em>require</em> one, so the caller's boundary governs.
+ * <p>No method opens its own transaction (global standards §5). {@link #tryReserve} and
+ * {@link #restore} are Redis writes and must be called <strong>outside</strong> one (ADR-046).
  */
 public interface CatalogFacade {
 
@@ -51,10 +48,8 @@ public interface CatalogFacade {
     /**
      * Total remaining across every tier of an event. Bounds how many buyers the queue admits.
      *
-     * @return remaining seats, or {@link #COUNTER_UNAVAILABLE} when <em>any</em> tier of the event
-     *     has no counter. That is a <strong>fault</strong> and must never be read as a sold-out
-     *     sale: doing so drained an entire waiting room in the first pass, because a {@code SUM}
-     *     over missing rows is indistinguishable from zero (ADR-035).
+     * @return remaining seats, or {@link #COUNTER_UNAVAILABLE} when <em>any</em> tier has no counter:
+     *     a <strong>fault</strong>, never a sold-out sale (ADR-035)
      */
     int getRemainingForEvent(long eventId);
 
@@ -67,16 +62,9 @@ public interface CatalogFacade {
     List<TierAvailability> getTierAvailability(long eventId);
 
     /**
-     * Atomically takes seats from a tier.
-     *
-     * <p><strong>Must not be called inside a SQL transaction.</strong> This is a Redis write, and
-     * Redis does not roll back — a decrement inside a transaction that then fails would leak the
-     * seats permanently (ADR-023). The caller records the hold that justifies it immediately
-     * afterwards and compensates with {@link #restore} if that record cannot be written.
-     *
-     * <p>It used to be the opposite: the decrement was a SQL {@code UPDATE} and
-     * {@code Propagation.MANDATORY} bound it to the caller's transaction so the two rolled back
-     * together. That coupling no longer exists and the annotation would now be a lie about it.
+     * Atomically takes seats from a tier. <strong>Must not be called inside a SQL transaction</strong>:
+     * it is a Redis write that cannot roll back (ADR-023, ADR-046). The caller writes the hold that
+     * justifies it immediately afterwards, and {@link #restore}s only on a definite rejection.
      */
     ReserveResult tryReserve(long eventId, long tierId, int quantity);
 

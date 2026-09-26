@@ -8,24 +8,13 @@ import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
 
 /**
- * Gives money back when the seats could not be delivered (ADR-012).
+ * Gives money back when the seats could not be delivered (ADR-012). Reached from
+ * {@link CheckoutService} (the commit failed after the charge) and {@link PaymentSettlementService}
+ * (a webhook for a hold already gone): one compensation, two triggers.
  *
- * <p>Two callers reach this, and they are the two halves of the same failure. {@link CheckoutService}
- * gets here when the charge settled and the commit then failed — typically a concurrent expiry won
- * the seats. {@link PaymentSettlementService} gets here when a webhook arrives for a hold that is
- * already gone. Same compensation, same outcome for the buyer; only the trigger differs, which is
- * why it lives in one place rather than being written twice.
- *
- * <p>Not {@code @Transactional} and it must not become so: it makes a network call to the provider
- * (ADR-023). {@link OrderCommitService#markRefunded} owns the transaction that follows.
- *
- * <p><strong>A failed refund is not recorded as a refund.</strong> The earlier version of this path
- * discarded {@link RefundResult} entirely, so a provider that refused the refund still produced an
- * order marked {@code REFUNDED} and an email telling the buyer their money was on its way. That is
- * money this business is holding and should not be, described to the only person who would notice as
- * already returned. The order is still moved to {@code REFUNDED} — the seats really are gone and no
- * other state is truer — but the failure is written into {@code failure_reason} and counted, so it
- * surfaces as something a human has to settle rather than as silence.
+ * <p>Not {@code @Transactional}: it calls the provider (ADR-023). A refused refund is still recorded
+ * as {@code REFUNDED}, since the seats are gone, but the failure is written to {@code failure_reason}
+ * and counted, so money we still hold surfaces for a human rather than being described as returned.
  */
 @Slf4j
 @Service

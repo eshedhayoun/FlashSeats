@@ -97,7 +97,7 @@ onto a page by accident.
 
 | Gap | Detail |
 | :--- | :--- |
-| **`POST /session/reset` is unauthenticated, with no CSRF token** | It discards the caller's `fsid`, which *is* their queue position and their authority over their hold. A cross-site `POST` can therefore throw a visitor out of a line they were waiting in — a nuisance, not a disclosure, and recorded in `06-mvp-overview.md` §10. It exists for the bundled demo page; a real client has no reason to call it |
+| **`POST /session/reset` is unauthenticated** | It discards the caller's `fsid`, which *is* their queue position and their authority over their hold. It accepts **only `application/json`** (ADR-060), which a cross-site form cannot send, so the CSRF route to it is closed (`06-mvp-overview.md` §10 S13). Any page on the same origin can still call it — it exists for the bundled demo page, and a real client has no reason to |
 
 ---
 

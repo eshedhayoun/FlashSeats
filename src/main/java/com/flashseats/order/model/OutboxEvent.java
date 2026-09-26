@@ -16,16 +16,9 @@ import org.hibernate.annotations.JdbcTypeCode;
 import org.hibernate.type.SqlTypes;
 
 /**
- * A fulfilment message, written <strong>inside the same transaction as the order it describes</strong>.
- *
- * <p>That is the entire value of the pattern: a confirmed order without queued fulfilment is
- * impossible, because the two either commit together or not at all. Publishing directly to a broker
- * from the transaction would trade this guarantee for a race — and would hold row locks across a
- * network call besides.
- *
- * <p>The payload is a <strong>complete, self-contained snapshot</strong> (ADR-015). The consumer
- * calls no facade and knows nothing about {@code catalog}; everything it needs to render a ticket is
- * in here.
+ * A fulfilment message, written <strong>in the same transaction as its order</strong>, so a
+ * confirmed order without queued fulfilment cannot exist. The payload is a complete snapshot
+ * (ADR-015).
  */
 @Entity
 @Table(name = "outbox_events")

@@ -3,10 +3,10 @@ package com.flashseats.payment;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.awaitility.Awaitility.await;
 
-import com.flashseats.flashseats.support.BuyerSession;
-import com.flashseats.flashseats.support.IntegrationTest;
-import com.flashseats.flashseats.support.SaleFixture;
-import com.flashseats.flashseats.support.StripeWebhooks;
+import com.flashseats.app.support.BuyerSession;
+import com.flashseats.app.support.IntegrationTest;
+import com.flashseats.app.support.SaleFixture;
+import com.flashseats.app.support.StripeWebhooks;
 import java.time.Duration;
 import java.util.Map;
 import java.util.UUID;

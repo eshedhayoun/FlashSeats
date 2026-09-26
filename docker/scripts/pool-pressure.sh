@@ -70,11 +70,22 @@ if [[ -z "$ADMIN_PASS" ]]; then
     exit 1
 fi
 
+# `docker.exe` exists only on Windows. Hardcoding it here — as this script did —
+# does not fail loudly on macOS or Linux: read_gauge swallows the error, every
+# gauge prints "-", and the run finishes reporting worst-pending 0 and PASS having
+# measured NOTHING. That is this script's own header ("an instrument that measures
+# the wrong thing is worse than no instrument") coming true in the instrument.
+# sold-count.sh and hold-expiry-check.sh already detect it; so does this now.
+DOCKER_CLI="docker"
+if command -v docker.exe >/dev/null 2>&1; then
+    DOCKER_CLI="docker.exe"
+fi
+
 # Reads one gauge from one replica, from INSIDE the compose network — these
 # ports are not published, and going through nginx would defeat the purpose.
 read_gauge() {
     local replica="$1" metric="$2"
-    docker.exe compose exec -T "$replica" sh -c \
+    "$DOCKER_CLI" compose exec -T "$replica" sh -c \
         "curl -fsS -u '${ADMIN_USER}:${ADMIN_PASS}' 'http://localhost:8080/actuator/metrics/${metric}'" \
         < /dev/null \
         2>/dev/null | tr ',' '\n' | grep -A1 '"VALUE"' | grep '"value"' \
@@ -96,7 +107,23 @@ SAMPLES=0
 # authority, which reads the ledger — reported `sold + held + redis == capacity`
 # on every tier. An instrument that measures the wrong thing is worse than no
 # instrument, because its answer is specific (ADR-047).
-declare -A DRIFT_RUN=()
+# "Sustained" means the SAME replica drifted on two CONSECUTIVE sweeps, so all
+# this needs to remember is which replicas drifted on the previous one. A space-
+# delimited list says that directly, and — unlike the associative array this
+# replaced — runs on the bash macOS actually ships. `declare -A` is bash 4; macOS
+# is still on 3.2, so the instrument this drill depends on exited immediately with
+# `declare: -A: invalid option` on any stock Mac.
+#
+# And "consecutive" is measured in COMPUTATIONS, not in samples. The gauge is
+# recomputed every flashseats.order.drift-interval-ms (60 s by default), while
+# this script reaches a replica every 5-25 s depending on load. Two samples inside
+# one interval read the SAME computation twice. In Pass 13's 2,000-VU run that
+# reported a sustained drift of 13 on app-3 from two reads 24 s apart. The next
+# computation read 0.0, and sold-count.sh found the ledger exact on every tier.
+# So a replica's drift is sustained only when it is still non-zero at least one
+# drift interval after it was first seen, with no zero reading in between.
+DRIFT_INTERVAL="${DRIFT_INTERVAL_SECONDS:-60}"
+DRIFT_SINCE=""          # space-delimited "replica:epoch" -- bash 3.2 has no maps
 SUSTAINED_DRIFT=0
 TRANSIENT_DRIFT=0
 
@@ -129,16 +156,28 @@ while [[ $(date +%s) -lt $DEADLINE ]]; do
         fi
         if [[ "$DRIFT" != "-" && "${DRIFT%%.*}" -ne 0 ]]; then
             SAW_DRIFT=1
-            DRIFT_RUN[$replica]=$(( ${DRIFT_RUN[$replica]:-0} + 1 ))
-            if [[ "${DRIFT_RUN[$replica]}" -ge 2 ]]; then
-                SUSTAINED_DRIFT=1
-                FLAG="  <-- DRIFT, SUSTAINED — this is a correctness failure"
-            else
+            NOW="$(date +%s)"
+            SINCE=""
+            for entry in $DRIFT_SINCE; do
+                [[ "${entry%%:*}" == "$replica" ]] && SINCE="${entry#*:}"
+            done
+            if [[ -z "$SINCE" ]]; then
+                DRIFT_SINCE="$DRIFT_SINCE $replica:$NOW"
                 TRANSIENT_DRIFT=$((TRANSIENT_DRIFT + 1))
-                FLAG="  <-- drift on one sample; transient unless the next one repeats"
+                FLAG="  <-- drift on one computation; transient unless the next one repeats"
+            elif [[ $((NOW - SINCE)) -ge "$DRIFT_INTERVAL" ]]; then
+                SUSTAINED_DRIFT=1
+                FLAG="  <-- DRIFT, SUSTAINED across computations — a correctness failure"
+            else
+                FLAG="  <-- same drift computation as before ($((NOW - SINCE))s < ${DRIFT_INTERVAL}s); not a second reading"
             fi
         elif [[ "$DRIFT" != "-" ]]; then
-            DRIFT_RUN[$replica]=0
+            # A zero reading clears it. An unreadable one ("-") proves nothing either way.
+            KEPT=""
+            for entry in $DRIFT_SINCE; do
+                [[ "${entry%%:*}" != "$replica" ]] && KEPT="$KEPT $entry"
+            done
+            DRIFT_SINCE="$KEPT"
         fi
         [[ "$MISSING" != "-" && "${MISSING%%.*}" -ne 0 ]] && SAW_MISSING=1
 
@@ -163,9 +202,10 @@ if [[ "$SAW_MISSING" -eq 1 ]]; then
 fi
 
 if [[ "$SUSTAINED_DRIFT" -eq 1 ]]; then
-    echo "  FAIL  flashseats_stock_drift was non-zero on CONSECUTIVE samples for one"
-    echo "        replica. Invariant 1 is broken: confirmed + held + remaining no"
-    echo "        longer equals capacity. Read this as a correctness failure, not a"
+    echo "  FAIL  flashseats_stock_drift was non-zero on one replica for at least"
+    echo "        ${DRIFT_INTERVAL}s -- two separate computations, not one read twice."
+    echo "        Invariant 1 is broken: confirmed + held + remaining no longer equals"
+    echo "        capacity. Read this as a correctness failure, not a"
     echo "        capacity one (ADR-046)."
     exit 1
 fi

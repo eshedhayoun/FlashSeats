@@ -3,27 +3,12 @@ package com.flashseats.shared.error;
 import org.springframework.http.HttpStatus;
 
 /**
- * The canonical error-code registry (global standards §2).
+ * The canonical error-code registry (global standards §2). These values are <strong>stable API
+ * contract</strong>: the SPA switches on {@code code}, so renaming one is a breaking change. Each
+ * constant carries its HTTP status, and the RFC 7807 {@code type} URI is derived from the name.
  *
- * <p>These values are <strong>stable API contract</strong> — the SPA switches on {@code code}, never
- * on {@code detail} or status alone. Renaming one is a breaking change.
- *
- * <p>Each constant carries its HTTP status, and the RFC 7807 {@code type} URI is derived from the
- * constant name rather than hand-written, so a typo cannot silently disagree with the registry.
- *
- * <p><strong>Reachability is checked in both directions.</strong> Six codes were unreachable and
- * were removed; a code is added when the path that raises it is, not before. An unreachable code is
- * dead contract — a client writes a branch for a response the server can never send.
- *
- * <p>One exception survives deliberately: {@code BOT_VERIFICATION_FAILED} has a type but no throw
- * site, because bot defence fails open and there is no challenge provider yet (ADR-011, ADR-055).
- * {@code FE_SPEC.md} §2 tells clients so explicitly rather than letting them guess.
- *
- * <p>Four others were removed in the same pass and <strong>came straight back</strong> when the real
- * gateway, the webhook and the IP-rule surface landed: {@code PAYMENT_ACTION_REQUIRED},
- * {@code WEBHOOK_SIGNATURE_INVALID}, {@code BOT_VERIFICATION_FAILED} and {@code IP_BLOCKED}. That is
- * the rule working in both directions rather than a mistake — but it is also the reason to delete a
- * code only when its feature is genuinely not being built, rather than merely not built yet.
+ * <p>Reachability is checked both ways: a code is added with the path that raises it, and removed
+ * only when its feature is genuinely not being built.
  */
 public enum ErrorCode {
 
@@ -32,6 +17,12 @@ public enum ErrorCode {
     VALIDATION_FAILED(HttpStatus.BAD_REQUEST),
     /** Anything unhandled. Carries a traceId and never any internal detail. */
     INTERNAL_ERROR(HttpStatus.INTERNAL_SERVER_ERROR),
+    /**
+     * Back-pressure, not a fault: no database connection became free inside
+     * {@code connection-timeout} (ADR-059). Carries {@code retryAfterSeconds} and a
+     * {@code Retry-After} header. Checkout is find-or-create, so re-POSTing the same body is safe.
+     */
+    SERVICE_BUSY(HttpStatus.SERVICE_UNAVAILABLE),
 
     // --- bot ----------------------------------------------------------------
     RATE_LIMITED(HttpStatus.TOO_MANY_REQUESTS),

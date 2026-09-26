@@ -110,11 +110,18 @@ are an oversell nothing recovers.
 
 ---
 
-## 5. The restart guard
+## 5. The restart guard — and the failover guard, which is the same guard
 
 Redis AOF is `appendfsync everysec`, so a restart replays to about a second ago: the `DECRBY`s in
 that second are gone while the `ticket_holds` rows they paid for remain. **The counters come back
 high**, which is the one direction that oversells.
+
+**A Sentinel failover is the same event, and it is now reachable.** The `cluster` profile runs a
+primary with two replicas and three sentinels (ADR-058). A promoted replica is a *different process*
+with a different `run_id` and is a second or so behind, so a failover distrusts **every managed
+event at once** and refuses holds until each is rebuilt. Failover keeps the cluster up and stops the
+sale; that is the trade ADR-046 chose deliberately, because the alternative is selling from counters
+that read high. The recovery is `POST /admin/events/{id}/rebuild-stock`, per event.
 
 `catalog:vouch:{e}` records which Redis `run_id` last derived this event's counters from scratch. A
 mismatch means selling is refused for that event until a rebuild runs.

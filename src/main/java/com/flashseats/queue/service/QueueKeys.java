@@ -1,5 +1,9 @@
 package com.flashseats.queue.service;
 
+import java.time.Duration;
+import java.time.Instant;
+import org.springframework.data.redis.core.StringRedisTemplate;
+
 /**
  * Every Redis key this module owns, formatted in one place.
  *
@@ -84,32 +88,36 @@ public final class QueueKeys {
     }
 
     /**
-     * The cluster-wide admission allowance for one promotion interval (ADR-049).
-     *
-     * <p><strong>The one key here that is deliberately not scoped by event.</strong> ADR-036's rule
-     * is about per-buyer keys — one visitor in two concurrent sales must not have one sale's state
-     * overwrite the other's — and this is the opposite kind of thing: a single counter that every
-     * sale and every replica is meant to share. Scoping it by event would reproduce exactly the
-     * per-sale accounting ADR-049 exists to replace.
-     *
-     * <p>It carries no window suffix either: its own TTL is the window, so the replicas need not
-     * agree about the time.
+     * The cluster-wide admission allowance for one promotion interval (ADR-049). It is the one key
+     * deliberately not scoped by event: every sale shares it. Its own TTL is the window, so replicas
+     * need not agree on the time.
      */
     public static String admissionBudget() {
         return "queue:budget";
     }
 
     /**
-     * Marker that this event's stock is gone and nobody holds a claim on it.
-     *
-     * <p>Set by the promotion worker and <strong>deleted again the moment stock returns</strong>, so
-     * {@code EXHAUSTED} is a state derived from live inventory rather than an irreversible act
-     * (ADR-035). The earlier design expressed exhaustion by deleting the waiting set, which cannot
-     * be undone — and a released hold or a rebuilt counter routinely makes it wrong.
-     *
-     * <p>It also makes the terminal frame publish once instead of on every tick.
+     * Marker that this event's stock is gone and nobody holds a claim on it. Deleted again the moment
+     * stock returns, so {@code EXHAUSTED} is derived, never an irreversible act (ADR-035). It also makes
+     * the terminal frame publish once.
      */
     public static String exhausted(long eventId) {
         return "queue:exhausted:" + eventId;
+    }
+
+    /**
+     * Sets {@code key} to expire {@code retentionSeconds} after the sale ends (ADR-036).
+     *
+     * <p>Every queue key expires and none is deleted by the application: deleting a live waiting room
+     * cannot be undone, and Redis runs {@code noeviction}, so a key with no TTL is a leak nothing
+     * else cleans up. Idempotent; the promotion tick refreshes it every second. A sale already past
+     * the retention window sets nothing, because Redis reads a non-positive TTL as "delete now".
+     */
+    static void expireWithSale(
+            StringRedisTemplate redis, String key, Instant now, Instant saleEndTime, long retentionSeconds) {
+        Duration ttl = Duration.between(now, saleEndTime.plusSeconds(retentionSeconds));
+        if (ttl.isPositive()) {
+            redis.expire(key, ttl);
+        }
     }
 }

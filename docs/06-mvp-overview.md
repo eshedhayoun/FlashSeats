@@ -111,12 +111,12 @@ it, so if anything fails the hold returns to `ACTIVE` and expires normally.
 | Module | Ships now | Deferred |
 | :--- | :--- | :--- |
 | `shared` | `ErrorCode` (42 codes), `ProblemDetails`, one global advice, `SessionId`, `Money`, `Clock`, `SignedToken`, `TraceIdFilter` | — |
-| `bot` | Redis-backed Bucket4j session + IP buckets (SSE **counted once**, not exempt); reCAPTCHA v3 on join, failing open; cached `ip_rules`; async `bot_audit_logs`; operator surface | Rate-limit **metrics**; CIDR ranges; audit retention. The `fsid` cookie moved to `shared` in Pass 7 |
+| `bot` | Redis-backed Bucket4j session + IP buckets (SSE **counted once**, not exempt); reCAPTCHA v3 on join, failing open behind its own circuit breaker; cached `ip_rules`; async `bot_audit_logs`; operator surface; **`flashseats.bot.refusals{outcome}`** | CIDR ranges; audit retention. The `fsid` cookie moved to `shared` in Pass 7 |
 | `catalog` | Events, tiers, window derivation, metadata cache, `serverTime`, bucketed availability, **Redis counters + Lua, the `-2` fault path, pre-warm, pause/resume, the Redis-restart guard** | create-event endpoint, `TierAvailabilityChangedEvent` |
-| `queue` | `ZADD NX` join, `FIFO`/`RANDOM` ordering, SSE with heartbeats, HMAC passes, admission sessions, promotion worker, **pub/sub fan-out**, measured drain-rate estimates, `tier-availability` frame | `Last-Event-ID` replay |
+| `queue` | `ZADD NX` join, `FIFO`/`RANDOM` ordering, SSE with heartbeats, HMAC passes, admission sessions, promotion worker, **pub/sub fan-out**, measured drain-rate estimates, `tier-availability` frame, **`Last-Event-ID` replay of broadcast frames** | per-event queue metrics |
 | `hold` | `ticket_holds` authority, the settle-once claim, atomic reserve **with compensation**, **after-commit restore**, bounded grace, sweeper, all three endpoints, `hold:{token}` Redis timers and the keyspace listener | — |
-| `payment` | Real `PaymentFacade`, `payment_transactions`, three idempotency layers, stub gateway behind the final interface | Stripe, webhooks, 3-D Secure, Resilience4j |
-| `order` | Full orchestration, find-or-create, server-side pricing, receipt tokens, outbox relay with `SKIP LOCKED`, compensating refund, **the stock rebuild and the drift gauge** | `PaymentSettledEvent` listener, `/checkout/resume` |
+| `payment` | Real `PaymentFacade`, `payment_transactions`, three idempotency layers, **Stripe behind the same seam, the webhook receiver, 3-D Secure, a hand-declared circuit breaker**, stub gateway as the default | — |
+| `order` | Full orchestration, find-or-create, server-side pricing, receipt tokens, outbox relay with `SKIP LOCKED`, compensating refund, **the stock rebuild, the drift gauge and the `PaymentSettledEvent` listener** | — (there is deliberately no `/checkout/resume`; re-POSTing is the retry, ADR-054) |
 | `notification` | Rabbit topology + DLX, insert-then-send consumers, PDFBox tickets, HTML email, refund notices, Mailpit | Failure classification |
 | `saleflow` | `GET /sale/{id}/state`, failing soft per section | — |
 
@@ -212,9 +212,11 @@ Findings that cost real time and would cost it again.
 ## 8. Verification
 
 ```bash
-./mvnw test        # 112 tests: unit, modularity, concurrency, journey, recovery, queue lifecycle,
+./mvnw test        # 228 tests: unit, modularity, concurrency, journey, recovery, queue lifecycle,
                    #             pre-warm, stock rebuild, drift, Redis-restart guard, the metadata
-                   #             cache's five rules, and the cluster admission allowance
+                   #             cache's five rules, the cluster admission allowance, payment and
+                   #             webhooks, bot defence, and fulfilment through a real broker.
+                   #             Green in alphabetical, reverse and filesystem order (ADR-061)
 ```
 
 | Test | What it proves |
@@ -228,6 +230,9 @@ Findings that cost real time and would cost it again.
 | `CheckoutRecoveryIT` | A gateway outage keeps the seats **and** the ability to pay for them; it costs none of the three card attempts; a charge genuinely in flight is still refused; an order stranded by a crash resumes once no charge can still be running. |
 | `QueueLifecycleIT` | An un-warmed event pauses promotion rather than selling out; a closed sale ends the wait instead of freezing it; a pass for one sale is never offered to another; exhaustion reverses when seats return. |
 | `NotificationClaimIT` | The claim blocks a duplicate, is terminal once sent, and releases a dead letter for replay. |
+| `NotificationListenerIT` | **Fulfilment through a real RabbitMQ and both real listeners**, the one thing the test profile's `notification.enabled=false` had left unexercised. One ticket per order even when the message is redelivered; a malformed message or a failed send goes to the DLQ after **one** attempt (ADR-029); a replay after the outage sends exactly once (ADR-038); and mail that was sent but not recorded stays `SENT`, so a replay cannot send a second ticket (ADR-042). Checked by mutation: removing that guard fails the test. |
+| `BackPressureResponseTest` | A HikariCP timeout is `503 SERVICE_BUSY` with `Retry-After`; any other transaction failure is still `500` (ADR-059). |
+| `SessionResetIT` | `POST /session/reset` refuses form and `text/plain` bodies with `415` and expires nothing; a JSON POST still works (ADR-060). |
 | `CatalogAvailabilityIT` | A tier with no counter reads `UNKNOWN`, a drained tier still reads `SOLD_OUT`, and the two are never the same answer (ADR-040). |
 | `ProblemResponseIT` | Spring's own binding failures are `400` with a registry `code`, not `500` (ADR-041). |
 | `RemainingForEventTest` | "Nothing known" is never "nothing left", at the method every admission decision reads: no tiers, a missing counter, genuinely drained and live are four distinct answers (ADR-004, ADR-035, ADR-040). |
@@ -258,14 +263,17 @@ Honest list. None of these is hidden behind a passing test.
   them, while each sits at **114–142 % of one core** with a 2,000-VU k6 competing for the same ten.
   2,000 VUs is still the ceiling here, but a 32 GB machine would not move it — a machine where the
   load generator is not sharing cores with the system under test would.
-- **Checkout p99 is 682 ms at 300 VUs on one sale, 6.4 s at 300 VUs across five — 9.3 s before
-  Pass 9's review removed a checkout transaction — and ~30–45 s at
-  2,000 VUs across five** — against a 200 ms exit criterion. The 2,000-VU figures are the host: ten
-  cores shared between three JVMs and the load generator, with `connections_pending` peaking at 10 of 90
-  in the run that sold 76 % of capacity. **The 300-VU five-sale number is the real open one**: 682 ms →
-  9.3 s for the same VU count spread over five sales is a 13× cost that the pool does not explain, and
-  finding what does is the next latency question. It needs a host where k6 is not competing for cores.
-- **A pool timeout surfaces to a buyer as `500 INTERNAL_ERROR` mid-checkout.** Not seen in the runs that
+- **Checkout p99 meets the 200 ms criterion up to about 600 VUs across five sales, on this
+  laptop.** The Pass 13 sweep (§11) measured 145 ms at 600, 201 ms at 300 VUs across *ten* sales,
+  207 ms at 1,000 across five, and 6.1 s at 2,000. Each is a single run with visible variance.
+  **The limit is host CPU, not the pool**: `hikaricp_connections_pending` was 0 on every sample of
+  every run, while the three replicas and k6 took all ten cores. The earlier five-sale figures —
+  9.3 s, 6.4 s and 4.8 s — were measured with other work on the same machine. Finding the pool's
+  own edge needs a host where the load generator is not competing with the system under test.
+- ~~**A pool timeout surfaces to a buyer as `500 INTERNAL_ERROR` mid-checkout.**~~ **Fixed (Pass 13,
+  ADR-059):** it is now `503 SERVICE_BUSY` with `Retry-After: 1`, classified by HikariCP's own
+  `SQLTransientConnectionException` in the cause chain so a database that is genuinely down still
+  answers `500`. The original finding, kept for the record: not seen in the runs that
   sell out — `pending` stays at zero there — but with `connection-timeout=3000`, CPU starvation produced
   1,218 of them across three replicas in the 2,000-VU run; one order was left `FAILED`. The compensation held — that tier's `sold + held + redis` was still
   exactly 500, so no seats were stranded — and a buyer's documented recovery (re-POST the same body)
@@ -375,6 +383,61 @@ Honest list. None of these is hidden behind a passing test.
 - **The operator surface is curl-only.** ADR-043 calls it a correctness dependency; one that can only
   be driven by hand-written Basic-auth curl during an incident is half-built.
 
+**Found in Pass 11, reading the frontend merge (PR #16):**
+
+- ~~**`./mvnw test` does not pass in the default order.**~~ **Fixed, root cause found (Pass 13,
+  ADR-061).** The symptom was that, in some class orders, every `/queue` request in the shared test
+  context answered a bare `500` (`timestamp/status/error/path`, no registry `code`). Pass 12 ruled
+  out everything inside the application. The cause was outside it: **Spring Framework 7 pauses a
+  cached test context whenever a test class switches to a different context**, and restarts it when
+  a later class uses it again. The contexts that `BotDefenceIT` and `RecaptchaFailOpenIT` create
+  caused that switch. Adding `NotificationListenerIT`, a third such context, turned "needs most of the
+  suite" into a three-class reproduction: `HoldLifecycleIT` → `NotificationListenerIT` →
+  `CheckoutRecoveryIT`. A temporary highest-precedence servlet filter then showed that the failing
+  requests **never reached the resumed context's filter chain**, which matches Pass 12's finding
+  that `GlobalExceptionHandler` never saw them. `spring.test.context.cache.pause=never` in
+  `src/test/resources/spring.properties` fixes the reproduction. The full suite is green in
+  `alphabetical`, `reversealphabetical` and `filesystem` order. The pom keeps `alphabetical` pinned,
+  now only for a stable order. **Not established:** *why* a resumed context's embedded Tomcat
+  answers without running its filters. The fix does not depend on the answer, and it is recorded
+  as open in ADR-061.
+- ~~**Replicas were OOM-killed at 2,000 VUs.**~~ **Fixed (Pass 13, ADR-062).** No container memory
+  limit meant each JVM sized its heap against the whole Docker VM, so at 2,000 VUs the VM's kernel
+  killed three of them mid-sale. Seats in flight were under-counted, never oversold, and a rebuild
+  recovered them exactly (§11). Now each replica has a 1.5 GiB limit, and G1 and
+  `ExitOnOutOfMemoryError` are set explicitly. The same load then ran with zero restarts.
+- **An app replica can keep writing to a Redis node that Sentinel demoted while it was still up.**
+  Found in Pass 13 when rebuilding the cluster for the drill. The Pass 12 failover check had left
+  `redis-replica-2` as primary, and that state lives in the sentinel volumes, so it survives
+  `docker compose down`. On the next `up`, `redis` briefly started as a primary, the app replicas
+  connected to it, and Sentinel then made it a replica again. Lettuce looks up the primary through
+  Sentinel only when it opens a connection, and Redis does not close clients when a node becomes a
+  replica. So every write failed with `READONLY`, and every request answered a bare `500`: the rate
+  limiter's filter writes to Redis before Spring MVC is reached. Nothing sold, and nothing
+  oversold, because every Redis write failed. That is the fail-safe direction, but it is a total
+  outage. `docker compose --profile cluster restart app-1 app-2 app-3` recovers it, and so does
+  wiping the sentinel volumes. A real failover, where the old primary actually goes *down*, drops
+  the connections and does not hit this, which matches Pass 12's result. **Not fixed.** The fix
+  would be a Lettuce topology refresh or a reconnect on `READONLY`, and it deserves its own test on
+  the cluster profile.
+- ~~**SSE reconnect replay never fired.**~~ **Fixed** (ADR-058). Live frames carried a
+  per-connection `"local-N"` id, retained frames carried a Redis sequence, and the replay parsed the
+  header as a number — so the normal case, where the last frame received was a two-second position
+  update, replayed nothing. Only replayable frames carry an `id` now.
+- ~~**The replay log retained promotion frames, and they carry a `passToken`.**~~ **Fixed**
+  (ADR-058). A single-use 120 s capability was being written into a per-event ZSET that outlives the
+  sale. Broadcasts only are retained; a promoted buyer's reconnect re-reads the live pass instead.
+- ~~**The SPA could not start without a Stripe publishable key**~~ — while the backend defaults to
+  the stub gateway, so the configuration everyone actually runs was the one the client could not
+  drive. **Fixed** (ADR-058): no key means stub mode, with the stub's magic tokens offered in the UI.
+- **The committed `node_modules` was not a working install.** Beyond the 57 MB, git had dropped the
+  `.bin` exec bits and at least one package file (`vite/dist/node/module-runner.js`), so `npm test`
+  failed on a fresh clone with a module-not-found error. `rm -rf node_modules && npm install` is the
+  fix, and the directory is untracked now.
+- **The SPA is dev-only.** `npm run dev` on `:5173` proxying to `:8080`. There is no compose service
+  and nginx serves no static root, so the cluster still serves the demo client at
+  `src/main/resources/static`. Wiring it is a separate stage (ADR-058).
+
 ---
 
 ## 10. Security posture
@@ -382,7 +445,7 @@ Honest list. None of these is hidden behind a passing test.
 **This MVP is not production-ready, and the gaps are deliberate rather than overlooked.** Everything
 below is a real exposure someone should close before real money moves through it.
 
-### Closed in Pass 1
+### Closed in Pass 1 (and later)
 
 | # | Was | Now |
 | :-- | :--- | :--- |
@@ -391,6 +454,7 @@ below is a real exposure someone should close before real money moves through it
 | S3 | **`Secure` cookie defaults to false** | Now `${FLASHSEATS_COOKIE_SECURE:false}`, so it is set per environment rather than edited in a properties file. The default stays `false` because a `Secure` cookie is silently dropped over `http://localhost` and would break every local session |
 | S4 | **Receipt tokens never expire** and were `sign(orderNumber)` — deterministic, so derivable by counting against sequential order numbers | Payload is `orderNumber:expiry:nonce`, mirroring `QueueTokens`. Default lifetime 90 days (`flashseats.order.receipt-token-ttl-days`) |
 | S11 | **`X-Forwarded-For` trusted from any client** — anyone could rotate a fake address for unlimited fresh IP buckets, or poison a real one. With the session bucket already free to mint, this left *no* effective rate limit for a cookie-less caller | Honoured only from a peer in `flashseats.bot.trusted-proxies`, **empty by default** (ADR-039) |
+| S13 | **`POST /session/reset` discarded the caller's identity on a cross-site form post** — under S6 a hidden form on any site could throw a waiting buyer out of the queue and cut them off from their live hold | **Closed in Pass 13** (ADR-060): the endpoint `consumes` `application/json` only. A form can send only `urlencoded`/`multipart`/`text/plain`, and a cross-origin JSON `fetch` needs a preflight nothing grants, so anything else is `415` and expires nothing. The demo page already sent JSON; kept on every profile because the cluster serves that page. **S6 itself is unchanged** for the other mutating endpoints |
 
 ### Must fix before any deployment
 
@@ -404,7 +468,6 @@ below is a real exposure someone should close before real money moves through it
 | :-- | :--- | :--- |
 | S5 | **Session identity is free to mint** | The rate limiter's primary bucket is per-`fsid`, and anyone can discard a cookie to get a fresh one. The IP bucket is therefore the only real backstop — and it is deliberately loose (300 burst) so NAT populations are not blocked. This is the ADR-011 trade working as designed, but it means **the session bucket does not constrain a determined attacker at all.** Pass 1 made the IP bucket real (S11). **Pass 9 built the compensating control** — reCAPTCHA v3 on join, failing open, plus `ip_rules` for the manual case (ADR-055). **It is off by default**, because `flashseats.bot.recaptcha.secret` is blank in a clean checkout, so this closes only where someone sets the secret. ADR-044's verified accounts remain the other route: an account costs something to mint, a discarded cookie costs nothing. |
 | S6 | **CSRF is disabled while a cookie authorises actions** | Justified for a stateless JSON API, and the checkout path is safe because it needs a `holdToken` an attacker cannot guess. But a cross-site `POST /queue/join` or `POST /holds` *would* succeed against a logged-in visitor and could be used to consume their one-hold-per-event allowance. Low impact, non-zero. Require a custom header, or re-enable CSRF for the mutating endpoints. |
-| S13 | **`POST /api/v1/session/reset` discards the caller's identity, unauthenticated** | A demo affordance: it expires the `fsid` cookie so the bundled page can start over as a new visitor. Under S6 a cross-site `POST` therefore throws a visitor out of a queue they were waiting in and cuts them off from their own live hold — no disclosure, but during a flash sale it is the most damaging thing on the CSRF list, because the session *is* the queue position. Scope it to the demo profile, or make it a `DELETE` that requires a header a form post cannot send. |
 | S7 | **Order numbers are sequential** | `TK-00001`, `TK-00002`. Access is properly controlled, so this is not an IDOR — but it publishes exact sales volume to anyone who buys one ticket. It was worse in combination with S4: a deterministic receipt token over a countable order number meant one leaked secret enumerated every buyer's email. The nonce closes that; the volume leak remains. Prefer a non-sequential public reference. |
 | S8 | **SSE connections are uncapped per session** | The stream is exempt from per-request rate accounting (correctly — it is one connection, not a request stream), and nothing limits how many a single session opens. A few thousand connections would exhaust the container. Cap concurrent streams per session and per IP. |
 | S9 | **PII is stored and logged in clear** | `orders.user_email` and `notification_logs.recipient_email` are plaintext, with no retention policy and no deletion path. Whatever regime applies, decide it explicitly. |
@@ -499,14 +562,23 @@ to run, and would have rate-limited its own load harness to nothing.
 
 **Carried forward, deliberately:**
 
-- **Redis Sentinel**, deferred in ADR-047. No exit criterion needs failover, and it works against the
-  Redis-restart criterion, which is cleanest against a standalone instance that simply stops.
+- ~~**Redis Sentinel**, deferred in ADR-047.~~ **Built in Pass 11** (ADR-058): one primary, two
+  replicas, three sentinels in the `cluster` profile, with `sentinel-failover-check.sh` proving
+  promotion and rejoin. **The topology is proven and the inventory half is not** — a failover changes
+  Redis's `run_id`, so `StockEpoch` distrusts every managed event and the sale stops until an
+  operator rebuilds. That is ADR-046 working as designed, and it is untested end to end.
+  **No capacity number in this document has been re-measured through Sentinel.**
 - **The 10,000-VU run and the p99 number.** Both need a host where the load generator is not
   competing with the system under test; see §9.
 - ~~The `hold:{token}` timer and the `__keyevent@0__:expired` listener.~~ **Built in Stage 4**, and
   proven on the rig Stage 3 left behind: restored exactly once, in 339 ms, across three replicas.
-- The rest of the metric set and its alarms: `outbox.lag.seconds`, `dlq.depth`,
-  `queue.promotion.rate`, `payment.decline.ratio`, `jvm.threads.pinned`. `stock.drift` and
+- ~~The rest of the metric set and its alarms: `outbox.lag.seconds`, `dlq.depth`,
+  `queue.promotion.rate`, `payment.decline.ratio`, `jvm.threads.pinned`.~~ **Mostly built in
+  Pass 11** (ADR-058): `outbox.lag.seconds`, `dlq.depth`, `payment.decline.ratio`,
+  `payment.webhook.received{type}`, `bot.refusals{outcome}` and `notification.delivered` / `.failed`
+  all emit; `queue.promotion.rate` shipped earlier as the untagged `queue.admissions`. What is left
+  is `queue.depth{event}`, `hold.conversion.ratio{event}` and `sse.connections.active` — all
+  per-event or per-connection shapes — plus `jvm.threads.pinned`. `stock.drift` and
   `hikaricp_connections_pending` are exported and were read per replica throughout.
 
 ### Stage 4 — The operator surface (ADR-043) — **done**
@@ -554,7 +626,13 @@ A console is presentation and can wait. The endpoints are the capability.
   deterministic ones already skip it.
 - `tier-availability` frames in the waiting room (ADR-027) and `RANDOM` queue ordering (ADR-024) are
   built; keep the next UI work focused on browser coverage rather than another API-only proof.
-- The React SPA against `FE_SPEC.md`, if the demo client is outgrown.
+- ~~The React SPA against `FE_SPEC.md`, if the demo client is outgrown.~~ **Built** (PR #16), and
+  **dev-only**: `cd frontend && npm install && npm run dev` serves it on `:5173` with `/api` proxied
+  to `:8080`. All six views, per-event namespaced storage, `serverTime`-derived countdowns and a
+  keyless stub-payment mode so decline, outage and 3-D Secure are walkable in a browser (ADR-058).
+  **It is not wired into the cluster** — no compose service, no nginx static root — so
+  `--profile cluster` still serves the demo client. Wiring it, and checking it against §9's recovery
+  matrix in a real browser, is the next client stage.
 - **The Playwright suite specified in `FE_SPEC.md` §8.** Every one of the four client rules is a
   browser behaviour — a skewed clock, a real reload, a live `EventSource` — so none of them is
   reachable from the API suite, and the twelve reload points are checked by hand today. Two of the
@@ -701,10 +779,92 @@ them. 5 sales × 500 seats, 2,000 VUs, three replicas.
 | **E** | **300** | same as D | **10** | 1,414 | 1,904 / 2,500 — 76 % | 9.3 s |
 | **F** | **300** | **allowance 45/tick** | **0** | **2,002** | **2,496 / 2,500 — 99.8 %** | 10.0 s |
 | **G** | **300** | + one-round-trip queue read | **2** | — | **2,500 / 2,500 — 100 %** | 4.8 s |
+| **H** | **300** | **+ Sentinel topology** (Pass 12) | **0** | — | **2,499 / 2,500 — 99.96 %** | **129 ms** |
 
 **Runs F and G are the answer: five sales open at once sell out, and nothing oversells.** Run G took
 every seat — 500 of 500 on all five tiers — with `sold + held + redis == 500` throughout and
 `hikaricp_connections_pending` never above 2 of 90.
+
+**Run H (Pass 12) is the first measured through Sentinel**, and answers the question the topology
+change raised: it does not regress. 2,499 of 2,500 across the five tiers, `sold + held + redis == 500`
+exact on every one, zero inventory 503s, zero rate-limited requests, and
+`hikaricp_connections_pending` **0** across 54 samples on three replicas with drift `0.0` on every
+sample. The single unsold seat is an artefact of the run, not the build: the failover test earlier in
+the same session rebuilt 9001's counter, and one seat was still held when the drill started.
+
+**Read H's 129 ms against G's 4.8 s with care — the host is most of that difference, not the code.**
+G was measured with other work on the same laptop; H ran with nothing but the cluster. It is
+nonetheless the first time the **200 ms checkout p99 exit criterion has been met at all**, and the
+first evidence that the criterion is reachable on this design rather than only on a bigger machine.
+One run, one host: treat it as a data point, not as the criterion being closed. Sampling covered the
+ramp and steady state; the last ~45 s of ramp-down was not sampled.
+
+#### Pass 13 — finding the edge (25 Sept 2026)
+
+Runs A–H all *passed*, and a drill that only passes has not found its edge. This sweep went looking
+for it on the same laptop, with nothing else running. The host has 10 cores and a 7.65 GiB Docker VM.
+Each run used the same runner: seed, then `pool-pressure.sh`, a `docker stats` sampler every 10 s,
+`k6-concurrent`, and finally `sold-count.sh`, with replica restart counts recorded before and after.
+The pass criteria were fixed before the first run:
+- `pending` sustained above 0
+- ledger sellout below 99 %
+- checkout p99 above 200 ms
+- any drift or oversell stops the sweep as a correctness failure
+
+**On the final configuration** (per-replica memory limit and explicit G1, ADR-062):
+
+| Run | E × VUs | peak `pending` | **seats sold (ledger)** | checkout p99 | replica CPU peak | restarts |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+| **I′** | **10 × 300** | **0** | **4,997 / 5,000** | 201 ms | 2.6–2.8 cores | 0 |
+| **K′** | 5 × 600 | **0** | 2,498 / 2,500 | **145 ms** | 3.0–3.7 cores | 0 |
+| **J′** | 5 × 1,000 | **0** | 2,499 / 2,500 | 207 ms | 3.1–3.4 cores | 0 |
+| **L′** | 5 × 2,000 | **0** | **2,500 / 2,500** | **6,059 ms** | 2.8–3.0 cores | 0 |
+
+`sold + held + redis == capacity` on every tier of every run, zero inventory `503`s and zero
+rate-limited requests.
+
+**The stated ceiling, for this host:**
+- **Correctness holds at every load tried.** No oversell, no drift and no lost seat, up to 2,000 VUs
+  across five sales. Ten concurrent sales, the top of the operating envelope in `03` §2, sell out.
+  That had never been measured before.
+- **The 200 ms latency criterion holds up to about 600 VUs across five sales.** It is at the line
+  at 300 VUs across ten sales and at 1,000 across five (201 and 207 ms), and it collapses by
+  2,000 (6.1 s).
+- **The limit is CPU, not the connection pool.** `hikaricp_connections_pending` read 0 on every
+  sample of every run, including the one with a 6 s p99. Meanwhile each replica peaked at around
+  3 cores and k6 took 1.4–2.1 more, which is the whole machine. So the pool's own edge (ADR-049)
+  is **beyond what this laptop can generate**. The load generator saturates the host before the
+  pool saturates. A host where k6 runs elsewhere is the only way to find the pool's edge. §9
+  already said that, and now there is a number behind it.
+- Single runs, with visible run-to-run variance: I′ measured 201 ms here and 106 ms on the
+  configuration below. Treat each figure as ± tens of ms, not as exact.
+
+**What the first attempt found, before that configuration existed.** The same sweep, run first
+with the replicas as they were, went wrong at 2,000 VUs in two separate ways:
+
+| Run | E × VUs | peak `pending` | seats sold (ledger) | p99 | what happened |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| I | 10 × 300 | 0 | 4,997 / 5,000 | 106 ms | clean |
+| J | 5 × 1,000 | 7 (one sample) | 2,500 / 2,500 | 390 ms | clean |
+| K | 5 × 600 | 0 | 2,499 / 2,500 | 147 ms | clean |
+| L | 5 × 2,000 | 0 | 2,500 / 2,500 | 6,130 ms | the instrument reported sustained drift; the ledger was exact |
+| L2 | 5 × 2,000 | 0 | **1,765 / 2,500** | 7,992 ms | **replicas OOM-killed mid-sale**; the ledger showed 3 seats under-counted |
+
+1. **L's "sustained drift" was the instrument, not the system.** The drift gauge is recomputed
+   every 60 s, and under load `pool-pressure.sh` reached app-3 every ~24 s. So it read the **same
+   computation twice** and called that sustained. The next computation read 0, and the ledger was
+   exact. The instrument now requires non-zero drift across a whole drift interval, which means two
+   separate computations. This is ADR-047's trap again, "an instrument stricter than the ADR it
+   cites", this time in the time dimension.
+2. **L2 was real, and it shows the design doing what it claims.** The Docker VM's kernel log shows
+   the OOM killer taking three `java` processes, with RSS of 4.0, 2.5 and 2.7 GiB. The replicas had
+   no memory limit, so `MaxRAMPercentage=75` sized each heap against the whole VM (ADR-062). A
+   replica killed between the Redis decrement and the hold insert loses exactly those seats.
+   `sold-count.sh` showed tiers 9003 and 9004 at 499 and 498. They were **under-counted, never
+   over**, which is invariant 12's promised direction under an ambiguous failure. `rebuild-stock`
+   on each event restored both to exactly 500. That makes it the first time the crash-recovery
+   path has been exercised by a *real* crash under load rather than argued for. The 70 % sellout
+   is the outage: whatever was in flight on a killed replica was lost.
 
 Run F's table below is kept because it is the one that exposed the tail-of-sale edge, four seats short:
 
@@ -1679,3 +1839,194 @@ passes"*, and its own prescribed fix applies: give the fixture a seam.
 **Also noticed, not fixed:** `README.md` §"Architecture at a glance" is materially stale — it
 describes `tier_inventory`, dropped in `V7`, and a `filter ──► bot` module edge that does not exist.
 It predates ADR-046 and was not in this pass's scope.
+
+### Pass 11 — reconciling the frontend merge
+
+- **Scope:** PR #16 (`shoham-phase4-imp`), 7,943 files, merged to `preview` with **no document change
+  at all**. The pass read the merge, wrote down what it actually did, fixed what it broke, and took
+  the dependencies back out of git. No new capability was added.
+
+- **The finding that shaped it, and it is not a defect.** The merge contains four pieces of real
+  work — Redis Sentinel, SSE reconnect replay, most of the "specified, not built" metric set, and a
+  React SPA implementing `FE_SPEC` — and **none of it was discoverable.** `04` still said Stripe was
+  unbuilt, `06` §11 still said Sentinel was deferred, and `03` §7 still listed six live metrics as
+  aspirational. In a repo whose first rule is that a stale spec is fixed rather than the code, that is
+  not untidiness: it is six standing orders to rebuild what exists. The rule in `CLAUDE.md` is now
+  demonstrably load-bearing rather than stylistic, and **ADR-058 is what should have been in the
+  merge.**
+
+**Built:**
+
+| Change | Effect |
+| :--- | :--- |
+| **One SSE id space** (ADR-058) | Only replayable frames carry an `id`; everything else is sent with none, which the SSE spec defines as leaving the client's last-event-id alone. As merged, position frames stamped a `"local-N"` over it every two seconds and the replay parsed ids as numbers — **so the feature returned nothing on the normal path** |
+| **The replay log holds broadcasts only** (ADR-058) | The promotion frame carries a `passToken`, single-use with a 120 s TTL, and was being written to a per-event ZSET that outlives the sale. A promoted buyer's reconnect now re-reads the live pass and rebuilds the frame — which also works with no `Last-Event-ID`, in a fresh tab |
+| **`QueueReplayIT`** | The feature shipped with no test; both defects above are the kind a first test catches. Three now: the log holds no capability, broadcasts replay in order from a sequence, and an unretained frame does not burn one |
+| **The client mirrors the payment seam** (ADR-058) | `stripe.ts` threw at module load without `VITE_STRIPE_PUBLISHABLE_KEY`, so a clean checkout was a white screen — against a backend whose default is the stub. No key now means stub mode with the stub's magic tokens in the UI. `frontend/.env.example` added |
+| **One idempotency key per hold** | The merged client minted a fresh UUID per attempt, which opens a *second* PaymentIntent — the failure ADR-054 exists to prevent. `getIdempotencyKey` already existed, was imported, and was unused. `FE_SPEC` §3 has always specified once-per-hold |
+| **`useCheckoutSubmit`** | The POST, the 3-D Secure re-post and the `problem.code` table are one hook; the Stripe and stub paths differ only in how a payment method is obtained. Written to add the second path without duplicating 120 lines of error handling |
+| **7,858 tracked frontend files → 47** | `node_modules` (57 MB), `dist`, four `tsc` outputs, and five scratch files including a Windows classpath dump. The `.gitignore` rules for them were added *in the same merge that tracked them*, so they were inert |
+
+**Deliberately not done:**
+
+- **The history rewrite.** The pack is 24 MB; `filter-repo` costs every collaborator a re-clone and
+  every open branch a rebase. Revisit if it becomes a problem.
+- **Wiring the SPA into nginx and compose.** It touches `nginx.conf`, which is correctness rather
+  than tuning, and it wants its own pass and its own browser-level verification.
+- **The ten failing tests.** See §9. Reproduced unmodified at the merge commit, so it is not this
+  pass's regression, and two hypotheses were tested and disproved rather than guessed at. Everything
+  this pass touched was verified by targeted run: `QueueLifecycleIT`, `QueueBroadcasterTest`,
+  `UserJourneyIT`, `ModularityTests`, `SaleflowRehydrationIT`, both hold ITs and the new
+  `QueueReplayIT` — 29 tests, green — plus the frontend's 18 vitest tests and a production build.
+
+**The transferable lesson, and it is the opposite of Pass 10's.** Pass 10 learned that deleting on
+"nothing references this" has a time horizon. This pass learned the same thing about *writing*: a
+merge that adds four capabilities and no documentation is indistinguishable, a week later, from a
+merge that added nothing — and the repo's own instructions then actively mislead. The cost is not
+paid by the author, who knows what they built; it is paid by whoever reads `04` next and starts
+building Stripe again.
+
+### Pass 12 — establishing the base
+
+- **Scope:** make the suite's verdict trustworthy, read PR #16's backend against the ADRs it must
+  honour, and verify the cluster on the Sentinel topology it now ships. Fix-as-you-go: every finding
+  got a test and its doc update in the same commit.
+
+- **The finding that reframes the merge.** Pass 11 fixed what reading the *code* exposed. This pass
+  ran it, and that is a different instrument: **the Sentinel cluster had never started, on any
+  machine.** All three shell scripts PR #16 added were committed mode 644, and one of them is a
+  container `entrypoint`, so the sentinels restart-looped on `permission denied` and every app
+  replica depends on them. Nothing said so, because the topology is only reachable through
+  `--profile cluster` and no test goes there. **The drill's own instrument was in the same state** —
+  `declare -A` on a bash macOS does not ship, and a hardcoded `docker.exe` that would have reported
+  a clean PASS having measured nothing. Code review would not have found either; running it did.
+
+**Built:**
+
+| Change | Effect |
+| :--- | :--- |
+| **Surefire `runOrder` pinned** | The default is filesystem order, so two machines could disagree about whether the suite passed. 213/213 twice from cold containers. **Pinned, not fixed** — the order dependence in §9 stays open, and the pom says so |
+| **The fulfilment-lag gauge stopped scanning its own table** | `MIN(created_at) WHERE status <> PROCESSED` matched neither partial index, so it sequentially scanned `outbox_events` — processed rows included — every 10 s per replica. Asked one status at a time it is two bounded reads. No new index: that table is written once per checkout |
+| **`payment.decline.ratio` → `payment.attempts{outcome}`** | A ratio cumulative since process start is the one shape that cannot show a spike, which `03` §7 says is why it exists. Counters leave the windowing to the query and delete state rather than adding it |
+| **Three script modes, and an entrypoint that no longer depends on one** | See above. `CLAUDE.md` carries the rule and the one-line audit |
+| **`pool-pressure.sh` runs, and measures** | bash 3.2 compatible, and `docker.exe` detected rather than assumed |
+| **The `UPCOMING` dev event restored** | `prewarm` refuses any other window, so with every dev event `OPEN` the seeding path ADR-004 protects could not be exercised on `dev` at all |
+| **Two payment comments corrected** | Both claimed guarantees they do not hold. The refund short-circuit does not cover the crash case its comment described — the gateway's idempotency key does — and `charge` had lost the reason it constrains payment methods |
+
+**Verified on the cluster, for the first time through Sentinel:**
+
+- `fanout-check.sh` — 30/30 promoted, 10/10/10 across three replicas.
+- `hold-expiry-check.sh` — restored exactly once, 669 ms, across three replicas.
+- `sentinel-failover-check.sh` — replica promoted, old primary rejoined as a replica.
+- **The half that script deliberately skips, done by hand and now the highest-value claim in the
+  system that is no longer merely argued.** After a failover all three replicas independently refused
+  to sell event 9001 — the vouched `run_id` no longer matched the promoted primary's — a buyer's hold
+  answered **`503 INVENTORY_UNAVAILABLE`, retryable**, and not "sold out"; `rebuild-stock` on **one**
+  replica resumed selling on **all three**. That is ADR-046's derived-never-consumed design observed
+  end to end against a failover rather than a restart.
+- Run **H** of the concurrent-sales drill; see §11.
+
+**Worth carrying forward.** Only the replica that serves `rebuild-stock` logs "vouched for again";
+the other two release silently on their next tick. An operator reading logs sees the refusal three
+times and the recovery once. Correct by design and mildly unhelpful during an incident.
+
+**The transferable lesson.** Pass 11's was that undocumented work is invisible. This pass's is
+narrower and sharper: **a path no test and no script exercises is not "probably fine", it is
+unknown.** Every defect here lived in exactly such a path — a profile the suite never starts, a shell
+the author never ran — and each was found in the first minute of trying to use it.
+
+### Pass 13 — evidence, back-pressure, and finding the edge
+
+- **Scope:** close the largest coverage hole (fulfilment was never driven through a listener), make
+  two error paths honest, close S13, find the load edge instead of passing again, and tidy the
+  repository's setup story. Each fix got a test that failed before it, and its docs in the same
+  commit.
+
+**Built:**
+
+| Change | Effect |
+| :--- | :--- |
+| **`NotificationListenerIT`** | Fulfilment through a real RabbitMQ with both real listeners and the production topology. Only SMTP is faked. It proves dedupe on redelivery, dead-letter after one attempt (ADR-029), exactly-once replay (ADR-038), and that a delivered-but-unrecorded message stays `SENT` (ADR-042). Checked by mutation: removing the ADR-042 guard fails it |
+| **`503 SERVICE_BUSY`** (ADR-059) | A HikariCP timeout was `500 INTERNAL_ERROR`. It is back-pressure, so it now gets `Retry-After: 1`. It is classified by the cause chain, so a database that is down is still `500` |
+| **`/session/reset` accepts JSON only** (ADR-060) | S13 closed: a cross-site form can no longer expire a buyer's session. No client change was needed |
+| **The order-dependent suite, root-caused** (ADR-061) | Spring Framework 7 pauses cached test contexts, and the resumed context answered every `/queue` request before its own filters ran. Pass 12 had ruled out everything inside the application; the cause was outside it. **228 tests, green in alphabetical, reverse and filesystem order** |
+| **Replica memory limit, explicit G1** (ADR-062) | Replicas were OOM-killed by the Docker VM at 2,000 VUs. The same load now runs with zero restarts |
+| **Drill instruments corrected** | `seed-concurrent.sh` could not seed anything but five sales (a psql `\set` overrode `-v`), and its per-key Redis clean-up outran the pre-warm window. `pool-pressure.sh` read one drift computation twice and called it sustained |
+| **README** | The environment files in the order a new developer creates them, and a repository-layout section |
+
+**Measured** (§11): ten concurrent sales sell out, and correctness held at every load up to 2,000
+VUs. p99 meets 200 ms to about 600 VUs across five sales, and the limit is host CPU, not the pool.
+The run that crashed became the best evidence in the pass: a real mid-sale crash left 3 seats
+under-counted and none oversold, and `rebuild-stock` recovered them exactly.
+
+**Found and not fixed, recorded in §9:** a Redis node demoted by Sentinel while still up keeps the
+replicas' connections, so every write fails `READONLY` until the replicas restart. It was hit on
+this pass's first cluster boot because the Pass 12 failover test had left its state in the sentinel
+volumes.
+
+**Considered and declined: moving the backend into `backend/`.** It would change about fifty paths
+across the Dockerfile, compose, the drill scripts and the docs, and it would conflict with both
+teammates' branches, all for no change in behaviour, late in the project and on a cluster that has
+only just started working. The README explains the layout instead.
+
+**The transferable lesson.** Pass 12 learned that an unexercised path is unknown. This pass learned
+the version of that for *instruments*: **every number here was wrong at least once because of the
+thing measuring it, not the thing measured.** A test harness paused its own context, a seed script
+could not seed what it claimed, a sampler read one computation twice, and a Dockerfile flag was
+cancelled by a compose file. Each was found by distrusting a result that looked either too good or
+too bad, and by asking which layer produced it.
+
+### Pass 14 — structure review: one set of patterns, applied everywhere
+
+- **Scope:** an in-depth review of the backend's structure, flow and patterns, with the goal of a
+  codebase that is simple, clear and minimal. No behaviour change; the wire format is
+  byte-identical.
+
+- **The verdict that framed it.** The architecture was already sound. Module boundaries are
+  enforced and acyclic, facades are implemented by their services, every module has the same
+  package layout, and no dead code was found: every public method referenced once is a framework
+  entry point. The separate transactional beans (`*Store`, `OrderCommitService`) look like
+  duplication but are required, because Spring's proxy ignores self-invocation. What needed work was
+  **consistency**: the repo had rules it applied in some places and not others, because nobody had
+  written them down in one place.
+
+**Changed:**
+
+| Change | Effect |
+| :--- | :--- |
+| **App class at the root package**; app config in `com.flashseats.app` | Four scan-widening annotations gone. `app` is a leaf module with no inbound edges |
+| **Properties classes use Lombok accessors** | 528 lines of hand-written getters and setters removed; binding unchanged |
+| **An exception class only where a `catch` names it** (ADR-063) | Seven classes become factories on `PaymentErrors`, `OrderErrors` and `BotErrors`. Same codes and extensions, in the same order |
+| **One notification delivery flow** | The two consumers were copies; ADR-042's guard now exists once. The mutation check still fails the test when the guard is disabled |
+| **Controllers only map** | `QueueController.stream`'s connect flow moved to `QueueBroadcaster.connect`, and join's bot check into `QueueService.join` |
+| **Behaviour next to its data** | `EventRow.windowStatus`, `AvailabilityLevel.of` (which also removes a model → service dependency), `QueueKeys.expireWithSale` |
+| **`event` packages mean "published"** | `hold/event` and `order/event` held only in-module triggers; they moved beside their listeners |
+| **Comments say why, briefly** | 5,389 → 3,721 comment lines. The pass found **eleven comments that had become false**: a code "with no throw site", a filter in the wrong module, a table that no longer exists, a transaction requirement stated backwards. Stale comments are instructions, the same way stale specs are |
+| **The conventions, written down** | `05-global-standards.md` §11. A reviewer now has a list to check against |
+
+**Size:** 239 → 230 files, 15,924 → 13,608 lines (−15%); executable code about −490 lines.
+
+**Declined, with reasons:**
+- **Sub-packages inside `order`** (checkout / outbox / stock): it would break the one layout every
+  other module follows. `StockReconciliationService` stays in `order` because only `order` reaches
+  the ledger, holds and counters without a cycle.
+- **Lombok `@RequiredArgsConstructor` across 56 classes:** cosmetic churn, and several constructors
+  do real work.
+- **Properties as records:** ITs adjust the live beans to avoid forking contexts (ADR-061).
+
+**Verified:**
+- 228/228 after every step, and in reverse order at the end.
+- Every commit compiles on its own.
+- `ModularityTests` passes with `app` as a leaf.
+- On the rebuilt cluster: `fanout-check.sh` 30/30 across three replicas (it exercises the new
+  `connect` path), and `hold-expiry-check.sh` restored exactly once in 749 ms.
+- Two 5 × 300 VU drill runs, both with an exact ledger, pending 0 and zero restarts: 2,499 and
+  2,498 of 2,500 sold. Checkout p99 was **513 ms** on the first run and **64 ms** on the second,
+  the best of any run so far. The first run started minutes after the replicas were rebuilt, so it
+  measured JIT warm-up (app-1 peaked at four cores). **Discard the first drill run after any replica
+  restart**; Pass 13's I′ (201 ms) was the same effect.
+
+**The transferable lesson.** A convention that exists only as a pattern in the code is copied
+unevenly. Pass 9's ADR-057 was right, and branches that forked before it re-added exactly what it
+removed. Writing the rules as a checklist (§11) is what makes the next reviewer's job a comparison
+rather than an archaeology.

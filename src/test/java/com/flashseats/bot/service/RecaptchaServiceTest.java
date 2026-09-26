@@ -50,7 +50,14 @@ class RecaptchaServiceTest {
 
         assertThat(service.verify("session-1", "token")).isEqualTo(RecaptchaService.Verdict.PASSED);
 
-        verify(values).set("bot:verified:session-1", "1", Duration.ofSeconds(1800));
+        verify(values)
+                .set(
+                        "bot:verified:session-1",
+                        "1",
+                        // The configured TTL, not a literal: the field default and
+                        // application.properties disagreed by 15 minutes and only the
+                        // property is what ships, so a magic number here tests neither.
+                        Duration.ofSeconds(properties.getRecaptcha().getVerifiedTtlSeconds()));
         server.verify();
     }
     @Test
@@ -74,7 +81,14 @@ class RecaptchaServiceTest {
         assertThat(service.verify("session-1", "token")).isEqualTo(RecaptchaService.Verdict.PASSED);
 
         verify(redis, times(2)).hasKey("bot:verified:session-1");
-        verify(values).set("bot:verified:session-1","1",Duration.ofSeconds(1800));
+        verify(values)
+                .set(
+                        "bot:verified:session-1",
+                        "1",
+                        // The configured TTL, not a literal: the field default and
+                        // application.properties disagreed by 15 minutes and only the
+                        // property is what ships, so a magic number here tests neither.
+                        Duration.ofSeconds(properties.getRecaptcha().getVerifiedTtlSeconds()));
 
         // The MockRestServiceServer has exactly one expected provider call.
         // If the second verify() contacted reCAPTCHA, this assertion would fail.

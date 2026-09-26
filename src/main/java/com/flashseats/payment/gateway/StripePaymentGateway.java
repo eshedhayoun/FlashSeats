@@ -15,29 +15,13 @@ import com.stripe.param.RefundCreateParams;
 import lombok.extern.slf4j.Slf4j;
 
 /**
- * Stripe, behind the interface the stub already satisfied.
+ * Stripe, behind the interface the stub already satisfied. Server-confirmed PaymentIntents keep the
+ * {@code FE_SPEC} §2 checkout body and ADR-001's ordering unchanged.
  *
- * <p>Server-confirmed PaymentIntents: the client sends a {@code pm_...} and this charges it, which
- * is what keeps {@code FE_SPEC} §2's checkout body, ADR-001's charge-then-consume ordering and the
- * whole synchronous {@code 402}/{@code 409} contract unchanged. The alternative — Payment Element,
- * where the browser confirms and the webhook is the primary settlement path — would invert that
- * sequence and make most of the contract dead.
- *
- * <p>Three details are load-bearing:
- *
- * <ul>
- *   <li><strong>{@code holdToken} goes in metadata.</strong> It is how the webhook finds the order
- *       when the HTTP response was lost, and it is the natural key the rest of the system anchors on
- *       (ADR-014).
- *   <li><strong>{@code maxNetworkRetries(0)}.</strong> Stripe's client-side retry is a second retry
- *       mechanism, and this system already has one: re-POSTing the same checkout body.
- *   <li><strong>{@code allowRedirects(NEVER)}.</strong> A redirect-based method would take the buyer
- *       off-site mid-hold with no return path that this API models.
- * </ul>
- *
- * <p>Transport failures are <em>thrown</em> as {@link GatewayTransportException} so the circuit
- * breaker can count them; declines are <em>returned</em>, because a refused card is a correct answer
- * and a breaker that counted declines would open during an ordinary burst of expired cards.
+ * <p>Load-bearing details: {@code holdToken} in metadata (ADR-014); {@code maxNetworkRetries(0)},
+ * because re-POSTing the checkout body is already the retry; {@code allowRedirects(NEVER)}, because
+ * no off-site return path is modelled. Transport failures are thrown for the breaker, declines are
+ * returned (ADR-052).
  */
 @Slf4j
 public class StripePaymentGateway implements PaymentGateway {
@@ -55,16 +39,25 @@ public class StripePaymentGateway implements PaymentGateway {
     }
 
     @Override
+    /**
+     * A server-confirmed, card-only intent in one round trip ({@code setConfirm(true)}), which keeps
+     * ADR-001's charge-then-consume ordering.
+     *
+     * <p>Card only is a requirement: a redirect-based method needs a return URL, and there is no resume
+     * endpoint (ADR-054), so it would strand a buyer holding seats. Naming the type also turns off
+     * automatic payment methods. Card 3-D Secure still happens, as {@code requires_action}. Order number
+     * and hold token go into metadata for reconciliation and the webhook.
+     */
     public GatewayResult charge(GatewayCharge charge) {
         PaymentIntentCreateParams params = PaymentIntentCreateParams.builder()
-            .setAmount(charge.amountCents())
-            .setCurrency(charge.currency().toLowerCase())
-            .setPaymentMethod(charge.paymentMethodId())
-            .setConfirm(true)
-            .addPaymentMethodType("card")
-            .putMetadata("orderNumber", charge.orderNumber())
-            .putMetadata("holdToken", charge.holdToken())
-            .build();
+                .setAmount(charge.amountCents())
+                .setCurrency(charge.currency().toLowerCase())
+                .setPaymentMethod(charge.paymentMethodId())
+                .setConfirm(true)
+                .addPaymentMethodType("card")
+                .putMetadata("orderNumber", charge.orderNumber())
+                .putMetadata("holdToken", charge.holdToken())
+                .build();
         RequestOptions options = charge.clientIdempotencyKey() == null
                         || charge.clientIdempotencyKey().isBlank()
                 ? baseOptions
@@ -113,16 +106,9 @@ public class StripePaymentGateway implements PaymentGateway {
                         .build();
 
         /*
-        * A refund is a money movement, so the provider request itself must be
-        * idempotent.
-        *
-        * FlashSeats performs full refunds, so the PaymentIntent id + amount
-        * uniquely identify the refund operation.
-        *
-        * If our application crashes after Stripe succeeds but before our DB
-        * records REFUNDED, retrying this exact request returns Stripe's
-        * idempotent result instead of creating another refund.
-        */
+         * Full refunds only, so intent id + amount identify the operation. Retrying after a crash returns
+         * Stripe's original result instead of refunding twice.
+         */
         RequestOptions refundOptions =
                 baseOptions
                         .toBuilderFullCopy()
@@ -150,18 +136,10 @@ public class StripePaymentGateway implements PaymentGateway {
         }
     }
     /**
-     * Maps an intent's status onto the three answers this system understands.
-     *
-     * <p>Only {@code requires_action} is a challenge. {@code requires_confirmation} means the
-     * <em>server</em> has yet to confirm, which with {@code setConfirm(true)} should not occur —
-     * and answering it with {@code PAYMENT_ACTION_REQUIRED} would be worse than useless: the client
-     * would receive a {@code clientSecret} whose {@code handleNextAction} does nothing, re-POST,
-     * retrieve the same state, and be told to authenticate again for the life of the hold.
-     *
-     * <p>{@code processing} and {@code requires_capture} are deliberately <em>not</em> successes
-     * either: confirming an order against either would hand over seats for money that has not moved.
-     * All of them fall to the transport branch, which is the honest "this is a state we do not
-     * model" — a retryable {@code 503} with the seats retained and no attempt consumed.
+     * Maps an intent's status onto the three answers this system understands. Only
+     * {@code requires_action} is a challenge. {@code processing} and {@code requires_capture} are not
+     * successes: money has not moved. Everything unmodelled becomes a retryable {@code 503}, with seats
+     * kept and no attempt consumed.
      */
     GatewayResult classify(PaymentIntent intent) {
         return switch (intent.getStatus()) {

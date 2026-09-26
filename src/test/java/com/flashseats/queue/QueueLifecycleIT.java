@@ -3,9 +3,9 @@ package com.flashseats.queue;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.awaitility.Awaitility.await;
 
-import com.flashseats.flashseats.support.BuyerSession;
-import com.flashseats.flashseats.support.IntegrationTest;
-import com.flashseats.flashseats.support.SaleFixture;
+import com.flashseats.app.support.BuyerSession;
+import com.flashseats.app.support.IntegrationTest;
+import com.flashseats.app.support.SaleFixture;
 import com.flashseats.queue.config.QueueOrdering;
 import com.flashseats.queue.config.QueueProperties;
 import com.flashseats.queue.service.QueueBroadcaster;
@@ -201,11 +201,11 @@ class QueueLifecycleIT extends IntegrationTest {
         String first = "session-first";
         String second = "session-second";
 
-        queue.join(first, eventId);
+        queue.join(first, eventId, null, "127.0.0.1");
         Double firstDraw = redis.opsForZSet().score(QueueKeys.waiting(eventId), first);
-        queue.join(second, eventId);
+        queue.join(second, eventId, null, "127.0.0.1");
         Double secondDraw = redis.opsForZSet().score(QueueKeys.waiting(eventId), second);
-        queue.join(first, eventId);
+        queue.join(first, eventId, null, "127.0.0.1");
 
         assertThat(redis.opsForZSet().score(QueueKeys.waiting(eventId), first)).isEqualTo(firstDraw);
         assertThat(firstDraw).isNotEqualTo(secondDraw);

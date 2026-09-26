@@ -556,14 +556,15 @@ tx2 (short):  UPDATE outbox_events SET status='PROCESSED', processed_at=now()
 order.events.exchange  (topic)  ── order.confirmed ──►  notification.order-confirmed.queue
                                 └─ order.refunded  ──►  notification.order-refunded.queue
       ↓
-OrderConfirmedConsumer                                    -- no @Transactional around 2-4
-   1. INSERT notification_logs (order_number, kind='TICKET_DELIVERY', status='PENDING')
-        └─ unique violation ⇒ already handled ⇒ ack and stop
-   2. PDFBox renders the ticket in memory
-   3. Thymeleaf renders the HTML body
-   4. JavaMailSender → SMTP (Mailpit locally)
-   5. status='SENT', sent_at=now, basicAck
-   ✗ on failure: 3 retries (5s, 30s, 2m) → DLQ, status='DLQ'
+NotificationConsumer (one flow, two listeners)          -- no @Transactional around 2-3
+   1. claim: INSERT notification_logs (order_number, kind, status='PENDING') ON CONFLICT DO NOTHING,
+      or re-claim a row in 'DLQ'                          ⇒ rowcount 0: already handled, ack, stop
+   2. TICKET_DELIVERY: PDFBox renders the ticket; REFUND_NOTICE: no attachment
+   3. EmailComposer builds the HTML; JavaMailSender → SMTP (Mailpit locally)
+   4. status='SENT', sent_at=now, basicAck
+   ✗ on failure: NO retries (ADR-029) → basicNack(requeue=false) → DLQ
+      · not yet sent  ⇒ status='DLQ'  (re-claimable, so an operator replay sends)
+      · already sent  ⇒ status='SENT' (ADR-042 — a DLQ row would authorise a second ticket)
 ```
 
 **`FOR UPDATE SKIP LOCKED`** stops three replicas from publishing the same event three times.
@@ -863,6 +864,12 @@ threshold refuses one (ADR-011, ADR-055).
 | `flashseats.queue.admission.budget.denied` | counter, per replica | **sustained** non-zero with `pending` at zero means the allowance is throttling a pool that could serve more (ADR-049) |
 | `flashseats.catalog.metadata.cache{result}` | counter, per replica | a miss rate near 1 means the cache is off or the TTL is below the poll interval (ADR-051) |
 | `flashseats.payment.refund.failed` | counter, per replica | **any non-zero value.** Each one is money owed to a named buyer that automation could not return (ADR-053) |
+| `flashseats.outbox.lag.seconds` | gauge, per replica | sustained above a few seconds — a stalled relay otherwise shows up only as buyers not receiving tickets (ADR-058) |
+| `flashseats.dlq.depth` | gauge, per replica | any non-zero. The DLQ was listable by an operator and alarmed on by nothing; each entry is a paid buyer's ticket (ADR-029, ADR-058) |
+| `flashseats.payment.attempts{outcome}` | counter, per replica | `rate(attempts{outcome="declined"}[5m]) / rate(attempts[5m])` is the decline ratio over any window — a spike is either a provider incident or a fraud rule mis-firing, and both used to look like silence. **Deliberately not a ratio gauge:** one cumulative since process start is the single shape that cannot show a spike, because every healthy sample dilutes the next. `outcome` is a four-value enum, so the same series also answers "are we reaching the provider at all" (ADR-052) |
+| `flashseats.payment.webhook.received{type}` | counter, per replica | **zero while orders are being placed.** A stale webhook secret rejects every delivery, and the symptom is indistinguishable from a quiet day |
+| `flashseats.bot.refusals{outcome}` | counter, per replica | answers "are we shedding load right now?" without querying `bot_audit_logs` |
+| `flashseats.notification.delivered` · `.failed` | counters, per replica | `failed` rising while `delivered` is flat is a mail path that is down rather than idle |
 | `resilience4j_circuitbreaker_state` | gauge, per replica | `open` — every checkout is answering `503` without reaching the provider (ADR-052) |
 | `resilience4j_circuitbreaker_calls{kind}` | counter, per replica | a rising `failed` count is transport trouble; declines are **not** counted here by design |
 
@@ -882,12 +889,13 @@ genuine gap rather than a deleted idea:
 | `flashseats.queue.depth{event}` | the only direct read on whether a waiting room is draining |
 | ~~`flashseats.queue.promotion.rate{event}`~~ | **built** as `flashseats.queue.admissions`, above — untagged, so it answers "is the cluster promoting?" and not "is *this* sale promoting?" |
 | `flashseats.hold.conversion.ratio{event}` | the number the 1.5× oversubscribe factor is a guess at |
-| `flashseats.outbox.lag.seconds` | a stalled relay currently shows up as buyers not receiving tickets |
-| `flashseats.dlq.depth{queue}` | the DLQ is listable by an operator but nothing alarms on it |
 | `flashseats.sse.connections.active` | the input to every capacity question about the broadcaster |
-| `flashseats.payment.decline.ratio` | a spike is either a provider incident or a fraud rule mis-firing, and today both look like silence |
-| `flashseats.payment.webhook.received{type}` | a webhook secret mismatch rejects **every** delivery, and the symptom is indistinguishable from a quiet day |
-| `flashseats.bot.refusals{outcome}` | refusals are now durable in `bot_audit_logs`, but a dashboard still cannot answer "are we shedding load right now?" without a query |
+
+**Built in Pass 11** (ADR-058), and listed above rather than here: `outbox.lag.seconds`,
+`dlq.depth`, `payment.decline.ratio`, `payment.webhook.received{type}`, `bot.refusals{outcome}` and
+`notification.delivered` / `.failed`. Note that `dlq.depth` is **untagged** — it answers "is anything
+dead-lettered?", not which queue — and that the three above are the whole of what remains, all of
+them per-event or per-connection shapes the current counters cannot express.
 
 Controls: `POST /api/v1/admin/events/{id}/pause` and `/resume` (stop promotions and new holds, honour
 existing ones), `POST /api/v1/admin/events/{id}/rebuild-stock`,
