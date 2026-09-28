@@ -1,60 +1,103 @@
 import { test as base, type Page } from '@playwright/test';
-import type { BrowserContext } from '@playwright/test';
 
-/**
- * Buyer fixture: represents one buyer (one session/cookie jar).
- * Each test context gets a fresh browser context and page.
- */
 export type BuyerFixture = {
   page: Page;
-  userId: string; // unique id per test
+  userId: string;
 };
 
 export type SaleFixture = {
   eventId: number;
   tierId: number;
+  tierName: string;
   capacity: number;
 };
 
-/**
- * Extend the test with buyer and sale fixtures.
- */
-export const test = base.extend<{ buyer: BuyerFixture; sale: SaleFixture }>({
+type ApiEvent = {
+  eventId: number;
+  title: string;
+  windowStatus: string;
+};
+
+type ApiEventDetails = {
+  eventId: number;
+  tiers: Array<{
+    tierId: number;
+    tierName: string;
+    availability: string;
+    maxPerOrder: number;
+  }>;
+};
+
+async function loadSales(minCount: number): Promise<SaleFixture[]> {
+  const response = await fetch('http://localhost:8081/api/v1/events');
+  if (!response.ok) {
+    throw new Error(`GET /events failed with ${response.status}`);
+  }
+
+  const events = (await response.json()) as ApiEvent[];
+  if (!Array.isArray(events)) {
+    throw new Error('GET /events did not return an array');
+  }
+
+  const sales: SaleFixture[] = [];
+
+  for (const event of events) {
+    if (event.windowStatus !== 'OPEN') continue;
+
+    const detailResponse = await fetch(
+      `http://localhost:8081/api/v1/events/${event.eventId}`
+    );
+    if (!detailResponse.ok) continue;
+
+    const details = (await detailResponse.json()) as ApiEventDetails;
+    const tier = details.tiers.find(
+      (candidate) =>
+        candidate.availability !== 'SOLD_OUT' && candidate.maxPerOrder >= 1
+    );
+
+    if (!tier) continue;
+
+    // The current public event DTO does not expose raw remaining capacity,
+    // so the fixture keeps the field for compatibility and uses 0 as unknown.
+    sales.push({
+      eventId: details.eventId,
+      tierId: tier.tierId,
+      tierName: tier.tierName,
+      capacity: 0,
+    });
+
+    if (sales.length >= minCount) break;
+  }
+
+  if (sales.length < minCount) {
+    throw new Error(
+      `Need at least ${minCount} open sales with an available tier; found ${sales.length}.`
+    );
+  }
+
+  return sales;
+}
+
+export type FlashSeatsFixtures = {
+  buyer: BuyerFixture;
+  sale: SaleFixture;
+  sales: [SaleFixture, SaleFixture];
+};
+
+export const test = base.extend<FlashSeatsFixtures>({
   buyer: async ({ page }, use) => {
-    const userId = Math.random().toString(36).substring(7);
-    const buyer: BuyerFixture = {
-      page,
-      userId,
-    };
-    await use(buyer);
+    const userId = Math.random().toString(36).slice(2);
+    await use({ page, userId });
   },
 
   sale: async ({}, use) => {
-    // Seed a sale via SQL (this requires the backend to be running).
-    // For now, we'll use the first available sale from the API.
-    const response = await fetch('http://localhost:8080/api/v1/events', {
-      credentials: 'include',
-    });
-    const events = await response.json();
+    const [sale] = await loadSales(1);
+    await use(sale);
+  },
 
-    if (!events || events.length === 0) {
-      throw new Error('No events available in backend. Run seed script first.');
-    }
-
-    const eventId = events[0].eventId;
-    const detailResponse = await fetch(
-      `http://localhost:8080/api/v1/events/${eventId}`,
-      { credentials: 'include' }
-    );
-    const details = await detailResponse.json();
-    const tierId = details.tiers[0].tierId;
-    const capacity = details.tiers[0].capacity;
-
-    await use({
-      eventId,
-      tierId,
-      capacity,
-    });
+  sales: async ({}, use) => {
+    const sales = await loadSales(2);
+    await use([sales[0], sales[1]]);
   },
 });
 
