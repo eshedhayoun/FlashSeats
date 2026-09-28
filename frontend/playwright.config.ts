@@ -1,57 +1,68 @@
-import { defineConfig, devices } from '@playwright/test';
+import { defineConfig, devices } from "@playwright/test";
+import os from "node:os";
+import path from "node:path";
 
-/**
- * Read environment variables from file.
- * https://github.com/motdotla/dotenv
- */
-// require('dotenv').config();
+const playwrightOutputDir = path.join(
+  os.tmpdir(),
+  "flashseats-playwright",
+  "test-results"
+);
 
-/**
- * See https://playwright.dev/docs/test-configuration.
- */
+const playwrightReportDir = path.join(
+  os.tmpdir(),
+  "flashseats-playwright",
+  "playwright-report"
+);
+
 export default defineConfig({
-  testDir: './e2e',
-  /* Run tests in files in parallel */
-  fullyParallel: false,
-  /* Fail the build on CI if you accidentally left test.only in the source code. */
-  forbidOnly: !!process.env.CI,
-  /* Retry on CI only */
-  retries: process.env.CI ? 2 : 0,
-  /* Opt out of parallel tests on CI. */
-  workers: process.env.CI ? 1 : 1,
-  /* Reporter to use. See https://playwright.dev/docs/test-reporters */
-  reporter: 'html',
-  /* Shared settings for all the projects below. See https://playwright.dev/docs/api/class-testoptions. */
-  use: {
-    /* Base URL to use in actions like `await page.goto('/')`. */
-    baseURL: 'http://localhost:5173',
-    httpCredentials: undefined,
-    /* Collect trace when retrying the failed test. See https://playwright.dev/docs/trace-viewer */
-    trace: 'on-first-retry',
-  },
+  testDir: "./e2e",
 
-  /* Configure projects for major browsers */
-  projects: [
-    {
-      name: 'chromium',
-      use: { ...devices['Desktop Chrome'] },
-    },
+  fullyParallel: false,
+
+  forbidOnly: !!process.env.CI,
+
+  retries: process.env.CI ? 2 : 0,
+
+  workers: 1,
+
+  reporter: [
+    ["line"],
+    [
+      "html",
+      {
+        outputFolder: playwrightReportDir,
+        open: "never"
+      }
+    ]
   ],
 
-  /* Run your local dev server before starting the tests */
+  use: {
+    baseURL: "http://localhost:5173",
+    httpCredentials: undefined,
+    trace: "on-first-retry"
+  },
+
+  projects: [
+    {
+      name: "chromium",
+      use: {
+        ...devices["Desktop Chrome"]
+      }
+    }
+  ],
+
   webServer: {
-    command: 'npm run dev',
-    url: 'http://localhost:5173',
+    command: "npm run dev",
+    url: "http://localhost:5173",
     reuseExistingServer: !process.env.CI,
-    timeout: 120 * 1000,
+    timeout: 120 * 1000
   },
-  
-  /* Output directory for test results */
-  outputDir: 'test-results',
-  
-  /* Timeout settings */
+
+  outputDir: playwrightOutputDir,
+
   timeout: 30 * 1000,
+
   expect: {
-    timeout: 5 * 1000,
-  },
+    timeout: 5 * 1000
+  }
 });
