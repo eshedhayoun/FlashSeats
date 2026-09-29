@@ -347,7 +347,8 @@ export async function reserveOneSeat(
  */
 export async function waitFor(
   condition: () => Promise<boolean>,
-  timeoutMs = 10000
+  timeoutMs = 10_000,
+  intervalMs = 100
 ): Promise<void> {
   const start = Date.now();
 
@@ -357,7 +358,7 @@ export async function waitFor(
     }
 
     await new Promise<void>((resolve) =>
-      setTimeout(resolve, 100)
+      setTimeout(resolve, intervalMs)
     );
   }
 
