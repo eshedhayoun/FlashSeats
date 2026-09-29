@@ -1,0 +1,43 @@
+Sampling app-1 app-2 app-3 every 5s for 300s. Pool maximum is 30 per replica.
+
+time      replica    pending    active    drift  missing
+--------- -------- --------- --------- -------- --------
+17:01:25  app-1          0.0       0.0      0.0      0.0
+17:01:55  app-2          0.0       1.0      0.0      0.0
+17:02:20  app-3          0.0       0.0      0.0      0.0
+17:02:48  app-1          0.0       4.0      0.0      0.0
+17:03:09  app-2          0.0      11.0      0.0      0.0
+17:03:45  app-3          0.0       5.0      0.0      0.0
+17:04:25  app-1          0.0       8.0      0.0      0.0
+17:04:51  app-2          0.0       3.0      0.0      0.0
+17:05:08  app-3          0.0       2.0      0.0      0.0
+17:05:23  app-1          0.0       0.0      2.0      0.0  <-- drift on one computation; transient unless the next one repeats
+17:05:27  app-2          0.0       0.0      0.0      0.0
+17:05:32  app-3          0.0       0.0      0.0      0.0
+17:05:41  app-1          0.0       0.0      0.0      0.0
+17:05:45  app-2          0.0       0.0      0.0      0.0
+17:05:50  app-3          0.0       0.0      0.0      0.0
+17:05:58  app-1          0.0       1.0      0.0      0.0
+17:06:02  app-2          0.0       0.0      0.0      0.0
+17:06:05  app-3          0.0       0.0      0.0      0.0
+17:06:13  app-1          0.0       0.0      0.0      0.0
+17:06:16  app-2          0.0       0.0      0.0      0.0
+17:06:20  app-3          0.0       0.0      0.0      0.0
+
+--------------------------------------------------------------------
+  21 samples across app-1, app-2, app-3
+  worst hikaricp_connections_pending: 0
+
+  NOTE  flashseats_stock_drift was non-zero on 1 isolated sample(s) and
+        zero on the next read of that replica. That is the measurement's own
+        artefact, not a defect: Redis and PostgreSQL are not read in one
+        snapshot, so a hold created between them shows as a momentary gap
+        (ADR-046). Confirm with docker/scripts/sold-count.sh, which reads the
+        ledger and is the authority.
+
+  No pool pressure observed at this VU count and this E.
+
+  Read that narrowly. It means the budget was not exceeded HERE — not that
+  ADR-049's arithmetic is wrong. Scale VUS up, or EVENTS up, until it is,
+  and record the point at which it turns over. A drill that only ever
+  passes has not found the edge, it has just not looked far enough.

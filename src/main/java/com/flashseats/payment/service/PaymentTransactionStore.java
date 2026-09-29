@@ -120,6 +120,24 @@ public class PaymentTransactionStore {
                 .map(PaymentTransaction::getTransactionReference);
     }
 
+    /**
+     * Resolves the internal payment reference from the order/hold when the provider
+     * webhook arrived before the Stripe PaymentIntent id was recorded.
+     */
+    @Transactional(propagation = Propagation.REQUIRES_NEW, readOnly = true)
+    public Optional<String> referenceForOrderAndHold(
+            String orderNumber,
+            String holdToken) {
+
+        if (orderNumber == null || orderNumber.isBlank()) {
+            return Optional.empty();
+        }
+
+        return transactions
+                .findFirstByOrderNumberAndHoldTokenOrderByIdDesc(orderNumber, holdToken)
+                .map(PaymentTransaction::getTransactionReference);
+    }
+
     @Transactional(propagation = Propagation.REQUIRES_NEW, readOnly = true)
     public PaymentTransaction require(String transactionReference) {
         return transactions
