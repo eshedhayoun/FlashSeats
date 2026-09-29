@@ -42,6 +42,7 @@ public class PaymentWebhookService {
     private final PaymentProperties properties;
 
     private final MeterRegistry meters;
+    private static final String ORDER_NUMBER_METADATA = "orderNumber";
 
     public PaymentWebhookService(
             WebhookEventStore webhookEvents,
@@ -85,10 +86,29 @@ public class PaymentWebhookService {
         }
 
         try {
+            String orderNumber = orderNumberOf(intent);
+
+            String transactionReference =
+                    transactions.referenceForGateway(intent.getId()).orElse(null);
+
+            if (transactionReference == null) {
+                transactionReference =
+                        transactions.referenceForOrderAndHold(orderNumber, holdToken).orElse(null);
+
+                if (transactionReference != null) {
+                    log.info(
+                            "Webhook {} resolved payment transaction {} by order/hold fallback; "
+                                    + "Stripe intent {} was not linked yet",
+                            event.getId(),
+                            transactionReference,
+                            intent.getId());
+                }
+            }
+
             events.publishEvent(new PaymentSettledEvent(
                     holdToken,
                     intent.getId(),
-                    transactions.referenceForGateway(intent.getId()).orElse(null),
+                    transactionReference,
                     intent.getAmount() == null ? 0L : intent.getAmount(),
                     intent.getCurrency() == null ? null : intent.getCurrency().toUpperCase()));
 
@@ -107,7 +127,17 @@ public class PaymentWebhookService {
             throw settlementFailed;
         }
     }
+    private static String orderNumberOf(PaymentIntent intent) {
+        if (intent.getMetadata() == null) {
+            return null;
+        }
 
+        String orderNumber = intent.getMetadata().get(ORDER_NUMBER_METADATA);
+
+        return orderNumber == null || orderNumber.isBlank()
+                ? null
+                : orderNumber;
+    }
     private Event verify(String rawBody, String signature) {
         try {
             return Webhook.constructEvent(rawBody, signature, properties.getStripe().getWebhookSecret());

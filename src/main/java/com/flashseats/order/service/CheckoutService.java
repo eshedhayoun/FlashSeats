@@ -20,6 +20,7 @@ import java.time.Instant;
 import java.util.Optional;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
+import com.flashseats.hold.exception.HoldAlreadySettledException;
 
 /**
  * The single checkout entry point. The sequence is ADR-001 in order:
@@ -144,8 +145,42 @@ public class CheckoutService {
             //    one path where the pool is the measured ceiling.
             try {
                 receipt = commit.confirm(order.orderNumber(), hold, tier, payment);
+
+            } catch (HoldAlreadySettledException competingCheckout) {
+
+                /*
+                * Another checkout/webhook may have consumed this hold and successfully
+                * confirmed the same order while this request was trying to commit.
+                *
+                * Do NOT refund immediately. First check whether the competing transaction
+                * already completed the purchase.
+                */
+                Optional<OrderReceiptResponse> alreadyConfirmed =
+                        queries.findConfirmedReceiptFor(request.holdToken());
+
+                if (alreadyConfirmed.isPresent()) {
+                    log.info(
+                            "Concurrent checkout already confirmed order {}; returning its receipt",
+                            order.orderNumber());
+
+                    return new CheckoutOutcome(alreadyConfirmed.get(), true);
+                }
+
+                /*
+                * The other transaction may still be committing. Leave the order PENDING
+                * and let the Stripe webhook/retry path finish the purchase.
+                *
+                * DuplicatePaymentException is deliberately outside the generic catch below,
+                * so markAbandoned() will NOT change the order to FAILED.
+                */
+                log.warn(
+                        "Order {} lost the hold claim to a concurrent checkout; "
+                                + "leaving payment resolution to the other path",
+                        order.orderNumber());
+
+                throw new DuplicatePaymentException();
+
             } catch (RuntimeException commitFailed) {
-                // 9. Money moved but the seats did not. Give it back and say so.
                 compensate(order.orderNumber(), payment, amountCents, commitFailed);
                 throw OrderErrors.refunded();
             }

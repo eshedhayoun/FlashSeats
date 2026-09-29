@@ -36,6 +36,7 @@ import http from 'k6/http';
 import { check, sleep } from 'k6';
 import { Counter, Rate, Trend } from 'k6/metrics';
 
+const RUN_ID = __ENV.RUN_ID || 'local';
 const BASE      = __ENV.BASE_URL  || 'http://nginx:80';
 const FIRST_ID  = parseInt(__ENV.FIRST_ID || '9001', 10);
 const EVENTS    = parseInt(__ENV.EVENTS   || '5', 10);
@@ -194,7 +195,7 @@ export default function () {
       holdToken,
       userEmail: `vu${__VU}@loadtest.local`,
       paymentMethodId: 'pm_card_visa',
-      idempotencyKey: `k6c-${__VU}-${__ITER}`,
+      idempotencyKey: `k6c-${RUN_ID}-${__VU}-${__ITER}`,
     }),
     { headers: clientHeaders(), tags: { step: 'checkout', ...tag } },
   );

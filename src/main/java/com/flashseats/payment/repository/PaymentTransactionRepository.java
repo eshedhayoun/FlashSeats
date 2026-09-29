@@ -28,4 +28,13 @@ public interface PaymentTransactionRepository extends JpaRepository<PaymentTrans
      * single-valued by construction.
      */
     Optional<PaymentTransaction> findByGatewayReference(String gatewayReference);
+    /**
+     * Most recent payment attempt for one order/hold.
+     *
+     * <p>Used by webhook reconciliation when Stripe has already succeeded but the
+     * synchronous checkout has not yet recorded the PaymentIntent id.
+     */
+    Optional<PaymentTransaction> findFirstByOrderNumberAndHoldTokenOrderByIdDesc(
+            String orderNumber,
+            String holdToken);
 }
