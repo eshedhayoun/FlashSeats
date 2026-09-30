@@ -89,50 +89,64 @@ public class PaymentSettlementService {
      */
     private void settle(Order order, PaymentSettledEvent event) {
         String orderNumber = order.getOrderNumber();
-        try {
-            HoldSummary hold = holds.getActiveHold(event.holdToken(), order.getUserSessionId());
-            TierSummary tier = catalog.getTierSummary(hold.eventId(), hold.tierId());
 
-            commit.confirm(orderNumber, hold, tier, resultOf(event));
-            log.info("Order {} confirmed from a webhook settlement", orderNumber);
+        try {
+            HoldSummary hold =
+                    holds.getActiveHold(event.holdToken(), order.getUserSessionId());
+
+            TierSummary tier =
+                    catalog.getTierSummary(hold.eventId(), hold.tierId());
+
+            commit.confirm(
+                    orderNumber,
+                    hold,
+                    tier,
+                    resultOf(event));
+
+            log.info(
+                    "Order {} confirmed from a webhook settlement",
+                    orderNumber);
 
         } catch (HoldAlreadySettledException competingSettlement) {
 
             /*
-            * Another checkout/webhook may have consumed this exact hold and be
-            * committing the order right now.
-            *
-            * Re-read the order after the failed transaction before deciding that
-            * the charge must be refunded.
+            * Another checkout/webhook may have consumed the same hold.
+            * Losing the hold claim does NOT by itself mean that the payment
+            * must be refunded.
             */
-            Order latest = orders.findByHoldToken(event.holdToken()).orElse(null);
+            Order latest =
+                    orders.findByHoldToken(event.holdToken()).orElse(null);
 
-            if (latest != null && latest.getStatus() == OrderStatus.CONFIRMED) {
+            if (latest != null
+                    && latest.getStatus() == OrderStatus.CONFIRMED) {
+
                 log.info(
-                        "Webhook settlement for order {} lost a concurrent hold claim; "
-                                + "order is already CONFIRMED, no refund",
+                        "Webhook settlement for order {} lost a concurrent "
+                                + "hold claim; order is already CONFIRMED, no refund",
                         orderNumber);
 
                 return;
             }
 
-            if (latest != null && latest.getStatus() == OrderStatus.REFUNDED) {
+            if (latest != null
+                    && latest.getStatus() == OrderStatus.REFUNDED) {
+
                 log.info(
-                        "Webhook settlement for order {} lost a concurrent hold claim; "
-                                + "order is already REFUNDED, no further action",
+                        "Webhook settlement for order {} lost a concurrent "
+                                + "hold claim; order is already REFUNDED, no further action",
                         orderNumber);
 
                 return;
             }
 
             /*
-            * The competing transaction has not become visible as CONFIRMED yet.
-            * Do NOT refund from this race observation. Throw so the webhook claim is
-            * released and Stripe can redeliver after the competing transaction settles.
+            * The competing transaction has not committed a terminal result yet.
+            * Releasing the webhook claim lets Stripe retry instead of refunding
+            * based on an incomplete observation.
             */
             log.warn(
-                    "Webhook settlement for order {} lost the hold claim, but the "
-                            + "order is not confirmed yet; releasing webhook claim for retry",
+                    "Webhook settlement for order {} lost the hold claim, but "
+                            + "the order is not resolved yet; releasing webhook claim for retry",
                     orderNumber,
                     competingSettlement);
 
@@ -141,11 +155,46 @@ public class PaymentSettlementService {
         } catch (HoldNotFoundException | HoldExpiredException seatsGone) {
 
             /*
-            * These are different: the hold is definitively unavailable, rather than
-            * merely claimed by a concurrent checkout.
+            * IMPORTANT:
+            *
+            * HoldExpiredException is also what getActiveHold() reports when a
+            * hold was already CONSUMED. Therefore "hold unavailable" is not enough
+            * evidence to refund.
+            *
+            * Re-read the durable order before compensating.
+            */
+            Order latest =
+                    orders.findByHoldToken(event.holdToken()).orElse(null);
+
+            if (latest != null
+                    && latest.getStatus() == OrderStatus.CONFIRMED) {
+
+                log.info(
+                        "Webhook settlement for order {} found a settled hold, "
+                                + "but the order is already CONFIRMED; no refund",
+                        orderNumber);
+
+                return;
+            }
+
+            if (latest != null
+                    && latest.getStatus() == OrderStatus.REFUNDED) {
+
+                log.info(
+                        "Webhook settlement for order {} found an already "
+                                + "REFUNDED order; no further action",
+                        orderNumber);
+
+                return;
+            }
+
+            /*
+            * At this point there is no durable successful order to protect.
+            * The hold is genuinely unavailable, so the settled Stripe charge
+            * must be compensated.
             */
             log.warn(
-                    "Webhook settlement for order {} found hold {} gone — refunding",
+                    "Webhook settlement for order {} found hold {} unavailable; refunding",
                     orderNumber,
                     event.holdToken(),
                     seatsGone);
@@ -159,11 +208,12 @@ public class PaymentSettlementService {
     }
 
     /**
-        * The event, shaped as {@link OrderCommitService#confirm} expects.
-        * <p>{@code transactionReference} should normally be resolved before this event
-        * is published. The payment webhook first looks up the Stripe intent directly,
-        * then falls back to the order/hold pair when the intent id has not yet been
-        * persisted onto the payment ledger row.
+     * The event, shaped as {@link OrderCommitService#confirm} expects.
+     *
+     * <p>{@code transactionReference} should normally be resolved before this event
+     * is published. The payment webhook first looks up the Stripe intent directly,
+     * then falls back to the order/hold pair when the intent id has not yet been
+     * persisted onto the payment ledger row.
      */
     private static PaymentResult resultOf(PaymentSettledEvent event) {
         return new PaymentResult(
