@@ -1,0 +1,10 @@
+services:
+  app-1:
+    environment:
+      FLASHSEATS_QUEUE_GLOBAL_ADMISSION_BUDGET_PER_TICK: "30"
+  app-2:
+    environment:
+      FLASHSEATS_QUEUE_GLOBAL_ADMISSION_BUDGET_PER_TICK: "30"
+  app-3:
+    environment:
+      FLASHSEATS_QUEUE_GLOBAL_ADMISSION_BUDGET_PER_TICK: "30"

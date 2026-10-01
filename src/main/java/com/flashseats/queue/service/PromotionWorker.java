@@ -14,7 +14,10 @@ import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.data.redis.connection.RedisStringCommands;
+import org.springframework.data.redis.core.RedisCallback;
 import org.springframework.data.redis.core.StringRedisTemplate;
+import org.springframework.data.redis.core.types.Expiration;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Component;
 import tools.jackson.databind.ObjectMapper;
@@ -165,43 +168,77 @@ public class PromotionWorker {
             return;
         }
 
-        long promoted = 0;
+        List<String> promotedSessions = new ArrayList<>();
         for (String sessionId : front) {
-            if (promoted >= budgeted) {
+            if (promotedSessions.size() >= budgeted) {
                 break;
             }
-            issuePass(eventId, sessionId, now);
-            promoted++;
+            promotedSessions.add(sessionId);
         }
+        issuePasses(eventId, promotedSessions, now);
+        long promoted = promotedSessions.size();
         admitted.increment(promoted);
         log.debug("Promoted {} session(s) for event {}", promoted, eventId);
     }
 
     /**
-     * Mints a pass, moves the buyer out of the line, and tells them.
+     * Mints passes and moves buyers out of the line in one Redis pipeline. The state changes remain
+     * the same as the individual operations, but one network round trip avoids making promotion
+     * overhead grow with every buyer admitted in a tick.
      *
      * <p>The {@code PUBLISH} is what actually reaches the browser. This worker runs on one replica;
      * the buyer's stream may be held by another. Every replica subscribes and delivers to its own
      * connections (ADR-007).
      */
-    private void issuePass(long eventId, String sessionId, Instant now) {
-        String passToken = tokens.mintPass(eventId, sessionId);
+    private void issuePasses(long eventId, List<String> sessionIds, Instant now) {
+        if (sessionIds.isEmpty()) {
+            return;
+        }
+
         Instant expiresAt = now.plusSeconds(properties.getPassTtlSeconds());
+        String passesKey = QueueKeys.passes(eventId);
+        String waitingKey = QueueKeys.waiting(eventId);
+        List<Promotion> promotions = new ArrayList<>(sessionIds.size());
+        for (String sessionId : sessionIds) {
+            promotions.add(new Promotion(
+                    sessionId,
+                    tokens.mintPass(eventId, sessionId),
+                    QueueKeys.pass(eventId, sessionId)));
+        }
 
-        redis.opsForValue()
-                .set(
-                        QueueKeys.pass(eventId, sessionId),
-                        passToken,
-                        Duration.ofSeconds(properties.getPassTtlSeconds()));
-        redis.opsForZSet()
-                .add(QueueKeys.passes(eventId), sessionId, (double) expiresAt.toEpochMilli());
-        redis.opsForZSet().remove(QueueKeys.waiting(eventId), sessionId);
+        redis.executePipelined((RedisCallback<Object>) connection -> {
+            for (Promotion promotion : promotions) {
+                connection.stringCommands().set(
+                        utf8(promotion.passKey()),
+                        utf8(promotion.passToken()),
+                        Expiration.seconds(properties.getPassTtlSeconds()),
+                        RedisStringCommands.SetOption.UPSERT);
+                connection.zSetCommands().zAdd(
+                        utf8(passesKey),
+                        expiresAt.toEpochMilli(),
+                        utf8(promotion.sessionId()));
+                connection.zSetCommands().zRem(
+                        utf8(waitingKey),
+                        utf8(promotion.sessionId()));
+            }
+            return null;
+        });
 
-        publish(
-                eventId,
-                QueueChannelMessage.promotion(
-                        sessionId, passToken, properties.getPassTtlSeconds()));
+        for (Promotion promotion : promotions) {
+            publish(
+                    eventId,
+                    QueueChannelMessage.promotion(
+                            promotion.sessionId(),
+                            promotion.passToken(),
+                            properties.getPassTtlSeconds()));
+        }
     }
+
+    private static byte[] utf8(String value) {
+        return value.getBytes(java.nio.charset.StandardCharsets.UTF_8);
+    }
+
+    private record Promotion(String sessionId, String passToken, String passKey) {}
 
     /**
      * Stock is gone and nobody holds a claim on it: say so once, and change nothing else. The waiting

@@ -51,6 +51,7 @@ public class CheckoutService {
     private final OrderCommitService commit;
     private final OrderRefundService refunds;
     private final OrderQueryService queries;
+    private final CheckoutMetrics metrics;
     private final OrderProperties properties;
     private final Clock clock;
 
@@ -61,6 +62,7 @@ public class CheckoutService {
             OrderCommitService commit,
             OrderRefundService refunds,
             OrderQueryService queries,
+            CheckoutMetrics metrics,
             OrderProperties properties,
             Clock clock) {
         this.holds = holds;
@@ -69,6 +71,7 @@ public class CheckoutService {
         this.commit = commit;
         this.refunds = refunds;
         this.queries = queries;
+        this.metrics = metrics;
         this.properties = properties;
         this.clock = clock;
     }
@@ -79,24 +82,39 @@ public class CheckoutService {
         //    consumes its hold, so checking the hold first would answer a resubmission with
         //    "your reservation expired" when the buyer in fact already owns the seats.
         Optional<OrderReceiptResponse> alreadyBought =
-                queries.findConfirmedReceiptFor(request.holdToken());
+                metrics.record(
+                        "receipt_lookup",
+                        () -> queries.findConfirmedReceiptFor(request.holdToken()));
         if (alreadyBought.isPresent()) {
             return new CheckoutOutcome(alreadyBought.get(), true);
         }
 
         // 1. The hold must be live and this session's. Throws 404/410 otherwise.
-        HoldSummary hold = holds.getActiveHold(request.holdToken(), sessionId);
+        HoldSummary hold =
+                metrics.record(
+                        "hold_lookup", () -> holds.getActiveHold(request.holdToken(), sessionId));
 
         // 2. Price from the tier, never from the request (ADR-013).
-        TierSummary tier = catalog.getTierSummary(hold.eventId(), hold.tierId());
+        TierSummary tier =
+                metrics.record(
+                        "tier_lookup", () -> catalog.getTierSummary(hold.eventId(), hold.tierId()));
         long amountCents = tier.priceCents() * hold.quantity();
 
         // 3. Sale window, with the post-close grace for buyers already at the payment form.
         requireCheckoutWindow(tier);
 
         // 4. Find-or-create on UNIQUE(hold_token). A completed checkout replays as 200 + receipt.
-        CheckoutOrder order = commit.findOrCreate(
-                request.holdToken(), sessionId, request.userEmail(), hold, amountCents, tier.currency());
+        CheckoutOrder order =
+                metrics.record(
+                        "order_find_or_create",
+                        () ->
+                                commit.findOrCreate(
+                                        request.holdToken(),
+                                        sessionId,
+                                        request.userEmail(),
+                                        hold,
+                                        amountCents,
+                                        tier.currency()));
         if (order.alreadyConfirmed()) {
             return new CheckoutOutcome(queries.receiptFor(order.orderNumber()), true);
         }
@@ -109,19 +127,26 @@ public class CheckoutService {
         try {
             // 5. The one grace extension. Idempotent across retries; throws if the hold has been
             //    settled by a concurrent expiry — in which case we must NOT charge (ADR-023).
-            Instant expiresAt = holds.grantGrace(request.holdToken());
+            Instant expiresAt =
+                    metrics.record(
+                            "grace_extension", () -> holds.grantGrace(request.holdToken()));
             requireTimeToComplete(expiresAt);
 
             // 6. Money moves here, with no transaction open.
-            PaymentResult payment = payments.authorize(new AuthorizeCommand(
-                    order.orderNumber(),
-                    request.holdToken(),
-                    sessionId,
-                    amountCents,
-                    tier.currency(),
-                    request.paymentMethodId(),
-                    request.idempotencyKey(),
-                    order.attemptNumber() + 1));
+            PaymentResult payment =
+                    metrics.record(
+                            "payment_authorize",
+                            () ->
+                                    payments.authorize(
+                                            new AuthorizeCommand(
+                                                    order.orderNumber(),
+                                                    request.holdToken(),
+                                                    sessionId,
+                                                    amountCents,
+                                                    tier.currency(),
+                                                    request.paymentMethodId(),
+                                                    request.idempotencyKey(),
+                                                    order.attemptNumber() + 1)));
 
             // 3-D Secure. Thrown, so the catch-all below marks the order FAILED — resumable on the
             // same order number, with NO attempt consumed (ADR-034). The buyer completes the
@@ -135,7 +160,11 @@ public class CheckoutService {
             if (!payment.succeeded()) {
                 // The hold stays ACTIVE. The buyer was promised they could try another card.
                 int attemptsRemaining =
-                        commit.recordFailedAttempt(order.orderNumber(), payment.failureReason());
+                        metrics.record(
+                                "failed_attempt",
+                                () ->
+                                        commit.recordFailedAttempt(
+                                                order.orderNumber(), payment.failureReason()));
                 throw PaymentErrors.declined(payment.failureReason(), attemptsRemaining, expiresAt);
             }
 
@@ -144,7 +173,10 @@ public class CheckoutService {
             //    so re-reading the order to build it would cost a second pooled connection on the
             //    one path where the pool is the measured ceiling.
             try {
-                receipt = commit.confirm(order.orderNumber(), hold, tier, payment);
+            receipt =
+                    metrics.record(
+                            "order_confirm",
+                            () -> commit.confirm(order.orderNumber(), hold, tier, payment));
 
             } catch (HoldAlreadySettledException competingCheckout) {
 
@@ -156,7 +188,9 @@ public class CheckoutService {
                 * already completed the purchase.
                 */
                 Optional<OrderReceiptResponse> alreadyConfirmed =
-                        queries.findConfirmedReceiptFor(request.holdToken());
+                        metrics.record(
+                                "competing_receipt_lookup",
+                                () -> queries.findConfirmedReceiptFor(request.holdToken()));
 
                 if (alreadyConfirmed.isPresent()) {
                     log.info(
