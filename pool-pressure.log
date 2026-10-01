@@ -1,37 +1,25 @@
-Sampling app-1 app-2 app-3 every 5s for 300s. Pool maximum is 30 per replica.
+Sampling app-1 app-2 app-3 every 5s for 180s. Pool maximum is 30 per replica.
 
 time      replica    pending    active    drift  missing
 --------- -------- --------- --------- -------- --------
-17:54:12  app-1          0.0       0.0      0.0      0.0
-17:54:31  app-2          0.0       0.0      0.0      0.0
-17:54:53  app-3          0.0       2.0      0.0      0.0
-17:55:11  app-1          0.0       0.0      0.0      0.0
-17:55:24  app-2          0.0       0.0      0.0      0.0
-17:55:37  app-3          0.0       3.0      0.0      0.0
-17:55:54  app-1          0.0       0.0      0.0      0.0
-17:56:05  app-2          0.0       1.0      0.0      0.0
-17:56:16  app-3          0.0       2.0      2.0      0.0  <-- drift on one computation; transient unless the next one repeats
-17:56:32  app-1          0.0       1.0      0.0      0.0
-17:56:51  app-2          0.0       2.0      0.0      0.0
-17:57:03  app-3          0.0       1.0      2.0      0.0  <-- same drift computation as before (47s < 60s); not a second reading
-17:57:21  app-1          0.0       1.0      0.0      0.0
-17:57:33  app-2          0.0       1.0      0.0      0.0
-17:57:40  app-3          0.0       1.0      0.0      0.0
-17:57:52  app-1          0.0       0.0      0.0      0.0
-17:57:59  app-2          0.0       0.0      0.0      0.0
-17:58:11  app-3          0.0       0.0      0.0      0.0
-17:58:25  app-1          0.0       0.0      0.0      0.0
-17:58:32  app-2          0.0       0.0      0.0      0.0
-17:58:39  app-3          0.0       0.0      0.0      0.0
-17:58:55  app-1          0.0       0.0      0.0      0.0
-17:59:02  app-2          0.0       1.0      0.0      0.0
-17:59:08  app-3          0.0       0.0      0.0      0.0
+18:20:03  app-1          0.0       1.0      0.0      0.0
+18:20:25  app-2          0.0       1.0      0.0      0.0
+18:20:42  app-3          0.0       2.0      0.0      0.0
+18:21:10  app-1          0.0       7.0      2.0      0.0  <-- drift on one computation; transient unless the next one repeats
+18:21:26  app-2          0.0       0.0      0.0      0.0
+18:21:40  app-3          0.0       0.0      0.0      0.0
+18:21:56  app-1          0.0       1.0      2.0      0.0  <-- same drift computation as before (46s < 60s); not a second reading
+18:22:08  app-2          0.0       1.0      0.0      0.0
+18:22:17  app-3          0.0       0.0      2.0      0.0  <-- drift on one computation; transient unless the next one repeats
+18:22:29  app-1          0.0       0.0      0.0      0.0
+18:22:35  app-2          0.0       0.0      0.0      0.0
+18:22:42  app-3          0.0       0.0      2.0      0.0  <-- same drift computation as before (25s < 60s); not a second reading
 
 --------------------------------------------------------------------
-  24 samples across app-1, app-2, app-3
+  12 samples across app-1, app-2, app-3
   worst hikaricp_connections_pending: 0
 
-  NOTE  flashseats_stock_drift was non-zero on 1 isolated sample(s) and
+  NOTE  flashseats_stock_drift was non-zero on 2 isolated sample(s) and
         zero on the next read of that replica. That is the measurement's own
         artefact, not a defect: Redis and PostgreSQL are not read in one
         snapshot, so a hold created between them shows as a momentary gap

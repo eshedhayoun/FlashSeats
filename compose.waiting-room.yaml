@@ -1,0 +1,14 @@
+services:
+  k6-waiting-room:
+    image: grafana/k6:latest
+    profiles: ["loadtest"]
+    environment:
+      BASE_URL: ${K6_BASE_URL:-http://nginx:80}
+      EVENT_ID: ${K6_EVENT_ID:-9001}
+      VUS: ${K6_VUS:-10000}
+      WAIT_SECONDS: ${K6_WAIT_SECONDS:-180}
+      POLL_SECONDS: ${K6_POLL_SECONDS:-2}
+    volumes:
+      - ./docker/k6:/scripts
+    entrypoint: ["k6", "run", "/scripts/waiting-room.js"]
+    networks: [flashseats]

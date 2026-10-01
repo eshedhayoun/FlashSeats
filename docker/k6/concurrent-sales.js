@@ -185,7 +185,7 @@ export default function () {
   sleep(2 + Math.random() * 8);
 
   // --- 6. Checkout ---------------------------------------------------------
-  // Eight sequential database transactions behind this one call. That figure is
+  // Nine sequential database transactions behind this one call. That figure is
   // the reason ADR-049 re-derives the admission budget rather than reusing
   // ADR-028's, and this is where it is paid.
   const t0 = Date.now();

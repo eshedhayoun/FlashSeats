@@ -13,6 +13,7 @@ import com.flashseats.payment.gateway.PaymentGateway;
 import com.flashseats.payment.model.PaymentTransaction;
 import io.micrometer.core.instrument.Counter;
 import io.micrometer.core.instrument.MeterRegistry;
+import io.micrometer.core.instrument.Timer;
 import java.time.Duration;
 import java.util.EnumMap;
 import java.util.Map;
@@ -36,6 +37,9 @@ public class PaymentService implements PaymentFacade {
     private final PaymentTransactionStore store;
     private final StringRedisTemplate redis;
     private final PaymentProperties properties;
+    private final Timer beginAttemptTimer;
+    private final Timer gatewayTimer;
+    private final Timer recordOutcomeTimer;
     private final Map<GatewayResult.Outcome, Counter> attemptsByOutcome =
             new EnumMap<>(GatewayResult.Outcome.class);
 
@@ -49,6 +53,9 @@ public class PaymentService implements PaymentFacade {
         this.store = store;
         this.redis = redis;
         this.properties = properties;
+        this.beginAttemptTimer = timer(meters, "begin_attempt");
+        this.gatewayTimer = timer(meters, "gateway");
+        this.recordOutcomeTimer = timer(meters, "record_outcome");
         /*
          * One counter tagged by outcome, not a lifetime ratio, which cannot show a spike.
          * rate(attempts{outcome="declined"}[5m]) / rate(attempts[5m]) is the ratio over any window.
@@ -96,19 +103,26 @@ public class PaymentService implements PaymentFacade {
             // life of the hold (FE_SPEC §1), so a second charge would replay the provider's cached
             // "requires_action" answer for ever — and varying the key per attempt instead would
             // open a second intent and risk billing twice for one authentication.
-            ChargeAttempt attempt = store.beginAttempt(command); // tx1
+            ChargeAttempt attempt = timed(beginAttemptTimer, () -> store.beginAttempt(command)); // tx1
 
-            GatewayResult result = attempt.isResume() // no transaction open
-                    ? gateway.retrieve(attempt.resumableGatewayReference())
-                    : gateway.charge(new GatewayCharge(
-                            command.orderNumber(),
-                            command.holdToken(),
-                            command.amountCents(),
-                            command.currency(),
-                            command.paymentMethodId(),
-                            command.clientIdempotencyKey()));
+            GatewayResult result =
+                    timed(
+                            gatewayTimer,
+                            () ->
+                                    attempt.isResume() // no transaction open
+                                            ? gateway.retrieve(attempt.resumableGatewayReference())
+                                            : gateway.charge(
+                                                    new GatewayCharge(
+                                                            command.orderNumber(),
+                                                            command.holdToken(),
+                                                            command.amountCents(),
+                                                            command.currency(),
+                                                            command.paymentMethodId(),
+                                                            command.clientIdempotencyKey())));
 
-            store.recordOutcome(attempt.transactionReference(), result); // tx2
+            timed(
+                    recordOutcomeTimer,
+                    () -> store.recordOutcome(attempt.transactionReference(), result)); // tx2
             attemptsByOutcome.get(result.outcome()).increment();
 
             if (result.outcome() == GatewayResult.Outcome.ERROR) {
@@ -196,5 +210,31 @@ public class PaymentService implements PaymentFacade {
                 false,
                 0,
                 result.failureReason());
+    }
+
+    private static Timer timer(MeterRegistry meters, String stage) {
+        return Timer.builder("flashseats.payment.stage")
+                .description("Payment authorization stage duration")
+                .tag("stage", stage)
+                .publishPercentiles(0.5, 0.95, 0.99)
+                .register(meters);
+    }
+
+    private static <T> T timed(Timer timer, java.util.function.Supplier<T> operation) {
+        Timer.Sample sample = Timer.start();
+        try {
+            return operation.get();
+        } finally {
+            sample.stop(timer);
+        }
+    }
+
+    private static void timed(Timer timer, Runnable operation) {
+        timed(
+                timer,
+                () -> {
+                    operation.run();
+                    return null;
+                });
     }
 }
