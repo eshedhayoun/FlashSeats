@@ -2936,3 +2936,34 @@ call happened first is unknown. An automatic send would turn every crash after t
 accepted a message into a second ticket email — ADR-042's failure, reached from a crash instead of a
 redelivery. A person decides, and the buyer can download the ticket in the meantime (ADR-050).
 
+---
+
+## ADR-070 — A live stream belongs to a tab, and a frame to the sale it is about
+
+**Status:** accepted, Pass 15. Amends ADR-007 (fan-out delivers to the replica's own connections).
+
+**Context.** `SseEmitterRegistry` kept one stream per **session**: a new stream for a session completed
+the old one. Two consequences, both on paths FE_SPEC calls supported:
+
+- **Two tabs fought.** A buyer with the sale open twice, or queued in two sales at once (FE_SPEC rule
+  5), had each new stream close the other. Both tabs reconnected within a second, closed each other
+  again, and showed "Reconnecting" over and over; the polling fallback never started because each
+  reconnect succeeded.
+- **A promotion could reach the wrong sale.** A session-addressed frame went to whatever stream the
+  session held, whichever sale it was for. A buyer queued in sale A whose latest stream was for sale B
+  received A's `queue-promoted` in B's tab, which spent the pass on B and failed — ADR-036's "a pass for
+  one sale is never offered to another", broken in the delivery layer.
+
+**Decision.**
+
+1. **Streams are kept per event and per session**, as many as the session opens. Sweeps and
+   broadcasts reach every stream of the event; a session-addressed frame reaches that session's
+   streams **for the event named by the channel it arrived on**, and no other.
+2. **The frames a connect sends — the replay after `Last-Event-ID`, the "connected" comment, a pass
+   rebuilt from Redis, the first position, the paused notice — go to the new stream only**, not to the
+   buyer's other tabs.
+3. **A session may hold five streams per sale**; a sixth closes its oldest. That bounds what one
+   session can hold open (06 §10 S8), and an honest buyer never reaches it.
+
+Positions stay clamped per stream, so each tab's number still never rises.
+
