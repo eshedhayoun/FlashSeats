@@ -72,7 +72,9 @@ spike this system exists to serve.
 | session | 20 | 10/s |
 | IP | 300 | 150/s |
 
-**`X-Forwarded-For` is believed only from a trusted peer** (ADR-039), and the trusted set is
+**`X-Forwarded-For` is read right to left** (ADR-071): a proxy appends the address it saw, so the
+client is the right-most entry that is not itself a trusted proxy — never the left-most, which the
+client wrote. **And it is believed only from a trusted peer** (ADR-039), and the trusted set is
 **empty by default — trust nobody**. Trusting the header unconditionally let any caller mint unlimited
 fresh IP buckets by rotating a fake address; combined with a session bucket that is free to mint by
 dropping a cookie, that left the backstop enforcing nothing at all.

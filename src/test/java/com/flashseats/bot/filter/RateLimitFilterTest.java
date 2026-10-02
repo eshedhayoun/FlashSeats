@@ -95,7 +95,7 @@ class RateLimitFilterTest {
     }
 
     @Test
-    void trustedProxyUsesTheFirstForwardedAddress() throws Exception {
+    void aChainOfTrustedProxiesResolvesToTheClient() throws Exception {
         RateLimitService rateLimits = mock(RateLimitService.class);
         IpRuleService ipRules = mock(IpRuleService.class);
         BotAuditService audit = mock(BotAuditService.class);
@@ -103,7 +103,10 @@ class RateLimitFilterTest {
         ObjectMapper json = mock(ObjectMapper.class);
         FilterChain chain = mock(FilterChain.class);
 
+        // Every hop after the client is a proxy we run; the client is the right-most entry that is not.
         when(rateLimits.isTrustedProxy("10.0.0.10")).thenReturn(true);
+        when(rateLimits.isTrustedProxy("10.0.0.11")).thenReturn(true);
+        when(rateLimits.isTrustedProxy("10.0.0.12")).thenReturn(true);
         when(ipRules.actionFor("203.0.113.55")).thenReturn(null);
         when(rateLimits.allowSession("session-1")).thenReturn(true);
         when(rateLimits.allowIp("203.0.113.55")).thenReturn(true);
@@ -223,5 +226,63 @@ class RateLimitFilterTest {
         verify(chain).doFilter(request, response);
         verify(metrics).recordLimiterUnavailable();
         assertThat(response.getStatus()).isEqualTo(200);
+    }
+
+    /**
+     * Each proxy appends the address it saw, so everything left of the last trusted hop is whatever the
+     * client sent. Reading the left-most entry let any caller mint a fresh IP bucket per request (ADR-071).
+     */
+    @Test
+    void aSpoofedForwardedForBehindATrustedProxyIsIgnored() throws Exception {
+        RateLimitService rateLimits = mock(RateLimitService.class);
+        IpRuleService ipRules = mock(IpRuleService.class);
+        FilterChain chain = mock(FilterChain.class);
+
+        when(rateLimits.isTrustedProxy("172.28.0.10")).thenReturn(true);
+        when(rateLimits.allowSession("session-1")).thenReturn(true);
+        when(rateLimits.allowIp("203.0.113.9")).thenReturn(true);
+
+        RateLimitFilter filter = new RateLimitFilter(
+                rateLimits, ipRules, mock(BotAuditService.class), mock(BotMetrics.class), mock(ObjectMapper.class));
+
+        MockHttpServletRequest request = new MockHttpServletRequest();
+        request.setRequestURI("/api/v1/queue/join");
+        request.setRemoteAddr("172.28.0.10");
+        // The client sent "6.6.6.6"; nginx appended the address it actually saw.
+        request.addHeader("X-Forwarded-For", "6.6.6.6, 203.0.113.9");
+        request.setAttribute(SessionId.REQUEST_ATTRIBUTE, "session-1");
+
+        filter.doFilter(request, new MockHttpServletResponse(), chain);
+
+        assertThat(request.getAttribute(com.flashseats.shared.web.ClientAddress.REQUEST_ATTRIBUTE))
+                .isEqualTo("203.0.113.9");
+        verify(rateLimits).allowIp("203.0.113.9");
+    }
+
+    /** A trusted hop inside the chain — the load harness in front of nginx — is skipped too. */
+    @Test
+    void trustedHopsInsideTheChainAreSkipped() throws Exception {
+        RateLimitService rateLimits = mock(RateLimitService.class);
+        IpRuleService ipRules = mock(IpRuleService.class);
+        FilterChain chain = mock(FilterChain.class);
+
+        when(rateLimits.isTrustedProxy("172.28.0.10")).thenReturn(true);
+        when(rateLimits.isTrustedProxy("172.28.0.200")).thenReturn(true);
+        when(rateLimits.allowSession("session-1")).thenReturn(true);
+        when(rateLimits.allowIp("10.0.3.7")).thenReturn(true);
+
+        RateLimitFilter filter = new RateLimitFilter(
+                rateLimits, ipRules, mock(BotAuditService.class), mock(BotMetrics.class), mock(ObjectMapper.class));
+
+        MockHttpServletRequest request = new MockHttpServletRequest();
+        request.setRequestURI("/api/v1/queue/join");
+        request.setRemoteAddr("172.28.0.10");
+        request.addHeader("X-Forwarded-For", "10.0.3.7, 172.28.0.200");
+        request.setAttribute(SessionId.REQUEST_ATTRIBUTE, "session-1");
+
+        filter.doFilter(request, new MockHttpServletResponse(), chain);
+
+        assertThat(request.getAttribute(com.flashseats.shared.web.ClientAddress.REQUEST_ATTRIBUTE))
+                .isEqualTo("10.0.3.7");
     }
 }

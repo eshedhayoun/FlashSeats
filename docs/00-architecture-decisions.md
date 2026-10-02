@@ -1015,7 +1015,8 @@ mint unlimited fresh IP buckets, or poison a real one. Since discarding the cook
 fresh session bucket, this left **no effective rate limiting whatsoever** for a cookie-less client —
 while ADR-011 was explicitly relying on the IP bucket as the backstop that makes a deliberately
 loose session bucket acceptable. Note that `server.forward-headers-strategy` does not help here: the
-filter reads the header itself, so it does its own trust check.
+filter reads the header itself, so it does its own trust check. *(ADR-071: it did hurt, though — the
+`framework` strategy rewrote the request's remote address from the client's own header first.)*
 
 **The defect behind rules 2 and 3.** `flashseats.order.receipt-secret` defaulted to
 `${FLASHSEATS_SESSION_SECRET}`, so every deployment that set the session secret signed receipts with
@@ -2966,4 +2967,38 @@ the old one. Two consequences, both on paths FE_SPEC calls supported:
    session can hold open (06 §10 S8), and an honest buyer never reaches it.
 
 Positions stay clamped per stream, so each tab's number still never rises.
+
+---
+
+## ADR-071 — The client's address is the right-most one nobody we trust appended
+
+**Status:** accepted, Pass 15. Amends ADR-039 (trusted proxies) and ADR-047 (the load harness's
+per-VU addresses).
+
+**Context.** nginx sets `X-Forwarded-For $proxy_add_x_forwarded_for`: it **appends** the address it
+saw to whatever the client sent. Two readers then took the **left-most** entry — the one the client
+chose:
+
+- `RateLimitFilter`, which honoured the header from a trusted proxy and read `split(",")[0]`;
+- and, before it, Spring's own `ForwardedHeaderFilter`, enabled by `SERVER_FORWARD_HEADERS_STRATEGY:
+  framework`, which rewrote the request's remote address from the left-most entry for **any** caller.
+
+So any client behind nginx could send its own `X-Forwarded-For` and get a fresh IP bucket per request
+— ADR-039's original defect, back in the deployed shape, and with it the only rate-limit control a
+cookie-less client cannot reset.
+
+**Decision.**
+
+1. **The cluster uses `server.forward-headers-strategy=native`** — Tomcat's `RemoteIpValve`, which
+   trusts only internal proxies and walks the header right to left, stopping at the first address that
+   is not one. The request's remote address is then the real client, whatever it sent.
+2. **`RateLimitFilter` reads the header the same way**, as defence in depth for a deployment without
+   the valve: from a trusted peer, the right-most entry that is not itself in
+   `flashseats.bot.trusted-proxies`.
+
+**The load harness still works, and that is checked rather than assumed.** k6 gives every VU its own
+`X-Forwarded-For` (ADR-047) from `10.0.0.0/8`, which the valve's default internal-proxy pattern also
+covers, so the walk passes through k6's container and nginx and lands on the VU's address. A drill in
+which every VU shared one bucket would show up as `429`s in k6's summary; Pass 15's drills are where
+that is confirmed.
 

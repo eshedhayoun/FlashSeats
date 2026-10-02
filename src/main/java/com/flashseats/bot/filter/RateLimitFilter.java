@@ -141,6 +141,11 @@ public class RateLimitFilter extends OncePerRequestFilter {
      * {@code X-Forwarded-For} is client-supplied, so it is honoured only from
      * {@code flashseats.bot.trusted-proxies}, which is empty by default. Trusting it blindly gave anyone
      * unlimited fresh IP buckets.
+     *
+     * <p><strong>The right-most entry that is not itself a trusted proxy</strong> (ADR-071). Each proxy
+     * <em>appends</em> the address it saw, so entries to the left of the last trusted hop are whatever
+     * the client chose to send. Reading the left-most one — as this did — let any caller behind nginx
+     * mint a fresh IP bucket per request by sending its own header.
      */
     private String clientIpOf(HttpServletRequest request) {
         String peer = request.getRemoteAddr();
@@ -148,8 +153,15 @@ public class RateLimitFilter extends OncePerRequestFilter {
             return peer;
         }
         String forwarded = request.getHeader("X-Forwarded-For");
-        if (forwarded != null && !forwarded.isBlank()) {
-            return forwarded.split(",")[0].trim();
+        if (forwarded == null || forwarded.isBlank()) {
+            return peer;
+        }
+        String[] hops = forwarded.split(",");
+        for (int hop = hops.length - 1; hop >= 0; hop--) {
+            String address = hops[hop].trim();
+            if (!address.isEmpty() && !rateLimits.isTrustedProxy(address)) {
+                return address;
+            }
         }
         return peer;
     }
