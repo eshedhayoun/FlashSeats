@@ -4,6 +4,7 @@ import com.flashseats.catalog.facade.CatalogFacade;
 import com.flashseats.queue.config.QueueProperties;
 import io.micrometer.core.instrument.Counter;
 import io.micrometer.core.instrument.MeterRegistry;
+import java.nio.charset.StandardCharsets;
 import java.time.Clock;
 import java.time.Duration;
 import java.time.Instant;
@@ -14,7 +15,10 @@ import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.data.redis.connection.RedisStringCommands.SetOption;
+import org.springframework.data.redis.core.RedisCallback;
 import org.springframework.data.redis.core.StringRedisTemplate;
+import org.springframework.data.redis.core.types.Expiration;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Component;
 import tools.jackson.databind.ObjectMapper;
@@ -165,42 +169,54 @@ public class PromotionWorker {
             return;
         }
 
-        long promoted = 0;
-        for (String sessionId : front) {
-            if (promoted >= budgeted) {
-                break;
-            }
-            issuePass(eventId, sessionId, now);
-            promoted++;
-        }
-        admitted.increment(promoted);
-        log.debug("Promoted {} session(s) for event {}", promoted, eventId);
+        List<Promotion> promotions = front.stream()
+                .limit(budgeted)
+                .map(sessionId -> new Promotion(sessionId, tokens.mintPass(eventId, sessionId)))
+                .toList();
+        issuePasses(eventId, promotions, now);
+        admitted.increment(promotions.size());
+        log.debug("Promoted {} session(s) for event {}", promotions.size(), eventId);
     }
 
     /**
-     * Mints a pass, moves the buyer out of the line, and tells them.
+     * Mints the passes, moves the buyers out of the line, and tells them.
      *
-     * <p>The {@code PUBLISH} is what actually reaches the browser. This worker runs on one replica;
-     * the buyer's stream may be held by another. Every replica subscribes and delivers to its own
+     * <p>The writes go in one pipeline: three commands per buyer as separate round trips made the
+     * tick's cost grow with every buyer it admitted, and the tick has to finish inside its own lock
+     * (ADR-032). The byte-level API, because the connection inside a pipeline is a proxy that does not
+     * cast to {@code StringRedisConnection}.
+     *
+     * <p>The {@code PUBLISH} comes after every pass exists, so no browser is told about a pass it
+     * cannot yet redeem. It is what actually reaches the browser: this worker runs on one replica, the
+     * buyer's stream may be held by another, and every replica subscribes and delivers to its own
      * connections (ADR-007).
      */
-    private void issuePass(long eventId, String sessionId, Instant now) {
-        String passToken = tokens.mintPass(eventId, sessionId);
-        Instant expiresAt = now.plusSeconds(properties.getPassTtlSeconds());
+    private void issuePasses(long eventId, List<Promotion> promotions, Instant now) {
+        byte[] passes = utf8(QueueKeys.passes(eventId));
+        byte[] waiting = utf8(QueueKeys.waiting(eventId));
+        double expiresAt = now.plusSeconds(properties.getPassTtlSeconds()).toEpochMilli();
+        Expiration passTtl = Expiration.seconds(properties.getPassTtlSeconds());
 
-        redis.opsForValue()
-                .set(
-                        QueueKeys.pass(eventId, sessionId),
-                        passToken,
-                        Duration.ofSeconds(properties.getPassTtlSeconds()));
-        redis.opsForZSet()
-                .add(QueueKeys.passes(eventId), sessionId, (double) expiresAt.toEpochMilli());
-        redis.opsForZSet().remove(QueueKeys.waiting(eventId), sessionId);
+        redis.executePipelined((RedisCallback<Object>) connection -> {
+            for (Promotion promotion : promotions) {
+                byte[] sessionId = utf8(promotion.sessionId());
+                connection.stringCommands().set(
+                        utf8(QueueKeys.pass(eventId, promotion.sessionId())),
+                        utf8(promotion.passToken()),
+                        passTtl,
+                        SetOption.UPSERT);
+                connection.zSetCommands().zAdd(passes, expiresAt, sessionId);
+                connection.zSetCommands().zRem(waiting, sessionId);
+            }
+            return null;
+        });
 
-        publish(
-                eventId,
-                QueueChannelMessage.promotion(
-                        sessionId, passToken, properties.getPassTtlSeconds()));
+        for (Promotion promotion : promotions) {
+            publish(
+                    eventId,
+                    QueueChannelMessage.promotion(
+                            promotion.sessionId(), promotion.passToken(), properties.getPassTtlSeconds()));
+        }
     }
 
     /**
@@ -248,6 +264,12 @@ public class PromotionWorker {
                         Duration.ofMillis(properties.getPromotionIntervalMs() * 9 / 10));
         return Boolean.TRUE.equals(acquired);
     }
+
+    private static byte[] utf8(String value) {
+        return value.getBytes(StandardCharsets.UTF_8);
+    }
+
+    private record Promotion(String sessionId, String passToken) {}
 
     private long count(String zsetKey, double fromMillis) {
         Long count = redis.opsForZSet().count(zsetKey, fromMillis, Double.POSITIVE_INFINITY);

@@ -1803,6 +1803,8 @@ ticket unavailable exactly when fulfilment is broken, which is the case the endp
 
 ## ADR-051 — Event and tier metadata are cached; the sale window is still derived
 
+> **Amended by ADR-065:** concurrent misses on one key share a single load.
+
 **Context.** Nothing in this system was cached. `events` changes only when an operator pauses or
 resumes a sale and `ticket_tiers` never changes after creation, yet every window check, event
 summary, tier summary and tier-id lookup was its own PostgreSQL transaction — on the landing page,
@@ -2715,3 +2717,40 @@ ledger row to refund against.
 
 **Cost.** One column. The checkout hot path gains no query and no transaction; the refund path gains
 one short transaction (the claim) and only runs when seats were lost.
+
+---
+
+## ADR-065 — Promotion writes in one pipeline; a metadata miss loads once
+
+**Status:** accepted, Pass 15. Amends ADR-051. Ported from the `shoham-preview-fixup` branch, which
+built both while load-testing a 10,000-buyer waiting room; re-applied here rather than merged.
+
+**Context.** Two costs grew with load in places that are meant to stay flat:
+
+- **`PromotionWorker` issued three Redis round trips per promoted buyer** — the pass, the `passes`
+  ZSET entry, the removal from the line — one buyer at a time. A tick admitting a full batch made
+  well over a hundred sequential calls, and the tick must finish inside its own 900 ms lock
+  (ADR-032), or a second replica starts the same event's tick.
+- **`CatalogMetadata` loaded a missed key once per reader.** Every entry expires on a timer, so every
+  key has a moment when all its readers miss together. For an event a whole waiting room is polling,
+  that is a burst of identical reads into the pool once a second — ADR-056's "a cache must not become
+  the load", reached through a TTL boundary rather than a failure.
+
+**Decision 1 — one pipeline per tick.** The pass, the ZSET entry and the removal for every buyer in
+the batch go in one pipeline, through the byte-level API (a pipelined connection is a proxy and does
+not cast to `StringRedisConnection`). The `PUBLISH` frames follow the pipeline, so no browser hears of
+a pass that does not exist yet. The state written is unchanged.
+
+**Decision 2 — single-flight per key.** The first reader to miss registers its load; readers that miss
+while it runs wait on it (a park, so a virtual thread does not pin). A failed load reaches every
+waiter and is not remembered, keeping ADR-051's "a miss is never cached". An eviction drops the
+in-flight load as well, and a load that was overtaken by an eviction does not store what it read — a
+row read before a committed pause must not be served for a TTL afterwards on the replica that paused.
+
+**What was not ported, and why.** Per-stage checkout and payment timers (diagnostic only; one rethrew
+from a `finally`, ADR-056's trap); a compose overlay for one tuning value (`-e` does it); run logs;
+a frontend port change. The branch's waiting-room script **was** ported, as the `k6-waiting-room`
+service — with its own header saying what it cannot measure. **Its ~9,000-buyer ceiling is not
+quoted:** the run that produced it shows a Sentinel failover and nginx upstream connect timeouts
+mid-run, which is the host running out of CPU, not the waiting room running out of capacity.
+

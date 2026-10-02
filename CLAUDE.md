@@ -6,13 +6,13 @@ Guidance for Claude Code when working in this repository.
 
 FlashSeats — a high-concurrency ticket flash-sale engine. Modular monolith, Java 21, Spring Boot
 4.1.1. The **MVP is built and running**: all nine modules, the full journey from landing page to emailed
-PDF ticket, 243 tests green in any class order. **Inventory lives in Redis** (Stage 1, ADR-046): `catalog:stock:{e}:{t}`
+PDF ticket, 245 tests green in any class order. **Inventory lives in Redis** (Stage 1, ADR-046): `catalog:stock:{e}:{t}`
 is the live count and PostgreSQL keeps no copy of it. **Payment is real** (Stage 2, ADR-052-054) —
 but `flashseats.payment.stripe.enabled` is **false by default**, so `dev`, `test`, the load harness
 and every drill still run the in-process stub through the complete journey, 3-D Secure included.
 
 **Read [`docs/00-architecture-decisions.md`](docs/00-architecture-decisions.md) before changing
-anything.** It contains 64 ADRs. Most record a defect and its fix — 034-039 come from the first
+anything.** It contains 65 ADRs. Most record a defect and its fix — 034-039 come from the first
 review pass over the built code, 040-042 from the second — and several look like over-engineering
 until you read the failure they prevent. 043-045 are the exception: forward-looking decisions about
 the operator surface, buyer accounts and what health should report, with nothing built against them
@@ -28,7 +28,8 @@ has a memory limit with the JVM flags owned by the image alone. **063 is Pass 14
 class only where a `catch` names it. Pass 14 also wrote the code conventions down —
 [`05-global-standards.md`](docs/05-global-standards.md) §11 — read that before adding a class.
 **064 is Pass 15**: the checkout and the webhook settle the same charge, and the `orders` row —
-compare-and-set on every transition — decides whether it ends confirmed or refunded.
+compare-and-set on every transition — decides whether it ends confirmed or refunded. **065**:
+promotion writes go in one pipeline, and a metadata miss loads once however many readers miss it.
 
 **The operating envelope is 3–10 concurrent sales**, not one
 ([`03-end-to-end-flow.md`](docs/03-end-to-end-flow.md) §2). Every capacity number written before
@@ -45,7 +46,7 @@ security posture, next stages, and the review-pass log. It is the doc to update 
 ## Document precedence
 
 ```
-00-architecture-decisions.md      ← highest authority (64 ADRs)
+00-architecture-decisions.md      ← highest authority (65 ADRs)
 05-global-standards.md            ← cross-cutting contract; module docs conform to it
 FE_SPEC.md                        ← client contract (repo root)
 03-end-to-end-flow.md             ← the authoritative user journey AND the operating envelope
@@ -418,6 +419,12 @@ docker compose --profile loadtest run --rm -e VUS=300 k6-concurrent
                                                  # The FIRST run after a replica restart measures
                                                  # JIT warm-up: 513 ms p99 cold vs 64 ms warm, same
                                                  # build (Pass 14). Discard it, or warm up first
+docker compose --profile loadtest run --rm -e VUS=2000 k6-waiting-room
+                                                 # the waiting room alone: browse, join, poll.
+                                                 # No holds, no checkout, so promotion stops once
+                                                 # unredeemed passes fill the oversubscription. It
+                                                 # measures the front door, not sale throughput.
+                                                 # A run showing a Sentinel failover measured the host
 docker/scripts/sold-count.sh                     # what was ACTUALLY sold, and the invariant per tier.
                                                  # k6's count is what the CLIENT saw: it abandons
                                                  # in-flight requests at 60s and at ramp-down, and

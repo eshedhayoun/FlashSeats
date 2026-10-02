@@ -16,7 +16,7 @@ Read in this order:
 | Document | What it covers |
 | :--- | :--- |
 | [`docs/07-system-on-one-page.md`](docs/07-system-on-one-page.md) | **Read first.** The whole system on one page — journey, module graph, checkout sequence, where each concept lives, and what looks removable but is not |
-| [`docs/00-architecture-decisions.md`](docs/00-architecture-decisions.md) | 64 ADRs — every non-obvious decision and the failure it prevents. Read before changing a decision |
+| [`docs/00-architecture-decisions.md`](docs/00-architecture-decisions.md) | 65 ADRs — every non-obvious decision and the failure it prevents. Read before changing a decision |
 | [`docs/01-system-architecture.md`](docs/01-system-architecture.md) | Stack, module map, dependency graph, deployment |
 | [`docs/02-high-level-design.md`](docs/02-high-level-design.md) | Infrastructure and the concurrency model |
 | [`docs/03-end-to-end-flow.md`](docs/03-end-to-end-flow.md) | **The authoritative user journey**, step by step |
@@ -256,7 +256,7 @@ browser. Set a `pk_test_` key, and start the backend with `STRIPE_ENABLED=true`,
 provider.
 
 ```bash
-./mvnw test                         # 243 tests, green in any class order (ADR-061). Needs Docker:
+./mvnw test                         # 245 tests, green in any class order (ADR-061). Needs Docker:
                                     # every integration test runs real PostgreSQL, Redis and,
                                     # for fulfilment, RabbitMQ containers
 ```
@@ -296,6 +296,7 @@ docker/nginx/nginx.conf         least_conn · SSE unbuffered · X-Forwarded-For
 docker/seed/                    seed.sh (one sale) · seed-concurrent.sh (five, for the drill)
 docker/k6/flash-sale.js         load harness; asserts zero overbooking
 docker/k6/concurrent-sales.js   E sales at once (ADR-049); pair with pool-pressure.sh
+docker/k6/waiting-room.js       the waiting room alone: join and poll, no checkout
 docker/scripts/                 dev-up, fan-out / expiry / failover checks, pool-pressure, sold-count
 ```
 

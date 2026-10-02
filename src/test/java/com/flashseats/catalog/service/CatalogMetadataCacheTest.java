@@ -24,6 +24,11 @@ import java.time.ZoneId;
 import java.time.ZoneOffset;
 import java.util.List;
 import java.util.Optional;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
 import org.junit.jupiter.api.Test;
 
 /**
@@ -133,6 +138,64 @@ class CatalogMetadataCacheTest {
 
         verify(tiers, times(1)).findByEventIdOrderByPriceCentsDesc(1L);
         verifyNoMoreInteractions(events);
+    }
+
+    /**
+     * Every entry expires on a timer, so every key has a moment when all of its readers miss at once.
+     * Without single-flight, a waiting room polling one event spiked the pool on every TTL boundary.
+     */
+    @Test
+    void concurrentMissesShareOneLoad() throws Exception {
+        CountDownLatch loading = new CountDownLatch(1);
+        CountDownLatch release = new CountDownLatch(1);
+        when(events.findById(1L)).thenAnswer(invocation -> {
+            loading.countDown();
+            assertThat(release.await(5, TimeUnit.SECONDS)).isTrue();
+            return Optional.of(event());
+        });
+
+        try (ExecutorService readers = Executors.newFixedThreadPool(2)) {
+            Future<EventRow> first = readers.submit(() -> metadata.event(1L));
+            assertThat(loading.await(5, TimeUnit.SECONDS)).isTrue();
+            Future<EventRow> second = readers.submit(() -> metadata.event(1L));
+            release.countDown();
+
+            assertThat(first.get(5, TimeUnit.SECONDS).title()).isEqualTo("Cache Fest");
+            assertThat(second.get(5, TimeUnit.SECONDS).title()).isEqualTo("Cache Fest");
+        }
+
+        verify(events, times(1)).findById(1L);
+    }
+
+    /**
+     * A load that read the row before a committed change must not store what it read: the next
+     * reader would be served the pre-pause status for a whole TTL on the very replica that paused.
+     */
+    @Test
+    void aLoadOvertakenByAnInvalidationIsNotStored() throws Exception {
+        CountDownLatch loading = new CountDownLatch(1);
+        CountDownLatch release = new CountDownLatch(1);
+        Event live = event();
+        when(events.findById(1L))
+                .thenAnswer(invocation -> {
+                    loading.countDown();
+                    assertThat(release.await(5, TimeUnit.SECONDS)).isTrue();
+                    return Optional.of(event());
+                })
+                .thenReturn(Optional.of(live));
+
+        try (ExecutorService readers = Executors.newSingleThreadExecutor()) {
+            Future<EventRow> stale = readers.submit(() -> metadata.event(1L));
+            assertThat(loading.await(5, TimeUnit.SECONDS)).isTrue();
+
+            live.setStatus(EventStatus.PAUSED);
+            metadata.onEventMetadataChanged(new EventMetadataChanged(1L));
+            release.countDown();
+            assertThat(stale.get(5, TimeUnit.SECONDS).status()).isEqualTo(EventStatus.PUBLISHED);
+        }
+
+        assertThat(metadata.event(1L).status()).isEqualTo(EventStatus.PAUSED);
+        verify(events, times(2)).findById(1L);
     }
 
     private Event event() {
