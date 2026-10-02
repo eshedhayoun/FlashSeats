@@ -33,7 +33,10 @@ rules make it safe to have at all. The **TTL is the cross-replica invalidation**
 reaches only the replica that served the operator's call — so the event TTL is the bound on how long a
 paused sale can still answer `OPEN` elsewhere, and it is a correctness setting rather than a
 performance one. And the **window status is never cached**: it is derived from the row and the clock on
-every call, since it flips with no write to evict on.
+every call, since it flips with no write to evict on. **A miss loads once**: readers that miss the same
+key together wait for the load already running instead of each taking a connection — every entry
+expires on a timer, so a polled event would otherwise spike the pool on every TTL boundary. A load
+that an eviction overtakes is not stored (ADR-065).
 
 **There is no copy of the count in PostgreSQL.** `tier_inventory` was dropped in `V7` — it had
 become a write-only copy of a number that had moved to Redis, with a stale column named `remaining`

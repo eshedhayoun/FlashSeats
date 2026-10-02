@@ -212,7 +212,7 @@ Findings that cost real time and would cost it again.
 ## 8. Verification
 
 ```bash
-./mvnw test        # 243 tests: unit, modularity, concurrency, journey, recovery, queue lifecycle,
+./mvnw test        # 245 tests: unit, modularity, concurrency, journey, recovery, queue lifecycle,
                    #             pre-warm, stock rebuild, drift, Redis-restart guard, the metadata
                    #             cache's five rules, the cluster admission allowance, payment and
                    #             webhooks, bot defence, and fulfilment through a real broker.
@@ -237,7 +237,7 @@ Findings that cost real time and would cost it again.
 | `CatalogAvailabilityIT` | A tier with no counter reads `UNKNOWN`, a drained tier still reads `SOLD_OUT`, and the two are never the same answer (ADR-040). |
 | `ProblemResponseIT` | Spring's own binding failures are `400` with a registry `code`, not `500` (ADR-041). |
 | `RemainingForEventTest` | "Nothing known" is never "nothing left", at the method every admission decision reads: no tiers, a missing counter, genuinely drained and live are four distinct answers (ADR-004, ADR-035, ADR-040). |
-| `CatalogMetadataCacheTest` | Every rule that makes a cache in front of `events` safe: an entry stops being served when its TTL passes, a miss is never remembered, a committed change evicts, and the recovery path reads PostgreSQL (ADR-051). |
+| `CatalogMetadataCacheTest` | Every rule that makes a cache in front of `events` safe: an entry stops being served when its TTL passes, a miss is never remembered, a committed change evicts, the recovery path reads PostgreSQL (ADR-051), concurrent misses share one load, and a load overtaken by an eviction is not stored (ADR-065). |
 | `GlobalPromotionBudgetIT` | One allowance is shared by every caller whichever sale it is promoting, a single claim cannot exceed a window, the window refills, and **no open sale is starved by another** (ADR-049). |
 | `ModularityTests` | The boundary graph is acyclic and unbroken. |
 | `SignedTokenTest`, `AvailabilityBucketsTest`, `TicketPdfRendererTest` | The signing primitive — including domain separation — the availability rule including its fault value, and a ticket that renders whatever alphabet the title is in. |
@@ -1027,6 +1027,18 @@ to convert them starves its own queue: the inventory bound is
 `floor(remaining × 1.5) − pendingPasses − liveAdmissions`, so buyers admitted and then unable to finish
 hold the allowance down for ten minutes. It is correct behaviour and it is why C admitted 352 rather
 than the ~2,300 its allowance permitted.
+
+#### The waiting room alone — not yet measured on this build (Pass 15)
+
+`docker/k6/waiting-room.js` (service `k6-waiting-room`) arrives with this pass, ported from a
+teammate's branch. It drives only the front door — browse, join, poll — so it reaches VU counts the
+full journey cannot on one host. **The branch's own runs are not quoted here**, and the reason is
+worth keeping: the run behind its "caps at about 9,000" note shows Redis failing over to a replica
+mid-run (`StockEpoch` refusing the new primary; Lettuce reconnecting across all three nodes), nginx
+timing out *connecting* to the replicas, and replicas taking 152 s to start. Sentinel failing over
+under load is what a CPU-starved host looks like, not what the waiting room's capacity looks like.
+Re-measure it on this build, with `pool-pressure.sh` alongside, and discard any run that shows a
+failover.
 
 ### Stage 5 — Buyer accounts, as an overlay (ADR-044)
 
@@ -2090,7 +2102,9 @@ rather than an archaeology.
 | **Repo hygiene** | `seed.sh` runs again from any shell; generated Playwright output, logs and `.claude/` are ignored; a cleanup script that killed every Node and Chrome process on the machine is gone; the Stripe sample keys in `.env.example` are placeholders again |
 | **Working documents retired** | A hand-off note, a duplicated design system and two coverage documents that ticked boxes no test checked are replaced by `frontend/README.md`. `REFACTORING_BLUEPRINT.md`'s Part 1 is now [`07-system-on-one-page.md`](07-system-on-one-page.md); its open items are in §11 |
 | **A settled charge ends exactly one way** (ADR-064) | Review found the checkout and the webhook could each refund a purchase the other had just confirmed, and overwrite `CONFIRMED` with `REFUNDED`; the checkout refunded on a pool timeout; a refund ran before the order recorded it; and a refused refund still emailed "refunded in full". The order row now decides: every transition is a compare-and-set (`V13` adds `version`), a refund is claimed before money moves, a lost hold asks the order, and ambiguity moves no money — the retry reuses the charge that settled. Shoham's re-read and receipt check are the seed of this; his branch also left the expiry case unrefunded, which this does not |
+| **Promotion writes in one pipeline; a metadata miss loads once** (ADR-065) | Ported from the teammate's branch. The promotion tick no longer makes three Redis round trips per buyer, and a waiting room polling one event no longer spikes the pool each time the cached row expires. The waiting-room drill is a `loadtest` service; its unredeemed-pass ceiling and the branch's unusable ~9k figure are recorded in §11 |
+| **k6 keys are unique per run** | The stub ignores the checkout idempotency key, but Stripe keeps one for 24 hours and would answer a reused key with the previous run's response |
 
-**Verified so far:** 243/243 (228 + 15 new), including `SettlementArbiterIT`, which races confirm
+**Verified so far:** 245/245 (228 + 17 new), including `SettlementArbiterIT`, which races confirm
 against refund fifteen times with the refund claim staggered across the confirm transaction: both
 endings occur, and every round ends exactly one way.

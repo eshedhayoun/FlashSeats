@@ -126,14 +126,15 @@ front    = ZRANGE queue:waiting:{e} 0 admittable-1
 granted  = claim(queue:budget, want = |front|)       ← cluster-wide, atomic, fails closed
 if granted == 0: promote nobody
 
-for sid in first `granted` of front:
+in ONE pipeline, for sid in first `granted` of front:      ← ADR-065
     mint pass → SET queue:pass:{e}:{sid} EX 120
     ZADD queue:passes:{e} <expiry> <sid>
     ZREM queue:waiting:{e} <sid>
-    PUBLISH queue:events:{e}
+then, once every pass exists:
+    PUBLISH queue:events:{e}  (one per promoted buyer)
 ```
 
-**Five things here are load-bearing:**
+**Six things here are load-bearing:**
 
 - **The shuffle.** Every replica reads the open events in the same ascending order and claims the
   shared allowance as it reaches each sale, so a fixed order lets the lowest event id take the whole
@@ -150,6 +151,10 @@ for sid in first `granted` of front:
 - **`PUBLISH` is what reaches the browser.** The promoter runs on one replica; the buyer's emitter
   lives in another's heap. Without fan-out, roughly two-thirds of promotions vanish on three
   replicas — and the bug is invisible on one (ADR-007).
+- **The writes are one pipeline, and the publishes follow it.** Three round trips per buyer made the
+  tick's cost grow with every buyer it admitted, and the tick has to finish inside its own 900 ms
+  lock. Publishing only after the pipeline means no browser is told about a pass it cannot redeem
+  yet (ADR-065).
 
 **A session's state is one Redis round trip**, not four. `GET /queue/status` runs this code and is the
 most-called endpoint in the system by roughly 80× — ~90,000 calls per replica in a 300-VU five-sale run

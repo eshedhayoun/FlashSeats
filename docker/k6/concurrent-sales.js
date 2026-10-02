@@ -37,6 +37,9 @@ import { check, sleep } from 'k6';
 import { Counter, Rate, Trend } from 'k6/metrics';
 
 const BASE      = __ENV.BASE_URL  || 'http://nginx:80';
+// Unique per run. The stub ignores the key, but Stripe keeps one for 24 hours, and a key reused
+// by the next run is answered with the previous run's response or an idempotency error.
+const RUN_ID   = __ENV.RUN_ID || Date.now().toString(36);
 const FIRST_ID  = parseInt(__ENV.FIRST_ID || '9001', 10);
 const EVENTS    = parseInt(__ENV.EVENTS   || '5', 10);
 const VUS       = parseInt(__ENV.VUS      || '10000', 10);
@@ -194,7 +197,7 @@ export default function () {
       holdToken,
       userEmail: `vu${__VU}@loadtest.local`,
       paymentMethodId: 'pm_card_visa',
-      idempotencyKey: `k6c-${__VU}-${__ITER}`,
+      idempotencyKey: `k6c-${RUN_ID}-${__VU}-${__ITER}`,
     }),
     { headers: clientHeaders(), tags: { step: 'checkout', ...tag } },
   );
