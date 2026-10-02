@@ -43,8 +43,14 @@ x-app: &app
     SPRING_MAIL_HOST: mailpit
     SPRING_MAIL_PORT: 1025
     # Behind Nginx the client IP arrives in X-Forwarded-For. The bot module
-    # rate-limits on it, so Spring must be told to trust the proxy.
-    SERVER_FORWARD_HEADERS_STRATEGY: framework
+    # rate-limits on it, so Spring must be told to trust the proxy — and NATIVE,
+    # not `framework` (ADR-071). Spring's ForwardedHeaderFilter takes the LEFT-
+    # most X-Forwarded-For entry from anyone, and nginx APPENDS to whatever the
+    # client sent, so `framework` let every caller choose its own address and
+    # mint a fresh IP bucket per request. Tomcat's RemoteIpValve trusts only
+    # internal proxies and walks right to left, stopping at the first address
+    # that is not one: the real client, whatever it sent.
+    SERVER_FORWARD_HEADERS_STRATEGY: native
     # ...and so must the rate limiter, which reads the header itself and
     # therefore does its own trust check (ADR-039). Without an entry here the
     # header is ignored and every request shares nginx's single IP bucket.
