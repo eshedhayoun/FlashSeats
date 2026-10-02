@@ -83,9 +83,23 @@ if [[ -z "${FLASHSEATS_ADMIN_PLAINTEXT:-}" ]]; then
 fi
 
 if [[ -z "${FLASHSEATS_ADMIN_PLAINTEXT:-}" ]]; then
-    echo "error: the admin password is not available in this shell." >&2
-    echo "Run docker/secrets/gen-env.sh again and export the password it prints, then retry." >&2
-    exit 1
+    echo "Generating a fresh local admin password for this demo run..."
+    tmp_env="$(mktemp)"
+    cp .env "$tmp_env"
+    trap 'rm -f "$password_file" "$tmp_env"' EXIT
+    awk '
+        /^FLASHSEATS_ADMIN_PASSWORD=/ {
+            print "FLASHSEATS_ADMIN_PASSWORD={noop}admin"
+            next
+        }
+        { print }
+    ' "$tmp_env" > .env
+    bash docker/secrets/gen-env.sh | tee "$password_file"
+    FLASHSEATS_ADMIN_PLAINTEXT="$(
+        awk '/^  #    / { print substr($0, 9); exit }' "$password_file"
+    )"
+    export FLASHSEATS_ADMIN_PLAINTEXT
+    rm -f "$tmp_env"
 fi
 
 echo "Building and starting the evaluator stack..."
