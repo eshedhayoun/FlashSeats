@@ -3057,3 +3057,40 @@ fixed".
 the new primary is a different process, and `StockEpoch` distrusts counters it did not vouch for
 (ADR-046). That is the guard working, not this defect.
 
+---
+
+## ADR-074 — A provider key per attempt, a challenge finished whatever the clock says, and a ledger that hears the webhook
+
+**Status:** accepted, Pass 15. Amends ADR-054 (3-D Secure resumes the intent) and ADR-030 (the time
+check before a charge). The Stripe-only half is verified by the stub suite and by reading Stripe's
+documented idempotency rules; it still wants a run of `stripe-check.sh` with a real test key.
+
+**Context.** Three defects on the provider path, none visible to the stub:
+
+- **"Try another card" could not work on Stripe.** The client keeps one idempotency key for the life
+  of a hold (FE_SPEC §1), and `payment` forwarded it unchanged on every `paymentIntents().create`.
+  Stripe keeps a key's first answer for 24 hours and rejects the same key with different parameters:
+  the second card either got the first card's decline replayed or an idempotency error — a
+  `StripeException`, so reported as a provider outage and counted against the circuit breaker. A
+  burst of decline-then-retry buyers could open the breaker for the whole sale.
+- **Finishing 3-D Secure close to expiry was refused as if it were a new charge.** Checkout's time
+  check (at least 45 s left before *starting* a charge) ran before `authorize` noticed it was
+  resuming an intent that had already succeeded, and answered `INSUFFICIENT_TIME_REMAINING` —
+  "nothing was charged" — about money that had moved.
+- **A charge settled by webhook stayed `PROCESSING` in the ledger.** The webhook confirmed the order
+  and never told `payment_transactions`, so reconciliation found a charge in limbo for ever.
+
+**Decision.**
+
+1. **The provider key is the client's key scoped to the attempt**: `{clientKey}:{attemptNumber}`. A
+   decline consumes an attempt, so the next card is a new request; a provider outage consumes none,
+   so its retry repeats the same request and Stripe replays the answer instead of charging twice.
+2. **The time check stands aside for a charge that already exists.** When the hold has too little
+   time to start one, checkout asks `PaymentFacade.hasChargeFor(hold)` — an intent authenticating, or
+   one that settled — and proceeds to complete it. Asked only when time is short, so a normal checkout
+   pays for no extra read.
+3. **The webhook records the settlement on the ledger**: an `INITIATED` or `PROCESSING` row becomes
+   `SUCCEEDED`, and an unlinked one gets its intent id. The fallback that finds an unlinked row by
+   hold now looks only at `INITIATED` rows — the attempt in flight — never at a declined one, which
+   also carries no intent id.
+

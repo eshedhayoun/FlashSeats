@@ -139,7 +139,8 @@ class PaymentMetricsTest {
         assertThat(charge.amountCents()).isEqualTo(7_500);
         assertThat(charge.currency()).isEqualTo("usd");
         assertThat(charge.paymentMethodId()).isEqualTo("pm_card_visa");
-        assertThat(charge.clientIdempotencyKey()).isEqualTo("client-idem-42");
+        // Scoped to the attempt, so a second card after a decline is a new request to the provider (ADR-074).
+        assertThat(charge.idempotencyKey()).isEqualTo("client-idem-42:1");
     }
     @Test
     void failedResumeRetrievalDoesNotStartASecondCharge() {
@@ -164,5 +165,14 @@ class PaymentMetricsTest {
     private static AuthorizeCommand command(String orderNumber, String holdToken) {
         return new AuthorizeCommand(
                 orderNumber, holdToken, "session-1", 1_000, "usd", "pm_card", "idem-" + orderNumber, 1);
+    }
+
+    /** Each attempt is its own request to the provider; a retry of one attempt is the same request (ADR-074). */
+    @Test
+    void theProviderKeyIsScopedToTheAttempt() {
+        var second = new com.flashseats.payment.facade.AuthorizeCommand(
+                "order-42", "hold-42", "session-7", 7_500, "usd", "pm_card_visa", "client-idem-42", 2);
+
+        assertThat(PaymentService.providerKey(second)).isEqualTo("client-idem-42:2");
     }
 }

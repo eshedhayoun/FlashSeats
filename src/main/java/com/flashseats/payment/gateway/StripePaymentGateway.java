@@ -58,11 +58,11 @@ public class StripePaymentGateway implements PaymentGateway {
                 .putMetadata("orderNumber", charge.orderNumber())
                 .putMetadata("holdToken", charge.holdToken())
                 .build();
-        RequestOptions options = charge.clientIdempotencyKey() == null
-                        || charge.clientIdempotencyKey().isBlank()
+        RequestOptions options = charge.idempotencyKey() == null
+                        || charge.idempotencyKey().isBlank()
                 ? baseOptions
                 : baseOptions.toBuilderFullCopy()
-                        .setIdempotencyKey(charge.clientIdempotencyKey())
+                        .setIdempotencyKey(charge.idempotencyKey())
                         .build();
 
         try {

@@ -22,8 +22,9 @@ public interface PaymentTransactionRepository extends JpaRepository<PaymentTrans
     Optional<PaymentTransaction> findFirstByHoldTokenAndStatusInOrderByIdDesc(
             String holdToken, Collection<PaymentStatus> statuses);
 
-    /** The hold's newest attempt that has not been linked to a provider intent yet. */
-    Optional<PaymentTransaction> findFirstByHoldTokenAndGatewayReferenceIsNullOrderByIdDesc(String holdToken);
+    /** The hold's newest attempt in a state, not yet linked to a provider intent. */
+    Optional<PaymentTransaction> findFirstByHoldTokenAndGatewayReferenceIsNullAndStatusOrderByIdDesc(
+            String holdToken, PaymentStatus status);
 
     /**
      * The ledger row for a provider intent id.

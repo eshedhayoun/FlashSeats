@@ -132,6 +132,32 @@ class CheckoutServiceTest {
     }
 
     @Test
+    @DisplayName("Too little time to start a charge is refused, and nothing is charged")
+    void tooLittleTimeRefusesANewCharge() {
+        when(holds.grantGrace(HOLD)).thenReturn(NOW.plusSeconds(30));
+        when(payments.hasChargeFor(HOLD)).thenReturn(false);
+
+        assertThatThrownBy(() -> checkout.checkout("sid", request()))
+                .isInstanceOfSatisfying(FlashSeatsException.class,
+                        refused -> assertThat(refused.code()).isEqualTo(ErrorCode.INSUFFICIENT_TIME_REMAINING));
+        verify(payments, never()).authorize(any());
+    }
+
+    /**
+     * Finishing 3-D Secure starts no new charge, so the time budget for starting one does not apply.
+     * Refusing it answered "nothing was charged" about money that had moved (ADR-074).
+     */
+    @Test
+    @DisplayName("Too little time is no reason to refuse completing a charge that already exists")
+    void completingAnExistingChargeIsNotRefusedForTime() {
+        when(holds.grantGrace(HOLD)).thenReturn(NOW.plusSeconds(30));
+        when(payments.hasChargeFor(HOLD)).thenReturn(true);
+        when(commit.confirm(ORDER, hold, tier, settled)).thenReturn(receipt);
+
+        assertThat(checkout.checkout("sid", request()).receipt()).isEqualTo(receipt);
+    }
+
+    @Test
     @DisplayName("A commit that failed for no stated reason moves no money and leaves the order resumable")
     void ambiguousCommitFailureIsNeverRefunded() {
         when(commit.confirm(ORDER, hold, tier, settled))
