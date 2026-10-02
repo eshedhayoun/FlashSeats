@@ -15,7 +15,7 @@ Nine steps, all real HTTP. The demo client at `/` is one consumer of it.
 | # | Call | Lands in | Gated by |
 | :-- | :--- | :--- | :--- |
 | 1 | `GET /api/v1/events/{id}` | `EventController` → `CatalogService` | mints the signed `fsid` cookie |
-| 2 | `POST /api/v1/queue/join` | `QueueController` → `BotFacade`, then `QueueService` | the challenge check, which **fails open** (ADR-055); sale window `OPEN`; `ZADD NX` so a refresh keeps your place |
+| 2 | `POST /api/v1/queue/join` | `QueueController` → `BotFacade`, then `QueueService` | the challenge check, which **fails open** (ADR-055); sale window `OPEN` or `PAUSED` (ADR-066); `ZADD NX` so a refresh keeps your place |
 | 3 | `GET /api/v1/queue/stream` | `QueueController` → `SseEmitterRegistry` | SSE. `GET /queue/status` is the polling equivalent |
 | 4 | *(worker, 1 s)* | `PromotionWorker` | cluster-wide `queue:budget`, then the per-event batch |
 | 5 | `POST /api/v1/queue/admit` | `QueueService.admit` | pass is single-use — revoked here |
@@ -77,7 +77,7 @@ The sequence *is* the design. Read `CheckoutService.checkout()` alongside this.
 0  already CONFIRMED for this hold?   → return the receipt, 200
 1  getActiveHold(token, sid)          → 404/410 if missing, expired or not yours
 2  getTierSummary()                   → price computed SERVER-SIDE; no client value reaches it
-3  window gate                        → OPEN, or CLOSED within 15 min
+3  window gate                        → OPEN or PAUSED, or CLOSED within 15 min (ADR-066)
 4  find-or-create on UNIQUE(hold_token)
 5  grantGrace()                       → once per hold. FAILS ⇒ abort 410, DO NOT CHARGE
 6  authorize()                        → OUTSIDE every transaction

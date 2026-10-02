@@ -60,7 +60,8 @@ public class QueueController {
 
     /**
      * Live position updates: {@code position-update}, {@code queue-promoted},
-     * {@code sale-exhausted}, {@code sale-closed}, plus comment heartbeats. A client that cannot hold
+     * {@code tier-availability}, {@code sale-exhausted}, {@code sale-closed}, {@code sale-paused},
+     * {@code sale-resumed}, plus comment heartbeats. A client that cannot hold
      * a stream polls {@code /queue/status}, which returns the same information.
      *
      * <p>{@code Last-Event-ID} is what a browser's EventSource sends by itself; the query parameter

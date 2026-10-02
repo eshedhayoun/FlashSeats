@@ -26,6 +26,6 @@ public enum EventWindowStatus {
      */
     PAUSED,
 
-    /** Not published, or past {@code sale_end_time}. */
+    /** Neither published nor paused, or past {@code sale_end_time}. */
     CLOSED
 }

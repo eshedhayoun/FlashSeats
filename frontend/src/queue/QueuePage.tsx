@@ -44,9 +44,11 @@ export function QueuePage({
             >
               {stream.position ?? queue.position ?? "—"}
             </Typography>
-            <Typography color="text.secondary" aria-live="polite">
-              {formatWaitTime(stream.estWaitSeconds ?? queue.estWaitSeconds)}
-            </Typography>
+            {!stream.paused && (
+              <Typography color="text.secondary" aria-live="polite">
+                {formatWaitTime(stream.estWaitSeconds ?? queue.estWaitSeconds)}
+              </Typography>
+            )}
             <Typography color="text.secondary">
               {stream.connection === "open"
                 ? "Connected"

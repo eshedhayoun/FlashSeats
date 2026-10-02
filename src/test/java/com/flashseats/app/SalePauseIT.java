@@ -13,6 +13,7 @@ import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.web.server.LocalServerPort;
+import org.springframework.data.redis.core.StringRedisTemplate;
 
 /**
  * A pause halts a sale without ending it (ADR-066). Gate by gate: the line keeps forming and nobody is
@@ -32,6 +33,9 @@ class SalePauseIT extends IntegrationTest {
 
     @Autowired
     private SaleFixture fixture;
+
+    @Autowired
+    private StringRedisTemplate redis;
 
     private long eventId;
     private long tierId;
@@ -80,6 +84,8 @@ class SalePauseIT extends IntegrationTest {
         assertThat(firstStatus.number("position")).isEqualTo(1);
         assertThat(firstStatus.json().get("paused").asBoolean()).isTrue();
         assertThat(firstStatus.text("passToken")).isNull();
+        // The line is not moving, so no estimate: the drain rate behind one is frozen pre-pause.
+        assertThat(firstStatus.json().get("estWaitSeconds").isNull()).isTrue();
         assertThat(secondStatus.number("position")).isEqualTo(2);
 
         resume();
@@ -89,6 +95,29 @@ class SalePauseIT extends IntegrationTest {
             assertThat(second.get("/queue/status?eventId=" + eventId).text("passToken")).isNotNull();
         });
         assertThat(first.get("/queue/status?eventId=" + eventId).json().get("paused").asBoolean()).isFalse();
+    }
+
+    /**
+     * Exhaustion is derived from stock, and stock still moves while paused: an unpaid hold that expires
+     * gives its seats back. The marker used to be re-checked only by the promotion tick, which skips a
+     * paused sale, so a buyer joining during the pause was told the sale had sold out (ADR-066).
+     */
+    @Test
+    @DisplayName("Sold out un-derives while paused when seats come back, so a buyer joining then is in line")
+    void exhaustionClearsWhilePausedWhenSeatsReturn() {
+        pause();
+        // The state a pause can inherit: marked sold out, and a counter that has since been refilled
+        // by expiring holds. The marker key is spelled out, as the fixture spells out every key.
+        redis.opsForValue().set("queue:exhausted:" + eventId, "2026-10-02T12:00:00Z");
+        assertThat(fixture.remaining(tierId)).isEqualTo(CAPACITY);
+
+        await().atMost(PATIENCE).until(() -> !Boolean.TRUE.equals(redis.hasKey("queue:exhausted:" + eventId)));
+
+        BuyerSession arriving = new BuyerSession(port);
+        arriving.get("/events/" + eventId);
+        var joined = arriving.post("/queue/join", Map.of("eventId", eventId));
+        assertThat(joined.status()).isEqualTo(202);
+        assertThat(joined.text("phase")).isEqualTo("WAITING");
     }
 
     @Test

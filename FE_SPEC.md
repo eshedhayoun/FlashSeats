@@ -563,7 +563,7 @@ facts** — the same distinction the server maintains between `SOLD_OUT` and `UN
 | **V5, reloaded after buying** | `hold: null`, `order: CONFIRMED` | **Receipt, not the landing page.** Rehydration returned only *pending* orders, so a completed purchase was invisible and the buyer was invited to queue for seats they already owned (ADR-037) |
 | **V2, sale closed while waiting** | `queue.state: CLOSED` | V6. The window is resolved before ZSET rank, and the broadcaster sends `sale-closed` and completes the stream (ADR-036) |
 | **V2, counter unreadable** | `queue.state` unchanged, promotion paused | **Stay in V2.** A missing counter is a fault, never a sold-out sale (ADR-004, ADR-035) |
-| **Any view, sale paused by an operator** | `windowStatus: PAUSED`, every other section unchanged | **Stay where you are**, with "Sales are paused for a moment — your place is kept". The line, a pass, an admission, a hold: nothing is torn down. Holds cannot be created until it resumes; a hold that already exists can still be paid for (ADR-066) |
+| **Any view, sale paused by an operator** | `windowStatus: PAUSED`, every other section unchanged | **Stay where you are**, with "Sales are paused for a moment — your place is kept". The line, a pass, an admission, a hold: nothing is torn down, though each keeps its own clock. Holds cannot be created until it resumes; a hold that already exists can still be paid for. Show no wait estimate while paused — the line is not moving (ADR-066) |
 | Second tab, **same** sale | same session | Both tabs converge on the same state |
 | **Second tab, a different sale** | independent per-event state | **Both sales proceed independently.** Queued for A while holding seats in B is a legitimate, supported state. This is what rule 5 exists for, and the current demo client fails it |
 
@@ -635,18 +635,18 @@ itself; a client that cannot set headers may pass `?lastEventId=` instead. The s
 **broadcast** frames minted after that sequence — `tier-availability`, `sale-exhausted`,
 `sale-closed`.
 
-**`sale-paused` and `sale-resumed` are neither retained nor replayed** (ADR-066). A pause is a
-*current* condition, not an event in the sale's history: each replica sends `sale-paused` to its own
-streams on every sweep while the sale is paused, and on connect, and `sale-resumed` once when it
-resumes — so a reconnect after the resume is never handed a pause that has ended. A `position-update`
-also means the sale is running.
-
-**Only those frames carry an `id`.** Position updates and `queue-promoted` are sent with none, which
+**Only those frames carry an `id`.** Position updates, `queue-promoted`, `sale-paused` and `sale-resumed` are sent with none, which
 the SSE specification defines as leaving the client's last-event-id unchanged — so storing
 `e.lastEventId` on *every* frame, as the snippet above does, is correct and always records a sequence
 the server can replay from. A promotion is never replayed: the server re-reads the live pass on
 connect and re-sends `queue-promoted` if one is still valid, so a promoted buyer recovers even in a
 fresh tab that has no `Last-Event-ID` at all (ADR-058).
+
+**`sale-paused` and `sale-resumed` are neither retained nor replayed** (ADR-066). A pause is a
+*current* condition, not an event in the sale's history: each replica sends `sale-paused` to its own
+streams on every sweep while the sale is paused, and on connect, and `sale-resumed` once when it
+resumes — so a reconnect after the resume is never handed a pause that has ended. A `position-update`
+also means the sale is running.
 
 **Backoff** — full jitter, capped, with a polling fallback:
 

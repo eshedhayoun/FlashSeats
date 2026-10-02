@@ -256,7 +256,7 @@ browser. Set a `pk_test_` key, and start the backend with `STRIPE_ENABLED=true`,
 provider.
 
 ```bash
-./mvnw test                         # 256 tests, green in any class order (ADR-061). Needs Docker:
+./mvnw test                         # 257 tests, green in any class order (ADR-061). Needs Docker:
                                     # every integration test runs real PostgreSQL, Redis and,
                                     # for fulfilment, RabbitMQ containers
 ```

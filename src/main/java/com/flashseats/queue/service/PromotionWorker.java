@@ -99,6 +99,31 @@ public class PromotionWorker {
                 log.error("Promotion tick failed for event {}", eventId, failure);
             }
         }
+
+        Set<Long> open = Set.copyOf(openEvents);
+        for (long eventId : catalog.findManagedEventIds()) {
+            if (!open.contains(eventId)) {
+                try {
+                    refreshExhaustion(eventId);
+                } catch (RuntimeException failure) {
+                    log.warn("Could not re-check exhaustion for paused event {}", eventId, failure);
+                }
+            }
+        }
+    }
+
+    /**
+     * A paused sale promotes nobody, but its stock still moves: an unpaid hold that expires during the
+     * pause gives its seats back. Exhaustion is derived from that stock, so it must un-derive while
+     * paused too, or a buyer who joins during the pause is told the sale has sold out — and the first
+     * broadcaster sweep after the resume repeats it to everyone in line (ADR-035, ADR-066). Nothing is
+     * ever marked exhausted here: no seat can be taken while paused.
+     */
+    private void refreshExhaustion(long eventId) {
+        if (Boolean.TRUE.equals(redis.hasKey(QueueKeys.exhausted(eventId)))
+                && catalog.getRemainingForEvent(eventId) > 0) {
+            redis.delete(QueueKeys.exhausted(eventId));
+        }
     }
 
     private void promote(long eventId) {

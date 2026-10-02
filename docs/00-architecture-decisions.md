@@ -315,6 +315,10 @@ the `SELECT`-based idempotency check and both send.
 
 ## ADR-016 — Sale windows are enforced, and the server owns the clock
 
+> **Amended by ADR-066:** there is a fourth status, `PAUSED`, inside the window. Join accepts `OPEN`
+> or `PAUSED`; holds still require `OPEN`; checkout accepts `OPEN` or `PAUSED`, or `CLOSED` within
+> the grace.
+
 **Decision.** `catalog` derives `windowStatus ∈ {UPCOMING, OPEN, CLOSED}` from `sale_start_time`,
 `sale_end_time` and `events.status`. `GET /api/v1/events/{id}` returns `serverTime` alongside it.
 
@@ -2762,7 +2766,7 @@ mid-run, which is the host running out of CPU, not the waiting room running out 
 
 ## ADR-066 — A pause is a pause: its own window status, and nothing ends
 
-**Status:** accepted, Pass 15. Amends ADR-048 Decision 4.
+**Status:** accepted, Pass 15. Amends ADR-048 Decision 4 and ADR-016's gate table.
 
 **Context.** ADR-048 made pause a publication state that every gate read as `CLOSED`, precisely so no
 gate needed new code. That bought the gates and cost the buyers. A paused sale:
@@ -2803,6 +2807,14 @@ fallback hears it too.
 
 **Decision 4 — the admin refusal gets its own code.** Pausing a `DRAFT` or `CANCELLED` event is
 `409 EVENT_NOT_PAUSABLE`. `SALE_PAUSED` now means one thing, to buyers.
+
+**Decision 5 — two things keep moving while paused, and the answers follow them** (found in review).
+*Exhaustion* is derived from stock, and an unpaid hold that expires during a pause gives its seats
+back; the promotion tick skips a paused sale, so it now re-checks only that — clearing
+`queue:exhausted:{e}` when seats have returned, never setting it — or a buyer joining during the pause
+is told the sale sold out, and the first sweep after the resume repeats it to the whole line. And the
+*wait estimate* is omitted while paused: the line is not moving, and the drain rate behind an estimate
+is frozen at its pre-pause value.
 
 **What a pause does not stop: the clocks.** A pass keeps its 120 s, an admission its 600 s, a hold its
 TTL. The line itself keeps every place for as long as the pause lasts, but a pause longer than an

@@ -34,8 +34,8 @@ public final class CatalogErrors {
         return switch (actual) {
             case PAUSED -> new FlashSeatsException(
                             ErrorCode.SALE_PAUSED,
-                            "Sales are paused for a moment. Your place is kept; you can reserve as soon as"
-                                    + " they resume.")
+                            "Sales are paused for a moment. You can reserve as soon as they resume, while"
+                                    + " your time to choose seats lasts.")
                     .with("retryable", true);
             case UPCOMING -> new FlashSeatsException(ErrorCode.SALE_NOT_OPEN, "This sale has not started yet.");
             case CLOSED -> new FlashSeatsException(ErrorCode.SALE_CLOSED, "Sales for this event have ended.");

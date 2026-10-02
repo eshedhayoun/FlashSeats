@@ -69,8 +69,8 @@ Nine steps. Everything below is real HTTP; the demo client at `/` is one consume
 | # | Call | What happens |
 | :-- | :--- | :--- |
 | 1 | `GET /api/v1/events/{id}` | Metadata, `windowStatus`, `serverTime`, **bucketed** availability. This request also mints the visitor's signed `fsid` cookie. |
-| 2 | `POST /api/v1/queue/join` | Window-gated. `ZADD NX` — a refresh keeps your place rather than sending you to the back. |
-| 3 | `GET /api/v1/queue/stream` | SSE: `position-update` (2 s, clamped monotonic), `queue-promoted`, `sale-exhausted`, `sale-closed`, plus heartbeats. `GET /queue/status` is the equivalent polling path. |
+| 2 | `POST /api/v1/queue/join` | Window-gated (`OPEN` or `PAUSED`). `ZADD NX` — a refresh keeps your place rather than sending you to the back. |
+| 3 | `GET /api/v1/queue/stream` | SSE: `position-update` (2 s, clamped monotonic), `queue-promoted`, `tier-availability`, `sale-exhausted`, `sale-closed`, `sale-paused` / `sale-resumed`, plus heartbeats. `GET /queue/status` is the equivalent polling path. |
 | 4 | *(worker)* | `PromotionWorker` ticks once a second, admits `min(45, floor(remaining × 1.5) − pendingPasses − liveAdmissions)`, and publishes each pass to `queue:events:{id}` so it reaches whichever replica holds that browser's stream. |
 | 5 | `POST /api/v1/queue/admit` | Exchanges the 120 s pass for a 600 s admission session, **and revokes the pass here** — that is what makes it single-use. |
 | 6 | `POST /api/v1/holds` | Requires `X-Admission-Token`. Validates the tier and window, caps quantity, then decrements stock and inserts the hold **in one transaction**. |
@@ -212,7 +212,7 @@ Findings that cost real time and would cost it again.
 ## 8. Verification
 
 ```bash
-./mvnw test        # 256 tests: unit, modularity, concurrency, journey, recovery, queue lifecycle,
+./mvnw test        # 257 tests: unit, modularity, concurrency, journey, recovery, queue lifecycle,
                    #             pre-warm, stock rebuild, drift, Redis-restart guard, the metadata
                    #             cache's five rules, the cluster admission allowance, payment and
                    #             webhooks, bot defence, and fulfilment through a real broker.
@@ -610,7 +610,7 @@ to read every other module's internals. Full account in **ADR-048**.
 
 | Endpoint | Module | Note |
 | :--- | :--- | :--- |
-| `POST /admin/events/{id}/pause` · `/resume` | `catalog` | `EventStatus.PAUSED`; every gate closes through `SaleWindows` with no new code |
+| `POST /admin/events/{id}/pause` · `/resume` | `catalog` | `EventStatus.PAUSED`, read as the `PAUSED` window status: holds refused (`SALE_PAUSED`), joins and checkout still allowed, nobody promoted (ADR-066) |
 | `GET /admin/notifications/dlq` | `notification` | paged, capped, on a partial index (`V8`) |
 | `POST /admin/notifications/resend/{orderNumber}` | **`order`** | the payload lives in `outbox_events`, not `notification_logs` |
 | `GET /admin/orders/{orderNumber}` | `order` | a distinct DTO that withholds `receiptToken` |
@@ -622,8 +622,8 @@ Three things worth carrying forward as design, not trivia:
 - **A resend is one new outbox row.** The relay publishes it and the consumer's `claim()` already
   falls through to `reclaimDeadLettered`. No DLQ draining, no shovel, no new facade edge — and
   resending something that already worked sends nothing, because a `SENT` row is not `DLQ`.
-- **`PAUSED` split the event query four ways.** A paused sale leaves the promotion loop and the
-  browse list, but stays in `findManagedEventIds`, which drives the drift gauge *and* `StockEpoch`.
+- **`PAUSED` split the event query four ways.** A paused sale leaves the promotion loop — but, since
+  ADR-066, not the browse list — and stays in `findManagedEventIds`, which drives the drift gauge *and* `StockEpoch`.
   Pausing is what an operator does while investigating a counter; a paused event whose counters a
   Redis restart rolled back must be flagged then, not when someone resumes and starts selling from
   them. Verified against the cluster.
@@ -2111,8 +2111,8 @@ rather than an archaeology.
 | **Promotion writes in one pipeline; a metadata miss loads once** (ADR-065) | Ported from the teammate's branch. The promotion tick no longer makes three Redis round trips per buyer, and a waiting room polling one event no longer spikes the pool each time the cached row expires. The waiting-room drill is a `loadtest` service; its unredeemed-pass ceiling and the branch's unusable ~9k figure are recorded in §11 |
 | **k6 keys are unique per run** | The stub ignores the checkout idempotency key, but Stripe keeps one for 24 hours and would answer a reused key with the previous run's response. The waiting-room drill also parks each VU after its one journey (a fix from the teammate's last commit), so it measures arrivals rather than a request loop |
 | **Failures are classified by what they prove** (ADR-067) | A reserve whose hold transaction never began — a pool timeout, the common failure under pressure — now gives its seats back instead of hiding them until a rebuild. An unknown path is `404 NOT_FOUND`, not `500`. The rate limiter fails open (counted in `flashseats.bot.limiter.unavailable`) instead of answering every call a bare `500` when Redis is down. Request fields are bounded by their columns, and only the hold-token constraint reads as a concurrent checkout |
-| **A pause is a pause** (ADR-066) | A paused sale used to read `CLOSED`: buyers were told it had ended, their streams were closed, the close was **replayed after the resume**, and the event left `/events`. `PAUSED` is now a window status inside the sale window: the line keeps forming in arrival order, nobody is promoted, holds answer `409 SALE_PAUSED` (retryable), a buyer already holding seats can still pay, and `sale-paused` / `sale-resumed` are sent to each replica's own streams and never retained. The admin refusal to pause a draft is `EVENT_NOT_PAUSABLE` |
+| **A pause is a pause** (ADR-066) | A paused sale used to read `CLOSED`: buyers were told it had ended, their streams were closed, the close was **replayed after the resume**, and the event left `/events`. `PAUSED` is now a window status inside the sale window: the line keeps forming in arrival order, nobody is promoted, holds answer `409 SALE_PAUSED` (retryable), a buyer already holding seats can still pay, and `sale-paused` / `sale-resumed` are sent to each replica's own streams and never retained. The admin refusal to pause a draft is `EVENT_NOT_PAUSABLE`. A review then found two things that keep moving while paused: sold-out now un-derives during the pause when expiring holds return seats, and no wait estimate is shown while the line is not moving |
 
-**Verified so far:** 256/256 (228 + 28 new), including `SettlementArbiterIT`, which races confirm
+**Verified so far:** 257/257 (228 + 29 new), including `SettlementArbiterIT`, which races confirm
 against refund fifteen times with the refund claim staggered across the confirm transaction: both
 endings occur, and every round ends exactly one way.

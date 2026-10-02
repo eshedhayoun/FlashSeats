@@ -6,7 +6,7 @@ Guidance for Claude Code when working in this repository.
 
 FlashSeats — a high-concurrency ticket flash-sale engine. Modular monolith, Java 21, Spring Boot
 4.1.1. The **MVP is built and running**: all nine modules, the full journey from landing page to emailed
-PDF ticket, 256 tests green in any class order. **Inventory lives in Redis** (Stage 1, ADR-046): `catalog:stock:{e}:{t}`
+PDF ticket, 257 tests green in any class order. **Inventory lives in Redis** (Stage 1, ADR-046): `catalog:stock:{e}:{t}`
 is the live count and PostgreSQL keeps no copy of it. **Payment is real** (Stage 2, ADR-052-054) —
 but `flashseats.payment.stripe.enabled` is **false by default**, so `dev`, `test`, the load harness
 and every drill still run the in-process stub through the complete journey, 3-D Secure included.
@@ -58,8 +58,9 @@ FE_SPEC.md                        ← client contract (repo root)
 docs/modules/*.md                 ← lowest; one page per module: owns / exposes / never
 ```
 
-**ADR-019 supersedes ADR-003**, **ADR-020 amends ADR-006**, **ADR-049 amends ADR-028** — the
-originals are kept for the record but do not describe the current design.
+**ADR-019 supersedes ADR-003**, **ADR-020 amends ADR-006**, **ADR-049 amends ADR-028**, **ADR-058
+supersedes ADR-047 Decision 5**, **ADR-064 amends ADR-053 and ADR-056**, **ADR-066 amends ADR-016 and
+ADR-048 Decision 4** — the originals are kept for the record but do not describe the current design.
 
 When a module spec contradicts an ADR, the ADR wins and the module spec is stale — fix the module
 spec rather than the code.
