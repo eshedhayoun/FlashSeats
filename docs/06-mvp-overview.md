@@ -212,7 +212,7 @@ Findings that cost real time and would cost it again.
 ## 8. Verification
 
 ```bash
-./mvnw test        # 266 tests: unit, modularity, concurrency, journey, recovery, queue lifecycle,
+./mvnw test        # 269 tests: unit, modularity, concurrency, journey, recovery, queue lifecycle,
                    #             pre-warm, stock rebuild, drift, Redis-restart guard, the metadata
                    #             cache's five rules, the cluster admission allowance, payment and
                    #             webhooks, bot defence, and fulfilment through a real broker.
@@ -423,8 +423,10 @@ Honest list. None of these is hidden behind a passing test.
   killed three of them mid-sale. Seats in flight were under-counted, never oversold, and a rebuild
   recovered them exactly (§11). Now each replica has a 1.5 GiB limit, and G1 and
   `ExitOnOutOfMemoryError` are set explicitly. The same load then ran with zero restarts.
-- **An app replica can keep writing to a Redis node that Sentinel demoted while it was still up.**
-  Found in Pass 13 when rebuilding the cluster for the drill. The Pass 12 failover check had left
+- ~~**An app replica can keep writing to a Redis node that Sentinel demoted while it was still up.**~~
+  **Fixed (Pass 15, ADR-073):** the sentinels re-derive the primary from the data nodes on every
+  start, and a watchdog on each replica reconnects through Sentinel when its node reports a role other
+  than `master`. The original finding, kept for the record — found in Pass 13 when rebuilding the cluster for the drill. The Pass 12 failover check had left
   `redis-replica-2` as primary, and that state lives in the sentinel volumes, so it survives
   `docker compose down`. On the next `up`, `redis` briefly started as a primary, the app replicas
   connected to it, and Sentinel then made it a replica again. Lettuce looks up the primary through
@@ -434,9 +436,7 @@ Honest list. None of these is hidden behind a passing test.
   oversold, because every Redis write failed. That is the fail-safe direction, but it is a total
   outage. `docker compose --profile cluster restart app-1 app-2 app-3` recovers it, and so does
   wiping the sentinel volumes. A real failover, where the old primary actually goes *down*, drops
-  the connections and does not hit this, which matches Pass 12's result. **Not fixed.** The fix
-  would be a Lettuce topology refresh or a reconnect on `READONLY`, and it deserves its own test on
-  the cluster profile.
+  the connections and does not hit this, which matches Pass 12's result.
 - ~~**SSE reconnect replay never fired.**~~ **Fixed** (ADR-058). Live frames carried a
   per-connection `"local-N"` id, retained frames carried a Redis sequence, and the replay parsed the
   header as a number — so the normal case, where the last frame received was a two-second position
@@ -2112,12 +2112,13 @@ rather than an archaeology.
 | **k6 keys are unique per run** | The stub ignores the checkout idempotency key, but Stripe keeps one for 24 hours and would answer a reused key with the previous run's response. The waiting-room drill also parks each VU after its one journey (a fix from the teammate's last commit), so it measures arrivals rather than a request loop |
 | **Failures are classified by what they prove** (ADR-067) | A reserve whose hold transaction never began — a pool timeout, the common failure under pressure — now gives its seats back instead of hiding them until a rebuild. An unknown path is `404 NOT_FOUND`, not `500`. The rate limiter fails open (counted in `flashseats.bot.limiter.unavailable`) instead of answering every call a bare `500` when Redis is down. Request fields are bounded by their columns, and only the hold-token constraint reads as a concurrent checkout |
 | **The cluster serves the React client; one command starts the demo** (ADR-068) | Ported from the teammate's final commits. The nginx image builds the SPA and serves it at `:8080` with a deep-link fallback, replacing nginx's own 404. `docker/scripts/professor-demo.sh` needs only Docker: secrets, build, health, and two seeded, pre-warmed sales |
+| **Sentinel and the data nodes agree on the primary** (ADR-073) | A failover's state lived in the sentinel volumes while the nodes took their roles from compose on every start, so the next `up` sent every replica to a node about to be demoted: `READONLY`, a bare `500` on every request, until restarted by hand. The sentinels now ask the nodes who is primary on every start, and `RedisPrimaryWatchdog` reconnects a replica — and its pub/sub listeners — that finds itself on a non-primary node |
 | **A charge fits inside the time a hold guarantees** (ADR-072) | An undocumented in-process retry ran every gateway call three times with backoff — about 61 s worst case, against the 45 s checkout guarantees before it starts a charge. A charge and a retrieve are now tried once (the buyer's re-POST is the retry); only a refund is retried |
 | **The client's address can no longer be chosen by the client** (ADR-071) | nginx appends to `X-Forwarded-For`, and both Spring's `framework` forward-headers strategy and `RateLimitFilter` read the left-most entry — the client's own — so any caller could pick a fresh IP bucket per request. The cluster now uses `native` (Tomcat's right-to-left `RemoteIpValve`) and the filter walks right to left too |
 | **One live stream per tab, not per session** (ADR-070) | Streams were keyed by session, so a second tab — or a buyer queued in two sales, a supported state — completed the first, and the two reconnected over each other for ever. Worse, a promotion was delivered to whichever sale's stream the session held last, so a pass for one sale could be spent on another. Streams are now per event and per session, frames are addressed to the event they belong to, and a session may hold five streams per sale |
 | **Money owed and mail stranded are states, not silences** (ADR-069) | A refused refund is `REFUND_FAILED` and answers `409 REFUND_FAILED` — never "refunded in full". A notification claim stranded by a process that died mid-send is dead-lettered by a sweep after 10 minutes, so it shows in the operator's DLQ and a resend works; it used to be acknowledged and never sent |
 | **A pause is a pause** (ADR-066) | A paused sale used to read `CLOSED`: buyers were told it had ended, their streams were closed, the close was **replayed after the resume**, and the event left `/events`. `PAUSED` is now a window status inside the sale window: the line keeps forming in arrival order, nobody is promoted, holds answer `409 SALE_PAUSED` (retryable), a buyer already holding seats can still pay, and `sale-paused` / `sale-resumed` are sent to each replica's own streams and never retained. The admin refusal to pause a draft is `EVENT_NOT_PAUSABLE`. A review then found two things that keep moving while paused: sold-out now un-derives during the pause when expiring holds return seats, and no wait estimate is shown while the line is not moving |
 
-**Verified so far:** 266/266 (228 + 38 new), including `SettlementArbiterIT`, which races confirm
+**Verified so far:** 269/269 (228 + 41 new); `OutboxRecoveryIT` also made immune to the context's own relay, which could claim a row in the moment a test left it `PENDING`, including `SettlementArbiterIT`, which races confirm
 against refund fifteen times with the refund claim staggered across the confirm transaction: both
 endings occur, and every round ends exactly one way.
