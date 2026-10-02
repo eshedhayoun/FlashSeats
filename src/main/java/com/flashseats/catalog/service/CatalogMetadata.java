@@ -12,6 +12,8 @@ import java.time.Clock;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionException;
 import java.util.function.Supplier;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Component;
@@ -48,6 +50,9 @@ public class CatalogMetadata implements DerivedStateCache {
     private final Map<Long, Entry<EventRow>> eventCache = new ConcurrentHashMap<>();
     private final Map<Long, Entry<List<TierRow>>> tierCache = new ConcurrentHashMap<>();
     private final Map<Long, Entry<List<EventRow>>> listCache = new ConcurrentHashMap<>();
+    private final Map<Long, CompletableFuture<EventRow>> eventLoads = new ConcurrentHashMap<>();
+    private final Map<Long, CompletableFuture<List<TierRow>>> tierLoads = new ConcurrentHashMap<>();
+    private final Map<Long, CompletableFuture<List<EventRow>>> listLoads = new ConcurrentHashMap<>();
 
     private final Counter hits;
     private final Counter misses;
@@ -80,12 +85,22 @@ public class CatalogMetadata implements DerivedStateCache {
      *     class note on misses.
      */
     public EventRow event(long eventId) {
-        return read(eventCache, eventId, properties.getMetadataEventTtlMs(), () -> loadEvent(eventId));
+        return read(
+                eventCache,
+                eventLoads,
+                eventId,
+                properties.getMetadataEventTtlMs(),
+                () -> loadEvent(eventId));
     }
 
     /** An event's tiers, most expensive first — the order the landing page renders. */
     public List<TierRow> tiers(long eventId) {
-        return read(tierCache, eventId, properties.getMetadataTierTtlMs(), () -> loadTiers(eventId));
+        return read(
+                tierCache,
+                tierLoads,
+                eventId,
+                properties.getMetadataTierTtlMs(),
+                () -> loadTiers(eventId));
     }
 
     /**
@@ -95,7 +110,12 @@ public class CatalogMetadata implements DerivedStateCache {
      * It is not clock-dependent, so caching it is safe.
      */
     public List<EventRow> selectableEvents() {
-        return read(listCache, ALL, properties.getMetadataEventTtlMs(), this::loadSelectable);
+        return read(
+                listCache,
+                listLoads,
+                ALL,
+                properties.getMetadataEventTtlMs(),
+                this::loadSelectable);
     }
 
     /**
@@ -154,7 +174,12 @@ public class CatalogMetadata implements DerivedStateCache {
 
     // ----------------------------------------------------------------- internals
 
-    private <T> T read(Map<Long, Entry<T>> cache, long eventId, long ttlMs, Supplier<T> loader) {
+    private <T> T read(
+            Map<Long, Entry<T>> cache,
+            Map<Long, CompletableFuture<T>> loads,
+            long eventId,
+            long ttlMs,
+            Supplier<T> loader) {
         if (!properties.isMetadataCacheEnabled()) {
             return loader.get();
         }
@@ -167,16 +192,45 @@ public class CatalogMetadata implements DerivedStateCache {
         }
 
         misses.increment();
-        // Outside the map, and therefore outside any monitor: see the class note on pinning.
-        T loaded = loader.get();
-        if (cache.size() < properties.getMetadataCacheMaxEvents() || cache.containsKey(eventId)) {
-            cache.put(eventId, entry(loaded, ttlMs));
-        } else {
-            // The bound is a leak guard, not an eviction policy. Dropping a live entry to make room
-            // for this one would be worse than serving this one uncached.
-            purgeExpired(cache, now);
+        CompletableFuture<T> load = new CompletableFuture<>();
+        CompletableFuture<T> existing = loads.putIfAbsent(eventId, load);
+        if (existing != null) {
+            return await(existing);
         }
-        return loaded;
+
+        try {
+            // Outside the map, and therefore outside any monitor: see the class note on pinning.
+            T loaded = loader.get();
+            if (cache.size() < properties.getMetadataCacheMaxEvents() || cache.containsKey(eventId)) {
+                cache.put(eventId, entry(loaded, ttlMs));
+            } else {
+                // The bound is a leak guard, not an eviction policy. Dropping a live entry to make
+                // room for this one would be worse than serving this one uncached.
+                purgeExpired(cache, now);
+            }
+            load.complete(loaded);
+            return loaded;
+        } catch (RuntimeException | Error failed) {
+            load.completeExceptionally(failed);
+            throw failed;
+        } finally {
+            loads.remove(eventId, load);
+        }
+    }
+
+    private static <T> T await(CompletableFuture<T> load) {
+        try {
+            return load.join();
+        } catch (CompletionException failed) {
+            Throwable cause = failed.getCause();
+            if (cause instanceof RuntimeException runtime) {
+                throw runtime;
+            }
+            if (cause instanceof Error error) {
+                throw error;
+            }
+            throw failed;
+        }
     }
 
     private <T> void purgeExpired(Map<Long, Entry<T>> cache, long now) {
