@@ -3026,3 +3026,34 @@ through is money owed to a named buyer (ADR-069).
 the 45 s `min-remaining-seconds-for-retry` with room for the commit. Raising either timeout, or adding a
 retry, means re-checking that sum.
 
+---
+
+## ADR-073 — Sentinel and the data nodes agree on the primary after every start
+
+**Status:** accepted, Pass 15. Amends ADR-058 (Sentinel, built).
+
+**Context.** `sentinel-entrypoint.sh` wrote `sentinel.conf` once and left it to Sentinel, which records
+every failover in it, in a volume. The data nodes keep nothing of the kind: on every start they take
+their role from compose — `redis` primary, the replicas `--replicaof redis`. After a failover and a
+`down`/`up`, the two disagreed: the Sentinels named a replica, the nodes had reverted, and Sentinel
+then demoted the node every app replica had just connected to. Lettuce asks Sentinel for the primary
+only when it opens a connection, and Redis does not close clients when a node becomes a replica, so
+every write answered `READONLY` — a bare `500` on every request, because the rate limiter writes to
+Redis before MVC is reached — until someone restarted the replicas. Recorded since Pass 13 as "not
+fixed".
+
+**Decision.**
+
+1. **The Sentinels ask the nodes.** The entrypoint rewrites `sentinel.conf` on every start and
+   monitors the node that reports `role:master` (one with replicas first, then a lone one, then
+   compose's default). After a `down`/`up` that is `redis`, which is what the nodes say too; after a
+   Sentinel-only restart mid-incident, it is whichever node really is primary.
+2. **Each replica checks where it is.** `RedisPrimaryWatchdog` (cluster profile only) asks its
+   connected node for its role every 5 s; on anything but `master` it resets the shared connection —
+   the next one is resolved through Sentinel — restarts the pub/sub listeners, whose connections are
+   their own, and counts it in `flashseats.redis.primary.reconnects`.
+
+**What does not change.** A failover still stops every sale until an operator rebuilds the counters:
+the new primary is a different process, and `StockEpoch` distrusts counters it did not vouch for
+(ADR-046). That is the guard working, not this defect.
+

@@ -6,13 +6,13 @@ Guidance for Claude Code when working in this repository.
 
 FlashSeats — a high-concurrency ticket flash-sale engine. Modular monolith, Java 21, Spring Boot
 4.1.1. The **MVP is built and running**: all nine modules, the full journey from landing page to emailed
-PDF ticket, 266 tests green in any class order. **Inventory lives in Redis** (Stage 1, ADR-046): `catalog:stock:{e}:{t}`
+PDF ticket, 269 tests green in any class order. **Inventory lives in Redis** (Stage 1, ADR-046): `catalog:stock:{e}:{t}`
 is the live count and PostgreSQL keeps no copy of it. **Payment is real** (Stage 2, ADR-052-054) —
 but `flashseats.payment.stripe.enabled` is **false by default**, so `dev`, `test`, the load harness
 and every drill still run the in-process stub through the complete journey, 3-D Secure included.
 
 **Read [`docs/00-architecture-decisions.md`](docs/00-architecture-decisions.md) before changing
-anything.** It contains 72 ADRs. Most record a defect and its fix — 034-039 come from the first
+anything.** It contains 73 ADRs. Most record a defect and its fix — 034-039 come from the first
 review pass over the built code, 040-042 from the second — and several look like over-engineering
 until you read the failure they prevent. 043-045 are the exception: forward-looking decisions about
 the operator surface, buyer accounts and what health should report, with nothing built against them
@@ -40,7 +40,8 @@ dead-lettered for an operator instead of silently never sent. **070**: live stre
 per sale, and a frame reaches only the sale it is about. **071**: the client's address is the
 right-most `X-Forwarded-For` entry nobody we trust appended — `native` forward headers, never
 `framework`. **072**: a charge is tried once inside the hold's clock (25 s worst case under the 45 s
-guarantee); only a refund is retried in-process.
+guarantee); only a refund is retried in-process. **073**: Sentinel and the data nodes agree on the
+primary after every start, and a replica stranded on a demoted node reconnects by itself.
 
 **The operating envelope is 3–10 concurrent sales**, not one
 ([`03-end-to-end-flow.md`](docs/03-end-to-end-flow.md) §2). Every capacity number written before
@@ -57,7 +58,7 @@ security posture, next stages, and the review-pass log. It is the doc to update 
 ## Document precedence
 
 ```
-00-architecture-decisions.md      ← highest authority (72 ADRs)
+00-architecture-decisions.md      ← highest authority (73 ADRs)
 05-global-standards.md            ← cross-cutting contract; module docs conform to it
 FE_SPEC.md                        ← client contract (repo root)
 03-end-to-end-flow.md             ← the authoritative user journey AND the operating envelope
@@ -122,11 +123,12 @@ describing superseded designs. That is the failure mode this rule exists to stop
   deferral). `dev`, `test` and the plain `docker compose up -d` stack stay standalone. **A failover
   stops every sale**: the promoted replica is a new process with a new `run_id`, so `StockEpoch`
   distrusts every managed event until an operator rebuilds it. That is ADR-046 working, not a bug.
-  **Failover state survives `down`**: it lives in the sentinel volumes. After
-  `sentinel-failover-check.sh`, the next `up` can leave every app replica connected to a node that
-  Sentinel then demotes, and every request answers a bare `500` with `READONLY` in the logs.
-  `docker compose --profile cluster restart app-1 app-2 app-3` fixes it (`06` §9, not yet fixed in
-  code).
+  **A failover no longer survives `down` as a trap** (ADR-073): the sentinels derive the primary from
+  the data nodes on every start instead of trusting the failover recorded in their volumes, and each
+  replica's `RedisPrimaryWatchdog` reconnects through Sentinel if it ever finds itself on a node that
+  is not the primary (`flashseats.redis.primary.reconnects`). Before that, the next `up` after
+  `sentinel-failover-check.sh` left every app replica writing to a demoted node — `READONLY`, a bare
+  `500` on every request — until restarted by hand.
 - The **transactional outbox is hand-rolled** in `order`. The Spring Modulith event-publication
   starters were deliberately removed; only `spring-modulith-starter-core` and `-starter-test`
   remain, purely for `ApplicationModules.verify()` (ADR-009). Do not re-add them casually.
