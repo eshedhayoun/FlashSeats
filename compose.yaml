@@ -319,7 +319,9 @@ services:
   app-3: { <<: *app, container_name: flashseats-app-3 }
 
   nginx:
-    image: nginx:1.27-alpine
+    build:
+      context: .
+      dockerfile: docker/nginx/Dockerfile
     container_name: flashseats-nginx
     profiles: ["cluster"]
     restart: unless-stopped

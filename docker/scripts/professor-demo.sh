@@ -13,6 +13,10 @@ set -euo pipefail
 
 cd "$(dirname "$0")/../.."
 
+HTTP_PORT="${HTTP_PORT:-$(grep -E '^HTTP_PORT=' .env 2>/dev/null | head -1 | cut -d= -f2-)}"
+HTTP_PORT="${HTTP_PORT:-8080}"
+export HTTP_PORT
+
 RESET=0
 for arg in "$@"; do
     case "$arg" in
@@ -89,31 +93,32 @@ docker compose --profile cluster up -d --build
 
 echo "Waiting for the demo to become healthy..."
 for _ in $(seq 1 90); do
-    if curl -fsS http://localhost:8080/actuator/health >/dev/null 2>&1; then
+    if curl -fsS "http://localhost:${HTTP_PORT}/actuator/health" >/dev/null 2>&1; then
         break
     fi
     sleep 2
 done
 
-if ! curl -fsS http://localhost:8080/actuator/health >/dev/null 2>&1; then
+if ! curl -fsS "http://localhost:${HTTP_PORT}/actuator/health" >/dev/null 2>&1; then
     echo "error: the stack did not become healthy within 180 seconds." >&2
     echo "Inspect the startup log with: docker compose --profile cluster logs app-1" >&2
     exit 1
 fi
 
-echo "Seeding an open demonstration sale..."
-bash docker/seed/seed.sh
+echo "Seeding the Aurora Fest and Midnight Sessions demonstration sales..."
+bash docker/seed/seed-demo.sh
 
-cat <<'EOF'
+cat <<EOF
 
 FlashSeats is ready:
-  Demo:    http://localhost:8080
+  Demo:    http://localhost:${HTTP_PORT}
   Mailpit: http://localhost:8025
   RabbitMQ: http://localhost:15672
 
-The browser demo uses the in-process payment stub, so no Stripe account or
-API key is needed. Use pm_card_declined to demonstrate a declined payment
-that keeps the seats, or the normal success path to receive a PDF ticket.
+The browser demo is the packaged React client and uses the in-process payment
+stub, so no Node.js, Stripe account or API key is needed. Use pm_card_declined
+to demonstrate a declined payment that keeps the seats, or the normal success
+path to receive a PDF ticket.
 
 To stop without deleting data:
   docker compose --profile cluster down
