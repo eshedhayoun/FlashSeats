@@ -27,14 +27,20 @@ public final class CatalogErrors {
     /**
      * The action requires an open sale window (ADR-016).
      *
-     * <p>{@code UPCOMING} and {@code CLOSED} map to different codes on purpose: the SPA shows a
-     * countdown for one and a sale-ended panel for the other.
+     * <p>Each refusing status has its own code, because each asks the buyer for something different: a
+     * countdown, patience, or a sale-ended panel (ADR-066).
      */
     public static FlashSeatsException saleNotOpen(long eventId, EventWindowStatus actual) {
-        boolean closed = actual == EventWindowStatus.CLOSED;
-        return new FlashSeatsException(
-                closed ? ErrorCode.SALE_CLOSED : ErrorCode.SALE_NOT_OPEN,
-                closed ? "Sales for this event have ended." : "This sale has not started yet.");
+        return switch (actual) {
+            case PAUSED -> new FlashSeatsException(
+                            ErrorCode.SALE_PAUSED,
+                            "Sales are paused for a moment. Your place is kept; you can reserve as soon as"
+                                    + " they resume.")
+                    .with("retryable", true);
+            case UPCOMING -> new FlashSeatsException(ErrorCode.SALE_NOT_OPEN, "This sale has not started yet.");
+            case CLOSED -> new FlashSeatsException(ErrorCode.SALE_CLOSED, "Sales for this event have ended.");
+            case OPEN -> throw new IllegalArgumentException("Event " + eventId + " is open; nothing to refuse");
+        };
     }
 
     /**
@@ -59,7 +65,7 @@ public final class CatalogErrors {
      */
     public static FlashSeatsException eventNotPausable(long eventId, EventStatus status) {
         return new FlashSeatsException(
-                ErrorCode.SALE_PAUSED,
+                ErrorCode.EVENT_NOT_PAUSABLE,
                 "Event " + eventId + " is " + status + "; only a PUBLISHED or PAUSED sale can be"
                         + " paused or resumed.");
     }

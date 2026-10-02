@@ -137,6 +137,12 @@ public class SaleFixture {
         caches.forEach(DerivedStateCache::invalidateAll);
     }
 
+    /** Sets an event's publication status directly, for states no endpoint produces (a cancellation). */
+    public void setEventStatus(long eventId, String status) {
+        jdbc.update("UPDATE events SET status = ? WHERE id = ?", status, eventId);
+        caches.forEach(DerivedStateCache::invalidateAll);
+    }
+
     /**
      * Forces the live counter to a value, as a Redis restart or a lost restore would leave it.
      *

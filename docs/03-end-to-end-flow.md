@@ -908,8 +908,9 @@ genuine gap rather than a deleted idea:
 dead-lettered?", not which queue — and that the three above are the whole of what remains, all of
 them per-event or per-connection shapes the current counters cannot express.
 
-Controls: `POST /api/v1/admin/events/{id}/pause` and `/resume` (stop promotions and new holds, honour
-existing ones), `POST /api/v1/admin/events/{id}/rebuild-stock`,
+Controls: `POST /api/v1/admin/events/{id}/pause` and `/resume` (stop promotions and new holds; the
+line keeps forming, and existing passes, admissions and holds are honoured — a buyer holding seats can
+still pay. Buyers see `PAUSED`, never "sale ended", ADR-066), `POST /api/v1/admin/events/{id}/rebuild-stock`,
 `GET /api/v1/admin/notifications/dlq`, `POST /api/v1/admin/notifications/resend/{orderNumber}`,
 `GET /api/v1/admin/orders/{orderNumber}`, and the bot surface —
 `GET`/`POST` `/api/v1/admin/bot/ip-rules`, `DELETE /api/v1/admin/bot/ip-rules/{ip}` and

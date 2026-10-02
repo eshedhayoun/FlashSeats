@@ -37,6 +37,9 @@ public class QueueBroadcaster {
      */
     private static final long STREAM_TIMEOUT_MS = Duration.ofHours(1).toMillis();
 
+    static final String SALE_PAUSED = "sale-paused";
+    static final String SALE_RESUMED = "sale-resumed";
+
     private final SseEmitterRegistry emitters;
     private final QueueService queue;
     private final QueueDrainRateTracker drainRate;
@@ -45,6 +48,9 @@ public class QueueBroadcaster {
     private final Clock clock;
     private final QueueReplayService replay;
     private final Map<Long, List<TierAvailability>> lastAvailability = new ConcurrentHashMap<>();
+
+    /** Events this replica last swept while paused, so the first sweep after a resume can say so. */
+    private final Set<Long> pausedEvents = ConcurrentHashMap.newKeySet();
 
     public QueueBroadcaster(
             SseEmitterRegistry emitters,
@@ -86,7 +92,8 @@ public class QueueBroadcaster {
         // looks like a failure to connect.
         emitters.comment(sessionId, "connected");
 
-        QueueState state = queue.getQueueState(sessionId, eventId);
+        EventWindowStatus window = catalog.getWindowStatus(eventId);
+        QueueState state = queue.getQueueState(sessionId, eventId, window);
         if (state.phase() == QueuePhase.PROMOTED && state.passToken() != null) {
             Long expiresInSeconds = queue.passTimeToLiveSeconds(sessionId, eventId);
             if (expiresInSeconds != null) {
@@ -95,6 +102,9 @@ public class QueueBroadcaster {
             }
         } else if (state.position() != null) {
             emitters.sendPosition(sessionId, state.position(), state.estWaitSeconds());
+        }
+        if (window == EventWindowStatus.PAUSED) {
+            emitters.send(sessionId, SALE_PAUSED, Map.of());
         }
         return emitter;
     }
@@ -110,6 +120,7 @@ public class QueueBroadcaster {
     public void pushPositions() {
         Set<Long> watchedEventIds = emitters.watchedEventIds();
         lastAvailability.keySet().removeIf(eventId -> !watchedEventIds.contains(eventId));
+        pausedEvents.removeIf(eventId -> !watchedEventIds.contains(eventId));
         for (long eventId : watchedEventIds) {
             try {
                 sweep(eventId);
@@ -125,10 +136,29 @@ public class QueueBroadcaster {
 
         if (window == EventWindowStatus.CLOSED) {
             lastAvailability.remove(eventId);
+            pausedEvents.remove(eventId);
             replay.publishAndFanOut(
                     eventId, QueueChannelMessage.toAll(
                             "sale-closed", Map.of("closedAt", clock.instant().toString())));
             return;
+        }
+
+        if (window == EventWindowStatus.PAUSED) {
+            // Not terminal, and neither retained nor fanned out: every replica sweeps its own streams,
+            // and a reconnect after the resume must not be replayed a pause that has ended. Sent every
+            // sweep, so a buyer who connects mid-pause hears it within one interval. Positions are not
+            // sent: nobody is promoted, so they cannot change (ADR-066).
+            pausedEvents.add(eventId);
+            for (String sessionId : emitters.sessionsWatching(eventId)) {
+                emitters.send(sessionId, SALE_PAUSED, Map.of());
+            }
+            return;
+        }
+
+        if (pausedEvents.remove(eventId)) {
+            for (String sessionId : emitters.sessionsWatching(eventId)) {
+                emitters.send(sessionId, SALE_RESUMED, Map.of());
+            }
         }
 
         sampleDepth(eventId);

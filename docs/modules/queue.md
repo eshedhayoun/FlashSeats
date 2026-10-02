@@ -67,8 +67,8 @@ in line, which is a fairness failure, not a correctness one.
 
 | Method | Path | Auth | Notes |
 | :--- | :--- | :--- | :--- |
-| `POST` | `/api/v1/queue/join` | `fsid` cookie | `202`. Idempotent — rejoining preserves position |
-| `GET` | `/api/v1/queue/status` | `fsid` cookie | polling fallback; returns the pass if one was minted |
+| `POST` | `/api/v1/queue/join` | `fsid` cookie | `202`. Idempotent — rejoining preserves position. Accepted while the sale is **paused**, so the line keeps its arrival order (ADR-066) |
+| `GET` | `/api/v1/queue/status` | `fsid` cookie | polling fallback; returns the pass if one was minted, and `paused` while an operator has paused the sale |
 | `POST` | `/api/v1/queue/admit` | `fsid` + `X-Queue-Pass-Token` | spends the pass, mints the admission session |
 | `GET` | `/api/v1/queue/stream` | `fsid` cookie | SSE, 1 h timeout |
 
@@ -83,6 +83,8 @@ in line, which is a fairness failure, not a correctness one.
 | `tier-availability` | `{tiers:[{tierId, level}]}` | on change — each replica diffs the buckets it last sent (ADR-027) |
 | `sale-exhausted` | `{soldOutAt}` | when derived — **not terminal**, it un-derives if stock returns |
 | `sale-closed` | `{closedAt}` | terminal; the stream is completed |
+| `sale-paused` | `{}` | every sweep while paused, and on connect — **not terminal**, never retained or replayed (ADR-066) |
+| `sale-resumed` | `{}` | once, on the first sweep after a pause ends; any `position-update` also means running |
 | *(comment)* | `:hb` | 15 s |
 
 `estWaitSeconds` is `null` when unknown, never a `-1` sentinel.

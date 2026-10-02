@@ -70,6 +70,10 @@ public class QueueService implements QueueFacade {
      * refreshing buyer to the back (ADR-008). {@code NX} also makes a random draw safe (ADR-024): a
      * rejoin's fresh draw is discarded. A score derived from the session id would be grindable, because
      * ids are free to mint.
+     *
+     * <p>Allowed while the sale is paused. Joining moves no stock, and a line that keeps forming during
+     * a pause is still in arrival order when the sale resumes; refusing would turn the resume into a
+     * race between whoever retries fastest (ADR-066).
      */
     public QueueStatusResponse join(
             String sessionId, long eventId, String recaptchaToken, String clientAddress) {
@@ -78,7 +82,7 @@ public class QueueService implements QueueFacade {
         bots.verifyHuman(sessionId, recaptchaToken, clientAddress);
 
         EventSummary event = catalog.getEventSummary(eventId);
-        if (event.windowStatus() != EventWindowStatus.OPEN) {
+        if (event.windowStatus() != EventWindowStatus.OPEN && event.windowStatus() != EventWindowStatus.PAUSED) {
             throw CatalogErrors.saleNotOpen(eventId, event.windowStatus());
         }
 
@@ -129,6 +133,7 @@ public class QueueService implements QueueFacade {
                 state.estWaitSeconds(),
                 state.passToken(),
                 state.admissionExpiresAt(),
+                window == EventWindowStatus.PAUSED,
                 clock.instant());
     }
 
@@ -161,6 +166,8 @@ public class QueueService implements QueueFacade {
      *
      * <ol>
      *   <li>{@code CLOSED} first: the window outranks everything, or a closed sale's queue waits forever.
+     *       A <em>paused</em> sale is read like an open one — the buyer's place is the answer, and the
+     *       pause is reported beside it (ADR-066).
      *   <li>{@code ADMITTED}, then {@code PROMOTED}: most advanced first.
      *   <li>{@code EXHAUSTED} before {@code WAITING}: a buyer with no pass or admission in a sale with no
      *       stock is told so, and keeps their place in case stock returns (ADR-035).

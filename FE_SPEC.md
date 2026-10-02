@@ -113,6 +113,7 @@ Three positions in that order are load-bearing:
 | :--- | :--- |
 | `UPCOMING` | disabled, `HH:MM:SS` countdown |
 | `OPEN` | **"Join Flash Sale"** enabled |
+| `PAUSED` | **"Join Flash Sale"** enabled, with "Sales are paused for a moment — you can still join the line". **Never** the sale-ended treatment (ADR-066) |
 | `CLOSED` | → V6 |
 
 **Availability badges** — bucketed, never numeric (ADR-027):
@@ -385,6 +386,11 @@ page survives a cookie clear and works from the confirmation email (ADR-010), su
 That "nothing was charged" line is not optional. It is the single most reassuring sentence in the
 product.
 
+**A paused sale is not a V6 state** (ADR-066). It is a banner over whatever view the buyer is in —
+"Sales are paused for a moment — your place is kept" — and it lifts on `sale-resumed`, the next
+`position-update`, or `windowStatus` returning to `OPEN`. Rendering it as "Sales have ended" tells
+every buyer in the line to leave a sale that is about to continue.
+
 ---
 
 ## 2. API mapping
@@ -397,11 +403,11 @@ Base `/api/v1`. `fsid` is an `HttpOnly` cookie — **JavaScript never reads or s
 | V1 | `GET` | `/events` | — | — | `200` | — |
 | V1 | `GET` | `/events/{eventId}` | — | — | `200` | `EVENT_NOT_FOUND` |
 | all | `GET` | `/sale/{eventId}/state` | — | — | `200` | `EVENT_NOT_FOUND` |
-| V1→V2 | `POST` | `/queue/join` | — | `{eventId}` | `202` | `SALE_NOT_OPEN`, `SALE_PAUSED`, `RATE_LIMITED` |
+| V1→V2 | `POST` | `/queue/join` | — | `{eventId}` | `202` | `SALE_NOT_OPEN`, `SALE_CLOSED`, `RATE_LIMITED`. A **paused** sale accepts the join — the line keeps its arrival order while nobody is let out (ADR-066) |
 | V2 | `GET` | `/queue/stream?eventId=&lastEventId=` | `Accept: text/event-stream`, `Last-Event-ID` | — | SSE | — |
-| V2 | `GET` | `/queue/status?eventId=` | — | — | `200` | — (a session that never joined is `phase: NOT_JOINED`, not an error) |
+| V2 | `GET` | `/queue/status?eventId=` | — | — | `200` | — (a session that never joined is `phase: NOT_JOINED`, not an error). `paused: true` while an operator has paused the sale; the phase stays truthful beside it |
 | V2→V3 | `POST` | `/queue/admit` | `X-Queue-Pass-Token` | `{eventId}` | `200` | `QUEUE_PASS_INVALID`, `VALIDATION_FAILED` |
-| V3 | `POST` | `/holds` | `X-Admission-Token` | `{eventId, tierId, quantity}` | `201` | `INSUFFICIENT_STOCK`, `QUANTITY_EXCEEDS_LIMIT`, `HOLD_LIMIT_EXCEEDED`, `ADMISSION_EXPIRED`, `INVENTORY_UNAVAILABLE` |
+| V3 | `POST` | `/holds` | `X-Admission-Token` | `{eventId, tierId, quantity}` | `201` | `INSUFFICIENT_STOCK`, `QUANTITY_EXCEEDS_LIMIT`, `HOLD_LIMIT_EXCEEDED`, `ADMISSION_EXPIRED`, `INVENTORY_UNAVAILABLE`, `SALE_PAUSED` (retryable: keep the buyer on V3 and let them try again once the sale resumes) |
 | V4 | `GET` | `/holds/{holdToken}` | — | — | `200` | `HOLD_NOT_FOUND`, `HOLD_EXPIRED` |
 | V4 | `DELETE` | `/holds/{holdToken}` | — | — | `204` | `HOLD_NOT_FOUND` |
 | V4 | `POST` | `/orders/checkout` | — | `{holdToken, userEmail, paymentMethodId, idempotencyKey}` | `201`/`200` | `PAYMENT_DECLINED`, `PAYMENT_ATTEMPTS_EXHAUSTED`, `HOLD_EXPIRED`, `DUPLICATE_PAYMENT`, `PAYMENT_GATEWAY_UNAVAILABLE`, `CHECKOUT_WINDOW_CLOSED`, `INSUFFICIENT_TIME_REMAINING`, `ORDER_REFUNDED`, `SERVICE_BUSY` |
@@ -557,6 +563,7 @@ facts** — the same distinction the server maintains between `SOLD_OUT` and `UN
 | **V5, reloaded after buying** | `hold: null`, `order: CONFIRMED` | **Receipt, not the landing page.** Rehydration returned only *pending* orders, so a completed purchase was invisible and the buyer was invited to queue for seats they already owned (ADR-037) |
 | **V2, sale closed while waiting** | `queue.state: CLOSED` | V6. The window is resolved before ZSET rank, and the broadcaster sends `sale-closed` and completes the stream (ADR-036) |
 | **V2, counter unreadable** | `queue.state` unchanged, promotion paused | **Stay in V2.** A missing counter is a fault, never a sold-out sale (ADR-004, ADR-035) |
+| **Any view, sale paused by an operator** | `windowStatus: PAUSED`, every other section unchanged | **Stay where you are**, with "Sales are paused for a moment — your place is kept". The line, a pass, an admission, a hold: nothing is torn down. Holds cannot be created until it resumes; a hold that already exists can still be paid for (ADR-066) |
 | Second tab, **same** sale | same session | Both tabs converge on the same state |
 | **Second tab, a different sale** | independent per-event state | **Both sales proceed independently.** Queued for A while holding seats in B is a legitimate, supported state. This is what rule 5 exists for, and the current demo client fails it |
 
@@ -614,6 +621,8 @@ function connect(eventId: number) {
   es.addEventListener('tier-availability', e => setTiers(JSON.parse(e.data).tiers));
   es.addEventListener('sale-exhausted',    () => { es.close(); goTo('V6:SOLD_OUT'); });
   es.addEventListener('sale-closed',       () => { es.close(); goTo('V6:SALE_CLOSED'); });
+  es.addEventListener('sale-paused',       () => setPaused(true));   // NOT terminal: keep the stream
+  es.addEventListener('sale-resumed',      () => setPaused(false));
 
   es.onopen  = () => { setConn('open'); attempt = 0; };
   es.onerror = () => { es.close(); scheduleReconnect(eventId); };
@@ -625,6 +634,12 @@ function connect(eventId: number) {
 itself; a client that cannot set headers may pass `?lastEventId=` instead. The server replays the
 **broadcast** frames minted after that sequence — `tier-availability`, `sale-exhausted`,
 `sale-closed`.
+
+**`sale-paused` and `sale-resumed` are neither retained nor replayed** (ADR-066). A pause is a
+*current* condition, not an event in the sale's history: each replica sends `sale-paused` to its own
+streams on every sweep while the sale is paused, and on connect, and `sale-resumed` once when it
+resumes — so a reconnect after the resume is never handed a pause that has ended. A `position-update`
+also means the sale is running.
 
 **Only those frames carry an `id`.** Position updates and `queue-promoted` are sent with none, which
 the SSE specification defines as leaving the client's last-event-id unchanged — so storing

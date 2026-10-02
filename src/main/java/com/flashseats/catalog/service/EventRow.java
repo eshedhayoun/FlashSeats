@@ -32,10 +32,15 @@ public record EventRow(
      * a second one that rounded a boundary differently would open a sale to one and not another.
      */
     public EventWindowStatus windowStatus(Instant now) {
-        if (status != EventStatus.PUBLISHED || !now.isBefore(saleEndTime)) {
+        boolean live = status == EventStatus.PUBLISHED || status == EventStatus.PAUSED;
+        if (!live || !now.isBefore(saleEndTime)) {
             return EventWindowStatus.CLOSED;
         }
-        return now.isBefore(saleStartTime) ? EventWindowStatus.UPCOMING : EventWindowStatus.OPEN;
+        if (now.isBefore(saleStartTime)) {
+            // A pause before the sale opens changes nothing anyone can see until it does.
+            return EventWindowStatus.UPCOMING;
+        }
+        return status == EventStatus.PAUSED ? EventWindowStatus.PAUSED : EventWindowStatus.OPEN;
     }
 
     /** The one place an entity becomes a snapshot, cached or not. */

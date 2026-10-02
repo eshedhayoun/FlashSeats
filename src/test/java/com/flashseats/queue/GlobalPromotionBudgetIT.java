@@ -41,11 +41,18 @@ class GlobalPromotionBudgetIT extends IntegrationTest {
     private long originalPromotionIntervalMs;
     private long originalBudgetPerTick;
 
+    /**
+     * The real {@code PromotionWorker} shares this context and this key. A tick that read a waiting
+     * line just before the reset can still claim just after it, creating a fresh window and spending it
+     * before the test's first claim — so the reset is followed by two ticks' quiet and a clean key.
+     */
     @BeforeEach
-    void reset() {
+    void reset() throws InterruptedException {
         fixture.reset();
         originalPromotionIntervalMs = properties.getPromotionIntervalMs();
         originalBudgetPerTick = properties.getGlobalAdmissionBudgetPerTick();
+        Thread.sleep(originalPromotionIntervalMs * 2);
+        redis.delete("queue:budget");
         properties.setGlobalAdmissionBudgetPerTick(5);
     }
 

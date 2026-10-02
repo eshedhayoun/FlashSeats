@@ -51,6 +51,10 @@ owns the truth. This is the `holdmeta` key ADR-019 deleted, and it is not coming
 
 A hold that is not yours answers `404`, not `403`, so tokens cannot be enumerated.
 
+A hold is created only while the sale window is `OPEN`. A **paused** sale answers `409 SALE_PAUSED`
+with `retryable: true` and moves no stock; holds that already exist are untouched by the pause, keep
+their own clock, and can still be paid for (ADR-066).
+
 **Facade:** `getActiveHold`, `findActiveHold`, `consumeHold`, `grantGrace`, `discardTimer`,
 `sumActiveQuantityForTier`.
 

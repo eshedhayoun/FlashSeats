@@ -212,7 +212,7 @@ Findings that cost real time and would cost it again.
 ## 8. Verification
 
 ```bash
-./mvnw test        # 245 tests: unit, modularity, concurrency, journey, recovery, queue lifecycle,
+./mvnw test        # 251 tests: unit, modularity, concurrency, journey, recovery, queue lifecycle,
                    #             pre-warm, stock rebuild, drift, Redis-restart guard, the metadata
                    #             cache's five rules, the cluster admission allowance, payment and
                    #             webhooks, bot defence, and fulfilment through a real broker.
@@ -228,6 +228,7 @@ Findings that cost real time and would cost it again.
 | `HoldLifecycleIT` | Double consume → `409`. Ten concurrent releases restore **once**. The sweeper reclaims an abandoned hold and does not keep restoring it. One hold per session. A missing counter is `503`, never "sold out". |
 | `UserJourneyIT` | The full journey over real HTTP with a real cookie; a spent pass is rejected; a decline retains the hold and the retry succeeds on the same order number; a double submit yields one order and one charge; `/sale/state` tracks the stage. |
 | `CheckoutRecoveryIT` | A gateway outage keeps the seats **and** the ability to pay for them; it costs none of the three card attempts; a charge genuinely in flight is still refused; an order stranded by a crash resumes once no charge can still be running. |
+| `SalePauseIT` | **A paused sale is paused, not over** (ADR-066): it stays listed as `PAUSED`; the line keeps forming in arrival order while nobody is promoted, then moves on resume; a hold is refused with a retryable `SALE_PAUSED` and no seat moves; a buyer already holding seats can pay; a cancelled event cannot be paused. `QueueBroadcasterTest` pins that the pause frames are never retained or fanned out and that the resume is announced once. |
 | `SettlementArbiterIT` | **A settled charge ends exactly one way** (ADR-064). A refund attempted against a confirmed purchase moves nothing; a confirmation attempted against a refunded order takes no seats; confirm and refund raced fifteen times, staggered across the whole confirm transaction, end exactly one way every round; and a retry after a commit that proved nothing confirms the charge that settled **without a second charge**. |
 | `QueueLifecycleIT` | An un-warmed event pauses promotion rather than selling out; a closed sale ends the wait instead of freezing it; a pass for one sale is never offered to another; exhaustion reverses when seats return. |
 | `NotificationClaimIT` | The claim blocks a duplicate, is terminal once sent, and releases a dead letter for replay. |
@@ -304,6 +305,10 @@ Honest list. None of these is hidden behind a passing test.
   a buyer who never retries is covered by the webhook, which redelivers for days and confirms or
   refunds. The stub has no webhook, so there the charge stays settled and unresolved: stub money,
   never real money, but a dev-profile ledger can show it.
+- **A pause does not stop the clocks** (ADR-066). The line keeps every place for as long as a pause
+  lasts, but a pass keeps its 120 s, an admission its 600 s and a hold its TTL. A pause longer than an
+  admission sends those buyers back to the end of the line; one longer than a hold returns its seats
+  (they can still pay while it lasts). Freezing them would mean extending every live key on resume.
 - **A refund interrupted between its claim and the provider call is found by query, not by alarm**
   (ADR-064). The order reads `REFUNDED` with the reason `refund pending: …`.
 - ~~**No admin surface** beyond pre-warm.~~ **Built** (Stage 4, ADR-048): pause/resume, the DLQ
@@ -2103,8 +2108,9 @@ rather than an archaeology.
 | **Working documents retired** | A hand-off note, a duplicated design system and two coverage documents that ticked boxes no test checked are replaced by `frontend/README.md`. `REFACTORING_BLUEPRINT.md`'s Part 1 is now [`07-system-on-one-page.md`](07-system-on-one-page.md); its open items are in §11 |
 | **A settled charge ends exactly one way** (ADR-064) | Review found the checkout and the webhook could each refund a purchase the other had just confirmed, and overwrite `CONFIRMED` with `REFUNDED`; the checkout refunded on a pool timeout; a refund ran before the order recorded it; and a refused refund still emailed "refunded in full". The order row now decides: every transition is a compare-and-set (`V13` adds `version`), a refund is claimed before money moves, a lost hold asks the order, and ambiguity moves no money — the retry reuses the charge that settled. Shoham's re-read and receipt check are the seed of this; his branch also left the expiry case unrefunded, which this does not |
 | **Promotion writes in one pipeline; a metadata miss loads once** (ADR-065) | Ported from the teammate's branch. The promotion tick no longer makes three Redis round trips per buyer, and a waiting room polling one event no longer spikes the pool each time the cached row expires. The waiting-room drill is a `loadtest` service; its unredeemed-pass ceiling and the branch's unusable ~9k figure are recorded in §11 |
-| **k6 keys are unique per run** | The stub ignores the checkout idempotency key, but Stripe keeps one for 24 hours and would answer a reused key with the previous run's response |
+| **k6 keys are unique per run** | The stub ignores the checkout idempotency key, but Stripe keeps one for 24 hours and would answer a reused key with the previous run's response. The waiting-room drill also parks each VU after its one journey (a fix from the teammate's last commit), so it measures arrivals rather than a request loop |
+| **A pause is a pause** (ADR-066) | A paused sale used to read `CLOSED`: buyers were told it had ended, their streams were closed, the close was **replayed after the resume**, and the event left `/events`. `PAUSED` is now a window status inside the sale window: the line keeps forming in arrival order, nobody is promoted, holds answer `409 SALE_PAUSED` (retryable), a buyer already holding seats can still pay, and `sale-paused` / `sale-resumed` are sent to each replica's own streams and never retained. The admin refusal to pause a draft is `EVENT_NOT_PAUSABLE` |
 
-**Verified so far:** 245/245 (228 + 17 new), including `SettlementArbiterIT`, which races confirm
+**Verified so far:** 251/251 (228 + 23 new), including `SettlementArbiterIT`, which races confirm
 against refund fifteen times with the refund claim staggered across the confirm transaction: both
 endings occur, and every round ends exactly one way.

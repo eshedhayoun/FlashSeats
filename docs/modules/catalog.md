@@ -75,6 +75,13 @@ Reads: `getEventSummary`, `getWindowStatus`, `getTierSummary`, `findOpenEventIds
 `findManagedEventIds`, `getRemainingForEvent`, `getLiveCounters`, `getTierCapacities`.
 Movement: `tryReserve`, `restore`, `applyRebuild`.
 
+**The window status has four values** — `UPCOMING`, `OPEN`, `PAUSED`, `CLOSED` — derived from the row
+and the clock on every call. `PAUSED` exists only inside the window: an event paused before its sale
+starts still reads `UPCOMING`, and one past its end reads `CLOSED`. A paused sale stays in the public
+event list, marked as such, so the buyers in its line can find it again (ADR-066). Every gate tests
+for the statuses it admits, never for the ones it refuses, so a gate that has not heard of a status
+refuses it — which is what made adding one safe (ADR-048's objection, answered in ADR-066).
+
 **`findOpenEventIds` and `findManagedEventIds` are not interchangeable.** *Managed* means open **or
 paused** — what an operator is still answerable for. Pausing is what an operator does *while*
 investigating a counter, so the drift gauge and the Redis-restart guard both need paused events

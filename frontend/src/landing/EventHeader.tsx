@@ -29,6 +29,11 @@ export function EventHeader({ event }: { event: EventDetails }) {
       {event.windowStatus === "OPEN" && (
         <Typography color="success.main">Sale is open</Typography>
       )}
+      {event.windowStatus === "PAUSED" && (
+        <Typography color="warning.main">
+          Sales are paused for a moment — you can still join the line
+        </Typography>
+      )}
       {event.windowStatus === "CLOSED" && (
         <Typography color="text.secondary">Sales have ended</Typography>
       )}

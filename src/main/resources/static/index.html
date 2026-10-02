@@ -118,6 +118,7 @@
   <section id="v-queue" hidden>
     <div class="card">
       <div class="muted" style="text-align:center">You're in the queue</div>
+      <div class="muted" style="text-align:center" id="q-paused" role="status" hidden>Sales are paused for a moment. Your place is kept, and the line moves again as soon as they resume.</div>
       <div class="bigposition mono" id="q-position">—</div>
       <div class="muted" style="text-align:center" id="q-wait">Working out how long…</div>
       <div class="bar"><span id="q-bar"></span></div>
@@ -337,10 +338,15 @@ async function route() {
 function showLanding() {
   const ev = state.event;
   const open = ev.windowStatus === "OPEN";
+  // A paused sale still takes its line in arrival order; nobody is let in until it resumes (ADR-066).
+  const paused = ev.windowStatus === "PAUSED";
 
-  $("window-label").textContent = open ? "Sale is open" : ev.windowStatus === "UPCOMING" ? "Sale opens soon" : "Sale closed";
-  $("window-detail").textContent = open ? "Join the queue to buy." : "";
-  $("btn-join").disabled = !open;
+  $("window-label").textContent = open ? "Sale is open"
+    : paused ? "Sales are paused"
+    : ev.windowStatus === "UPCOMING" ? "Sale opens soon" : "Sale closed";
+  $("window-detail").textContent = open ? "Join the queue to buy."
+    : paused ? "You can still join the queue; it moves again as soon as sales resume." : "";
+  $("btn-join").disabled = !(open || paused);
 
   $("landing-tiers").innerHTML = ev.tiers.map((t) => `
     <div class="tier">
@@ -413,8 +419,12 @@ function openStream() {
 
   es.addEventListener("position-update", (e) => {
     const d = JSON.parse(e.data);
+    $("q-paused").hidden = true;
     renderPosition(d.position, d.estWaitSeconds);
   });
+  // Not terminal: the stream stays open and the place is kept (ADR-066).
+  es.addEventListener("sale-paused", () => { $("q-paused").hidden = false; });
+  es.addEventListener("sale-resumed", () => { $("q-paused").hidden = true; });
   es.addEventListener("queue-promoted", (e) => admit(JSON.parse(e.data).passToken));
   es.addEventListener("tier-availability", (e) => {
     const d = JSON.parse(e.data);
