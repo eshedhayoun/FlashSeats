@@ -244,8 +244,8 @@ public class HoldService implements HoldFacade {
      * Reclaims one hold whose {@code hold:{token}} timer fired. <strong>The timer is a hint, never an
      * authority</strong> (ADR-048). The row is re-read and only a genuinely expired hold is reclaimed,
      * because {@code grantGrace} moves expiry in PostgreSQL, and AOF, eviction or a flush can all
-     * disagree with the row. A hold that is still alive gets its timer re-armed. Exactly one replica
-     * wins via the settle-once claim.
+     * disagree with the row. A hold that is still alive gets its timer re-armed once this read has
+     * committed. Exactly one replica wins via the settle-once claim.
      *
      * @return true if this replica won the claim and the seats are coming back
      */
@@ -257,8 +257,10 @@ public class HoldService implements HoldFacade {
             return false;
         }
         if (hold.getExpiresAt().isAfter(clock.instant())) {
-            timers.arm(holdToken, hold.getExpiresAt());
-            log.debug("Timer for hold {} fired early; re-armed to {}", holdToken, hold.getExpiresAt());
+            // Re-armed after this read commits, not inside it: a Redis write never sits inside a SQL
+            // transaction (invariant 9).
+            events.publishEvent(new HoldTimerFiredEarlyEvent(holdToken, hold.getExpiresAt()));
+            log.debug("Timer for hold {} fired early; re-arming it for {}", holdToken, hold.getExpiresAt());
             return false;
         }
         return settleAndRestore(hold, HoldStatus.EXPIRED, SettleReason.TTL);

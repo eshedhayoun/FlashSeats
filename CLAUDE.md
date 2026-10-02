@@ -6,13 +6,13 @@ Guidance for Claude Code when working in this repository.
 
 FlashSeats — a high-concurrency ticket flash-sale engine. Modular monolith, Java 21, Spring Boot
 4.1.1. The **MVP is built and running**: all nine modules, the full journey from landing page to emailed
-PDF ticket, 274 tests green in any class order. **Inventory lives in Redis** (Stage 1, ADR-046): `catalog:stock:{e}:{t}`
+PDF ticket, 299 tests green in any class order. **Inventory lives in Redis** (Stage 1, ADR-046): `catalog:stock:{e}:{t}`
 is the live count and PostgreSQL keeps no copy of it. **Payment is real** (Stage 2, ADR-052-054) —
 but `flashseats.payment.stripe.enabled` is **false by default**, so `dev`, `test`, the load harness
 and every drill still run the in-process stub through the complete journey, 3-D Secure included.
 
 **Read [`docs/00-architecture-decisions.md`](docs/00-architecture-decisions.md) before changing
-anything.** It contains 74 ADRs. Most record a defect and its fix — 034-039 come from the first
+anything.** It contains 76 ADRs. Most record a defect and its fix — 034-039 come from the first
 review pass over the built code, 040-042 from the second — and several look like over-engineering
 until you read the failure they prevent. 043-045 are the exception: forward-looking decisions about
 the operator surface, buyer accounts and what health should report, with nothing built against them
@@ -43,7 +43,11 @@ right-most `X-Forwarded-For` entry nobody we trust appended — `native` forward
 guarantee); only a refund is retried in-process. **073**: Sentinel and the data nodes agree on the
 primary after every start, and a replica stranded on a demoted node reconnects by itself. **074**:
 the provider's idempotency key is scoped to the attempt, finishing a charge is never refused for time,
-and the webhook records a settlement on the ledger.
+and the webhook records a settlement on the ledger. **075**: confirming holds the order row, every
+resolved order names the one charge it ended with, and any other settled charge for the hold goes
+back. **076**: a timer is re-armed after its read commits, an availability change is announced by one
+replica rather than each, access logs carry no query strings, and `SecretsGuard` refuses short,
+shared or unhashed secrets.
 
 **The operating envelope is 3–10 concurrent sales**, not one
 ([`03-end-to-end-flow.md`](docs/03-end-to-end-flow.md) §2). Every capacity number written before
@@ -60,7 +64,7 @@ security posture, next stages, and the review-pass log. It is the doc to update 
 ## Document precedence
 
 ```
-00-architecture-decisions.md      ← highest authority (74 ADRs)
+00-architecture-decisions.md      ← highest authority (76 ADRs)
 05-global-standards.md            ← cross-cutting contract; module docs conform to it
 FE_SPEC.md                        ← client contract (repo root)
 03-end-to-end-flow.md             ← the authoritative user journey AND the operating envelope
@@ -215,8 +219,10 @@ Rules:
     defensible, take the one that under-counts.
 13. **A settled charge ends exactly one way — confirmed or refunded — and the `orders` row decides**
     (ADR-064). Every order transition is a compare-and-set (`version`, or a conditional update that
-    bumps it). A refund is *claimed* on that row before any money moves; a confirmed order refuses the
-    claim. A lost hold is not lost seats: only this order can consume its hold.
+    bumps it); `confirm` holds the row while it checks (ADR-075). A refund is *claimed* on that row
+    before any money moves; a confirmed order refuses the claim. A lost hold is not lost seats: only
+    this order can consume its hold. A resolved order names the one charge it ended with, and any
+    other settled charge for its hold is returned (ADR-075).
 
 ## Traps this design already stepped in once
 
@@ -295,6 +301,9 @@ Do not reintroduce these — each cost a real defect in the first pass:
 | **Writing an audit row synchronously on a refusal path** | Every row is written on a path an attacker controls the rate of, so a synchronous insert lets them convert their own `429`s into database load during the sale. Bounded queue, **discard** policy: evidence is not worth an outage (ADR-055) |
 | **Refusing a request because the challenge provider was unreachable** | It fails at peak load, because that is when the provider is busiest too — so the failure mode is "the sale closes at exactly the wrong moment". Fail open and audit the degradation (ADR-011, ADR-055) |
 | **Deriving a "random" queue draw from the session id** | Idempotent and *precomputable*: ids are free to mint, so a bot grinds candidates offline until it holds a low draw. `ZADD NX` already makes a fresh draw idempotent (ADR-024) |
+| **Failing a confirmation because the order's version moved** | A retry *resuming* a stranded order moves the version too, and the order is still this purchase. Failing on it sent a valid purchase to the refund claim, which succeeded because the order was still unresolved — and the resuming retry then charged again. Hold the row while you check it (ADR-075) |
+| **Assuming "resolved elsewhere" means "resolved by this charge"** | Once the in-flight key and the `PENDING` check expire, two checkouts for one hold can both settle. The second charge reached an order the first had resolved and had no ending at all: a buyer billed twice for one set of seats. Compare with the charge the order names (ADR-075) |
+| **Deduplicating a broadcast against one replica's memory** | Every replica sees the same change, and the fan-out reaches every replica: each frame arrived once per replica, and a change back to a state a replica had announced was never sent, because its streams had heard the others since. Keep the last announcement in one key and swap it with `SET … GET` (ADR-076) |
 | **Forwarding the client's one idempotency key on every new charge** | Right for a retry of one attempt, wrong across attempts: Stripe replays a key's first answer, and refuses it with different parameters. The second card after a decline got the first card's decline, or an idempotency error counted as a provider outage. Scope the provider key to the attempt (ADR-074) |
 | **Reusing one provider idempotency key across a 3-D Secure resume** | The client mints ONE key per hold and reuses it on every retry, so a second `charge` replays the cached `requires_action` response **for ever** and the buyer can never finish. Varying the key per attempt is worse: it opens a *second* intent, so they authenticate one payment and are billed for two. Retrieve the existing intent (ADR-054) |
 | **Letting a webhook claim survive a failed settlement** | The provider redelivers, the claim says "already handled", and the buyer's settled charge never reaches an order. ADR-038's rule in a new place: `processed_at IS NULL` must mean *in flight*, and a failure must leave **no row at all** (ADR-053) |
@@ -344,6 +353,8 @@ rather than one module's corner:
 | `queue:events:{e}` | `queue` | Pub/Sub | — | promotion fan-out to whichever replica holds the SSE connection (ADR-007) |
 | `queue:replay:{e}` | `queue` | ZSET | sale end | the last 256 **broadcast** frames, scored by sequence, so a reconnect can be handed what it missed. A session-targeted frame is **never** retained here — the one that exists carries a pass token (ADR-058) |
 | `queue:replay-seq:{e}` | `queue` | String | sale end | the monotonic sequence behind those frames; it is the only SSE `id` the system issues |
+| `queue:availability:{e}` | `queue` | String | retention | the last `tier-availability` frame announced, swapped with `SET … GET` so one replica announces a change rather than each (ADR-076) |
+| `queue:closed:{e}` | `queue` | String | retention | claimed with `SET NX` by the one replica that announces and retains `sale-closed`; every replica still closes its own streams (ADR-076) |
 | `queue:promote:{e}` | `queue` | String | 900 ms | makes the promotion tick a singleton across replicas (ADR-032) |
 | `queue:budget` | `queue` | String | one tick | **the cluster-wide admission allowance**, shared by every open sale. The one key here deliberately *not* scoped by event; its TTL is the window, so replicas need not agree on the time (ADR-049) |
 | `queue:exhausted:{e}` | `queue` | String | sale end | derived sold-out marker; deleted the moment stock returns (ADR-035) |

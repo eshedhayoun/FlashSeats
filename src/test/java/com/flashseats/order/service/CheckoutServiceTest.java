@@ -98,7 +98,11 @@ class CheckoutServiceTest {
     @DisplayName("The reservation ended under the charge: the refund claim wins and the buyer is told")
     void lostClaimToAnExpiryRefunds() {
         when(commit.confirm(ORDER, hold, tier, settled)).thenThrow(new HoldAlreadySettledException(HOLD));
-        when(refunds.refund(ORDER, "pt_1", 15_000, "the reservation ended before the order could be confirmed"))
+        when(refunds.refund(
+                        ORDER,
+                        new SettledCharge("pt_1", "pi_1"),
+                        15_000,
+                        "the reservation ended before the order could be confirmed"))
                 .thenReturn(OrderRefundService.Outcome.REFUNDED);
 
         assertThatThrownBy(() -> checkout.checkout("sid", request()))

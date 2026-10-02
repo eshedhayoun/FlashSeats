@@ -47,7 +47,6 @@ public class QueueBroadcaster {
     private final StringRedisTemplate redis;
     private final Clock clock;
     private final QueueReplayService replay;
-    private final Map<Long, List<TierAvailability>> lastAvailability = new ConcurrentHashMap<>();
 
     /** Events this replica last swept while paused, so the first sweep after a resume can say so. */
     private final Set<Long> pausedEvents = ConcurrentHashMap.newKeySet();
@@ -121,7 +120,6 @@ public class QueueBroadcaster {
             initialDelayString = "${flashseats.queue.sse-position-interval-ms}")
     public void pushPositions() {
         Set<Long> watchedEventIds = emitters.watchedEventIds();
-        lastAvailability.keySet().removeIf(eventId -> !watchedEventIds.contains(eventId));
         pausedEvents.removeIf(eventId -> !watchedEventIds.contains(eventId));
         for (long eventId : watchedEventIds) {
             try {
@@ -137,11 +135,14 @@ public class QueueBroadcaster {
         EventWindowStatus window = catalog.getWindowStatus(eventId);
 
         if (window == EventWindowStatus.CLOSED) {
-            lastAvailability.remove(eventId);
             pausedEvents.remove(eventId);
-            replay.publishAndFanOut(
-                    eventId, QueueChannelMessage.toAll(
-                            "sale-closed", Map.of("closedAt", clock.instant().toString())));
+            var closed = QueueChannelMessage.toAll("sale-closed", Map.of("closedAt", clock.instant().toString()));
+            // Announced and retained once, by whichever replica claims it. Every other replica still
+            // closes its own streams, so one that connected after the announcement is not left open
+            // on a finished sale (ADR-076).
+            if (!replay.publishOnce(eventId, QueueKeys.closed(eventId), closed)) {
+                emitters.closeAll(eventId, closed.type(), closed.data());
+            }
             return;
         }
 
@@ -178,12 +179,10 @@ public class QueueBroadcaster {
 
     private void publishAvailabilityIfChanged(long eventId) {
         List<TierAvailability> current = catalog.getTierAvailability(eventId);
-        List<TierAvailability> previous = lastAvailability.put(eventId, current);
-        if (!current.equals(previous)) {
-            replay.publishAndFanOut(
-                    eventId, QueueChannelMessage.toAll(
-                            "tier-availability", Map.of("tiers", current)));
-        }
+        replay.publishIfChanged(
+                eventId,
+                QueueKeys.availability(eventId),
+                QueueChannelMessage.toAll("tier-availability", Map.of("tiers", current)));
     }
 
     /** Feeds the drain-rate estimate; see {@link QueueDrainRateTracker}. */

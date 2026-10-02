@@ -999,6 +999,9 @@ message that worked. No buyer receives two tickets.
 
 ## ADR-039 — Tokens are domain-separated and secret-separated; defaults refuse to boot
 
+> **Amended by ADR-076.** The guard now also refuses a signing key under 32 characters, two domains
+> sharing a key, and an admin password that is not a bcrypt, argon2, pbkdf2 or scrypt hash.
+
 **Decision.** Four rules covering the signed-capability surface:
 
 1. `X-Forwarded-For` is honoured **only** from a peer in `flashseats.bot.trusted-proxies`, which is
@@ -2644,6 +2647,11 @@ one static method on `<Module>Errors`, and a module's refusals are read from tha
 
 ## ADR-064 — A settled charge ends exactly one way, and the order row decides which
 
+> **Amended by ADR-075.** `confirm` now holds the order row rather than failing when its version
+> moves: a retry *resuming* the order also moves the version, and failing on that refunded a valid
+> purchase. Every resolved order now names the charge it ended with, and any other settled charge for
+> the hold is returned.
+
 **Status:** accepted, Pass 15. Amends ADR-053 (the settlement table) and ADR-056 (Decision 1, which
 had fixed only the webhook path).
 
@@ -3094,3 +3102,100 @@ documented idempotency rules; it still wants a run of `stripe-check.sh` with a r
    hold now looks only at `INITIATED` rows — the attempt in flight — never at a declined one, which
    also carries no intent id.
 
+
+---
+
+## ADR-075 — Confirming holds the order row, and a charge the order does not name goes back
+
+**Status:** accepted, Pass 15. Amends ADR-064 (Decision 1, how `confirm` arbitrates). Completes
+invariant 13.
+
+**Context.** ADR-064 made the order row the arbiter of a settled charge, with `orders.version`
+catching a write that raced `confirm`. Review of the remaining refund paths found the version check
+catching one write it should not have, and a charge nobody arbitrates:
+
+- **A resume failed a confirmation that was entitled to succeed.** `confirm` read the order, then
+  flushed `CONFIRMED` against the version it read. A second request that judged the order stranded
+  (`PENDING` past `stale-pending-seconds`) resumes it by bumping the version — the order is still
+  `PENDING`, still this purchase — and the first request's flush then failed. That
+  `OptimisticLockingFailureException` went to the refund claim, which *succeeded*, because the
+  order was still unresolved: a valid purchase refunded, its hold left `ACTIVE` until expiry
+  (the plan's C-19: seats withheld for the rest of the hold's clock), and the resuming request then
+  charging again into an order already `REFUNDED`. `SettlementArbiterIT` reproduced it on the
+  second of fifteen staggered rounds.
+- **A second charge for one hold had no ending.** The in-flight key and the `PENDING` check keep a
+  second checkout away while the first is charging, but both expire (90 s each). A checkout stalled
+  past them — a frozen JVM, a suspended VM — and a retry with a different provider key can both
+  settle. The order keeps one. The other reached `RESOLVED_ELSEWHERE`, which assumed "the other
+  path settled *this same* charge", and nothing ever returned it: a buyer billed twice for one set
+  of seats, the precise thing invariant 13 forbids.
+
+**Decision 1 — `confirm` locks the order row.** It reads the order `FOR UPDATE` after consuming the
+hold, so the status it checks is the status it overwrites. A refund claim waits on the lock and then
+finds `CONFIRMED`; a resume waits and then finds the version moved, and is told a charge is in
+flight. The version check stays on every other entity write. Lock order is hold row, then order row,
+on every path that takes both, so nothing deadlocks.
+
+**Decision 2 — the order names the charge it ended with.** `confirm` already recorded the charge's
+references; the refund claim now records the charge it is returning, in the same conditional update.
+So every resolved order — confirmed, refunded, or refund-failed — names exactly one charge, by the
+provider's reference: the one identifier both settlement paths always hold.
+
+**Decision 3 — a charge the order does not name goes back.** Wherever a path holding a settled charge
+finds the order already resolved — the checkout's `RESOLVED_ELSEWHERE`, and the webhook for an order
+already confirmed or refunded — it compares references. The order's own charge moves nothing. A
+different one is refunded against its own ledger row, with no change to the order and no notice; it
+is counted as `flashseats.payment.charge.stray{outcome=returned}`. The webhook makes this complete: it
+is the one witness of *every* settled charge, so a second charge whose checkout died is still found.
+
+**Decision 4 — only a definite mismatch moves money** (ADR-056). Both references known and different
+refunds. An unknown on either side — an ending that recorded no reference, a charge with no ledger
+row — is logged and counted as `outcome=unaccounted`, never guessed at; a refused stray refund is
+`outcome=refund_failed`. Both are for a person.
+
+**What this does not change.** The C-20 finding — "resend a ticket for a refunded order" — needs no
+code: since ADR-064 `CONFIRMED` is terminal and the `ORDER_CONFIRMED` outbox row is written in the
+confirming transaction, so a resend can only ever find a confirmed order.
+
+**Cost.** The confirm transaction holds the order row for the rest of its own work: one insert into
+`order_items`, one into `outbox_events`. A second read on the `RESOLVED_ELSEWHERE` path, which runs
+only when two paths met. No new column, no migration.
+
+---
+
+## ADR-076 — Small gaps: a timer after its read, one announcement per change, logs without capabilities, secrets the guard can trust
+
+**Status:** accepted, Pass 15. Amends ADR-048 (the timer re-arm), ADR-058 (what the replay log
+retains) and ADR-039/ADR-048 (what `SecretsGuard` accepts).
+
+**Context and decision**, item by item:
+
+1. **A Redis write inside a read transaction.** `HoldService.reclaimExpired` re-armed an early
+   timer while its read transaction was still open — invariant 9's one rule, broken for one SET. The
+   re-arm is now an event handled `AFTER_COMMIT`, like the first arm.
+2. **Every availability change, once per replica.** Each replica swept its own streams and compared
+   the tiers against *its own* memory of what it last announced, then published through the fan-out
+   that reaches every replica. Three replicas watching a sale delivered each `tier-availability`
+   frame to every stream three times and retained it three times; and a change back to a state a
+   replica had announced itself was never announced again, because its streams had heard the others
+   since. The last-announced value is now one Redis key, `queue:availability:{e}`, swapped with
+   `SET … GET`: the replica that replaces a different value announces; the rest find it said. The
+   close of a sale works the same way with `SET NX` on `queue:closed:{e}`: one replica retains and
+   fans out `sale-closed`, and every replica still closes its own streams, so one that connects
+   after the announcement is not left open on a finished sale. A claim whose frame failed to publish
+   is deleted again (ADR-038's rule).
+3. **Capabilities in access logs.** nginx logged `$request`, query string included, and the receipt
+   link carries a 90-day bearer token in `?receiptToken=`. The log now records the method, `$uri`
+   and protocol only.
+4. **A guard that accepted secrets it should not.** `SecretsGuard` refused the published defaults and
+   `{noop}`, nothing else. It now also refuses a signing key shorter than 32 characters (a token is
+   free to obtain, so a short key can be searched offline against one), two token domains sharing one
+   key (ADR-039's separation, enforced rather than suggested), and an admin password that is not an
+   adaptive hash: only `{bcrypt}`, `{argon2}`, `{pbkdf2}` and `{scrypt}` pass. An unprefixed value —
+   the compose default `admin` — started cleanly and then failed every login, because the delegating
+   encoder has no encoder for "no prefix".
+5. **Admin paging** (the plan's C-22) was already bounded — `size` clamped, `page` floored at zero —
+   and needs nothing.
+
+**Cost.** One Redis `SET … GET` per watched sale per sweep per replica — fifteen a second for ten
+sales on three replicas — in exchange for a third of the availability traffic on every stream.

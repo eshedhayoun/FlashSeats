@@ -97,6 +97,20 @@ public final class QueueKeys {
     }
 
     /**
+     * The tier availability last announced for an event, so a change reaches each stream once rather
+     * than once per replica (ADR-076). Swapped with {@code SET ... GET}; losing it costs one repeated
+     * frame.
+     */
+    public static String availability(long eventId) {
+        return "queue:availability:" + eventId;
+    }
+
+    /** Claimed by the replica that announces a sale's close, so the replay log records it once (ADR-076). */
+    public static String closed(long eventId) {
+        return "queue:closed:" + eventId;
+    }
+
+    /**
      * Marker that this event's stock is gone and nobody holds a claim on it. Deleted again the moment
      * stock returns, so {@code EXHAUSTED} is derived, never an irreversible act (ADR-035). It also makes
      * the terminal frame publish once.

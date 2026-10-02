@@ -122,7 +122,8 @@ whose connection drops for a moment, loses the event permanently and nothing red
 **The listener re-reads the row and settles only what the sweeper would have.** Three reasons this is
 not pedantry: `grantGrace` moves a hold's expiry in PostgreSQL, so the original timer fires
 mid-payment; AOF `everysec` can resurrect or lose a key relative to its row; an operator can flush
-the key. A hold found alive is **re-armed**, which keeps a grace-extended hold on the fast path.
+the key. A hold found alive is **re-armed** once that read has committed (invariant 9), which keeps a
+grace-extended hold on the fast path.
 
 **Exactly-once across replicas needs no coordination.** Keyspace expiry is broadcast, so all three
 replicas run the listener, all three reach the claim, and exactly one `UPDATE` returns 1. Restoring

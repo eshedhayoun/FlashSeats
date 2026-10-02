@@ -76,12 +76,16 @@ public class PaymentSettlementService {
         if (order.getStatus() == OrderStatus.CONFIRMED
                 || order.getStatus() == OrderStatus.REFUNDED
                 || order.getStatus() == OrderStatus.REFUND_FAILED) {
-            // The synchronous path already resolved this, or a previous delivery did. Nothing to do,
-            // and doing it again would consume a hold that is already consumed.
+            // The synchronous path already resolved this, or a previous delivery did, and settling
+            // again would consume a hold that is already consumed. Usually this is that same charge
+            // arriving late. If it is a different one, it is a second charge for these seats, and the
+            // webhook is the one witness of every settled charge, so it gives it back (ADR-075).
             log.debug(
-                    "Order {} is already {} — webhook settlement has nothing to do",
+                    "Order {} is already {} — webhook settlement has nothing to settle",
                     order.getOrderNumber(),
                     order.getStatus());
+            refunds.returnIfStray(
+                    order.getOrderNumber(), order.getGatewayReference(), chargeOf(event), order.getTotalAmountCents());
             return;
         }
 
@@ -115,13 +119,17 @@ public class PaymentSettlementService {
                 | OptimisticLockingFailureException claimLost) {
             OrderRefundService.Outcome outcome = refunds.refund(
                     orderNumber,
-                    event.transactionReference(),
+                    chargeOf(event),
                     order.getTotalAmountCents(),
                     "webhook settled against a reservation that no longer exists");
             if (outcome == OrderRefundService.Outcome.RESOLVED_ELSEWHERE) {
                 log.info("Order {} was resolved by the checkout before its webhook; nothing to do", orderNumber);
             }
         }
+    }
+
+    private static SettledCharge chargeOf(PaymentSettledEvent event) {
+        return new SettledCharge(event.transactionReference(), event.gatewayReference());
     }
 
     /**
