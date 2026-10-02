@@ -77,6 +77,7 @@ else.
 | The gateway | **real** — Stripe, server-confirmed PaymentIntents (ADR-052) |
 | An in-process stub, selected by default | **real, and load-bearing** — `dev`, `test`, the load harness and every drill run the full journey with no keys and no network |
 | Circuit breaker around every gateway call | **real** — counts transport failures only, never declines |
+| In-process retry | **refunds only**, three attempts. A charge or retrieve is tried once: three attempts could outlast the 45 s a hold guarantees, and the buyer's re-POST is their retry (ADR-072) |
 | Webhook ingestion, signature verification, replay protection | **real** (ADR-053) |
 | 3-D Secure | **real** — `402 PAYMENT_ACTION_REQUIRED` + `clientSecret`, resumed by re-POSTing checkout (ADR-054) |
 

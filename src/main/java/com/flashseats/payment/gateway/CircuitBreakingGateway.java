@@ -14,6 +14,13 @@ import io.github.resilience4j.retry.Retry;
  * {@link GatewayResult}: a breaker that counted declines would open on an ordinary burst of expired
  * cards. Transport failures and an open breaker both leave as {@link GatewayResult#error}, which
  * becomes {@code 503 PAYMENT_GATEWAY_UNAVAILABLE}: seats retained, no attempt consumed.
+ *
+ * <p><strong>Only a refund is retried here</strong> (ADR-072). A charge or a retrieve runs against a
+ * hold's clock: checkout refuses to start one with less than 45 s left, so one attempt must fit in
+ * that — a 5 s connect plus a 20 s read does — and three with backoff did not (about 61 s), which let a
+ * charge settle after its seats were gone. The buyer's re-POST is the retry for those, with the same
+ * idempotency key, as {@code maxNetworkRetries(0)} on the Stripe client already assumes. A refund has
+ * no such clock, so it keeps three attempts.
  */
 @Slf4j
 public class CircuitBreakingGateway implements PaymentGateway {
@@ -43,13 +50,13 @@ public class CircuitBreakingGateway implements PaymentGateway {
 
     @Override
     public GatewayResult refund(String gatewayReference, long amountCents, String reason) {
-        return guard("refund", () -> delegate.refund(gatewayReference, amountCents, reason));
+        return guard("refund", () -> retry.executeSupplier(
+                () -> delegate.refund(gatewayReference, amountCents, reason)));
     }
 
     private GatewayResult guard(String operation, Supplier<GatewayResult> call) {
         try {
-            return breaker.executeSupplier(
-                    () -> retry.executeSupplier(call));
+            return breaker.executeSupplier(call);
         } catch (CallNotPermittedException open) {
             log.warn(
                     "Payment gateway circuit is OPEN; refusing {} without calling the provider",

@@ -3002,3 +3002,27 @@ covers, so the walk passes through k6's container and nginx and lands on the VU'
 which every VU shared one bucket would show up as `429`s in k6's summary; Pass 15's drills are where
 that is confirmed.
 
+---
+
+## ADR-072 — A charge is tried once inside the hold's clock; only a refund is retried in-process
+
+**Status:** accepted, Pass 15. Amends ADR-052 (the gateway decorator).
+
+**Context.** `CircuitBreakingGateway` wrapped every call — charge, retrieve and refund — in a
+Resilience4j `Retry` of three attempts with exponential backoff. No document mentioned it, and it
+contradicted two that did: the Stripe client is built with `maxNetworkRetries(0)` *because* "the
+buyer's re-POST is the retry", and checkout refuses to start a charge with less than 45 s of hold left
+(ADR-030) on the premise that one charge finishes inside that. With a 5 s connect and a 20 s read
+timeout, three attempts plus backoff take about 61 s — so a charge started with 45 s left could
+settle after its seats had expired, and end in a refund and a confusing bank statement.
+
+**Decision.** A **charge** and a **retrieve** are tried **once** under the breaker. A transport
+failure becomes `503 PAYMENT_GATEWAY_UNAVAILABLE` — seats held, no attempt consumed — and the buyer's
+re-POST, with the same idempotency key, is the retry, exactly as before the decorator existed. A
+**refund** keeps the three attempts: it runs against no hold's clock, and every one that does not go
+through is money owed to a named buyer (ADR-069).
+
+**The budget, stated so it stays true:** one charge attempt is at most connect + read = 25 s, under
+the 45 s `min-remaining-seconds-for-retry` with room for the commit. Raising either timeout, or adding a
+retry, means re-checking that sum.
+
