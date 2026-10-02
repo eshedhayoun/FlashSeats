@@ -24,6 +24,8 @@ import org.springframework.web.bind.MissingServletRequestParameterException;
 import org.springframework.web.bind.annotation.ExceptionHandler;
 import org.springframework.web.bind.annotation.RestControllerAdvice;
 import org.springframework.web.method.annotation.MethodArgumentTypeMismatchException;
+import org.springframework.web.servlet.NoHandlerFoundException;
+import org.springframework.web.servlet.resource.NoResourceFoundException;
 
 /**
  * The one exception handler for the whole application (ADR-033). Every module exception extends
@@ -50,6 +52,16 @@ public class GlobalExceptionHandler {
             log.debug("{}: {}", ex.code(), ex.getMessage());
         }
         return ProblemDetails.from(ex);
+    }
+
+    /**
+     * A path nothing serves. With static resources on, Spring reports it as
+     * {@link NoResourceFoundException}, which the {@code Exception} backstop used to own: every typo'd
+     * URL was a {@code 500} with an {@code ERROR} line (ADR-041's trap, ADR-067).
+     */
+    @ExceptionHandler({NoResourceFoundException.class, NoHandlerFoundException.class})
+    public ProblemDetail onNoSuchPath(Exception ex) {
+        return ProblemDetails.of(ErrorCode.NOT_FOUND, "Nothing is served at this path.");
     }
 
     @ExceptionHandler(MethodArgumentNotValidException.class)

@@ -111,6 +111,7 @@ tells the client a state.
 | `VALIDATION_FAILED` | 400 | shared | Fix `violations` and resubmit |
 | `INTERNAL_ERROR` | 500 | shared | Show `traceId`, offer retry |
 | `SERVICE_BUSY` | 503 | shared | **Back-pressure, not a fault**: no database connection came free inside `connection-timeout`. Carries `Retry-After` and `retryAfterSeconds`; re-send the same request after it — checkout is find-or-create, so that is always safe. Seats, if any, are untouched (ADR-059) |
+| `NOT_FOUND` | 404 | shared | No endpoint or resource at this path — a caller's mistake, never a server fault. It used to be `500 INTERNAL_ERROR` (ADR-041's trap, ADR-067) |
 | `RATE_LIMITED` | 429 | bot | Back off `retryAfterSeconds` |
 | `BOT_VERIFICATION_FAILED` | 403 | bot | The challenge scored below the threshold. Reload for a fresh token and retry — **never** returned for a provider timeout or outage, which fail open (ADR-011, ADR-055) |
 | `IP_BLOCKED` | 403 | bot | A standing operator decision on this address. Terminal for the client — `retryable` is false; contact support (ADR-055) |
@@ -121,13 +122,14 @@ tells the client a state.
 | `SALE_CLOSED` | 409 | catalog | Terminal |
 | `INVENTORY_UNAVAILABLE` | 503 | catalog | **Fault** — retry; alarm fires server-side |
 | `PREWARM_WINDOW_CLOSED` | 409 | catalog | Admin only |
+| `STOCK_REBUILD_IN_PROGRESS` | 503 | catalog | Admin only. Another rebuild holds this event's lock; retry, never force — two rebuilds computing from a moving ledger is how a recovery makes things worse (ADR-046). Raised by `order`, which runs the rebuild |
 | `QUEUE_PASS_INVALID` | 401 | queue | Rejoin |
 | `ADMISSION_EXPIRED` | 410 | queue | Rejoin the queue |
 | `ADMISSION_REQUIRED` | 401 | queue | Not admitted to the sale |
 | `INSUFFICIENT_STOCK` | 409 | hold | Choose another tier |
 | `HOLD_NOT_FOUND` | 404 | hold | — |
 | `HOLD_EXPIRED` | 410 | hold | Reservation gone; nothing charged |
-| `HOLD_ALREADY_SETTLED` | 409 | hold | Already consumed or released |
+| `HOLD_ALREADY_SETTLED` | 409 | hold | Already consumed or released. **Not reachable over HTTP**: checkout routes it to the order row, which answers with a receipt or `ORDER_REFUNDED` (ADR-064) |
 | `HOLD_LIMIT_EXCEEDED` | 409 | hold | Release the existing hold first |
 | `QUANTITY_EXCEEDS_LIMIT` | 422 | hold | Max 6 per order |
 | `PAYMENT_DECLINED` | 402 | payment | Retry — see `attemptsRemaining` |

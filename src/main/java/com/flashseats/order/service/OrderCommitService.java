@@ -48,6 +48,9 @@ public class OrderCommitService {
     /** {@code failure_reason} is {@code VARCHAR(255)}; an exception message is not bounded. */
     private static final int REASON_LENGTH = 255;
 
+    /** {@code UNIQUE(hold_token)} as PostgreSQL names it in {@code V3}: ADR-002's constraint. */
+    private static final String ONE_ORDER_PER_HOLD = "orders_hold_token_key";
+
     private final OrderRepository orders;
     private final OrderItemRepository items;
     private final OutboxEventRepository outbox;
@@ -127,7 +130,12 @@ public class OrderCommitService {
                 currency);
         try {
             orders.saveAndFlush(order);
-        } catch (DataIntegrityViolationException concurrentCheckout) {
+        } catch (DataIntegrityViolationException violation) {
+            if (!isOneOrderPerHold(violation)) {
+                // Any other constraint is a real problem, not a race. Reporting it as a charge in
+                // flight sent the client polling for an order that would never exist (ADR-067).
+                throw violation;
+            }
             // Two requests raced to create the row. UNIQUE(hold_token) let exactly one win; this is
             // the other one, and it is the same situation as finding a PENDING row above.
             throw new DuplicatePaymentException();
@@ -351,6 +359,11 @@ public class OrderCommitService {
                         tier.eventId(), tier.eventTitle(), tier.venueName(), tier.eventStartTime()),
                 List.of(new OutboxPayload.Item(
                         hold.tierId(), tier.tierName(), hold.quantity(), tier.priceCents())));
+    }
+
+    private static boolean isOneOrderPerHold(DataIntegrityViolationException violation) {
+        String detail = violation.getMostSpecificCause().getMessage();
+        return detail != null && detail.contains(ONE_ORDER_PER_HOLD);
     }
 
     private static String bounded(String reason) {

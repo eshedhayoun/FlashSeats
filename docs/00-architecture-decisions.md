@@ -2810,3 +2810,48 @@ admission sends those buyers back to the end of the line, and one longer than a 
 seats. Freezing them would mean extending every live key on resume, under a lock, on every replica;
 pauses are minutes, and that cost is recorded in `06` §9 rather than paid.
 
+---
+
+## ADR-067 — A failure that proves nothing happened is compensated; a caller's mistake is never a 500
+
+**Status:** accepted, Pass 15. Extends ADR-046 (compensation on certain failures) and ADR-041 (every
+framework exception named before the backstop).
+
+**Context.** Four places answered the wrong question about a failure:
+
+- **A reserve whose hold transaction never began leaked its seats.** `createHold` decrements Redis,
+  then writes the row in its own transaction, and compensated only on a constraint rejection. A pool
+  timeout — `CannotCreateTransactionException`, thrown before any SQL — fell through to "ambiguous,
+  leave it to drift". Under pressure that is the *common* failure: a teammate's drill showed one tier's
+  counter sitting six seats below its ledger across successive drift computations, seats invisible to
+  every buyer until an operator rebuilt it. The sale reads as sold out early at exactly the load it
+  was built for.
+- **An unknown path answered `500 INTERNAL_ERROR`.** With static resources served, Spring reports it as
+  `NoResourceFoundException`, which the `Exception` backstop owned — ADR-041's trap again.
+- **The rate limiter threw when Redis did.** The buckets live in Redis, the check runs in a filter
+  below every exception handler, and so every API call answered a bare `500` with no `code`.
+- **Unbounded input reached bounded columns.** A 65-character idempotency key failed its insert on
+  every retry as a `500`; an email over 255 characters violated a column, was caught as the
+  `UNIQUE(hold_token)` race, and answered `409 DUPLICATE_PAYMENT`, which a client polls for ever.
+
+**Decision.**
+
+1. **Compensate every failure that proves nothing happened, and only those.** A reserve is given back
+   on a constraint rejection *and* on a transaction that never began. A failure at commit stays
+   ambiguous and stays with drift and the rebuild (invariant 12).
+2. **A path nothing serves is `404 NOT_FOUND`.** A new shared code, raised for
+   `NoResourceFoundException` and `NoHandlerFoundException`.
+3. **The rate limiter fails open**, as the challenge does (ADR-055), and counts it in
+   `flashseats.bot.limiter.unavailable`, warning at most once per ten seconds per replica. The
+   connection pool still bounds the load, and nothing that sells works without Redis anyway.
+4. **Every request field is bounded by the column it lands in** — `holdToken` 64, `userEmail` 255,
+   `paymentMethodId` 255, `idempotencyKey` 64, `recaptchaToken` 4096, an IP rule's address 45 and
+   reason 255 — so oversized input is a `400` before anything is written. And only the
+   `orders_hold_token_key` violation reads as a concurrent checkout; any other constraint is rethrown
+   rather than disguised as `DUPLICATE_PAYMENT`.
+
+**The rule underneath all four.** Classify a failure by what it *proves*, not by where it was caught.
+"Nothing reached the database" is as certain as a constraint rejection; "the caller sent something
+wrong" is never a server fault; and a component that sheds load must not become a source of `500`s when
+its own store is down.
+
