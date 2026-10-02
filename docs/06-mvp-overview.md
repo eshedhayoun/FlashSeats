@@ -1054,6 +1054,36 @@ are correct and neither needs changing.** What is thin is what they report:
 because a PostgreSQL counter cannot diverge from itself. It becomes real in Stage 1; the rest of the
 §9 alarm set lands in Stage 3. Do not mistake a green `/actuator/health` for observability.
 
+### Carried forward from the refactoring blueprint (retired in Pass 15)
+
+`REFACTORING_BLUEPRINT.md` was Pass 10's entry point. Its Part 1 is now
+[`07-system-on-one-page.md`](07-system-on-one-page.md); its refactor stages are history (§13,
+Pass 10). These are the items it still listed as open that the code confirms are still open. None is
+a correctness defect; each is legibility or tidiness.
+
+- **One shape per concept (blueprint Stage D).** Queue state has four shapes — `QueueState`,
+  `QueueStatusResponse`, `SaleStateResponse.QueueSection` (field-for-field identical to `QueueState`)
+  and an ad-hoc map in the SSE registry. An order line item has four, `OrderSummary` is a subset of
+  `AdminOrderResponse`, and tier availability is a `String` in one record and an enum in another.
+  Also wanted: a test pinning `OutboxPayload` and `OrderConfirmedPayload` structurally equal — they
+  are deliberately separate wire records, and nothing catches a silent divergence, whose failure
+  mode is undeliverable tickets.
+- **Files that are not concepts (Stage E).** `OrderNumbers`, `HoldKeys`, `HoldTokens` and
+  `HoldReconciliationSweeper` each wrap a line or two and could live in their single caller.
+- **One admin namespace, one owner (Stage F remainder).** `/api/v1/admin/events` is claimed by both
+  `catalog` (`AdminCatalogController`) and `order` (`AdminStockController`). Spring accepts it because
+  the sub-paths differ; it still confuses a reader. Re-basing changes URLs, so it amends ADR-043 and
+  ADR-048 and moves `FE_SPEC.md` §2.
+- **`QueueOrdering.RANDOM` (Stage F remainder).** `FIFO` ships; `RANDOM` is reached by one test and
+  never enabled. Removing it supersedes ADR-024, so it needs its own ADR.
+- **Two unused indexes.** `idx_pay_order` and `idx_orders_intent` are read by no query. `V12` left
+  them while `payment_transactions` was being built; drop them in a new migration once it settles.
+  (`idx_pay_hold` backs the 3-D Secure resume lookup — keep it.)
+- **The FE_SPEC §8 Playwright suite.** `frontend/e2e` holds a scaffold, not that suite: no spec yet
+  drives queue → hold → checkout in the browser (`frontend/README.md`).
+- **Optional doc consolidation.** Move the superseded ADRs (003, 006, 028) to `docs/archive/` behind
+  forward-pointing stubs, split §13 below into its own file, and fold `01`/`02` into `03`.
+
 ---
 
 ## 12. What to examine in the next review pass
@@ -1753,8 +1783,9 @@ this suite will hit the same wall.
   The trigger was not a defect: eight passes of adding correctness had left 215 Java files holding
   ~8,360 lines of real code — 91 of them 25 lines or fewer, 33 % of every file a comment — with six
   classes on the path from `checkout` to `charge` and five representations of an event. The
-  guarantees were sound; nobody could find them. `REFACTORING_BLUEPRINT.md` is the pass's main
-  artefact and is now the repo's entry point.
+  guarantees were sound; nobody could find them. `REFACTORING_BLUEPRINT.md` was the pass's main
+  artefact and the repo's entry point. *(Retired in Pass 15: Part 1 is now
+  [`07-system-on-one-page.md`](07-system-on-one-page.md), the open items are in §11.)*
 
 - **Written in parallel with Pass 9 and merged after it**, which turned out to be the most useful
   thing about it — see "what the merge taught" below. Numbered 10 and carrying **ADR-057** because

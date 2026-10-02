@@ -12,7 +12,7 @@
 	<artifactId>flashseats</artifactId>
 	<version>0.0.1-SNAPSHOT</version>
 	<name>flashseats</name>
-	<description/>
+	<description>High-concurrency ticket flash-sale engine: a Spring Modulith monolith that sells exactly the seats it has</description>
 	<url/>
 	<licenses>
 		<license/>
@@ -28,6 +28,8 @@
 	</scm>
 	<properties>
 		<java.version>21</java.version>
+		<!-- Surefire run order; see the surefire block. Override with -Dtest.runOrder=reversealphabetical or random -->
+		<test.runOrder>alphabetical</test.runOrder>
 		<spring-modulith.version>2.1.1</spring-modulith.version>
 		<!-- Third-party libraries not managed by the Spring Boot BOM. See docs/01-system-architecture.md -->
 		<bucket4j.version>8.14.0</bucket4j.version>
@@ -194,9 +196,9 @@
 		</dependency>
 		<!--
 			spring-boot-starter-mail-test was removed: flashseats.notification.enabled
-			is false in the test profile, so EmailDispatcher is not even a bean and no
-			test asserts on mail. It comes back with the consumer tests that need it
-			(see REFACTORING_BLUEPRINT.md, Remaining Tasks 3.2).
+			is false in the test profile, so EmailDispatcher is not even a bean. The one
+			test that drives the listeners, NotificationListenerIT, records mail with
+			its own RecordingMailSender, so it still needs nothing from the starter.
 		-->
 		<dependency>
 			<groupId>org.springframework.boot</groupId>
@@ -323,8 +325,13 @@
 						(ADR-061). src/test/resources/spring.properties turns that pausing off, and
 						the suite now passes in alphabetical, reversealphabetical and filesystem
 						order. The pin stays because a stable order is worth having anyway.
+
+						It is a property rather than a literal so that claim can be re-checked: a
+						literal here overrides -Dsurefire.runOrder, so the only way to run another
+						order was to edit this file. ./mvnw test -Dtest.runOrder=reversealphabetical
+						(or random) now does it.
 					-->
-					<runOrder>alphabetical</runOrder>
+					<runOrder>${test.runOrder}</runOrder>
 					<systemPropertyVariables>
 						<!--
 							Docker Engine 29 rejects the API version docker-java negotiates by

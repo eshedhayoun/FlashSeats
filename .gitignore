@@ -58,10 +58,21 @@ frontend/.vite/
 frontend/.env.local
 frontend/.env.*.local
 
+# Playwright output. Both directories were committed once, and `npm run test:e2e`
+# deletes them before every run, so a tracked copy dirtied the tree on each run.
+frontend/playwright-report/
+frontend/test-results/
+frontend/blob-report/
+
 # Scratch probes and classpath dumps. The merge that added the frontend also
 # carried Probe.java, its .class file and a Windows `cp.txt` into the repo root.
 *.class
 cp.txt
+
+# Run logs. Load drills write app and k6 logs next to wherever they were started.
+*.log
+
+.DS_Store
 
 # Claude Code's per-checkout settings. Its permission allow-list records the exact
 # commands that were approved, and one of them exported the admin plaintext, so
