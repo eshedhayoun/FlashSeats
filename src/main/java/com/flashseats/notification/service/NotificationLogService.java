@@ -1,5 +1,6 @@
 package com.flashseats.notification.service;
 
+import com.flashseats.notification.config.NotificationProperties;
 import com.flashseats.notification.dto.DeadLetterResponse;
 import com.flashseats.notification.model.NotificationKind;
 import com.flashseats.notification.model.NotificationStatus;
@@ -8,6 +9,7 @@ import java.time.Clock;
 import java.util.List;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.data.domain.PageRequest;
+import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Propagation;
 import org.springframework.transaction.annotation.Transactional;
@@ -24,11 +26,23 @@ import org.springframework.transaction.annotation.Transactional;
 @Service
 public class NotificationLogService {
 
+    /**
+     * What a stranded claim's {@code failure_reason} says. The process died after claiming, so whether
+     * the mail went out is unknown — the operator replaying it decides, and the buyer can always
+     * download the ticket from the receipt page meanwhile (ADR-050).
+     */
+    static final String STRANDED =
+            "stranded: claimed, then the process died before recording an outcome; the mail may or may not"
+                    + " have been sent";
+
     private final NotificationLogRepository logs;
+    private final NotificationProperties properties;
     private final Clock clock;
 
-    public NotificationLogService(NotificationLogRepository logs, Clock clock) {
+    public NotificationLogService(
+            NotificationLogRepository logs, NotificationProperties properties, Clock clock) {
         this.logs = logs;
+        this.properties = properties;
         this.clock = clock;
     }
 
@@ -46,12 +60,33 @@ public class NotificationLogService {
         if (logs.claimIfAbsent(orderNumber, kind.name(), recipientEmail) == 1) {
             return true;
         }
-        if (logs.reclaimDeadLettered(orderNumber, kind) == 1) {
+        if (logs.reclaimDeadLettered(orderNumber, kind, clock.instant()) == 1) {
             log.info("Re-claimed dead-lettered {} for {}", kind, orderNumber);
             return true;
         }
         log.debug("{} for {} was already handled", kind, orderNumber);
         return false;
+    }
+
+    /**
+     * Moves claims stranded in {@code PENDING} to {@code DLQ}, where an operator sees them and a replay
+     * sends (ADR-069). A process killed between {@link #claim} and recording an outcome left its row
+     * {@code PENDING} for ever: the broker's redelivery found it neither claimable nor dead-lettered and
+     * acknowledged it, the DLQ listing never showed it, and a resend could not re-claim it — a paid
+     * buyer's ticket silently never sent. Idempotent, so every replica may run it.
+     *
+     * <p>Not re-sent automatically: whether the mail went out before the process died is unknown, and an
+     * automatic send would turn every crash after the SMTP call into a second ticket email (ADR-042).
+     */
+    @Scheduled(fixedDelay = 60_000, initialDelay = 60_000)
+    @Transactional
+    public int deadLetterStranded() {
+        int stranded = logs.deadLetterStranded(
+                clock.instant().minusSeconds(properties.getStrandedAfterSeconds()), STRANDED, clock.instant());
+        if (stranded > 0) {
+            log.warn("{} notification claim(s) were stranded mid-send; dead-lettered for an operator", stranded);
+        }
+        return stranded;
     }
 
     /**

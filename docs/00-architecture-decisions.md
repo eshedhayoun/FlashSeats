@@ -2899,3 +2899,40 @@ one of which fails silently if skipped.
 **What it costs.** `frontend/` is now in the Docker build context (its `node_modules` and `dist` are
 not), and the first `--build` runs an `npm ci`. Both are paid once per image, not per request.
 
+---
+
+## ADR-069 — Money owed and mail stranded are states, not silences
+
+**Status:** accepted, Pass 15. Amends ADR-053 (the failed-refund claim) and ADR-038 (the claim that
+releases on failure).
+
+**Context.** Two failures were recorded nowhere a buyer or an operator would find them:
+
+- **A refund the provider refused was announced as a refund.** ADR-064 stopped the "refunded in full"
+  email for it, but the order still read `REFUNDED`, the checkout still answered `ORDER_REFUNDED` —
+  "you have been refunded in full" — and the receipt page agreed. Money this business still held,
+  described to the one person who would notice as returned.
+- **A notification claim could strand a ticket for ever.** A process killed between claiming and
+  recording an outcome left its row `PENDING`. The broker redelivered the message; the claim found the
+  row neither absent nor dead-lettered and acknowledged it; the DLQ listing showed nothing; an
+  operator's resend could not re-claim it. A paid buyer's ticket never went out, and nothing said so.
+
+**Decision 1 — `REFUND_FAILED` is an order status.** A refused refund, or one with no ledger row to
+refund against, moves the claimed order from `REFUNDED` to `REFUND_FAILED` (a compare-and-set, like
+every order transition, ADR-064). The checkout answers `409 REFUND_FAILED` — "the automatic refund
+did not go through; we have been alerted and will return your money" — and the webhook treats the
+order as resolved. No notice is queued, `flashseats.payment.refund.failed` counts it, and the ticket
+download refuses it like any order that is not `CONFIRMED`.
+
+**Decision 2 — a claim stranded in `PENDING` is dead-lettered.** A sweep on every replica (one
+conditional `UPDATE`, so idempotent) moves claims older than `flashseats.notification.stranded-after-seconds`
+(600 s, far above a render plus an SMTP round trip) to `DLQ`, with a reason that says the mail may or
+may not have been sent. That puts it in the operator's listing, raises `flashseats.dlq.depth`, and
+makes it re-claimable by a resend. Re-claiming a dead letter now also restarts its clock, so the sweep
+measures from the replay, not from the original claim.
+
+**Why not resend stranded mail automatically.** The process died after claiming, and whether the SMTP
+call happened first is unknown. An automatic send would turn every crash after the mail server
+accepted a message into a second ticket email — ADR-042's failure, reached from a crash instead of a
+redelivery. A person decides, and the buyer can download the ticket in the meantime (ADR-050).
+

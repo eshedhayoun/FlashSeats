@@ -85,9 +85,9 @@ class SettlementArbiterIT extends IntegrationTest {
                 "SELECT payment_transaction_ref FROM orders WHERE hold_token = ?", String.class, holdToken);
 
         // What the webhook's refund arm does when it lost the race to this confirmation.
-        boolean refunded = refunds.refund(orderNumber, transactionReference, PRICE, "late webhook");
+        var outcome = refunds.refund(orderNumber, transactionReference, PRICE, "late webhook");
 
-        assertThat(refunded).isFalse();
+        assertThat(outcome).isEqualTo(OrderRefundService.Outcome.RESOLVED_ELSEWHERE);
         assertThat(fixture.orderStatus(holdToken)).isEqualTo("CONFIRMED");
         assertThat(fixture.holdStatus(holdToken)).isEqualTo("CONSUMED");
         assertThat(fixture.refundedAmountFor(holdToken)).isZero();
@@ -103,7 +103,8 @@ class SettlementArbiterIT extends IntegrationTest {
         fixture.strandPendingOrder(holdToken, PRICE, "TK-REFUNDED-FIRST");
         String transactionReference = fixture.seedSettledPayment(holdToken, "pi_refunded_first", PRICE);
 
-        assertThat(refunds.refund("TK-REFUNDED-FIRST", transactionReference, PRICE, "reservation ended")).isTrue();
+        assertThat(refunds.refund("TK-REFUNDED-FIRST", transactionReference, PRICE, "reservation ended"))
+                .isEqualTo(OrderRefundService.Outcome.REFUNDED);
 
         HoldSummary hold = activeHold(holdToken);
         assertThatThrownBy(() -> commit.confirm("TK-REFUNDED-FIRST", hold, tier(), settled(transactionReference)))
@@ -148,7 +149,8 @@ class SettlementArbiterIT extends IntegrationTest {
                 Future<Boolean> refunded = pair.submit(() -> {
                     start.await();
                     Thread.sleep(stagger);
-                    return refunds.refund(orderNumber, transactionReference, PRICE, "race");
+                    return refunds.refund(orderNumber, transactionReference, PRICE, "race")
+                            == OrderRefundService.Outcome.REFUNDED;
                 });
                 start.countDown();
 

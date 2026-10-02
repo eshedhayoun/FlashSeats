@@ -82,6 +82,14 @@ export function checkoutErrorState(error: ApiError): CheckoutErrorState {
         refreshSale: true
       };
 
+    // The refund did not go through: never say "refunded" (ADR-069).
+    case "REFUND_FAILED":
+      return {
+        ...terminal(error.message),
+        clearHold: true,
+        refreshSale: true
+      };
+
     default:
       return {
         message: error.message,

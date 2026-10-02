@@ -57,7 +57,7 @@ class PaymentSettlementServiceTest {
         // reads as expired. The claim fails because the order is CONFIRMED, and nothing moves.
         when(holds.getActiveHold(HOLD, "session-test")).thenThrow(new HoldExpiredException(HOLD, Instant.now()));
         when(refunds.refund("TK-TEST", "pt_test", 5_000, "webhook settled against a reservation that no longer exists"))
-                .thenReturn(false);
+                .thenReturn(OrderRefundService.Outcome.RESOLVED_ELSEWHERE);
 
         assertThatCode(() -> settlement.onPaymentSettled(event)).doesNotThrowAnyException();
 

@@ -114,6 +114,7 @@ public class OrderCommitService {
                 case CONFIRMED -> new CheckoutOrder(existing.getOrderNumber(), existing.getPaymentAttempts(), true);
                 case PENDING -> resumeIfStranded(existing);
                 case REFUNDED -> throw OrderErrors.refunded();
+                case REFUND_FAILED -> throw OrderErrors.refundFailed();
                 case FAILED -> resumeFailed(existing);
             };
         }
@@ -301,15 +302,18 @@ public class OrderCommitService {
     }
 
     /**
-     * The refund did not happen. The order stays {@code REFUNDED}, because the seats are gone either
-     * way, but <strong>no notice is queued</strong>: telling a buyer "we've refunded you in full" about
-     * money we still hold is the one message worse than silence. The reason is what a human
-     * reconciles from.
+     * The refund did not happen: the order becomes {@code REFUND_FAILED}, and <strong>no notice is
+     * queued</strong> — telling a buyer "we've refunded you in full" about money we still hold is the
+     * one message worse than silence (ADR-069). The reason is what a human reconciles from.
      */
     @Transactional
     public void recordRefundFailure(String orderNumber, String reason) {
-        orders.findByOrderNumber(orderNumber)
-                .ifPresent(order -> order.setFailureReason(bounded(reason)));
+        orders.transition(
+                orderNumber,
+                EnumSet.of(OrderStatus.REFUNDED),
+                OrderStatus.REFUND_FAILED,
+                bounded(reason),
+                clock.instant());
     }
 
     // ----------------------------------------------------------------- helpers
