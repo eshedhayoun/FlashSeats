@@ -13,6 +13,9 @@ import com.flashseats.hold.facade.HoldFacade;
 import com.flashseats.hold.facade.HoldSummary;
 import com.flashseats.order.service.OrderCommitService;
 import com.flashseats.order.service.OrderRefundService;
+import com.flashseats.order.service.PaymentSettlementService;
+import com.flashseats.order.service.SettledCharge;
+import com.flashseats.payment.event.PaymentSettledEvent;
 import com.flashseats.payment.facade.PaymentResult;
 import java.time.Duration;
 import java.util.Map;
@@ -57,6 +60,9 @@ class SettlementArbiterIT extends IntegrationTest {
     private OrderRefundService refunds;
 
     @Autowired
+    private PaymentSettlementService settlement;
+
+    @Autowired
     private HoldFacade holds;
 
     @Autowired
@@ -85,7 +91,10 @@ class SettlementArbiterIT extends IntegrationTest {
                 "SELECT payment_transaction_ref FROM orders WHERE hold_token = ?", String.class, holdToken);
 
         // What the webhook's refund arm does when it lost the race to this confirmation.
-        var outcome = refunds.refund(orderNumber, transactionReference, PRICE, "late webhook");
+        String gatewayReference = jdbc.queryForObject(
+                "SELECT stripe_payment_intent_id FROM orders WHERE hold_token = ?", String.class, holdToken);
+        var outcome = refunds.refund(
+                orderNumber, new SettledCharge(transactionReference, gatewayReference), PRICE, "late webhook");
 
         assertThat(outcome).isEqualTo(OrderRefundService.Outcome.RESOLVED_ELSEWHERE);
         assertThat(fixture.orderStatus(holdToken)).isEqualTo("CONFIRMED");
@@ -103,11 +112,16 @@ class SettlementArbiterIT extends IntegrationTest {
         fixture.strandPendingOrder(holdToken, PRICE, "TK-REFUNDED-FIRST");
         String transactionReference = fixture.seedSettledPayment(holdToken, "pi_refunded_first", PRICE);
 
-        assertThat(refunds.refund("TK-REFUNDED-FIRST", transactionReference, PRICE, "reservation ended"))
+        assertThat(refunds.refund(
+                        "TK-REFUNDED-FIRST",
+                        new SettledCharge(transactionReference, "pi_refunded_first"),
+                        PRICE,
+                        "reservation ended"))
                 .isEqualTo(OrderRefundService.Outcome.REFUNDED);
 
         HoldSummary hold = activeHold(holdToken);
-        assertThatThrownBy(() -> commit.confirm("TK-REFUNDED-FIRST", hold, tier(), settled(transactionReference)))
+        assertThatThrownBy(() -> commit.confirm(
+                        "TK-REFUNDED-FIRST", hold, tier(), settled(transactionReference, "pi_refunded_first")))
                 .isInstanceOf(OptimisticLockingFailureException.class);
 
         assertThat(fixture.orderStatus(holdToken)).isEqualTo("REFUNDED");
@@ -126,8 +140,9 @@ class SettlementArbiterIT extends IntegrationTest {
                 Admitted buyer = admittedBuyer();
                 String holdToken = buyer.reserve();
                 String orderNumber = "TK-RACE-" + round;
+                String gatewayReference = "pi_race_" + round;
                 fixture.strandPendingOrder(holdToken, PRICE, orderNumber);
-                String transactionReference = fixture.seedSettledPayment(holdToken, "pi_race_" + round, PRICE);
+                String transactionReference = fixture.seedSettledPayment(holdToken, gatewayReference, PRICE);
                 HoldSummary hold = activeHold(holdToken);
                 TierSummary tier = tier();
 
@@ -135,7 +150,7 @@ class SettlementArbiterIT extends IntegrationTest {
                 Future<Boolean> confirmed = pair.submit(() -> {
                     start.await();
                     try {
-                        commit.confirm(orderNumber, hold, tier, settled(transactionReference));
+                        commit.confirm(orderNumber, hold, tier, settled(transactionReference, gatewayReference));
                         return true;
                     } catch (OptimisticLockingFailureException lost) {
                         return false;
@@ -149,7 +164,11 @@ class SettlementArbiterIT extends IntegrationTest {
                 Future<Boolean> refunded = pair.submit(() -> {
                     start.await();
                     Thread.sleep(stagger);
-                    return refunds.refund(orderNumber, transactionReference, PRICE, "race")
+                    return refunds.refund(
+                                    orderNumber,
+                                    new SettledCharge(transactionReference, gatewayReference),
+                                    PRICE,
+                                    "race")
                             == OrderRefundService.Outcome.REFUNDED;
                 });
                 start.countDown();
@@ -198,7 +217,112 @@ class SettlementArbiterIT extends IntegrationTest {
         assertThat(fixture.stockInvariantHolds(tierId)).isTrue();
     }
 
+    @Test
+    @DisplayName("A retry resuming the order cannot fail a confirmation already under way")
+    void aResumeNeverFailsAConfirmation() throws Exception {
+        try (ExecutorService pair = Executors.newFixedThreadPool(2)) {
+            for (int round = 0; round < 15; round++) {
+                Admitted buyer = admittedBuyer();
+                String holdToken = buyer.reserve();
+                String orderNumber = "TK-RESUME-" + round;
+                String gatewayReference = "pi_resume_" + round;
+                fixture.strandPendingOrder(holdToken, PRICE, orderNumber);
+                String transactionReference = fixture.seedSettledPayment(holdToken, gatewayReference, PRICE);
+                HoldSummary hold = activeHold(holdToken);
+                TierSummary tier = tier();
+                long version = jdbc.queryForObject(
+                        "SELECT version FROM orders WHERE order_number = ?", Long.class, orderNumber);
+
+                CountDownLatch start = new CountDownLatch(1);
+                Future<Boolean> confirmed = pair.submit(() -> {
+                    start.await();
+                    try {
+                        commit.confirm(orderNumber, hold, tier, settled(transactionReference, gatewayReference));
+                        return true;
+                    } catch (OptimisticLockingFailureException lost) {
+                        return false;
+                    }
+                });
+                // What a second request does when it judges this order stranded: put it back in
+                // flight on the version it read (OrderRepository.resume). The order stays this
+                // purchase, so the confirmation must stand, whichever lands first.
+                long stagger = (round % 5) * 3L;
+                Future<Integer> resumed = pair.submit(() -> {
+                    start.await();
+                    Thread.sleep(stagger);
+                    return jdbc.update(
+                            "UPDATE orders SET status = 'PENDING', version = version + 1, updated_at = now()"
+                                    + " WHERE order_number = ? AND version = ?",
+                            orderNumber,
+                            version);
+                });
+                start.countDown();
+
+                assertThat(confirmed.get(10, TimeUnit.SECONDS))
+                        .as("round %d: the confirmation stands (resumed %d row)", round, resumed.get(10, TimeUnit.SECONDS))
+                        .isTrue();
+                assertThat(fixture.orderStatus(holdToken)).isEqualTo("CONFIRMED");
+                assertThat(fixture.holdStatus(holdToken)).isEqualTo("CONSUMED");
+            }
+        }
+        assertThat(fixture.stockInvariantHolds(tierId)).isTrue();
+    }
+
+    @Test
+    @DisplayName("A second charge for a purchase goes back, and the order keeps the charge it names")
+    void aSecondChargeIsReturned() {
+        Admitted buyer = admittedBuyer();
+        String holdToken = buyer.reserve();
+        var purchase = buyer.session().post("/orders/checkout", checkout(holdToken, "pm_card_visa"));
+        assertThat(purchase.status()).isEqualTo(201);
+        String orderNumber = fixture.orderNumberFor(holdToken);
+        String kept = jdbc.queryForObject(
+                "SELECT payment_transaction_ref FROM orders WHERE hold_token = ?", String.class, holdToken);
+
+        // What a checkout stalled past the in-flight guard leaves behind: its own settled charge,
+        // reaching an order a retry already completed.
+        String second = fixture.seedSettledPayment(holdToken, "pi_second_charge", PRICE);
+        var outcome = refunds.refund(
+                orderNumber, new SettledCharge(second, "pi_second_charge"), PRICE, "the reservation ended");
+
+        assertThat(outcome).isEqualTo(OrderRefundService.Outcome.RESOLVED_ELSEWHERE);
+        assertThat(refundedAmount(second)).isEqualTo(PRICE);
+        assertThat(refundedAmount(kept)).isZero();
+        assertThat(fixture.orderStatus(holdToken)).isEqualTo("CONFIRMED");
+        assertThat(outboxRows(orderNumber, "ORDER_REFUNDED")).isZero();
+        assertThat(fixture.stockInvariantHolds(tierId)).isTrue();
+    }
+
+    @Test
+    @DisplayName("The webhook for a second charge returns it; the one for the order's own charge moves nothing")
+    void theWebhookReturnsOnlyASecondCharge() {
+        Admitted buyer = admittedBuyer();
+        String holdToken = buyer.reserve();
+        var purchase = buyer.session().post("/orders/checkout", checkout(holdToken, "pm_card_visa"));
+        assertThat(purchase.status()).isEqualTo(201);
+        String kept = jdbc.queryForObject(
+                "SELECT payment_transaction_ref FROM orders WHERE hold_token = ?", String.class, holdToken);
+        String keptIntent = jdbc.queryForObject(
+                "SELECT stripe_payment_intent_id FROM orders WHERE hold_token = ?", String.class, holdToken);
+        String second = fixture.seedSettledPayment(holdToken, "pi_webhook_second", PRICE);
+
+        settlement.onPaymentSettled(new PaymentSettledEvent(holdToken, keptIntent, kept, PRICE, "USD"));
+        assertThat(refundedAmount(kept)).isZero();
+
+        settlement.onPaymentSettled(new PaymentSettledEvent(holdToken, "pi_webhook_second", second, PRICE, "USD"));
+        assertThat(refundedAmount(second)).isEqualTo(PRICE);
+        assertThat(refundedAmount(kept)).isZero();
+        assertThat(fixture.orderStatus(holdToken)).isEqualTo("CONFIRMED");
+    }
+
     // ----------------------------------------------------------------- helpers
+
+    private long refundedAmount(String transactionReference) {
+        return jdbc.queryForObject(
+                "SELECT refunded_amount_cents FROM payment_transactions WHERE transaction_reference = ?",
+                Long.class,
+                transactionReference);
+    }
 
     private record Admitted(BuyerSession session, String admissionToken, long eventId, long tierId) {
 
@@ -235,8 +359,8 @@ class SettlementArbiterIT extends IntegrationTest {
         return catalog.getTierSummary(eventId, tierId);
     }
 
-    private static PaymentResult settled(String transactionReference) {
-        return new PaymentResult(transactionReference, true, "pi_settled", null, null, null, false, false);
+    private static PaymentResult settled(String transactionReference, String gatewayReference) {
+        return new PaymentResult(transactionReference, true, gatewayReference, null, null, null, false, false);
     }
 
     private int outboxRows(String orderNumber, String eventType) {

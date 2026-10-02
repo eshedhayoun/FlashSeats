@@ -38,6 +38,8 @@ correctness-neutral: delete the whole module and the sale is still correct, just
 | `queue:events:{e}` | Pub/Sub | — | promotion fan-out to whichever replica holds the SSE connection (ADR-007) |
 | `queue:replay:{e}` | ZSET, score = sequence | sale end + retention | the last 256 **broadcast** frames, so a reconnecting client can be handed what it missed (ADR-058) |
 | `queue:replay-seq:{e}` | String | sale end + retention | the monotonic sequence behind those frames |
+| `queue:availability:{e}` | String | retention, refreshed per sweep | the `tier-availability` frame last announced, swapped with `SET … GET` so a change is announced by one replica, not each (ADR-076) |
+| `queue:closed:{e}` | String | retention | claimed with `SET NX` by the replica that announces `sale-closed`, so it is retained once; every replica still closes its own streams (ADR-076) |
 
 **The replay log retains broadcast frames only** — `tier-availability`, `sale-closed`,
 `sale-exhausted`. It is one key per *event*, shared by everyone watching that sale and outliving the

@@ -21,6 +21,7 @@ import java.time.Clock;
 import java.time.Instant;
 import java.util.EnumSet;
 import java.util.List;
+import java.util.Optional;
 import java.util.Set;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.context.ApplicationEventPublisher;
@@ -151,9 +152,8 @@ public class OrderCommitService {
      * than Redis (ADR-019). Returns the receipt directly, so a successful checkout needs no second
      * pooled read.
      *
-     * @throws OptimisticLockingFailureException if the order was already resolved, or is resolved
-     *     while this runs, by the other path settling the same charge (ADR-064). Nothing commits,
-     *     the hold included.
+     * @throws OptimisticLockingFailureException if the order was already resolved by the other path
+     *     settling the same charge (ADR-064). Nothing commits, the hold included.
      */
     @Transactional
     public OrderReceiptResponse confirm(
@@ -167,7 +167,10 @@ public class OrderCommitService {
         // ahead of it and quietly drop the changes below.
         holds.consumeHold(hold.holdToken());
 
-        Order order = orders.findByOrderNumber(orderNumber).orElseThrow();
+        // Locked, so the status read here is the one this transaction overwrites. A retry resuming
+        // the order meanwhile changes nothing that matters (it is still this purchase); a refund
+        // claim waits, then finds the order confirmed (ADR-075).
+        Order order = orders.lockByOrderNumber(orderNumber).orElseThrow();
         if (!UNRESOLVED.contains(order.getStatus())) {
             // The webhook settled this charge first, or a refund claimed it. Confirming now would
             // either repeat a confirmation or deliver seats for money already on its way back.
@@ -258,19 +261,30 @@ public class OrderCommitService {
      * order can no longer be confirmed, and once the order is confirmed it can no longer be claimed.
      *
      * <p>The reason is written as "refund pending" until the provider answers, so an order whose
-     * process died between this claim and the refund is visible as exactly that.
+     * process died between this claim and the refund is visible as exactly that. The claim records the
+     * charge it is giving back, so the order names the one charge it ended with (ADR-075).
      *
      * @return true if this caller now owns the refund; false if the order was already resolved
      */
     @Transactional
-    public boolean claimRefund(String orderNumber, String reason) {
-        return orders.transition(
+    public boolean claimRefund(String orderNumber, SettledCharge charge, String reason) {
+        return orders.claimRefund(
                         orderNumber,
                         UNRESOLVED,
-                        OrderStatus.REFUNDED,
                         bounded("refund pending: " + reason),
+                        charge.transactionReference(),
+                        charge.gatewayReference(),
                         clock.instant())
                 == 1;
+    }
+
+    /**
+     * The provider's reference for the charge this order ended with, confirmed or refunded (ADR-075).
+     * Empty while the order is unresolved, and for an ending that recorded none.
+     */
+    @Transactional(readOnly = true)
+    public Optional<String> chargeOfRecord(String orderNumber) {
+        return orders.findByOrderNumber(orderNumber).map(Order::getGatewayReference);
     }
 
     /**

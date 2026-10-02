@@ -28,11 +28,15 @@ This module owns **no Redis key at all.**
 
 `UNIQUE(hold_token)` is the single-use guard: **one hold can never become two orders** (ADR-002).
 
-**The `orders` row decides how a settled charge ends** (ADR-064). Every status change is a
-compare-and-set — on `version` for an entity write, or a conditional update that bumps it — so the
+**The `orders` row decides how a settled charge ends** (ADR-064, ADR-075). Every status change is
+a compare-and-set — on `version` for an entity write, or a conditional update that bumps it — so the
 checkout and the webhook, settling the same charge at once, cannot both win. Confirming needs the
-order `PENDING` or `FAILED`; claiming a refund needs the same; whichever commits first leaves the
-other nothing to do.
+order `PENDING` or `FAILED` and **holds the row** while it checks; claiming a refund needs the same;
+whichever commits first leaves the other nothing to do.
+
+**A resolved order names the one charge it ended with** — confirmed or refunded — by the provider's
+reference (`stripe_payment_intent_id`). Any other settled charge for the same hold is a second one,
+and is returned against its own ledger row without touching the order (ADR-075).
 
 ---
 
@@ -111,10 +115,17 @@ and the retry finds the charge that settled and confirms it **without charging a
 answering `404`/`410` at step 1 or 5, checkout also looks for a confirmed order for the hold.
 
 **A refund is claimed, then made, then announced.** The claim moves the order to `REFUNDED` with the
-reason `refund pending: …`; the provider call comes after it; only a refund that went through queues
-the `ORDER_REFUNDED` notice, at most once. A refused one moves the order on to `REFUND_FAILED`, sends
-nothing, answers the buyer `409 REFUND_FAILED`, and is counted in `flashseats.payment.refund.failed`
-(ADR-069).
+reason `refund pending: …` and records which charge is going back; the provider call comes after it;
+only a refund that went through queues the `ORDER_REFUNDED` notice, at most once. A refused one moves
+the order on to `REFUND_FAILED`, sends nothing, answers the buyer `409 REFUND_FAILED`, and is counted
+in `flashseats.payment.refund.failed` (ADR-069).
+
+**A second charge goes back** (ADR-075). Two checkouts for one hold can both reach the provider only
+when the first stalls past the in-flight key and the `PENDING` check, which both expire. Whichever path
+then finds the order already resolved — the checkout's lost claim, or the webhook for an order already
+confirmed or refunded — compares its charge with the one the order names: the same charge moves
+nothing; a different one is refunded and counted in `flashseats.payment.charge.stray`. An unknown
+reference on either side is counted as `unaccounted` and left for a person, never guessed at.
 
 **`PENDING` is in-flight, never terminal** (ADR-034). The row is committed before the charge, so any
 exit that recorded no outcome would otherwise strand the buyer holding live seats behind a `409`
@@ -196,6 +207,8 @@ exactly what ADR-023 forbids.
 - Let a client value reach an amount.
 - Treat `PENDING` as terminal.
 - Read a lost hold as lost seats, or refund on an ambiguous failure — the order row decides (ADR-064).
+- Assume a resolved order was resolved by *this* charge — compare it with the charge the order names
+  (ADR-075).
 - Move money before the order row records why.
 - Release the hold on a decline.
 - Publish to the broker inside the outbox transaction, or mark `PROCESSED` before the broker confirms

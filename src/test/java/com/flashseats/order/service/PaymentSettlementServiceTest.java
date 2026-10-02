@@ -56,7 +56,11 @@ class PaymentSettlementServiceTest {
         // The checkout confirmed between onPaymentSettled's read and this claim: a CONSUMED hold
         // reads as expired. The claim fails because the order is CONFIRMED, and nothing moves.
         when(holds.getActiveHold(HOLD, "session-test")).thenThrow(new HoldExpiredException(HOLD, Instant.now()));
-        when(refunds.refund("TK-TEST", "pt_test", 5_000, "webhook settled against a reservation that no longer exists"))
+        when(refunds.refund(
+                        "TK-TEST",
+                        new SettledCharge("pt_test", "pi_test"),
+                        5_000,
+                        "webhook settled against a reservation that no longer exists"))
                 .thenReturn(OrderRefundService.Outcome.RESOLVED_ELSEWHERE);
 
         assertThatCode(() -> settlement.onPaymentSettled(event)).doesNotThrowAnyException();
@@ -81,11 +85,28 @@ class PaymentSettlementServiceTest {
     void confirmedOrderIsInert() {
         Order confirmed = new Order("TK-TEST", HOLD, "session-test", "b@example.com", "tok", 1L, 5_000, "USD");
         confirmed.setStatus(OrderStatus.CONFIRMED);
+        confirmed.setGatewayReference("pi_test");
         when(orders.findByHoldToken(HOLD)).thenReturn(Optional.of(confirmed));
 
         settlement.onPaymentSettled(event);
 
         verify(holds, never()).getActiveHold(any(), any());
         verify(refunds, never()).refund(anyString(), any(), anyLong(), anyString());
+        // Handed over so a second charge would go back; this one is the order's own.
+        verify(refunds).returnIfStray("TK-TEST", "pi_test", new SettledCharge("pt_test", "pi_test"), 5_000);
+    }
+
+    @Test
+    @DisplayName("A settled charge the resolved order does not name is handed back for return")
+    void aSecondChargeOnAResolvedOrderIsReturned() {
+        Order refunded = new Order("TK-TEST", HOLD, "session-test", "b@example.com", "tok", 1L, 5_000, "USD");
+        refunded.setStatus(OrderStatus.REFUNDED);
+        refunded.setGatewayReference("pi_first");
+        when(orders.findByHoldToken(HOLD)).thenReturn(Optional.of(refunded));
+
+        settlement.onPaymentSettled(event);
+
+        verify(holds, never()).getActiveHold(any(), any());
+        verify(refunds).returnIfStray("TK-TEST", "pi_first", new SettledCharge("pt_test", "pi_test"), 5_000);
     }
 }

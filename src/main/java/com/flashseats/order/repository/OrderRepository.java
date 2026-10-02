@@ -2,10 +2,12 @@ package com.flashseats.order.repository;
 
 import com.flashseats.order.model.Order;
 import com.flashseats.order.model.OrderStatus;
+import jakarta.persistence.LockModeType;
 import java.time.Instant;
 import java.util.Collection;
 import java.util.Optional;
 import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.data.jpa.repository.Lock;
 import org.springframework.data.jpa.repository.Modifying;
 import org.springframework.data.jpa.repository.Query;
 import org.springframework.data.repository.query.Param;
@@ -15,6 +17,16 @@ public interface OrderRepository extends JpaRepository<Order, Long> {
     Optional<Order> findByHoldToken(String holdToken);
 
     Optional<Order> findByOrderNumber(String orderNumber);
+
+    /**
+     * The order, row-locked until the caller's transaction ends (ADR-075). Confirming reads the status
+     * it is about to overwrite, so the read has to hold the row: otherwise a concurrent write between
+     * the read and the flush either goes unseen or, through the version check, fails a confirmation
+     * that was entitled to succeed.
+     */
+    @Lock(LockModeType.PESSIMISTIC_WRITE)
+    @Query("SELECT o FROM Order o WHERE o.orderNumber = :orderNumber")
+    Optional<Order> lockByOrderNumber(@Param("orderNumber") String orderNumber);
 
     /**
      * Moves an order to {@code to} only if it is still in one of {@code from} (ADR-064). This is how
@@ -42,6 +54,33 @@ public interface OrderRepository extends JpaRepository<Order, Long> {
             @Param("from") Collection<OrderStatus> from,
             @Param("to") OrderStatus to,
             @Param("reason") String reason,
+            @Param("now") Instant now);
+
+    /**
+     * {@link #transition} to {@code REFUNDED} that also records <strong>which charge</strong> is going
+     * back (ADR-075). An order then names the one charge it ended with, confirmed or refunded, and any
+     * other charge for the same hold is recognisably a second one.
+     *
+     * @return 1 if this caller claimed the refund, 0 if the order had already moved on
+     */
+    @Modifying(flushAutomatically = true)
+    @Query("""
+            UPDATE Order o
+               SET o.status = com.flashseats.order.model.OrderStatus.REFUNDED,
+                   o.failureReason = :reason,
+                   o.paymentTransactionRef = :transactionReference,
+                   o.gatewayReference = :gatewayReference,
+                   o.version = o.version + 1,
+                   o.updatedAt = :now
+             WHERE o.orderNumber = :orderNumber
+               AND o.status IN :from
+            """)
+    int claimRefund(
+            @Param("orderNumber") String orderNumber,
+            @Param("from") Collection<OrderStatus> from,
+            @Param("reason") String reason,
+            @Param("transactionReference") String transactionReference,
+            @Param("gatewayReference") String gatewayReference,
             @Param("now") Instant now);
 
     /**

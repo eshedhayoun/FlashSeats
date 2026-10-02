@@ -2,7 +2,11 @@ package com.flashseats.app;
 
 import jakarta.annotation.PostConstruct;
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Set;
+import java.util.function.Predicate;
+import java.util.regex.Pattern;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.context.annotation.Profile;
 import org.springframework.core.env.Environment;
@@ -22,30 +26,46 @@ public class SecretsGuard {
     private static final String DEFAULT_SECRET = "dev-only-change-me";
 
     /**
-     * Spring Security's marker for "this password is not hashed". The guard refuses the
-     * <strong>encoding</strong>, not a known value, so every plaintext password is rejected (ADR-048).
+     * The shortest signing key accepted: 256 bits of base64, the HMAC-SHA256 block. A token is free to
+     * obtain, so a short key can be searched offline against one, and every capability it signs is
+     * then forgeable (ADR-076).
      */
-    private static final String PLAINTEXT_PREFIX = "{noop}";
+    static final int MIN_SIGNING_SECRET_LENGTH = 32;
 
     /**
-     * Property, the environment variable that supplies it, and what disqualifies the value —
-     * {@code null} on {@code forbidden} means "reject any {@code {noop}} encoding".
+     * The admin password must name an adaptive hash. The guard accepts the <strong>encoding</strong>,
+     * not a value (ADR-048): {@code {noop}} is plaintext, the {@code MD5}/{@code SHA-*} family is fast
+     * enough to brute-force, and an unprefixed value — the compose default {@code admin} — names no
+     * encoder at all, so it would start cleanly and fail every login (ADR-076).
      */
-    private record Secret(String property, String envVar, String forbidden) {
+    private static final Pattern HASHED_PASSWORD =
+            Pattern.compile("^\\{(bcrypt|argon2|pbkdf2|scrypt)(@[^}]*)?}.+");
+
+    /** Property, the environment variable that supplies it, and the check its value must pass. */
+    private record Secret(String property, String envVar, Predicate<String> acceptable) {
 
         boolean isUnacceptable(String value) {
-            if (value == null || value.isBlank()) {
-                return true;
-            }
-            return forbidden == null ? value.startsWith(PLAINTEXT_PREFIX) : forbidden.equals(value);
+            return value == null || value.isBlank() || !acceptable.test(value);
         }
     }
 
-    private static final List<Secret> GUARDED = List.of(
-            new Secret("flashseats.session.secret", "FLASHSEATS_SESSION_SECRET", DEFAULT_SECRET),
-            new Secret("flashseats.queue.pass-secret", "FLASHSEATS_QUEUE_PASS_SECRET", DEFAULT_SECRET),
-            new Secret("flashseats.order.receipt-secret", "FLASHSEATS_RECEIPT_SECRET", DEFAULT_SECRET),
-            new Secret("flashseats.admin.password", "FLASHSEATS_ADMIN_PASSWORD", null));
+    private static Secret signingSecret(String property, String envVar) {
+        return new Secret(
+                property,
+                envVar,
+                value -> !DEFAULT_SECRET.equals(value) && value.length() >= MIN_SIGNING_SECRET_LENGTH);
+    }
+
+    /** The three keys that sign capability tokens. Each must also differ from the others. */
+    private static final List<Secret> SIGNING = List.of(
+            signingSecret("flashseats.session.secret", "FLASHSEATS_SESSION_SECRET"),
+            signingSecret("flashseats.queue.pass-secret", "FLASHSEATS_QUEUE_PASS_SECRET"),
+            signingSecret("flashseats.order.receipt-secret", "FLASHSEATS_RECEIPT_SECRET"));
+
+    private static final Secret ADMIN_PASSWORD = new Secret(
+            "flashseats.admin.password",
+            "FLASHSEATS_ADMIN_PASSWORD",
+            value -> HASHED_PASSWORD.matcher(value).matches());
 
     /**
      * Guarded only once the real provider is switched on: the stub needs no keys. With Stripe on, both
@@ -53,11 +73,11 @@ public class SecretsGuard {
      * response then never reaches an order.
      */
     private static final List<Secret> GUARDED_WITH_STRIPE = List.of(
-            new Secret("flashseats.payment.stripe.api-key", "STRIPE_API_KEY", "sk_test_..."),
+            new Secret("flashseats.payment.stripe.api-key", "STRIPE_API_KEY", value -> !"sk_test_...".equals(value)),
             new Secret(
                     "flashseats.payment.stripe.webhook-secret",
                     "STRIPE_WEBHOOK_SECRET",
-                    "whsec_dev_only_change_me"));
+                    value -> !"whsec_dev_only_change_me".equals(value)));
 
     private final Environment environment;
 
@@ -67,7 +87,8 @@ public class SecretsGuard {
 
     @PostConstruct
     void requireRealSecrets() {
-        List<Secret> guarded = new ArrayList<>(GUARDED);
+        List<Secret> guarded = new ArrayList<>(SIGNING);
+        guarded.add(ADMIN_PASSWORD);
         if (environment.getProperty("flashseats.payment.stripe.enabled", Boolean.class, false)) {
             guarded.addAll(GUARDED_WITH_STRIPE);
         }
@@ -76,6 +97,15 @@ public class SecretsGuard {
         for (Secret secret : guarded) {
             if (secret.isUnacceptable(environment.getProperty(secret.property()))) {
                 offenders.add(secret.property() + "  (set " + secret.envVar() + ")");
+            }
+        }
+        // One key per token domain, so one leak forges one kind of token, not three (ADR-039). The
+        // signed kind keeps a shared key from crossing domains, but not from leaking all of them.
+        Set<String> distinct = new HashSet<>();
+        for (Secret secret : SIGNING) {
+            String value = environment.getProperty(secret.property());
+            if (value != null && !value.isBlank() && !distinct.add(value)) {
+                offenders.add(secret.property() + "  (set " + secret.envVar() + " to its own value)");
             }
         }
         if (offenders.isEmpty()) {
@@ -91,13 +121,13 @@ public class SecretsGuard {
                 Each of these signs a capability token or guards the admin surface, and the default \
                 values are published in this repository. Anyone who knows them can forge a session, \
                 a queue pass, an admission and a receipt link for any buyer. Generate a distinct \
-                random value per environment:
+                random value, at least %d characters, per secret and per environment:
 
                   openssl rand -base64 48
 
-                FLASHSEATS_ADMIN_PASSWORD is different: it must be HASHED, and is rejected while it \
-                carries the {noop} prefix that means plaintext — whatever the password itself is. \
-                Produce one with:
+                FLASHSEATS_ADMIN_PASSWORD is different: it must be HASHED with bcrypt, argon2, pbkdf2 \
+                or scrypt and carry that prefix. A {noop} value is plaintext and an unprefixed one \
+                names no encoder, whatever the password itself is. Produce one with:
 
                   docker run --rm httpd:alpine htpasswd -bnBC 12 "" 'your-password' | tr -d ':\\n'
 
@@ -105,6 +135,7 @@ public class SecretsGuard {
                 does both. See docs/06-mvp-overview.md section 10."""
                         .formatted(
                                 String.join(", ", environment.getActiveProfiles()),
-                                String.join("\n  - ", offenders)));
+                                String.join("\n  - ", offenders),
+                                MIN_SIGNING_SECRET_LENGTH));
     }
 }

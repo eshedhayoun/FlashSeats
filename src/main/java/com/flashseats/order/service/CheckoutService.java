@@ -201,12 +201,13 @@ public class CheckoutService {
             log.warn("Order {} lost its hold after the charge settled; resolving from the order row", orderNumber, lost);
             return switch (refunds.refund(
                     orderNumber,
-                    payment.transactionReference(),
+                    new SettledCharge(payment.transactionReference(), payment.gatewayReference()),
                     amountCents,
                     "the reservation ended before the order could be confirmed")) {
                 case REFUNDED -> throw OrderErrors.refunded();
                 case REFUND_FAILED -> throw OrderErrors.refundFailed();
-                // Resolved by the other path: confirmed, or refunded by it — the row says which.
+                // Resolved by the other path: confirmed, or refunded by it — the row says which. A
+                // charge the row does not name has already gone back (ADR-075).
                 case RESOLVED_ELSEWHERE -> replayIfConfirmed(holdToken).orElseThrow(() ->
                         queries.statusFor(holdToken).filter(OrderStatus.REFUND_FAILED::equals).isPresent()
                                 ? OrderErrors.refundFailed()
