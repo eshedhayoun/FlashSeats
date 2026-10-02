@@ -45,6 +45,7 @@ public class QueueService implements QueueFacade {
     private final QueueProperties properties;
     private final Clock clock;
     private final BotFacade bots;
+    private final QueueMetrics metrics;
 
     public QueueService(
             StringRedisTemplate redis,
@@ -53,7 +54,8 @@ public class QueueService implements QueueFacade {
             QueueDrainRateTracker drainRate,
             QueueProperties properties,
             Clock clock,
-            BotFacade bots) {
+            BotFacade bots,
+            QueueMetrics metrics) {
         this.redis = redis;
         this.catalog = catalog;
         this.tokens = tokens;
@@ -61,6 +63,7 @@ public class QueueService implements QueueFacade {
         this.properties = properties;
         this.clock = clock;
         this.bots = bots;
+        this.metrics = metrics;
     }
 
     // -------------------------------------------------------------------- join
@@ -115,7 +118,7 @@ public class QueueService implements QueueFacade {
     // ------------------------------------------------------------------ status
 
     public QueueStatusResponse status(String sessionId, long eventId) {
-        return status(sessionId, eventId, catalog.getWindowStatus(eventId));
+        return metrics.timeStatus(() -> status(sessionId, eventId, catalog.getWindowStatus(eventId)));
     }
 
     private QueueStatusResponse status(String sessionId, long eventId, EventWindowStatus window) {
@@ -199,16 +202,17 @@ public class QueueService implements QueueFacade {
         // The byte-level API rather than a StringRedisConnection cast: inside a pipeline the
         // connection is a proxy, and the cast throws ClassCastException at runtime while compiling
         // perfectly. Replies come back through the template's own String serializer.
-        List<Object> replies = redis.executePipelined((RedisCallback<Object>) connection -> {
-            connection.stringCommands().get(utf8(admissionKey));
-            connection.keyCommands().ttl(utf8(admissionKey));
-            connection.stringCommands().get(utf8(passKey));
-            connection.zSetCommands().zRank(utf8(waitingKey), utf8(sessionId));
-            if (exhausted == null) {
-                connection.keyCommands().exists(utf8(exhaustedKey));
-            }
-            return null;
-        });
+        List<Object> replies = metrics.timeRedisRead(() -> redis.executePipelined(
+                (RedisCallback<Object>) connection -> metrics.timeRedisCallback(() -> {
+                    connection.stringCommands().get(utf8(admissionKey));
+                    connection.keyCommands().ttl(utf8(admissionKey));
+                    connection.stringCommands().get(utf8(passKey));
+                    connection.zSetCommands().zRank(utf8(waitingKey), utf8(sessionId));
+                    if (exhausted == null) {
+                        connection.keyCommands().exists(utf8(exhaustedKey));
+                    }
+                    return null;
+                })));
 
         int expected = exhausted == null ? 5 : 4;
         if (replies.size() != expected) {
@@ -219,12 +223,12 @@ public class QueueService implements QueueFacade {
                     "Expected " + expected + " pipelined replies, got " + replies.size());
         }
 
-        return new Snapshot(
+        return metrics.timeRedisDecode(() -> new Snapshot(
                 (String) replies.get(0),
                 (Long) replies.get(1),
                 (String) replies.get(2),
                 (Long) replies.get(3),
-                exhausted != null ? exhausted : truthy(replies.get(4)));
+                exhausted != null ? exhausted : truthy(replies.get(4))));
     }
 
     private QueueState decide(Snapshot snapshot, long eventId) {

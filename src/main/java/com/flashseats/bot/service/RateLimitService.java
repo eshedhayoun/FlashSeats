@@ -4,6 +4,8 @@ import com.flashseats.bot.config.BotProperties;
 import io.github.bucket4j.Bandwidth;
 import io.github.bucket4j.BucketConfiguration;
 import io.github.bucket4j.distributed.proxy.ProxyManager;
+import io.micrometer.core.instrument.MeterRegistry;
+import io.micrometer.core.instrument.Timer;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.Set;
@@ -31,8 +33,11 @@ public class RateLimitService {
     private final String sessionKeyPrefix;
     private final String ipKeyPrefix;
     private final Set<String> trustedProxies;
+    private final Timer sessionBucketTimer;
+    private final Timer ipBucketTimer;
 
-    public RateLimitService(ProxyManager<byte[]> buckets, BotProperties properties) {
+    public RateLimitService(
+            ProxyManager<byte[]> buckets, BotProperties properties, MeterRegistry meters) {
         this.buckets = buckets;
         BotProperties.Bucket sessionBucket = properties.getSessionBucket();
         BotProperties.Bucket ipBucket = properties.getIpBucket();
@@ -41,6 +46,12 @@ public class RateLimitService {
         this.sessionKeyPrefix = versionedPrefix(SESSION_PREFIX, sessionBucket);
         this.ipKeyPrefix = versionedPrefix(IP_PREFIX, ipBucket);
         this.trustedProxies = Set.copyOf(properties.getTrustedProxies());
+        this.sessionBucketTimer = Timer.builder("flashseats.bot.rate_limit.session")
+                .description("Session bucket check duration")
+                .register(meters);
+        this.ipBucketTimer = Timer.builder("flashseats.bot.rate_limit.ip")
+                .description("IP bucket check duration")
+                .register(meters);
     }
 
     /**
@@ -55,11 +66,11 @@ public class RateLimitService {
     }
 
     public boolean allowSession(String sessionId) {
-        return tryConsume(sessionKeyPrefix + sessionId, sessionConfig);
+        return timed(sessionBucketTimer, () -> tryConsume(sessionKeyPrefix + sessionId, sessionConfig));
     }
 
     public boolean allowIp(String ip) {
-        return tryConsume(ipKeyPrefix + ip, ipConfig);
+        return timed(ipBucketTimer, () -> tryConsume(ipKeyPrefix + ip, ipConfig));
     }
 
     private String versionedPrefix(String prefix, BotProperties.Bucket bucket) {
@@ -70,6 +81,15 @@ public class RateLimitService {
         return buckets.builder()
                 .build(key.getBytes(StandardCharsets.UTF_8), configuration)
                 .tryConsume(1);
+    }
+
+    private static boolean timed(Timer timer, Supplier<Boolean> operation) {
+        Timer.Sample sample = Timer.start();
+        try {
+            return operation.get();
+        } finally {
+            sample.stop(timer);
+        }
     }
 
     /**
