@@ -3,8 +3,10 @@
 The React client for the buyer journey in [`FE_SPEC.md`](../FE_SPEC.md): event page, waiting room,
 seat selection, checkout (stub gateway or Stripe), receipt and PDF ticket. React 18, MUI 6, Vite.
 
-It is a **development server only** — nothing in the cluster serves it (ADR-058). The backend's own
-minimal demo page is `src/main/resources/static/index.html`, served at `:8080/`.
+Under `--profile cluster` the nginx image builds it and serves it at `:8080` (ADR-068), and
+`docker/scripts/professor-demo.sh` starts that whole stack in one command. For development it runs on
+its own dev server, below. The backend's minimal demo page, `src/main/resources/static/index.html`, is
+what `./mvnw spring-boot:run` serves at `:8080`.
 
 ## Run it
 

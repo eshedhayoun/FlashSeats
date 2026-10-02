@@ -450,9 +450,9 @@ Honest list. None of these is hidden behind a passing test.
   `.bin` exec bits and at least one package file (`vite/dist/node/module-runner.js`), so `npm test`
   failed on a fresh clone with a module-not-found error. `rm -rf node_modules && npm install` is the
   fix, and the directory is untracked now.
-- **The SPA is dev-only.** `npm run dev` on `:5173` proxying to `:8080`. There is no compose service
-  and nginx serves no static root, so the cluster still serves the demo client at
-  `src/main/resources/static`. Wiring it is a separate stage (ADR-058).
+- ~~**The SPA is dev-only.**~~ **Fixed (Pass 15, ADR-068):** the nginx image builds the React client
+  and serves it at `:8080` under `--profile cluster`, with an `index.html` fallback for deep links.
+  The bundled page in `src/main/resources/static` is what `spring-boot:run` serves in development.
 
 ---
 
@@ -646,9 +646,8 @@ A console is presentation and can wait. The endpoints are the capability.
   **dev-only**: `cd frontend && npm install && npm run dev` serves it on `:5173` with `/api` proxied
   to `:8080`. All six views, per-event namespaced storage, `serverTime`-derived countdowns and a
   keyless stub-payment mode so decline, outage and 3-D Secure are walkable in a browser (ADR-058).
-  **It is not wired into the cluster** — no compose service, no nginx static root — so
-  `--profile cluster` still serves the demo client. Wiring it, and checking it against §9's recovery
-  matrix in a real browser, is the next client stage.
+  **Wired into the cluster in Pass 15** (ADR-068): the nginx image builds it, and
+  `docker/scripts/professor-demo.sh` starts the whole stack with two seeded sales in one command.
 - **The Playwright suite specified in `FE_SPEC.md` §8.** Every one of the four client rules is a
   browser behaviour — a skewed clock, a real reload, a live `EventSource` — so none of them is
   reachable from the API suite, and the twelve reload points are checked by hand today. Two of the
@@ -2111,6 +2110,7 @@ rather than an archaeology.
 | **Promotion writes in one pipeline; a metadata miss loads once** (ADR-065) | Ported from the teammate's branch. The promotion tick no longer makes three Redis round trips per buyer, and a waiting room polling one event no longer spikes the pool each time the cached row expires. The waiting-room drill is a `loadtest` service; its unredeemed-pass ceiling and the branch's unusable ~9k figure are recorded in §11 |
 | **k6 keys are unique per run** | The stub ignores the checkout idempotency key, but Stripe keeps one for 24 hours and would answer a reused key with the previous run's response. The waiting-room drill also parks each VU after its one journey (a fix from the teammate's last commit), so it measures arrivals rather than a request loop |
 | **Failures are classified by what they prove** (ADR-067) | A reserve whose hold transaction never began — a pool timeout, the common failure under pressure — now gives its seats back instead of hiding them until a rebuild. An unknown path is `404 NOT_FOUND`, not `500`. The rate limiter fails open (counted in `flashseats.bot.limiter.unavailable`) instead of answering every call a bare `500` when Redis is down. Request fields are bounded by their columns, and only the hold-token constraint reads as a concurrent checkout |
+| **The cluster serves the React client; one command starts the demo** (ADR-068) | Ported from the teammate's final commits. The nginx image builds the SPA and serves it at `:8080` with a deep-link fallback, replacing nginx's own 404. `docker/scripts/professor-demo.sh` needs only Docker: secrets, build, health, and two seeded, pre-warmed sales |
 | **A pause is a pause** (ADR-066) | A paused sale used to read `CLOSED`: buyers were told it had ended, their streams were closed, the close was **replayed after the resume**, and the event left `/events`. `PAUSED` is now a window status inside the sale window: the line keeps forming in arrival order, nobody is promoted, holds answer `409 SALE_PAUSED` (retryable), a buyer already holding seats can still pay, and `sale-paused` / `sale-resumed` are sent to each replica's own streams and never retained. The admin refusal to pause a draft is `EVENT_NOT_PAUSABLE`. A review then found two things that keep moving while paused: sold-out now un-derives during the pause when expiring holds return seats, and no wait estimate is shown while the line is not moving |
 
 **Verified so far:** 257/257 (228 + 29 new), including `SettlementArbiterIT`, which races confirm
