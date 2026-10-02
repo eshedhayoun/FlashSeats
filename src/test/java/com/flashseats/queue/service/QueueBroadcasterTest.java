@@ -1,6 +1,7 @@
 package com.flashseats.queue.service;
 
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyInt;
 import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.Mockito.mock;
@@ -70,9 +71,9 @@ class QueueBroadcasterTest {
         verify(queue).getQueueState("a", 1L, EventWindowStatus.OPEN, true);
         verify(queue).getQueueState("b", 1L, EventWindowStatus.OPEN, true);
         verify(queue).getQueueState("c", 1L, EventWindowStatus.OPEN, true);
-        verify(emitters).send("a", "sale-exhausted", Map.of("soldOutAt", "2026-09-12T16:12:00Z"));
-        verify(emitters).send("b", "sale-exhausted", Map.of("soldOutAt", "2026-09-12T16:12:00Z"));
-        verify(emitters).send("c", "sale-exhausted", Map.of("soldOutAt", "2026-09-12T16:12:00Z"));
+        verify(emitters).send("a", 1L, "sale-exhausted", Map.of("soldOutAt", "2026-09-12T16:12:00Z"));
+        verify(emitters).send("b", 1L, "sale-exhausted", Map.of("soldOutAt", "2026-09-12T16:12:00Z"));
+        verify(emitters).send("c", 1L, "sale-exhausted", Map.of("soldOutAt", "2026-09-12T16:12:00Z"));
     }
 
     /**
@@ -107,17 +108,15 @@ class QueueBroadcasterTest {
         broadcaster.pushPositions();
         broadcaster.pushPositions();
 
-        verify(emitters, times(2)).send("a", "sale-paused", Map.of());
-        verify(emitters, times(2)).send("b", "sale-paused", Map.of());
-        verify(emitters, never()).sendPosition(anyString(), org.mockito.ArgumentMatchers.anyInt(), any());
+        verify(emitters, times(2)).broadcast(1L, "sale-paused", Map.of());
+        verify(emitters, never()).sendPosition(anyString(), anyLong(), anyInt(), any());
         verify(emitters, never()).closeAll(anyLong(), anyString(), any());
         verifyNoInteractions(replay);
 
         broadcaster.pushPositions();
         broadcaster.pushPositions();
 
-        verify(emitters, times(1)).send("a", "sale-resumed", Map.of());
-        verify(emitters, times(1)).send("b", "sale-resumed", Map.of());
-        verify(emitters, times(2)).sendPosition("a", 3, null);
+        verify(emitters, times(1)).broadcast(1L, "sale-resumed", Map.of());
+        verify(emitters, times(2)).sendPosition("a", 1L, 3, null);
     }
 }

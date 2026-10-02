@@ -6,13 +6,13 @@ Guidance for Claude Code when working in this repository.
 
 FlashSeats — a high-concurrency ticket flash-sale engine. Modular monolith, Java 21, Spring Boot
 4.1.1. The **MVP is built and running**: all nine modules, the full journey from landing page to emailed
-PDF ticket, 260 tests green in any class order. **Inventory lives in Redis** (Stage 1, ADR-046): `catalog:stock:{e}:{t}`
+PDF ticket, 263 tests green in any class order. **Inventory lives in Redis** (Stage 1, ADR-046): `catalog:stock:{e}:{t}`
 is the live count and PostgreSQL keeps no copy of it. **Payment is real** (Stage 2, ADR-052-054) —
 but `flashseats.payment.stripe.enabled` is **false by default**, so `dev`, `test`, the load harness
 and every drill still run the in-process stub through the complete journey, 3-D Secure included.
 
 **Read [`docs/00-architecture-decisions.md`](docs/00-architecture-decisions.md) before changing
-anything.** It contains 69 ADRs. Most record a defect and its fix — 034-039 come from the first
+anything.** It contains 70 ADRs. Most record a defect and its fix — 034-039 come from the first
 review pass over the built code, 040-042 from the second — and several look like over-engineering
 until you read the failure they prevent. 043-045 are the exception: forward-looking decisions about
 the operator surface, buyer accounts and what health should report, with nothing built against them
@@ -36,7 +36,8 @@ compensated (a reserve whose transaction never began gives its seats back), and 
 never a `500`. **068**: the cluster's nginx image builds and serves the React client, and
 `docker/scripts/professor-demo.sh` starts the whole demo in one command. **069**: a refused refund is
 `REFUND_FAILED` (never "refunded"), and a notification claim stranded by a dead process is
-dead-lettered for an operator instead of silently never sent.
+dead-lettered for an operator instead of silently never sent. **070**: live streams are per tab and
+per sale, and a frame reaches only the sale it is about.
 
 **The operating envelope is 3–10 concurrent sales**, not one
 ([`03-end-to-end-flow.md`](docs/03-end-to-end-flow.md) §2). Every capacity number written before
@@ -53,7 +54,7 @@ security posture, next stages, and the review-pass log. It is the doc to update 
 ## Document precedence
 
 ```
-00-architecture-decisions.md      ← highest authority (69 ADRs)
+00-architecture-decisions.md      ← highest authority (70 ADRs)
 05-global-standards.md            ← cross-cutting contract; module docs conform to it
 FE_SPEC.md                        ← client contract (repo root)
 03-end-to-end-flow.md             ← the authoritative user journey AND the operating envelope
@@ -302,6 +303,7 @@ Do not reintroduce these — each cost a real defect in the first pass:
 | **Letting Spring Framework 7 pause cached test contexts** | When a class switches to another context, the cached one is paused and later restarted. The resumed shared context answered every `/queue` request with a bare `500` that never reached its own filters, so no application log showed anything. It looked like pollution *inside* the app for a whole pass. `spring.test.context.cache.pause=never` in `src/test/resources/spring.properties` (ADR-061). If a failure depends on how many contexts the suite has, suspect the framework's context lifecycle first |
 | **Leaving a transaction that never began to drift** | `createHold` decrements Redis first and compensated only on a constraint rejection, so a pool timeout — thrown before any SQL — kept the seats out of the counter until an operator rebuilt it. Under pressure that is the common failure, and the sale read as sold out early. "Nothing reached the database" is as certain as a constraint rejection: compensate it (ADR-067) |
 | **A filter that throws when its store is down** | The rate limiter's buckets are in Redis and the check runs below every exception handler, so a Redis outage answered every API call a bare `500` with no `code`. A load-shedding component fails open, counted (ADR-067) |
+| **Keying live connections by session** | One stream per session made a second tab — or a buyer queued in two sales — close the first, and the two reconnected over each other for ever. And a session-addressed frame went to whichever sale's stream the session held last, so a pass for one sale was spent on another. Key streams by event *and* session, and address a frame to the event it is about (ADR-070) |
 | **Representing a pause as the end of a sale** | Every gate read `PAUSED` as `CLOSED`, which was safe for the gates and told every waiting buyer "Sales have ended": the broadcaster sent `sale-closed`, which completes the stream, **retained** it for replay so a reconnect *after the resume* was told again, and the event dropped off `/events`. A condition that will end is not an event in the sale's history — never retain it (ADR-066) |
 | **A gate that tests for what it refuses** | `!= CLOSED` admits every status added after it was written. Test for what you admit (`== OPEN`), so a new status is refused until someone decides otherwise — that is what made adding `PAUSED` safe (ADR-066) |
 | **Reading a lost hold as lost seats** | Only this order can consume its hold, so a `CONSUMED` hold means the purchase *succeeded* — on the webhook path, which settles the same charge. `getActiveHold` reports it as expired, and both payment paths refunded purchases the other had just confirmed, then overwrote `CONFIRMED` with `REFUNDED` (ADR-064) |

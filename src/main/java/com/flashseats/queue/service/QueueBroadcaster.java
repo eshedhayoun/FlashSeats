@@ -80,17 +80,19 @@ public class QueueBroadcaster {
      * back a spent or expired pass (ADR-058).
      */
     public SseEmitter connect(String sessionId, long eventId, String lastEventId) {
-        SseEmitter emitter = emitters.register(sessionId, eventId, STREAM_TIMEOUT_MS);
+        // Everything below goes to THIS tab's stream only: a replay or a first position belongs to the
+        // connection that asked, not to the buyer's other tabs (ADR-070).
+        SseEmitterRegistry.Connection stream = emitters.open(sessionId, eventId, STREAM_TIMEOUT_MS);
 
         if (lastEventId != null) {
             for (var frame : replay.after(eventId, lastEventId)) {
-                emitters.send(sessionId, frame.type(), frame.data(), frame.id());
+                emitters.send(stream, frame.type(), frame.data(), frame.id());
             }
         }
 
         // Flush at once even if this buyer has no position to send; an empty stream for two seconds
         // looks like a failure to connect.
-        emitters.comment(sessionId, "connected");
+        emitters.comment(stream, "connected");
 
         EventWindowStatus window = catalog.getWindowStatus(eventId);
         QueueState state = queue.getQueueState(sessionId, eventId, window);
@@ -98,15 +100,15 @@ public class QueueBroadcaster {
             Long expiresInSeconds = queue.passTimeToLiveSeconds(sessionId, eventId);
             if (expiresInSeconds != null) {
                 var promotion = QueueChannelMessage.promotion(sessionId, state.passToken(), expiresInSeconds);
-                emitters.send(sessionId, promotion.type(), promotion.data());
+                emitters.send(stream, promotion.type(), promotion.data(), null);
             }
         } else if (state.position() != null) {
-            emitters.sendPosition(sessionId, state.position(), state.estWaitSeconds());
+            emitters.sendPosition(stream, state.position(), state.estWaitSeconds());
         }
         if (window == EventWindowStatus.PAUSED) {
-            emitters.send(sessionId, SALE_PAUSED, Map.of());
+            emitters.send(stream, SALE_PAUSED, Map.of(), null);
         }
-        return emitter;
+        return stream.emitter();
     }
 
     /**
@@ -149,16 +151,12 @@ public class QueueBroadcaster {
             // sweep, so a buyer who connects mid-pause hears it within one interval. Positions are not
             // sent: nobody is promoted, so they cannot change (ADR-066).
             pausedEvents.add(eventId);
-            for (String sessionId : emitters.sessionsWatching(eventId)) {
-                emitters.send(sessionId, SALE_PAUSED, Map.of());
-            }
+            emitters.broadcast(eventId, SALE_PAUSED, Map.of());
             return;
         }
 
         if (pausedEvents.remove(eventId)) {
-            for (String sessionId : emitters.sessionsWatching(eventId)) {
-                emitters.send(sessionId, SALE_RESUMED, Map.of());
-            }
+            emitters.broadcast(eventId, SALE_RESUMED, Map.of());
         }
 
         sampleDepth(eventId);
@@ -171,9 +169,9 @@ public class QueueBroadcaster {
                 // Derived from live stock, so it is not terminal for the connection: if seats come
                 // back the marker clears and this buyer's position is still theirs (ADR-035).
                 emitters.send(
-                        sessionId, "sale-exhausted", Map.of("soldOutAt", clock.instant().toString()));
+                        sessionId, eventId, "sale-exhausted", Map.of("soldOutAt", clock.instant().toString()));
             } else if (state.position() != null) {
-                emitters.sendPosition(sessionId, state.position(), state.estWaitSeconds());
+                emitters.sendPosition(sessionId, eventId, state.position(), state.estWaitSeconds());
             }
         }
     }

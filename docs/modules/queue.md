@@ -89,6 +89,12 @@ in line, which is a fairness failure, not a correctness one.
 
 `estWaitSeconds` is `null` when unknown, never a `-1` sentinel.
 
+**Streams are per tab** (ADR-070). Each replica keeps its streams per event and per session, so one
+buyer may hold several — two tabs on a sale, or one in each of two sales. A frame addressed to a
+session is delivered to that session's streams **for the event it belongs to** and no other, so a
+pass for one sale can never reach another sale's tab. A session may hold five streams per sale; a
+sixth closes its oldest.
+
 **Only the replayable frames carry an `id:`**, and they are exactly the broadcast ones the replay log
 retains. A reconnect sends that sequence back as `Last-Event-ID` — as a header, or as a
 `?lastEventId=` query parameter for clients that cannot set one — and receives the broadcasts it
