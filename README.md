@@ -15,7 +15,7 @@ Read in this order:
 
 | Document | What it covers |
 | :--- | :--- |
-| [`REFACTORING_BLUEPRINT.md`](REFACTORING_BLUEPRINT.md) | **Start here.** The whole system on one page — journey, module graph, where each concept lives, and what looks removable but is not. Then the staged refactor that makes the code match it |
+| [`docs/07-system-on-one-page.md`](docs/07-system-on-one-page.md) | **Read first.** The whole system on one page — journey, module graph, checkout sequence, where each concept lives, and what looks removable but is not |
 | [`docs/00-architecture-decisions.md`](docs/00-architecture-decisions.md) | 63 ADRs — every non-obvious decision and the failure it prevents. Read before changing a decision |
 | [`docs/01-system-architecture.md`](docs/01-system-architecture.md) | Stack, module map, dependency graph, deployment |
 | [`docs/02-high-level-design.md`](docs/02-high-level-design.md) | Infrastructure and the concurrency model |
