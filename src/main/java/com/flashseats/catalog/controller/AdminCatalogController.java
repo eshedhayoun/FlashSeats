@@ -29,9 +29,9 @@ public class AdminCatalogController {
     }
 
     /**
-     * Halts a live sale. Every gate closes at once, because a paused event is not {@code PUBLISHED}.
-     * Nothing is destroyed: positions, passes, admissions and stock stay, so {@code /resume} restores
-     * everyone. Idempotent.
+     * Halts a live sale: nobody is promoted and no hold is created, while the line keeps forming and a
+     * buyer already holding seats can still pay (ADR-066). Nothing is destroyed: positions, passes,
+     * admissions and stock stay, so {@code /resume} puts everyone back where they were. Idempotent.
      */
     @PostMapping("/{eventId}/pause")
     public Map<String, Object> pause(@PathVariable long eventId) {

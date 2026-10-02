@@ -186,7 +186,8 @@ public class QueueService implements QueueFacade {
         if (window == EventWindowStatus.CLOSED) {
             return new QueueState(QueuePhase.CLOSED, null, null, null, null);
         }
-        return decide(read(sessionId, eventId, exhausted), eventId);
+        QueueState state = decide(read(sessionId, eventId, exhausted), eventId);
+        return window == EventWindowStatus.PAUSED ? state.withoutEstimate() : state;
     }
 
     /**

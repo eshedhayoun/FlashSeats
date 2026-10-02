@@ -135,9 +135,9 @@ events="$(psql_q "SELECT count(*) FROM events" || echo 0)"
 if [[ "$events" == "0" ]]; then
     ok "database is empty — CatalogDevSeeder seeds an open sale on the next boot"
 else
-    # PUBLISHED, not ACTIVE. SaleWindows.statusOf answers CLOSED for anything
-    # that is not PUBLISHED — that is how an operator's pause closes a sale for
-    # free — so PUBLISHED is exactly the set that can be open.
+    # PUBLISHED, not ACTIVE. EventRow.windowStatus answers OPEN only for a
+    # PUBLISHED event inside its window — a paused one reads PAUSED (ADR-066) —
+    # so PUBLISHED is exactly the set that can be open.
     open_now="$(psql_q "
         SELECT count(*) FROM events
          WHERE status = 'PUBLISHED'

@@ -107,7 +107,7 @@ card: what the buyer does, what authorises it, and what clock is running.
 | :-- | :--- | :--- | :--- | :--- |
 | 0 | *(operator)* seeds counters | `POST /admin/events/{id}/prewarm` | HTTP Basic, `ROLE_ADMIN` | window must be `UPCOMING` |
 | 1 | Opens the landing page | `GET /events/{id}` | — (public) | — |
-| 2 | Joins the line | `POST /queue/join` | `fsid` cookie | window must be `OPEN` |
+| 2 | Joins the line | `POST /queue/join` | `fsid` cookie | window must be `OPEN` or `PAUSED` (ADR-066) |
 | 3 | Watches their position | `GET /queue/stream` (SSE)<br>`GET /queue/status` (fallback) | `fsid` cookie | stream 1 h; position pushed every 2 s |
 | 4 | *(is promoted)* | — server-initiated | — | **pass TTL 120 s** |
 | 5 | Enters the sale | `POST /queue/admit` + `X-Queue-Pass-Token` | the pass, **spent here** | **admission TTL 600 s** |
@@ -219,7 +219,8 @@ Without this, every client's skew smears the start of the sale and the fairness 
 ordering becomes a lie (ADR-016).
 
 `windowStatus` drives the UI directly: `UPCOMING` → countdown, "Join" disabled; `OPEN` → "Join Flash
-Sale" enabled; `CLOSED` → sale-ended panel.
+Sale" enabled; `PAUSED` → "Join" still enabled, with a paused banner — **never** the sale-ended panel
+(ADR-066); `CLOSED` → sale-ended panel.
 
 `availability` is a **bucket** — `PLENTY` | `LIMITED` | `SOLD_OUT` — never an exact count. Exact live
 inventory drives panic-buying and hands scalpers a free feed (ADR-027). `maxPerOrder` is
@@ -238,8 +239,9 @@ identity before the sale opens.
    validates the reCAPTCHA score (≥ 0.5). The verdict is cached in `bot:captcha:{sid}` for 30
    minutes so the hottest endpoint in the system makes at most one outbound call to Google per
    visitor.
-2. **`catalog`** confirms `windowStatus == OPEN`. A join before the sale opens is `409`, not a
-   silent success.
+2. **`catalog`** confirms `windowStatus` is `OPEN` or `PAUSED`. A join before the sale opens is
+   `409`, not a silent success. A join while paused is accepted: nobody is promoted until the sale
+   resumes, and the line keeps its arrival order (ADR-066).
 3. **`queue`** places the user:
 
    ```
@@ -258,7 +260,9 @@ identity before the sale opens.
    | `queue-promoted` | `{passToken, expiresInSeconds: 120}` | your turn — redirect |
    | `sale-exhausted` | `{soldOutAt}` | stock gone; queue drains |
    | `tier-availability` | `{tiers:[{tierId, level}]}` | a tier crossed a bucket boundary (ADR-027) |
-   | `sale-closed` | `{saleEndTime}` | window closed |
+   | `sale-closed` | `{closedAt}` | window closed — terminal |
+   | `sale-paused` | `{}` | an operator paused the sale — **not** terminal; never retained or replayed (ADR-066) |
+   | `sale-resumed` | `{}` | the pause ended; positions move again |
    | *(comment frame)* | `:hb` | 15 s heartbeat, keeps proxies open |
 
 Reconnects send `Last-Event-ID`. If the stream cannot be established at all, the client falls back
@@ -429,7 +433,7 @@ takes card details.
  1. HoldFacade.getActiveHold(holdToken, sid)      → 404/410 if missing/expired/not yours,
                                                     unless the webhook confirmed it since step 0
  2. CatalogFacade.getTierSummary(eventId,tierId)  → price snapshot, SERVER-SIDE (ADR-013)
- 3. window gate                                   → OPEN, or CLOSED within 15 min (ADR-016)
+ 3. window gate                                   → OPEN or PAUSED, or CLOSED within 15 min (ADR-016, ADR-066)
  4. find-or-create orders row, hold_token UNIQUE, status = PENDING (ADR-002)
  ┌─ from here every exit leaves the order RESUMABLE (ADR-034) ─────────────────┐
  │ 5. HoldFacade.grantGrace(holdToken)             → once, ceiling 420s (ADR-030)
@@ -752,6 +756,7 @@ marker on the next tick with stock**. Nothing deletes the waiting set.
 | Window closed | `CLOSED` | expires with the sale | no |
 | Stock zero, no claims held | `EXHAUSTED` | untouched, positions intact | **yes** — a released hold or a rebuilt counter clears it |
 | Counter unreadable | promotion **pauses**; phase unchanged | untouched | yes, on pre-warm or rebuild |
+| Sale paused by an operator | phase unchanged, `paused: true`, no wait estimate | untouched, still accepting joins | **yes** — on resume. Exhaustion keeps un-deriving while paused, since expiring holds still return seats (ADR-066) |
 
 The third row is the one that mattered most. `SUM(remaining)` over an event with no counter rows
 returns `0`, indistinguishable from sold out — so an un-warmed sale announced itself exhausted and

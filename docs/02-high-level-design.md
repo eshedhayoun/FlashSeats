@@ -177,7 +177,7 @@ limits as the compensating control.
 
 ### `catalog` — metadata and inventory ownership
 Owns `events`, `ticket_tiers` and the Redis stock counters. Derives
-`windowStatus ∈ {UPCOMING, OPEN, CLOSED}` and publishes `serverTime` so the landing-page countdown
+`windowStatus ∈ {UPCOMING, OPEN, PAUSED, CLOSED}` and publishes `serverTime` so the landing-page countdown
 runs on the server's clock, not the device's. Seeds counters via `SETNX` **only while `UPCOMING`**,
 and owns the rebuild procedure.
 

@@ -56,7 +56,7 @@ policy, and evicting a live counter is the worst failure this system has.
 
 | Method | Path | Auth |
 | :--- | :--- | :--- |
-| `GET` | `/api/v1/events` | public — published events only |
+| `GET` | `/api/v1/events` | public — published and paused events, each with its window status |
 | `GET` | `/api/v1/events/{eventId}` | public — the landing page |
 | `POST` | `/api/v1/admin/events/{eventId}/prewarm` | `ROLE_ADMIN` |
 | `POST` | `/api/v1/admin/events/{eventId}/pause` | `ROLE_ADMIN` |

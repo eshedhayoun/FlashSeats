@@ -197,7 +197,7 @@ public class CatalogService implements CatalogFacade {
      * Idempotent. The cache eviction is published {@code AFTER_COMMIT}, so a concurrent reader cannot
      * re-cache the row before this change lands.
      *
-     * @throws com.flashseats.shared.error.FlashSeatsException {@code SALE_PAUSED} if the event is
+     * @throws com.flashseats.shared.error.FlashSeatsException {@code EVENT_NOT_PAUSABLE} if the event is
      *     {@code DRAFT} or {@code CANCELLED}
      */
     @Transactional

@@ -420,11 +420,13 @@ function openStream() {
   es.addEventListener("position-update", (e) => {
     const d = JSON.parse(e.data);
     $("q-paused").hidden = true;
+    $("q-wait").hidden = false;
     renderPosition(d.position, d.estWaitSeconds);
   });
   // Not terminal: the stream stays open and the place is kept (ADR-066).
-  es.addEventListener("sale-paused", () => { $("q-paused").hidden = false; });
-  es.addEventListener("sale-resumed", () => { $("q-paused").hidden = true; });
+  // No wait estimate while paused: the line is not moving.
+  es.addEventListener("sale-paused", () => { $("q-paused").hidden = false; $("q-wait").hidden = true; });
+  es.addEventListener("sale-resumed", () => { $("q-paused").hidden = true; $("q-wait").hidden = false; });
   es.addEventListener("queue-promoted", (e) => admit(JSON.parse(e.data).passToken));
   es.addEventListener("tier-availability", (e) => {
     const d = JSON.parse(e.data);
