@@ -3,6 +3,7 @@ package com.flashseats.notification.repository;
 import com.flashseats.notification.model.NotificationKind;
 import com.flashseats.notification.model.NotificationLog;
 import com.flashseats.notification.model.NotificationStatus;
+import java.time.Instant;
 import java.util.Optional;
 import org.springframework.data.domain.Page;
 import org.springframework.data.domain.Pageable;
@@ -63,11 +64,35 @@ public interface NotificationLogRepository extends JpaRepository<NotificationLog
             UPDATE NotificationLog n
                SET n.status = com.flashseats.notification.model.NotificationStatus.PENDING,
                    n.retryCount = n.retryCount + 1,
-                   n.failureReason = null
+                   n.failureReason = null,
+                   n.updatedAt = :now
              WHERE n.orderNumber = :orderNumber
                AND n.kind = :kind
                AND n.status = com.flashseats.notification.model.NotificationStatus.DLQ
             """)
     int reclaimDeadLettered(
-            @Param("orderNumber") String orderNumber, @Param("kind") NotificationKind kind);
+            @Param("orderNumber") String orderNumber,
+            @Param("kind") NotificationKind kind,
+            @Param("now") Instant now);
+
+    /**
+     * Dead-letters every claim that has sat {@code PENDING} since before {@code claimedBefore}: its
+     * process died between claiming and finishing (ADR-069). One conditional statement, so it is
+     * idempotent and safe on every replica at once.
+     *
+     * @return how many claims were found stranded
+     */
+    @Modifying(flushAutomatically = true)
+    @Query("""
+            UPDATE NotificationLog n
+               SET n.status = com.flashseats.notification.model.NotificationStatus.DLQ,
+                   n.failureReason = :reason,
+                   n.updatedAt = :now
+             WHERE n.status = com.flashseats.notification.model.NotificationStatus.PENDING
+               AND n.updatedAt < :claimedBefore
+            """)
+    int deadLetterStranded(
+            @Param("claimedBefore") Instant claimedBefore,
+            @Param("reason") String reason,
+            @Param("now") Instant now);
 }

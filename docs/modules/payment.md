@@ -88,7 +88,7 @@ else.
 | :--- | :--- |
 | **A card cannot be swapped mid-challenge** | While a 3-D Secure intent is outstanding, every resubmission re-reads *that* intent, so a different card in the body is ignored until the hold expires. Accepted: the alternative is a second charge against a hold that already has one in flight (ADR-054) |
 | **Checkout does not survive a Redis outage** | It opens with `SETNX payment:inflight:{holdToken}`, which fails closed. For a payment that is the right direction, but it is a written-down limitation rather than a resilience feature |
-| **A failed refund still needs a human** | It is counted in `flashseats.payment.refund.failed`, written into `failure_reason`, and the buyer is sent no "refunded" notice (ADR-064) — but nothing retries it, and nothing should, automatically |
+| **A failed refund still needs a human** | The order becomes `REFUND_FAILED`, the buyer is told the refund is with a person, it is counted in `flashseats.payment.refund.failed`, and no "refunded" notice is sent (ADR-064, ADR-069) — but nothing retries it, and nothing should, automatically |
 | **A webhook that keeps failing keeps being redelivered** | Correct, and unbounded: the claim is released every time, so a permanently broken settlement is retried on the provider's schedule until it gives up. Visible in the logs, not in a metric |
 | **Live-provider coverage is a script, not a test** | The suite runs the stub. `docker/scripts/stripe-check.sh` is the only thing that proves the real account, the real status mapping and the real webhook secret agree |
 

@@ -79,6 +79,20 @@ public final class OrderErrors {
     }
 
     /**
+     * The charge settled, the seats could not be delivered, and the provider refused the refund
+     * (ADR-069). Said plainly, because the alternative — "refunded in full" — would be a lie about the
+     * buyer's money; the failure is counted and alarmed on, so a person returns it.
+     */
+    public static FlashSeatsException refundFailed() {
+        return new FlashSeatsException(
+                        ErrorCode.REFUND_FAILED,
+                        "Your payment went through, but this purchase could not be completed and the"
+                                + " automatic refund did not go through. We have been alerted and will return"
+                                + " your money; you do not need to do anything.")
+                .with("retryable", false);
+    }
+
+    /**
      * The caller owns this order, and it has no ticket (ADR-050). Only a {@code CONFIRMED} order
      * has one: a PDF for anything else is a forgery this system printed itself. {@code PENDING} may
      * still confirm, so it alone is {@code retryable}.

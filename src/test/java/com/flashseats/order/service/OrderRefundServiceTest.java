@@ -29,7 +29,7 @@ class OrderRefundServiceTest {
         when(payments.refund("tx-1", 7_500, "hold expired"))
                 .thenReturn(new RefundResult("tx-1", true, 7_500, null));
 
-        assertThat(refunds.refund("TK-00001", "tx-1", 7_500, "hold expired")).isTrue();
+        assertThat(refunds.refund("TK-00001", "tx-1", 7_500, "hold expired")).isEqualTo(OrderRefundService.Outcome.REFUNDED);
 
         var order = inOrder(commit, payments);
         order.verify(commit).claimRefund("TK-00001", "hold expired");
@@ -43,7 +43,8 @@ class OrderRefundServiceTest {
         // The claim fails when the order is already CONFIRMED (or refunded by the other path).
         when(commit.claimRefund("TK-00004", "hold expired")).thenReturn(false);
 
-        assertThat(refunds.refund("TK-00004", "tx-4", 7_500, "hold expired")).isFalse();
+        assertThat(refunds.refund("TK-00004", "tx-4", 7_500, "hold expired"))
+                .isEqualTo(OrderRefundService.Outcome.RESOLVED_ELSEWHERE);
 
         verify(payments, never()).refund(anyString(), anyLong(), anyString());
         verify(commit, never()).recordRefunded(anyString(), anyString());
@@ -56,7 +57,8 @@ class OrderRefundServiceTest {
         when(payments.refund("tx-2", 7_500, "hold expired"))
                 .thenReturn(new RefundResult("tx-2", false, 0, "provider rejected refund"));
 
-        assertThat(refunds.refund("TK-00002", "tx-2", 7_500, "hold expired")).isTrue();
+        assertThat(refunds.refund("TK-00002", "tx-2", 7_500, "hold expired"))
+                .isEqualTo(OrderRefundService.Outcome.REFUND_FAILED);
 
         verify(commit).recordRefundFailure("TK-00002", "refund failed: provider rejected refund");
         verify(commit, never()).recordRefunded(anyString(), anyString());
@@ -67,7 +69,8 @@ class OrderRefundServiceTest {
     void aMissingLedgerRowIsCountedAndNeverAnnouncedToTheBuyer() {
         when(commit.claimRefund("TK-00003", "hold expired")).thenReturn(true);
 
-        assertThat(refunds.refund("TK-00003", null, 7_500, "hold expired")).isTrue();
+        assertThat(refunds.refund("TK-00003", null, 7_500, "hold expired"))
+                .isEqualTo(OrderRefundService.Outcome.REFUND_FAILED);
 
         verify(payments, never()).refund(anyString(), anyLong(), anyString());
         verify(commit).recordRefundFailure("TK-00003", "refund not issued: no payment transaction found");

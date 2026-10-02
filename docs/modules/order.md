@@ -112,8 +112,9 @@ answering `404`/`410` at step 1 or 5, checkout also looks for a confirmed order 
 
 **A refund is claimed, then made, then announced.** The claim moves the order to `REFUNDED` with the
 reason `refund pending: …`; the provider call comes after it; only a refund that went through queues
-the `ORDER_REFUNDED` notice, at most once. A refused one sends nothing and is counted in
-`flashseats.payment.refund.failed`.
+the `ORDER_REFUNDED` notice, at most once. A refused one moves the order on to `REFUND_FAILED`, sends
+nothing, answers the buyer `409 REFUND_FAILED`, and is counted in `flashseats.payment.refund.failed`
+(ADR-069).
 
 **`PENDING` is in-flight, never terminal** (ADR-034). The row is committed before the charge, so any
 exit that recorded no outcome would otherwise strand the buyer holding live seats behind a `409`

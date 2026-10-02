@@ -73,7 +73,9 @@ public class PaymentSettlementService {
             return;
         }
 
-        if (order.getStatus() == OrderStatus.CONFIRMED || order.getStatus() == OrderStatus.REFUNDED) {
+        if (order.getStatus() == OrderStatus.CONFIRMED
+                || order.getStatus() == OrderStatus.REFUNDED
+                || order.getStatus() == OrderStatus.REFUND_FAILED) {
             // The synchronous path already resolved this, or a previous delivery did. Nothing to do,
             // and doing it again would consume a hold that is already consumed.
             log.debug(
@@ -111,12 +113,12 @@ public class PaymentSettlementService {
                 | HoldExpiredException
                 | HoldAlreadySettledException
                 | OptimisticLockingFailureException claimLost) {
-            boolean refunded = refunds.refund(
+            OrderRefundService.Outcome outcome = refunds.refund(
                     orderNumber,
                     event.transactionReference(),
                     order.getTotalAmountCents(),
                     "webhook settled against a reservation that no longer exists");
-            if (!refunded) {
+            if (outcome == OrderRefundService.Outcome.RESOLVED_ELSEWHERE) {
                 log.info("Order {} was resolved by the checkout before its webhook; nothing to do", orderNumber);
             }
         }

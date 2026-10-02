@@ -50,6 +50,12 @@ public enum ErrorCode {
      * computing from a ledger that is moving under them is how a recovery makes things worse.
      */
     STOCK_REBUILD_IN_PROGRESS(HttpStatus.SERVICE_UNAVAILABLE),
+    /**
+     * The charge settled, the seats could not be delivered, and the provider refused the refund. Money
+     * owed to the buyer, now with a person (ADR-069). Never {@link #ORDER_REFUNDED}, which says the
+     * money is back.
+     */
+    REFUND_FAILED(HttpStatus.CONFLICT),
 
     // --- queue --------------------------------------------------------------
     QUEUE_PASS_INVALID(HttpStatus.UNAUTHORIZED),

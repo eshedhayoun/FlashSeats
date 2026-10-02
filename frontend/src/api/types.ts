@@ -7,7 +7,7 @@ export type QueueState =
   | "ADMITTED"
   | "EXHAUSTED"
   | "CLOSED";
-export type OrderStatus = "PENDING" | "CONFIRMED" | "FAILED" | "REFUNDED";
+export type OrderStatus = "PENDING" | "CONFIRMED" | "FAILED" | "REFUNDED" | "REFUND_FAILED";
 
 export type Problem = {
   type: string;

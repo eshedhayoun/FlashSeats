@@ -6,13 +6,13 @@ Guidance for Claude Code when working in this repository.
 
 FlashSeats — a high-concurrency ticket flash-sale engine. Modular monolith, Java 21, Spring Boot
 4.1.1. The **MVP is built and running**: all nine modules, the full journey from landing page to emailed
-PDF ticket, 257 tests green in any class order. **Inventory lives in Redis** (Stage 1, ADR-046): `catalog:stock:{e}:{t}`
+PDF ticket, 260 tests green in any class order. **Inventory lives in Redis** (Stage 1, ADR-046): `catalog:stock:{e}:{t}`
 is the live count and PostgreSQL keeps no copy of it. **Payment is real** (Stage 2, ADR-052-054) —
 but `flashseats.payment.stripe.enabled` is **false by default**, so `dev`, `test`, the load harness
 and every drill still run the in-process stub through the complete journey, 3-D Secure included.
 
 **Read [`docs/00-architecture-decisions.md`](docs/00-architecture-decisions.md) before changing
-anything.** It contains 68 ADRs. Most record a defect and its fix — 034-039 come from the first
+anything.** It contains 69 ADRs. Most record a defect and its fix — 034-039 come from the first
 review pass over the built code, 040-042 from the second — and several look like over-engineering
 until you read the failure they prevent. 043-045 are the exception: forward-looking decisions about
 the operator surface, buyer accounts and what health should report, with nothing built against them
@@ -34,7 +34,9 @@ promotion writes go in one pipeline, and a metadata miss loads once however many
 and nothing tells a buyer the sale has ended. **067**: a failure that proves nothing happened is
 compensated (a reserve whose transaction never began gives its seats back), and a caller's mistake is
 never a `500`. **068**: the cluster's nginx image builds and serves the React client, and
-`docker/scripts/professor-demo.sh` starts the whole demo in one command.
+`docker/scripts/professor-demo.sh` starts the whole demo in one command. **069**: a refused refund is
+`REFUND_FAILED` (never "refunded"), and a notification claim stranded by a dead process is
+dead-lettered for an operator instead of silently never sent.
 
 **The operating envelope is 3–10 concurrent sales**, not one
 ([`03-end-to-end-flow.md`](docs/03-end-to-end-flow.md) §2). Every capacity number written before
@@ -51,7 +53,7 @@ security posture, next stages, and the review-pass log. It is the doc to update 
 ## Document precedence
 
 ```
-00-architecture-decisions.md      ← highest authority (68 ADRs)
+00-architecture-decisions.md      ← highest authority (69 ADRs)
 05-global-standards.md            ← cross-cutting contract; module docs conform to it
 FE_SPEC.md                        ← client contract (repo root)
 03-end-to-end-flow.md             ← the authoritative user journey AND the operating envelope

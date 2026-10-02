@@ -11,6 +11,7 @@ import com.flashseats.hold.facade.HoldSummary;
 import com.flashseats.order.config.OrderProperties;
 import com.flashseats.order.dto.CheckoutRequest;
 import com.flashseats.order.exception.OrderErrors;
+import com.flashseats.order.model.OrderStatus;
 import com.flashseats.payment.exception.DuplicatePaymentException;
 import com.flashseats.payment.exception.PaymentErrors;
 import com.flashseats.payment.facade.AuthorizeCommand;
@@ -198,15 +199,19 @@ public class CheckoutService {
             return new CheckoutOutcome(commit.confirm(orderNumber, hold, tier, payment), false);
         } catch (HoldNotFoundException | HoldAlreadySettledException | OptimisticLockingFailureException lost) {
             log.warn("Order {} lost its hold after the charge settled; resolving from the order row", orderNumber, lost);
-            if (refunds.refund(
+            return switch (refunds.refund(
                     orderNumber,
                     payment.transactionReference(),
                     amountCents,
                     "the reservation ended before the order could be confirmed")) {
-                throw OrderErrors.refunded();
-            }
-            // Resolved by the other path: confirmed, or already refunded by it.
-            return replayIfConfirmed(holdToken).orElseThrow(OrderErrors::refunded);
+                case REFUNDED -> throw OrderErrors.refunded();
+                case REFUND_FAILED -> throw OrderErrors.refundFailed();
+                // Resolved by the other path: confirmed, or refunded by it — the row says which.
+                case RESOLVED_ELSEWHERE -> replayIfConfirmed(holdToken).orElseThrow(() ->
+                        queries.statusFor(holdToken).filter(OrderStatus.REFUND_FAILED::equals).isPresent()
+                                ? OrderErrors.refundFailed()
+                                : OrderErrors.refunded());
+            };
         }
     }
 

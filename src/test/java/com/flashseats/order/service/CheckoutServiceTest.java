@@ -84,7 +84,8 @@ class CheckoutServiceTest {
     @DisplayName("The webhook confirmed this charge first: the buyer gets the receipt, and nothing is refunded")
     void lostClaimToAConfirmationReplaysTheReceipt() {
         when(commit.confirm(ORDER, hold, tier, settled)).thenThrow(new HoldAlreadySettledException(HOLD));
-        when(refunds.refund(anyString(), any(), anyLong(), anyString())).thenReturn(false);
+        when(refunds.refund(anyString(), any(), anyLong(), anyString()))
+                .thenReturn(OrderRefundService.Outcome.RESOLVED_ELSEWHERE);
         when(queries.findConfirmedReceiptFor(HOLD)).thenReturn(Optional.empty()).thenReturn(Optional.of(receipt));
 
         CheckoutOutcome outcome = checkout.checkout("sid", request());
@@ -98,7 +99,7 @@ class CheckoutServiceTest {
     void lostClaimToAnExpiryRefunds() {
         when(commit.confirm(ORDER, hold, tier, settled)).thenThrow(new HoldAlreadySettledException(HOLD));
         when(refunds.refund(ORDER, "pt_1", 15_000, "the reservation ended before the order could be confirmed"))
-                .thenReturn(true);
+                .thenReturn(OrderRefundService.Outcome.REFUNDED);
 
         assertThatThrownBy(() -> checkout.checkout("sid", request()))
                 .isInstanceOfSatisfying(FlashSeatsException.class,
@@ -110,11 +111,24 @@ class CheckoutServiceTest {
     void orderRefundedByTheOtherPathIsReportedAsRefunded() {
         when(commit.confirm(ORDER, hold, tier, settled))
                 .thenThrow(new OptimisticLockingFailureException("Order TK-00001 is already REFUNDED"));
-        when(refunds.refund(anyString(), any(), anyLong(), anyString())).thenReturn(false);
+        when(refunds.refund(anyString(), any(), anyLong(), anyString()))
+                .thenReturn(OrderRefundService.Outcome.RESOLVED_ELSEWHERE);
 
         assertThatThrownBy(() -> checkout.checkout("sid", request()))
                 .isInstanceOfSatisfying(FlashSeatsException.class,
                         refused -> assertThat(refused.code()).isEqualTo(ErrorCode.ORDER_REFUNDED));
+    }
+
+    @Test
+    @DisplayName("A refund the provider refused is reported as such, never as refunded")
+    void aRefusedRefundIsReportedHonestly() {
+        when(commit.confirm(ORDER, hold, tier, settled)).thenThrow(new HoldAlreadySettledException(HOLD));
+        when(refunds.refund(anyString(), any(), anyLong(), anyString()))
+                .thenReturn(OrderRefundService.Outcome.REFUND_FAILED);
+
+        assertThatThrownBy(() -> checkout.checkout("sid", request()))
+                .isInstanceOfSatisfying(FlashSeatsException.class,
+                        refused -> assertThat(refused.code()).isEqualTo(ErrorCode.REFUND_FAILED));
     }
 
     @Test

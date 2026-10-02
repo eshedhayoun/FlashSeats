@@ -212,7 +212,7 @@ Findings that cost real time and would cost it again.
 ## 8. Verification
 
 ```bash
-./mvnw test        # 257 tests: unit, modularity, concurrency, journey, recovery, queue lifecycle,
+./mvnw test        # 260 tests: unit, modularity, concurrency, journey, recovery, queue lifecycle,
                    #             pre-warm, stock rebuild, drift, Redis-restart guard, the metadata
                    #             cache's five rules, the cluster admission allowance, payment and
                    #             webhooks, bot defence, and fulfilment through a real broker.
@@ -232,7 +232,7 @@ Findings that cost real time and would cost it again.
 | `SalePauseIT` | **A paused sale is paused, not over** (ADR-066): it stays listed as `PAUSED`; the line keeps forming in arrival order while nobody is promoted, then moves on resume; a hold is refused with a retryable `SALE_PAUSED` and no seat moves; a buyer already holding seats can pay; a cancelled event cannot be paused. `QueueBroadcasterTest` pins that the pause frames are never retained or fanned out and that the resume is announced once. |
 | `SettlementArbiterIT` | **A settled charge ends exactly one way** (ADR-064). A refund attempted against a confirmed purchase moves nothing; a confirmation attempted against a refunded order takes no seats; confirm and refund raced fifteen times, staggered across the whole confirm transaction, end exactly one way every round; and a retry after a commit that proved nothing confirms the charge that settled **without a second charge**. |
 | `QueueLifecycleIT` | An un-warmed event pauses promotion rather than selling out; a closed sale ends the wait instead of freezing it; a pass for one sale is never offered to another; exhaustion reverses when seats return. |
-| `NotificationClaimIT` | The claim blocks a duplicate, is terminal once sent, and releases a dead letter for replay. |
+| `NotificationClaimIT` | The claim blocks a duplicate, is terminal once sent, and releases a dead letter for replay; a claim stranded by a dead process is dead-lettered and replayable, and a fresh one is left alone (ADR-069). |
 | `NotificationListenerIT` | **Fulfilment through a real RabbitMQ and both real listeners**, the one thing the test profile's `notification.enabled=false` had left unexercised. One ticket per order even when the message is redelivered; a malformed message or a failed send goes to the DLQ after **one** attempt (ADR-029); a replay after the outage sends exactly once (ADR-038); and mail that was sent but not recorded stays `SENT`, so a replay cannot send a second ticket (ADR-042). Checked by mutation: removing that guard fails the test. |
 | `BackPressureResponseTest` | A HikariCP timeout is `503 SERVICE_BUSY` with `Retry-After`; any other transaction failure is still `500` (ADR-059). |
 | `SessionResetIT` | `POST /session/reset` refuses form and `text/plain` bodies with `415` and expires nothing; a JSON POST still works (ADR-060). |
@@ -2111,8 +2111,9 @@ rather than an archaeology.
 | **k6 keys are unique per run** | The stub ignores the checkout idempotency key, but Stripe keeps one for 24 hours and would answer a reused key with the previous run's response. The waiting-room drill also parks each VU after its one journey (a fix from the teammate's last commit), so it measures arrivals rather than a request loop |
 | **Failures are classified by what they prove** (ADR-067) | A reserve whose hold transaction never began — a pool timeout, the common failure under pressure — now gives its seats back instead of hiding them until a rebuild. An unknown path is `404 NOT_FOUND`, not `500`. The rate limiter fails open (counted in `flashseats.bot.limiter.unavailable`) instead of answering every call a bare `500` when Redis is down. Request fields are bounded by their columns, and only the hold-token constraint reads as a concurrent checkout |
 | **The cluster serves the React client; one command starts the demo** (ADR-068) | Ported from the teammate's final commits. The nginx image builds the SPA and serves it at `:8080` with a deep-link fallback, replacing nginx's own 404. `docker/scripts/professor-demo.sh` needs only Docker: secrets, build, health, and two seeded, pre-warmed sales |
+| **Money owed and mail stranded are states, not silences** (ADR-069) | A refused refund is `REFUND_FAILED` and answers `409 REFUND_FAILED` — never "refunded in full". A notification claim stranded by a process that died mid-send is dead-lettered by a sweep after 10 minutes, so it shows in the operator's DLQ and a resend works; it used to be acknowledged and never sent |
 | **A pause is a pause** (ADR-066) | A paused sale used to read `CLOSED`: buyers were told it had ended, their streams were closed, the close was **replayed after the resume**, and the event left `/events`. `PAUSED` is now a window status inside the sale window: the line keeps forming in arrival order, nobody is promoted, holds answer `409 SALE_PAUSED` (retryable), a buyer already holding seats can still pay, and `sale-paused` / `sale-resumed` are sent to each replica's own streams and never retained. The admin refusal to pause a draft is `EVENT_NOT_PAUSABLE`. A review then found two things that keep moving while paused: sold-out now un-derives during the pause when expiring holds return seats, and no wait estimate is shown while the line is not moving |
 
-**Verified so far:** 257/257 (228 + 29 new), including `SettlementArbiterIT`, which races confirm
+**Verified so far:** 260/260 (228 + 32 new), including `SettlementArbiterIT`, which races confirm
 against refund fifteen times with the refund claim staggered across the confirm transaction: both
 endings occur, and every round ends exactly one way.

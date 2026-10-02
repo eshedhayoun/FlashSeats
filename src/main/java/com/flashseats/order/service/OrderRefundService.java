@@ -19,8 +19,8 @@ import org.springframework.stereotype.Service;
  * second let a confirmation land in between, and the buyer kept the seats <em>and</em> the money.
  *
  * <p>Not {@code @Transactional}: it calls the provider (ADR-023). A refused refund leaves the order
- * {@code REFUNDED}, since the seats are gone, but sends no notice and is counted, so money we still
- * hold surfaces for a human rather than being described to the buyer as returned.
+ * {@code REFUND_FAILED}, sends no notice and is counted, so money we still hold surfaces for a human
+ * rather than being described to the buyer as returned (ADR-069).
  */
 @Slf4j
 @Service
@@ -28,6 +28,16 @@ public class OrderRefundService {
 
     /** Non-zero means money is owed to a buyer that automation could not return. Alarm on any. */
     public static final String FAILED_REFUNDS = "flashseats.payment.refund.failed";
+
+    /** How one call to {@link #refund} ended, which is what the caller tells the buyer. */
+    public enum Outcome {
+        /** The other path settling this charge got there first: confirmed it, or refunded it. */
+        RESOLVED_ELSEWHERE,
+        /** This call claimed the refund and the money went back. */
+        REFUNDED,
+        /** This call claimed the refund and the provider refused it: money owed, now with a person. */
+        REFUND_FAILED
+    }
 
     private final PaymentFacade payments;
     private final OrderCommitService commit;
@@ -45,15 +55,14 @@ public class OrderRefundService {
      * @param transactionReference this module's payment reference, or {@code null} if the ledger row
      *     could not be found — which can only happen if the charge was made by something other than
      *     this system, and is recorded rather than swallowed
-     * @return true if the order is now refunded by this call; false if the other path had already
-     *     resolved it — confirmed, or refunded — in which case no money moved here
+     * @return how it ended; {@link Outcome#RESOLVED_ELSEWHERE} means no money moved here
      */
-    public boolean refund(
+    public Outcome refund(
             String orderNumber, String transactionReference, long amountCents, String reason) {
 
         if (!commit.claimRefund(orderNumber, reason)) {
             log.info("Order {} was already resolved by the other settlement path; nothing to refund", orderNumber);
-            return false;
+            return Outcome.RESOLVED_ELSEWHERE;
         }
 
         if (transactionReference == null) {
@@ -64,7 +73,7 @@ public class OrderRefundService {
                     orderNumber,
                     amountCents);
             commit.recordRefundFailure(orderNumber, "refund not issued: no payment transaction found");
-            return true;
+            return Outcome.REFUND_FAILED;
         }
 
         log.warn(
@@ -77,7 +86,7 @@ public class OrderRefundService {
 
         if (result.succeeded()) {
             commit.recordRefunded(orderNumber, reason);
-            return true;
+            return Outcome.REFUNDED;
         }
 
         failedRefunds.increment();
@@ -88,6 +97,6 @@ public class OrderRefundService {
                 amountCents,
                 result.failureReason());
         commit.recordRefundFailure(orderNumber, "refund failed: " + result.failureReason());
-        return true;
+        return Outcome.REFUND_FAILED;
     }
 }
