@@ -92,6 +92,12 @@ backstop would throttle all of them. It is not a statement that the traffic is t
 
 ## 3a. Verification fails open, and that is the decision
 
+**So does the rate limiter** (ADR-067). The buckets live in Redis; when they cannot be read, the
+filter used to throw below every exception handler, and every API call answered a bare `500` with no
+`code`. It now lets the request through and counts it in `flashseats.bot.limiter.unavailable` — any
+non-zero rate means rate limiting is off right now. The connection pool still bounds the load, and
+nothing that sells works without Redis anyway.
+
 `POST /queue/join` is the one place a challenge is worth its cost: it is the front of the line, it is
 cheap to repeat, and a session id costs nothing to mint — so ADR-011's per-session bucket does not
 constrain a determined attacker at all. Everything after join is already gated by a queue pass and an

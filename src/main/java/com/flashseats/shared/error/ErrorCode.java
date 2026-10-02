@@ -23,6 +23,8 @@ public enum ErrorCode {
      * {@code Retry-After} header. Checkout is find-or-create, so re-POSTing the same body is safe.
      */
     SERVICE_BUSY(HttpStatus.SERVICE_UNAVAILABLE),
+    /** No endpoint or resource at this path. A caller's mistake, never a server fault (ADR-067). */
+    NOT_FOUND(HttpStatus.NOT_FOUND),
 
     // --- bot ----------------------------------------------------------------
     RATE_LIMITED(HttpStatus.TOO_MANY_REQUESTS),

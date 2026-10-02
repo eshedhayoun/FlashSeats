@@ -10,8 +10,10 @@ import com.flashseats.bot.service.BotAuditService;
 import com.flashseats.bot.service.BotMetrics;
 import com.flashseats.bot.service.IpRuleService;
 import com.flashseats.bot.service.RateLimitService;
+import com.flashseats.shared.identity.SessionId;
 import jakarta.servlet.FilterChain;
 import org.junit.jupiter.api.Test;
+import org.springframework.data.redis.RedisConnectionFailureException;
 import org.springframework.mock.web.MockHttpServletRequest;
 import org.springframework.mock.web.MockHttpServletResponse;
 import tools.jackson.databind.ObjectMapper;
@@ -190,5 +192,36 @@ class RateLimitFilterTest {
 
         verify(metrics).recordRefusal(
                 com.flashseats.bot.model.BotOutcome.RATE_LIMITED);
+    }
+
+    /**
+     * The buckets live in Redis. Unreachable, the filter threw below every exception handler and every
+     * API call answered a bare 500 with no code. It fails open now, counted (ADR-067).
+     */
+    @Test
+    void anUnreadableLimiterLetsTheRequestThroughAndSaysSo() throws Exception {
+        RateLimitService rateLimits = mock(RateLimitService.class);
+        IpRuleService ipRules = mock(IpRuleService.class);
+        BotMetrics metrics = mock(BotMetrics.class);
+        FilterChain chain = mock(FilterChain.class);
+
+        when(rateLimits.isTrustedProxy("127.0.0.1")).thenReturn(false);
+        when(rateLimits.allowSession("session-1"))
+                .thenThrow(new RedisConnectionFailureException("redis down"));
+
+        RateLimitFilter filter = new RateLimitFilter(
+                rateLimits, ipRules, mock(BotAuditService.class), metrics, mock(ObjectMapper.class));
+
+        MockHttpServletRequest request = new MockHttpServletRequest();
+        request.setRequestURI("/api/v1/events");
+        request.setRemoteAddr("127.0.0.1");
+        request.setAttribute(SessionId.REQUEST_ATTRIBUTE, "session-1");
+        MockHttpServletResponse response = new MockHttpServletResponse();
+
+        filter.doFilter(request, response, chain);
+
+        verify(chain).doFilter(request, response);
+        verify(metrics).recordLimiterUnavailable();
+        assertThat(response.getStatus()).isEqualTo(200);
     }
 }

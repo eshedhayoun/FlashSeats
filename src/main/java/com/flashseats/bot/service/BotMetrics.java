@@ -17,6 +17,7 @@ import org.springframework.stereotype.Service;
 public class BotMetrics {
 
     private final Map<BotOutcome, Counter> refusalCounters;
+    private final Counter limiterUnavailable;
 
     public BotMetrics(MeterRegistry meters) {
         this.refusalCounters = new EnumMap<>(BotOutcome.class);
@@ -24,6 +25,14 @@ public class BotMetrics {
         register(meters, BotOutcome.RATE_LIMITED);
         register(meters, BotOutcome.IP_BLOCKED);
         register(meters, BotOutcome.VERIFICATION_FAILED);
+        this.limiterUnavailable = Counter.builder("flashseats.bot.limiter.unavailable")
+                .description("Requests let through because the rate-limit buckets could not be read (ADR-067)")
+                .register(meters);
+    }
+
+    /** The limiter failed open: any non-zero rate means rate limiting is off right now. */
+    public void recordLimiterUnavailable() {
+        limiterUnavailable.increment();
     }
 
     public void recordRefusal(BotOutcome outcome) {

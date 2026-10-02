@@ -75,13 +75,17 @@ roll back**. So they are ordered and compensated.
 reserve in Redis          ← outside any transaction
 write the hold row        ← its own transaction, flushed so the constraint speaks
     on constraint failure → restore, then 409/410
+    on "never began"      → restore, then 503 SERVICE_BUSY        ← ADR-067
 publish TicketHeldEvent
     AFTER_COMMIT          → arm the hold:{token} timer
 ```
 
-**Compensation runs only on a constraint rejection**, because that is the one failure whose outcome
-is certain. A flush that violates the one-live-hold index leaves no row, so the seats are
-unambiguously ours to return. **A failure at commit is ambiguous** — the row may exist, and returning
+**Compensation runs only on a certain failure.** A flush that violates the one-live-hold index leaves
+no row, so the seats are unambiguously ours to return. So does a transaction that **never began**:
+when no pooled connection comes free, nothing reached the database. That second case used to fall
+through to drift, so under exactly the pressure the system is built for, every pool timeout on a
+reserve hid its seats from every buyer until an operator rebuilt the counter (ADR-067). **A failure
+at commit is ambiguous** — the row may exist, and returning
 seats that are still held is an oversell. Those fall through to `flashseats.stock.drift` and a
 rebuild, which is the safe direction.
 

@@ -77,4 +77,41 @@ class ProblemResponseIT extends IntegrationTest {
         assertThat(response.errorCode()).isEqualTo("ADMIN_AUTH_REQUIRED");
         assertThat(response.text("traceId")).isNotBlank();
     }
+
+    /**
+     * ADR-041's trap, one more time: with static resources served, an unknown path reaches Spring as
+     * {@code NoResourceFoundException}, and the {@code Exception} backstop answered it {@code 500
+     * INTERNAL_ERROR} with an {@code ERROR} log line — a typo reported as an outage (ADR-067).
+     */
+    @Test
+    @DisplayName("An unknown path is 404 NOT_FOUND, not 500")
+    void anUnknownPathIsNotAServerFault() {
+        var response = new BuyerSession(port).get("/no-such-endpoint");
+
+        assertThat(response.status()).isEqualTo(404);
+        assertThat(response.errorCode()).isEqualTo("NOT_FOUND");
+        assertThat(response.text("traceId")).isNotBlank();
+    }
+
+    /**
+     * The limits are the columns the values land in. An idempotency key longer than its column used
+     * to fail its insert on every retry as a 500 (ADR-067).
+     */
+    @Test
+    @DisplayName("Oversized checkout input is 400 VALIDATION_FAILED, before anything is written")
+    void oversizedInputIsAClientError() {
+        var response = new BuyerSession(port).post(
+                "/orders/checkout",
+                Map.of(
+                        "holdToken", "hld-1",
+                        "userEmail", "a".repeat(250) + "@example.com",
+                        "paymentMethodId", "pm_card_visa",
+                        "idempotencyKey", "k".repeat(65)));
+
+        assertThat(response.status()).isEqualTo(400);
+        assertThat(response.errorCode()).isEqualTo("VALIDATION_FAILED");
+        assertThat(response.json().get("violations").toString())
+                .contains("idempotencyKey")
+                .contains("userEmail");
+    }
 }

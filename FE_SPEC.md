@@ -410,7 +410,7 @@ Base `/api/v1`. `fsid` is an `HttpOnly` cookie — **JavaScript never reads or s
 | V3 | `POST` | `/holds` | `X-Admission-Token` | `{eventId, tierId, quantity}` | `201` | `INSUFFICIENT_STOCK`, `QUANTITY_EXCEEDS_LIMIT`, `HOLD_LIMIT_EXCEEDED`, `ADMISSION_EXPIRED`, `INVENTORY_UNAVAILABLE`, `SALE_PAUSED` (retryable: keep the buyer on V3 and let them try again once the sale resumes) |
 | V4 | `GET` | `/holds/{holdToken}` | — | — | `200` | `HOLD_NOT_FOUND`, `HOLD_EXPIRED` |
 | V4 | `DELETE` | `/holds/{holdToken}` | — | — | `204` | `HOLD_NOT_FOUND` |
-| V4 | `POST` | `/orders/checkout` | — | `{holdToken, userEmail, paymentMethodId, idempotencyKey}` | `201`/`200` | `PAYMENT_DECLINED`, `PAYMENT_ATTEMPTS_EXHAUSTED`, `HOLD_EXPIRED`, `DUPLICATE_PAYMENT`, `PAYMENT_GATEWAY_UNAVAILABLE`, `CHECKOUT_WINDOW_CLOSED`, `INSUFFICIENT_TIME_REMAINING`, `ORDER_REFUNDED`, `SERVICE_BUSY` |
+| V4 | `POST` | `/orders/checkout` | — | `{holdToken, userEmail, paymentMethodId, idempotencyKey}` — at most 64, 255, 255 and 64 characters (`400 VALIDATION_FAILED` beyond) | `201`/`200` | `PAYMENT_DECLINED`, `PAYMENT_ATTEMPTS_EXHAUSTED`, `HOLD_EXPIRED`, `DUPLICATE_PAYMENT`, `PAYMENT_GATEWAY_UNAVAILABLE`, `CHECKOUT_WINDOW_CLOSED`, `INSUFFICIENT_TIME_REMAINING`, `ORDER_REFUNDED`, `SERVICE_BUSY` |
 | V5 | `GET` | `/orders/{orderNumber}?receiptToken=` | — | — | `200` | `ORDER_NOT_FOUND` |
 | V5 | `GET` | `/orders/{orderNumber}/ticket.pdf?receiptToken=` | `Accept: application/pdf, application/problem+json` | — | `200` | `ORDER_NOT_FOUND`, `TICKET_NOT_AVAILABLE` |
 | — | `POST` | `/session/reset` | `Content-Type: application/json` (required) | `{}` | `204` | `VALIDATION_FAILED` (`415`, any other content type) |
