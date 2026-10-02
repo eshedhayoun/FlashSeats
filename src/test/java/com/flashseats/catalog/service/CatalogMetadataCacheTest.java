@@ -24,6 +24,10 @@ import java.time.ZoneId;
 import java.time.ZoneOffset;
 import java.util.List;
 import java.util.Optional;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
 import org.junit.jupiter.api.Test;
 
 /**
@@ -133,6 +137,29 @@ class CatalogMetadataCacheTest {
 
         verify(tiers, times(1)).findByEventIdOrderByPriceCentsDesc(1L);
         verifyNoMoreInteractions(events);
+    }
+
+    @Test
+    void loadsOneMetadataEntryOnceWhenRequestsArriveTogether() throws Exception {
+        CountDownLatch loaderStarted = new CountDownLatch(1);
+        CountDownLatch releaseLoader = new CountDownLatch(1);
+        when(events.findById(1L)).thenAnswer(invocation -> {
+            loaderStarted.countDown();
+            assertThat(releaseLoader.await(5, TimeUnit.SECONDS)).isTrue();
+            return Optional.of(event());
+        });
+
+        try (ExecutorService workers = Executors.newFixedThreadPool(2)) {
+            var first = workers.submit(() -> metadata.event(1L));
+            assertThat(loaderStarted.await(5, TimeUnit.SECONDS)).isTrue();
+            var second = workers.submit(() -> metadata.event(1L));
+            releaseLoader.countDown();
+
+            assertThat(first.get(5, TimeUnit.SECONDS).title()).isEqualTo("Cache Fest");
+            assertThat(second.get(5, TimeUnit.SECONDS).title()).isEqualTo("Cache Fest");
+        }
+
+        verify(events, times(1)).findById(1L);
     }
 
     private Event event() {
