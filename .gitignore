@@ -62,3 +62,8 @@ frontend/.env.*.local
 # carried Probe.java, its .class file and a Windows `cp.txt` into the repo root.
 *.class
 cp.txt
+
+# Claude Code's per-checkout settings. Its permission allow-list records the exact
+# commands that were approved, and one of them exported the admin plaintext, so
+# `git add .` would have committed a live credential.
+.claude/
