@@ -143,7 +143,7 @@ That is what makes `noeviction` a correctness setting rather than a tuning one.
 | :--- | :--- |
 | [`README.md`](../README.md), then **this file** | first, always |
 | [`03-end-to-end-flow.md`](03-end-to-end-flow.md) | the authoritative journey and the 3–10 concurrent-sale operating envelope |
-| [`00-architecture-decisions.md`](00-architecture-decisions.md) | before changing a decision. 67 ADRs; most record a defect and its fix |
+| [`00-architecture-decisions.md`](00-architecture-decisions.md) | before changing a decision. 68 ADRs; most record a defect and its fix |
 | [`05-global-standards.md`](05-global-standards.md) | the cross-cutting contract — error registry, transaction rules, facade rules |
 | [`FE_SPEC.md`](../FE_SPEC.md) | the client contract |
 | [`modules/*.md`](modules/) | one page per module: owns / exposes / never |

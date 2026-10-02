@@ -2418,9 +2418,9 @@ reuses it across retries, as `FE_SPEC` §3 has always specified; as merged it mi
 attempt, which opens a second PaymentIntent — the failure ADR-054 exists to prevent, approached from
 the other side.
 
-**The SPA is not wired into the cluster**, deliberately and for now: `npm run dev` proxies to
-`:8080`, nginx serves no static root, and the demo client at `src/main/resources/static` remains what
-the cluster serves. Wiring it touches `nginx.conf`, which is correctness rather than tuning, and it
+**The SPA is not wired into the cluster**, deliberately and for now *(superseded by ADR-068: the
+nginx image now builds and serves it)*: `npm run dev` proxies to `:8080`, nginx serves no static root,
+and the demo client at `src/main/resources/static` remains what the cluster serves. Wiring it touches `nginx.conf`, which is correctness rather than tuning, and it
 deserves its own pass.
 
 **57 MB of `node_modules`, `frontend/dist`, four `tsc` outputs and five scratch files** were tracked,
@@ -2866,4 +2866,36 @@ framework exception named before the backstop).
 "Nothing reached the database" is as certain as a constraint rejection; "the caller sent something
 wrong" is never a server fault; and a component that sheds load must not become a source of `500`s when
 its own store is down.
+
+---
+
+## ADR-068 — The cluster serves the React client, and one command starts the whole demo
+
+**Status:** accepted, Pass 15. Supersedes the "not wired into the cluster" paragraph of ADR-058.
+Built by a teammate on `shoham-preview-fixup`, reviewed and ported here.
+
+**Context.** The React client implements `FE_SPEC.md`, but only `npm run dev` served it: nginx had no
+`location /`, so `http://localhost:8080/` under `--profile cluster` was nginx's own 404 page, and the
+documents disagreed about which client a reader should open. An evaluator also had to install Java,
+Maven and Node, generate secrets, start the cluster, seed a sale and pre-warm it — eight steps, any
+one of which fails silently if skipped.
+
+**Decision.**
+
+1. **The nginx image builds the client.** `docker/nginx/Dockerfile` runs `npm ci && npm run build` in
+   a Node stage and copies `dist/` into the nginx stage. `location /` serves it with an
+   `index.html` fallback, so deep links such as `/events/9101/checkout` reach the router. The API,
+   the SSE stream and health keep their own, more specific locations, and the client calls them on
+   the same origin — no CORS, no proxy. The build sets no Stripe key, so the packaged client drives
+   the stub gateway, which is what the backend runs by default.
+2. **`docker/scripts/professor-demo.sh` is the evaluator's one command.** It needs only Docker and a
+   POSIX shell: it generates secrets (and a fresh admin password if it cannot otherwise read one),
+   builds and starts the cluster, waits for health through nginx, and runs `docker/seed/seed-demo.sh`,
+   which seeds two sales (events 9101 and 9102), pre-warms them while `UPCOMING`, and waits for both
+   to open. `--reset` wipes the volumes first.
+3. **The bundled page at `src/main/resources/static` stays** — it is what `./mvnw spring-boot:run`
+   serves at `:8080` in development — and is labelled as the minimal demo it is.
+
+**What it costs.** `frontend/` is now in the Docker build context (its `node_modules` and `dist` are
+not), and the first `--build` runs an `npm ci`. Both are paid once per image, not per request.
 

@@ -12,7 +12,7 @@ but `flashseats.payment.stripe.enabled` is **false by default**, so `dev`, `test
 and every drill still run the in-process stub through the complete journey, 3-D Secure included.
 
 **Read [`docs/00-architecture-decisions.md`](docs/00-architecture-decisions.md) before changing
-anything.** It contains 67 ADRs. Most record a defect and its fix — 034-039 come from the first
+anything.** It contains 68 ADRs. Most record a defect and its fix — 034-039 come from the first
 review pass over the built code, 040-042 from the second — and several look like over-engineering
 until you read the failure they prevent. 043-045 are the exception: forward-looking decisions about
 the operator surface, buyer accounts and what health should report, with nothing built against them
@@ -33,7 +33,8 @@ promotion writes go in one pipeline, and a metadata miss loads once however many
 **066**: a pause is its own window status — the line keeps forming, holds wait, payment continues,
 and nothing tells a buyer the sale has ended. **067**: a failure that proves nothing happened is
 compensated (a reserve whose transaction never began gives its seats back), and a caller's mistake is
-never a `500`.
+never a `500`. **068**: the cluster's nginx image builds and serves the React client, and
+`docker/scripts/professor-demo.sh` starts the whole demo in one command.
 
 **The operating envelope is 3–10 concurrent sales**, not one
 ([`03-end-to-end-flow.md`](docs/03-end-to-end-flow.md) §2). Every capacity number written before
@@ -50,7 +51,7 @@ security posture, next stages, and the review-pass log. It is the doc to update 
 ## Document precedence
 
 ```
-00-architecture-decisions.md      ← highest authority (67 ADRs)
+00-architecture-decisions.md      ← highest authority (68 ADRs)
 05-global-standards.md            ← cross-cutting contract; module docs conform to it
 FE_SPEC.md                        ← client contract (repo root)
 03-end-to-end-flow.md             ← the authoritative user journey AND the operating envelope
@@ -391,8 +392,12 @@ docker/scripts/sentinel-failover-check.sh        # PROVE Sentinel promotes a rep
 docker/scripts/redis-master-cli.sh               # redis-cli against whichever node Sentinel calls
                                                  # the primary right now
 
-# The SPA. Dev-only: nginx serves no static root and there is no compose
-# service, so the cluster still serves src/main/resources/static (ADR-058).
+# The evaluator's one command: secrets, cluster build, health wait, two seeded
+# and pre-warmed sales (9101, 9102). Needs only Docker and a POSIX shell.
+docker/scripts/professor-demo.sh                 # --reset wipes the volumes first (ADR-068)
+
+# The SPA. The cluster's nginx image builds it and serves it at :8080 (ADR-068);
+# for development run it on its own:
 cd frontend && npm install && npm run dev        # :5173, proxies /api to :8080.
                                                  # cp .env.example .env.local and LEAVE THE STRIPE
                                                  # KEY BLANK to drive the stub gateway, which is

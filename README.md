@@ -16,7 +16,7 @@ Read in this order:
 | Document | What it covers |
 | :--- | :--- |
 | [`docs/07-system-on-one-page.md`](docs/07-system-on-one-page.md) | **Read first.** The whole system on one page — journey, module graph, checkout sequence, where each concept lives, and what looks removable but is not |
-| [`docs/00-architecture-decisions.md`](docs/00-architecture-decisions.md) | 67 ADRs — every non-obvious decision and the failure it prevents. Read before changing a decision |
+| [`docs/00-architecture-decisions.md`](docs/00-architecture-decisions.md) | 68 ADRs — every non-obvious decision and the failure it prevents. Read before changing a decision |
 | [`docs/01-system-architecture.md`](docs/01-system-architecture.md) | Stack, module map, dependency graph, deployment |
 | [`docs/02-high-level-design.md`](docs/02-high-level-design.md) | Infrastructure and the concurrency model |
 | [`docs/03-end-to-end-flow.md`](docs/03-end-to-end-flow.md) | **The authoritative user journey**, step by step |
@@ -239,8 +239,8 @@ declines and **keeps your seats**, `pm_card_error` fails the provider. The email
 
 ### The React client
 
-A second client implements [`FE_SPEC.md`](FE_SPEC.md) in full. It runs against the same backend and
-is **development-only** — nginx serves no static root and the cluster still serves the demo client.
+The React client implements [`FE_SPEC.md`](FE_SPEC.md). Under `--profile cluster` the nginx image
+builds it and serves it at `:8080` (ADR-068); for development, run it on its own:
 
 ```bash
 cd frontend
