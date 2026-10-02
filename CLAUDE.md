@@ -6,13 +6,13 @@ Guidance for Claude Code when working in this repository.
 
 FlashSeats — a high-concurrency ticket flash-sale engine. Modular monolith, Java 21, Spring Boot
 4.1.1. The **MVP is built and running**: all nine modules, the full journey from landing page to emailed
-PDF ticket, 269 tests green in any class order. **Inventory lives in Redis** (Stage 1, ADR-046): `catalog:stock:{e}:{t}`
+PDF ticket, 274 tests green in any class order. **Inventory lives in Redis** (Stage 1, ADR-046): `catalog:stock:{e}:{t}`
 is the live count and PostgreSQL keeps no copy of it. **Payment is real** (Stage 2, ADR-052-054) —
 but `flashseats.payment.stripe.enabled` is **false by default**, so `dev`, `test`, the load harness
 and every drill still run the in-process stub through the complete journey, 3-D Secure included.
 
 **Read [`docs/00-architecture-decisions.md`](docs/00-architecture-decisions.md) before changing
-anything.** It contains 73 ADRs. Most record a defect and its fix — 034-039 come from the first
+anything.** It contains 74 ADRs. Most record a defect and its fix — 034-039 come from the first
 review pass over the built code, 040-042 from the second — and several look like over-engineering
 until you read the failure they prevent. 043-045 are the exception: forward-looking decisions about
 the operator surface, buyer accounts and what health should report, with nothing built against them
@@ -41,7 +41,9 @@ per sale, and a frame reaches only the sale it is about. **071**: the client's a
 right-most `X-Forwarded-For` entry nobody we trust appended — `native` forward headers, never
 `framework`. **072**: a charge is tried once inside the hold's clock (25 s worst case under the 45 s
 guarantee); only a refund is retried in-process. **073**: Sentinel and the data nodes agree on the
-primary after every start, and a replica stranded on a demoted node reconnects by itself.
+primary after every start, and a replica stranded on a demoted node reconnects by itself. **074**:
+the provider's idempotency key is scoped to the attempt, finishing a charge is never refused for time,
+and the webhook records a settlement on the ledger.
 
 **The operating envelope is 3–10 concurrent sales**, not one
 ([`03-end-to-end-flow.md`](docs/03-end-to-end-flow.md) §2). Every capacity number written before
@@ -58,7 +60,7 @@ security posture, next stages, and the review-pass log. It is the doc to update 
 ## Document precedence
 
 ```
-00-architecture-decisions.md      ← highest authority (73 ADRs)
+00-architecture-decisions.md      ← highest authority (74 ADRs)
 05-global-standards.md            ← cross-cutting contract; module docs conform to it
 FE_SPEC.md                        ← client contract (repo root)
 03-end-to-end-flow.md             ← the authoritative user journey AND the operating envelope
@@ -293,6 +295,7 @@ Do not reintroduce these — each cost a real defect in the first pass:
 | **Writing an audit row synchronously on a refusal path** | Every row is written on a path an attacker controls the rate of, so a synchronous insert lets them convert their own `429`s into database load during the sale. Bounded queue, **discard** policy: evidence is not worth an outage (ADR-055) |
 | **Refusing a request because the challenge provider was unreachable** | It fails at peak load, because that is when the provider is busiest too — so the failure mode is "the sale closes at exactly the wrong moment". Fail open and audit the degradation (ADR-011, ADR-055) |
 | **Deriving a "random" queue draw from the session id** | Idempotent and *precomputable*: ids are free to mint, so a bot grinds candidates offline until it holds a low draw. `ZADD NX` already makes a fresh draw idempotent (ADR-024) |
+| **Forwarding the client's one idempotency key on every new charge** | Right for a retry of one attempt, wrong across attempts: Stripe replays a key's first answer, and refuses it with different parameters. The second card after a decline got the first card's decline, or an idempotency error counted as a provider outage. Scope the provider key to the attempt (ADR-074) |
 | **Reusing one provider idempotency key across a 3-D Secure resume** | The client mints ONE key per hold and reuses it on every retry, so a second `charge` replays the cached `requires_action` response **for ever** and the buyer can never finish. Varying the key per attempt is worse: it opens a *second* intent, so they authenticate one payment and are billed for two. Retrieve the existing intent (ADR-054) |
 | **Letting a webhook claim survive a failed settlement** | The provider redelivers, the claim says "already handled", and the buyer's settled charge never reaches an order. ADR-038's rule in a new place: `processed_at IS NULL` must mean *in flight*, and a failure must leave **no row at all** (ADR-053) |
 | **Binding a webhook body to a DTO before verifying its signature** | The signature is over the *bytes*, not the meaning. Jackson round-tripping an equivalent object changes key order and whitespace, so every legitimate delivery fails verification — and the fix looks like a provider bug for as long as you believe the JSON is the same |

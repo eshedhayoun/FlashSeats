@@ -122,7 +122,7 @@ public class CheckoutService {
             // 5. The one grace extension. Idempotent across retries; throws if the hold has been
             //    settled by a concurrent expiry — in which case we must NOT charge (ADR-023).
             Instant expiresAt = holds.grantGrace(request.holdToken());
-            requireTimeToComplete(expiresAt);
+            requireTimeToComplete(expiresAt, request.holdToken());
 
             // 6. Money moves here, with no transaction open. A retry after an ambiguous failure gets
             //    the charge that already settled back, not a second one (ADR-064).
@@ -246,10 +246,15 @@ public class CheckoutService {
      * <p>Telling the buyer plainly that there is not enough time is better than charging them and
      * then discovering the seats are gone — that path exists, but it ends in a refund and a
      * confusing bank statement.
+     *
+     * <p>A re-POST that <em>completes</em> a charge starts nothing — finishing 3-D Secure, or retrying
+     * after a commit that proved nothing — so it is not held to the same budget. Refusing it answered
+     * "nothing was charged" about money that had moved (ADR-074). Asked only when time is short, so
+     * the common checkout pays for no extra read.
      */
-    private void requireTimeToComplete(Instant expiresAt) {
+    private void requireTimeToComplete(Instant expiresAt, String holdToken) {
         long secondsLeft = Duration.between(clock.instant(), expiresAt).getSeconds();
-        if (secondsLeft < properties.getMinRemainingSecondsForRetry()) {
+        if (secondsLeft < properties.getMinRemainingSecondsForRetry() && !payments.hasChargeFor(holdToken)) {
             throw OrderErrors.insufficientTimeRemaining(expiresAt);
         }
     }

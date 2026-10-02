@@ -122,18 +122,49 @@ public class PaymentTransactionStore {
                 .map(PaymentTransaction::getTransactionReference);
     }
 
+    /** See {@code PaymentFacade.hasChargeFor}: the same lookup a checkout's attempt opens with. */
+    @Transactional(propagation = Propagation.REQUIRES_NEW, readOnly = true)
+    public boolean hasChargeFor(String holdToken) {
+        return transactions
+                .findFirstByHoldTokenAndStatusInOrderByIdDesc(
+                        holdToken, EnumSet.of(PaymentStatus.PROCESSING, PaymentStatus.SUCCEEDED))
+                .filter(transaction -> transaction.getGatewayReference() != null)
+                .isPresent();
+    }
+
+    /**
+     * The provider says this charge settled: record it, unless the row has already moved on (ADR-074).
+     * A charge that settled through 3-D Secure was otherwise left {@code PROCESSING} for ever when the
+     * buyer never came back — the webhook confirmed the order and the ledger never heard. Links the
+     * intent id too, for a webhook that arrived before the checkout recorded it.
+     */
+    @Transactional(propagation = Propagation.REQUIRES_NEW)
+    public void recordSettled(String transactionReference, String gatewayReference) {
+        transactions.findByTransactionReference(transactionReference).ifPresent(transaction -> {
+            if (transaction.getStatus() == PaymentStatus.INITIATED
+                    || transaction.getStatus() == PaymentStatus.PROCESSING) {
+                transaction.setStatus(PaymentStatus.SUCCEEDED);
+            }
+            if (transaction.getGatewayReference() == null) {
+                transaction.setGatewayReference(gatewayReference);
+            }
+        });
+    }
+
     /**
      * This module's reference for a settled intent the ledger has not linked yet.
      *
      * <p>The provider sends the webhook the moment the charge succeeds, which can be before the checkout
      * that made it has recorded the intent id. The attempt row exists from the moment the charge
-     * started, though, and it is the hold's newest one still waiting for an intent id. Without this, a
-     * webhook that has to refund would find no ledger row and refund nothing.
+     * started, though, and it is the hold's newest one still in flight — {@code INITIATED}, not a
+     * declined attempt, which also carries no intent id. Without this, a webhook that has to refund
+     * would find no ledger row and refund nothing.
      */
     @Transactional(propagation = Propagation.REQUIRES_NEW, readOnly = true)
     public Optional<String> referenceForUnlinkedAttempt(String holdToken) {
         return transactions
-                .findFirstByHoldTokenAndGatewayReferenceIsNullOrderByIdDesc(holdToken)
+                .findFirstByHoldTokenAndGatewayReferenceIsNullAndStatusOrderByIdDesc(
+                        holdToken, PaymentStatus.INITIATED)
                 .map(PaymentTransaction::getTransactionReference);
     }
 

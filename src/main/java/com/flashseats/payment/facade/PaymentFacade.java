@@ -25,6 +25,13 @@ public interface PaymentFacade {
     PaymentResult authorize(AuthorizeCommand command);
 
     /**
+     * Whether this hold already has a charge that a checkout would <em>complete</em> rather than start:
+     * one authenticating 3-D Secure, or one that settled. Checkout asks only when a hold is too close to
+     * expiry to start a charge, so finishing one that exists is not refused as if it were new (ADR-074).
+     */
+    boolean hasChargeFor(String holdToken);
+
+    /**
      * Refunds a settled charge. Used when the money moved but the seats cannot be delivered — the
      * commit failed, or a concurrent expiry gave the seats away (ADR-012).
      */

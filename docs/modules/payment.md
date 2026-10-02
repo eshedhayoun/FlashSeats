@@ -30,6 +30,12 @@ facade.** Adding one would make the graph cyclic, because `order → payment` al
 that sends a fresh key per retry — or none — would otherwise bypass it entirely. The hold token is
 the one value that identifies "this purchase" and that the client cannot mint.
 
+**The provider sees the client's key scoped to the attempt** — `{key}:{attempt}` (ADR-074). A retry of
+one attempt repeats the request, so the provider replays its answer; a new card after a decline is a
+new attempt, so it is a new request rather than a replayed decline or an idempotency error. **The
+webhook records a settlement on the ledger**, so a 3-D Secure charge the buyer never came back to
+finish does not stay `PROCESSING` for ever.
+
 **A hold is charged at most once** (ADR-064). Opening an attempt first looks for the hold's newest
 attempt that is either authenticating or already settled: an intent awaiting 3-D Secure is resumed
 (ADR-054), and a charge that already succeeded and was not refunded is **handed back instead of
