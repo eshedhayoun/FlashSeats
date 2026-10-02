@@ -1,8 +1,12 @@
 package com.flashseats.order.repository;
 
 import com.flashseats.order.model.Order;
+import com.flashseats.order.model.OrderStatus;
+import java.time.Instant;
+import java.util.Collection;
 import java.util.Optional;
 import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.data.jpa.repository.Modifying;
 import org.springframework.data.jpa.repository.Query;
 import org.springframework.data.repository.query.Param;
 
@@ -11,6 +15,54 @@ public interface OrderRepository extends JpaRepository<Order, Long> {
     Optional<Order> findByHoldToken(String holdToken);
 
     Optional<Order> findByOrderNumber(String orderNumber);
+
+    /**
+     * Moves an order to {@code to} only if it is still in one of {@code from} (ADR-064). This is how
+     * a settled charge's ending is decided: confirming requires the same row, so a refund claimed
+     * here can no longer be confirmed, and a confirmed order can no longer be claimed.
+     *
+     * <p>It bumps {@code version} itself, because a bulk update bypasses the entity: an {@code Order}
+     * loaded before this ran must fail its own flush rather than write over it. No
+     * {@code clearAutomatically}, for the reason {@code TicketHoldRepository.settle} gives.
+     *
+     * @return 1 if this caller made the transition, 0 if the order had already moved on
+     */
+    @Modifying(flushAutomatically = true)
+    @Query("""
+            UPDATE Order o
+               SET o.status = :to,
+                   o.failureReason = :reason,
+                   o.version = o.version + 1,
+                   o.updatedAt = :now
+             WHERE o.orderNumber = :orderNumber
+               AND o.status IN :from
+            """)
+    int transition(
+            @Param("orderNumber") String orderNumber,
+            @Param("from") Collection<OrderStatus> from,
+            @Param("to") OrderStatus to,
+            @Param("reason") String reason,
+            @Param("now") Instant now);
+
+    /**
+     * Puts a {@code FAILED} or stranded order back in flight, if nobody has touched it since it was
+     * read. Two retries racing to resume the same order both read the same version; one wins.
+     *
+     * @return 1 if this caller resumed it, 0 if another request got there first
+     */
+    @Modifying(flushAutomatically = true)
+    @Query("""
+            UPDATE Order o
+               SET o.status = com.flashseats.order.model.OrderStatus.PENDING,
+                   o.version = o.version + 1,
+                   o.updatedAt = :now
+             WHERE o.orderNumber = :orderNumber
+               AND o.version = :version
+            """)
+    int resume(
+            @Param("orderNumber") String orderNumber,
+            @Param("version") long version,
+            @Param("now") Instant now);
 
     /**
      * This session's most recent order for an event, <strong>whatever its status</strong>.

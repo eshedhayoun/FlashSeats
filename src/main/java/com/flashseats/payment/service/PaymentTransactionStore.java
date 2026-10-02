@@ -5,6 +5,7 @@ import com.flashseats.payment.gateway.GatewayResult;
 import com.flashseats.payment.model.PaymentStatus;
 import com.flashseats.payment.model.PaymentTransaction;
 import com.flashseats.payment.repository.PaymentTransactionRepository;
+import java.util.EnumSet;
 import java.util.Optional;
 import java.util.UUID;
 import org.springframework.stereotype.Component;
@@ -26,19 +27,20 @@ public class PaymentTransactionStore {
     }
 
     /**
-     * Opens one charge attempt: resume the intent this hold is authenticating, or record a new one. It
-     * is one transaction, not two, so the 3-D Secure minority adds no transaction to every checkout
-     * (ADR-049, ADR-051).
+     * Opens one charge attempt: hand back the charge this hold already settled, resume the intent it
+     * is authenticating, or record a new one. It is one query and one transaction, not three, so
+     * neither minority adds work to every checkout (ADR-049, ADR-051).
      */
     @Transactional(propagation = Propagation.REQUIRES_NEW)
     public ChargeAttempt beginAttempt(AuthorizeCommand command) {
-        Optional<PaymentTransaction> resumable = transactions
-                .findFirstByHoldTokenAndStatusOrderByIdDesc(command.holdToken(), PaymentStatus.PROCESSING)
-                .filter(transaction -> transaction.getGatewayReference() != null);
+        Optional<PaymentTransaction> latest = transactions.findFirstByHoldTokenAndStatusInOrderByIdDesc(
+                command.holdToken(), EnumSet.of(PaymentStatus.PROCESSING, PaymentStatus.SUCCEEDED));
 
-        if (resumable.isPresent()) {
-            PaymentTransaction pending = resumable.get();
-            return new ChargeAttempt(pending.getTransactionReference(), pending.getGatewayReference());
+        if (latest.isPresent() && latest.get().getGatewayReference() != null) {
+            PaymentTransaction existing = latest.get();
+            return existing.getStatus() == PaymentStatus.SUCCEEDED
+                    ? ChargeAttempt.settled(existing.getTransactionReference(), existing.getGatewayReference())
+                    : ChargeAttempt.resume(existing.getTransactionReference(), existing.getGatewayReference());
         }
 
         PaymentTransaction transaction = new PaymentTransaction(
@@ -50,7 +52,7 @@ public class PaymentTransactionStore {
                 command.currency(),
                 command.clientIdempotencyKey(),
                 command.attemptNumber());
-        return new ChargeAttempt(transactions.save(transaction).getTransactionReference(), null);
+        return ChargeAttempt.fresh(transactions.save(transaction).getTransactionReference());
     }
 
     /**
@@ -117,6 +119,21 @@ public class PaymentTransactionStore {
     public Optional<String> referenceForGateway(String gatewayReference) {
         return transactions
                 .findByGatewayReference(gatewayReference)
+                .map(PaymentTransaction::getTransactionReference);
+    }
+
+    /**
+     * This module's reference for a settled intent the ledger has not linked yet.
+     *
+     * <p>The provider sends the webhook the moment the charge succeeds, which can be before the checkout
+     * that made it has recorded the intent id. The attempt row exists from the moment the charge
+     * started, though, and it is the hold's newest one still waiting for an intent id. Without this, a
+     * webhook that has to refund would find no ledger row and refund nothing.
+     */
+    @Transactional(propagation = Propagation.REQUIRES_NEW, readOnly = true)
+    public Optional<String> referenceForUnlinkedAttempt(String holdToken) {
+        return transactions
+                .findFirstByHoldTokenAndGatewayReferenceIsNullOrderByIdDesc(holdToken)
                 .map(PaymentTransaction::getTransactionReference);
     }
 

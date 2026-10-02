@@ -49,8 +49,8 @@ class PaymentMetricsTest {
     @Test
     void countsEachOutcomeSeparately() {
         when(store.beginAttempt(any())).thenReturn(
-                new ChargeAttempt("tx_success", null),
-                new ChargeAttempt("tx_declined", null));
+                ChargeAttempt.fresh("tx_success"),
+                ChargeAttempt.fresh("tx_declined"));
         when(gateway.charge(any()))
                 .thenReturn(GatewayResult.succeeded("ch_success"))
                 .thenReturn(GatewayResult.declined("card_declined", "declined"));
@@ -64,7 +64,7 @@ class PaymentMetricsTest {
 
     @Test
     void countsAGatewayErrorAsAnError_notADecline() {
-        when(store.beginAttempt(any())).thenReturn(new ChargeAttempt("tx_error", null));
+        when(store.beginAttempt(any())).thenReturn(ChargeAttempt.fresh("tx_error"));
         when(gateway.charge(any())).thenReturn(GatewayResult.error("unavailable", "offline"));
 
         assertThatThrownBy(() -> payments.authorize(command("order-1", "hold-1")))
@@ -80,7 +80,7 @@ class PaymentMetricsTest {
     @Test
     void redisCleanupFailureDoesNotReplaceASuccessfulPaymentResult() {
         when(store.beginAttempt(any()))
-                .thenReturn(new ChargeAttempt("tx_success", null));
+                .thenReturn(ChargeAttempt.fresh("tx_success"));
 
         when(gateway.charge(any()))
                 .thenReturn(GatewayResult.succeeded("ch_success"));
@@ -110,7 +110,7 @@ class PaymentMetricsTest {
     @Test
     void forwardsTheExactChargeAndIdempotencyDataToTheGateway() {
         when(store.beginAttempt(any()))
-                .thenReturn(new ChargeAttempt("tx_success", null));
+                .thenReturn(ChargeAttempt.fresh("tx_success"));
 
         when(gateway.charge(any()))
                 .thenReturn(GatewayResult.succeeded("ch_success"));
@@ -144,7 +144,7 @@ class PaymentMetricsTest {
     @Test
     void failedResumeRetrievalDoesNotStartASecondCharge() {
         when(store.beginAttempt(any()))
-                .thenReturn(new ChargeAttempt("tx_existing", "pi_existing"));
+                .thenReturn(ChargeAttempt.resume("tx_existing", "pi_existing"));
 
         when(gateway.retrieve("pi_existing"))
                 .thenReturn(

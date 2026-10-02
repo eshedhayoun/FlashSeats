@@ -1961,6 +1961,10 @@ this system already has one — re-POSTing the same checkout body.
 
 ## ADR-053 — A webhook delivery is a claim, and a claim is released when its work did not happen
 
+> **Amended by ADR-064.** "Hold gone → refund" in the table below refunded purchases the checkout had
+> just confirmed, and a refused refund still queued the buyer's "refunded in full" email. A lost hold
+> now goes to a refund *claim* on the order row, which a confirmed order refuses.
+
 **Context.** The charge settles and the buyer never sees the response — a dropped connection, a killed
 replica, a closed laptop. The money moved and nothing in this system knows it. The provider's webhook
 is the only remaining witness, and ADR-005 reserved `payment → order` as the one cross-module event
@@ -2127,6 +2131,10 @@ that costs something to mint, where a discarded cookie costs nothing.
 ---
 
 ## ADR-056 — Compensation requires a definite failure; a cache in front of a failing dependency must back off
+
+> **Amended by ADR-064.** Decision 1 was applied to the webhook path only; the checkout still
+> compensated on any exception. And the "three definite outcomes" are definite about the *hold*, not
+> the money: a `CONSUMED` hold means the purchase succeeded. Both paths now let the order row decide.
 
 **Context.** Reviewing Stage 2 against the conditions it will actually meet — a rolled-back
 transaction, a dropped connection, one actor retrying hard, a sale with many buyers at once — turned
@@ -2618,3 +2626,92 @@ actually sees.
 
 **The rule, stated so it cannot drift again.** A class only if a `catch` names it. Everything else is
 one static method on `<Module>Errors`, and a module's refusals are read from that one file.
+
+---
+
+# Pass 15 — decisions the submission review forced (ADR-064 –)
+
+## ADR-064 — A settled charge ends exactly one way, and the order row decides which
+
+**Status:** accepted, Pass 15. Amends ADR-053 (the settlement table) and ADR-056 (Decision 1, which
+had fixed only the webhook path).
+
+**Context.** The synchronous checkout and the payment webhook settle the **same charge**, and Stripe
+sends the webhook the moment the payment succeeds — for 3-D Secure, the same moment the buyer's
+browser re-POSTs. Review found five ways the two collided:
+
+- **The webhook refunded a confirmed purchase.** It read the order `PENDING`, the checkout then
+  confirmed it, and `getActiveHold` reported the now-`CONSUMED` hold as expired. That was routed to
+  "seats gone": a refund, and `markRefunded` overwrote `CONFIRMED` with `REFUNDED` after the buyer had
+  their `201` and their ticket email.
+- **The checkout refunded a webhook-confirmed purchase**, from the other side: its `consumeHold`
+  lost to the webhook's and threw `HoldAlreadySettledException`, which `catch (RuntimeException)`
+  compensated.
+- **The checkout compensated on anything.** ADR-056 forbade refunding on an ambiguous failure, but
+  only the webhook path was changed. A pool timeout on `confirm` refunded a buyer whose seats were
+  fine and made the order terminal.
+- **Refund first, record second.** The provider refund ran before the order was marked, so a
+  confirmation could land in between — seats kept, money returned — and a refused refund still queued
+  the "we've refunded you in full" email. ADR-053's "a refund that fails is no longer recorded as a
+  refund" was not true of the notice.
+- **Lost updates.** No `@Version`, every transition load-modify-flush, and Hibernate writes every
+  column: a 3-D Secure re-POST racing the webhook could write `PENDING` over `CONFIRMED`, then
+  abandon it to `FAILED`.
+
+**The root cause is one sentence.** Both paths read *the hold is gone* as *the seats are gone*. Only
+this order can consume its hold — `UNIQUE(hold_token)` — so a `CONSUMED` hold means **this purchase
+succeeded**. A hold exception is a fact about the hold, not about the money.
+
+**Decision 1 — the order row is the arbiter.** Every transition of a settled charge is a
+compare-and-set on `orders`:
+
+- `orders.version` (`V13`) makes every entity write a compare-and-set; a writer holding a stale copy
+  fails its flush instead of overwriting.
+- The transitions where losing is an ordinary outcome are conditional updates that bump the version
+  themselves and report a rowcount: `markAbandoned` (`PENDING → FAILED`), `claimRefund`
+  (`PENDING|FAILED → REFUNDED`), and resuming a `FAILED` or stranded order (by version, so of two
+  racing retries one resumes and the other gets `409`).
+- `confirm` refuses an order that is no longer `PENDING` or `FAILED`, and fails at commit if one
+  changes under it. Either way it throws `OptimisticLockingFailureException` and the hold's
+  consumption rolls back with it.
+
+So once a refund is claimed the order cannot be confirmed, and once it is confirmed it cannot be
+claimed. `SettlementArbiterIT` races the two fifteen times with the claim staggered across the whole
+confirm transaction; every round ends exactly one way.
+
+**Decision 2 — claim first, money second.** `OrderRefundService` claims before it calls the provider.
+The reason reads `refund pending: …` until the provider answers; success replaces it and queues the
+`ORDER_REFUNDED` notice, at most once per order; a refused refund leaves the reason saying so, sends
+**no** notice, and increments `flashseats.payment.refund.failed`. A claim that fails means the other
+path resolved the order, and no money moves.
+
+**Decision 3 — a lost hold asks the order.** On both paths, a lost hold (`HoldNotFound`,
+`HoldExpired`, `HoldAlreadySettled`) or a lost compare-and-set goes to the refund claim, and the claim
+decides. Checkout answers a failed claim with the receipt — the webhook confirmed it — or with
+`ORDER_REFUNDED` if the webhook refunded it; the webhook simply acknowledges. Before checkout answers
+`404`/`410` at step 1 or step 5, it looks for a confirmed order for the hold, so a re-POST that lost a
+race to the webhook gets its receipt, not "your reservation expired".
+
+**Decision 4 — ambiguity moves no money, on the checkout path too.** Only Decision 3's exceptions
+compensate. Anything else from `confirm` — a pool timeout, a dropped connection — marks the order
+`FAILED` and propagates; checkout is find-or-create, so the buyer's retry resumes it. **The retry must
+not charge twice**, so `payment` now hands back a hold's charge that already `SUCCEEDED` (and was not
+refunded) instead of making another. It is the same query that finds a 3-D Secure intent to resume,
+widened to two statuses, so it costs every checkout nothing.
+
+**Decision 5 — a webhook that outruns the ledger still finds its charge.** The provider can deliver
+before the checkout has recorded the intent id on its attempt row. The webhook falls back to the
+hold's newest attempt still waiting for an intent id, so a settlement that has to refund has a
+ledger row to refund against.
+
+**What is left, and why it is acceptable.**
+
+- **With Stripe**, an ambiguous failure the buyer never retries is settled by the webhook, which
+  redelivers for days: confirm if the hold is still alive, refund if not. **The stub has no webhook**,
+  so there the charge stays settled and unresolved until a retry. That is stub money and is recorded
+  in `06` §9.
+- A process killed **between the claim and the provider call** leaves an order `REFUNDED` whose
+  reason still reads `refund pending:`. It is found by that query, not by an alarm.
+
+**Cost.** One column. The checkout hot path gains no query and no transaction; the refund path gains
+one short transaction (the claim) and only runs when seats were lost.

@@ -86,7 +86,10 @@ The sequence *is* the design. Read `CheckoutService.checkout()` alongside this.
                                         find-or-create resumes it (ADR-054). No resume endpoint.
 7  @Transactional                     → consumeHold · CONFIRMED · order_items · outbox_events
 8  AFTER_COMMIT                       → discardTimer, revokeAdmission — best-effort, safe to lose
-9  commit failed after a charge?      → refund · REFUNDED · ORDER_REFUNDED outbox row
+9  lost the hold after a charge?      → the order row decides (ADR-064): CONFIRMED by the webhook
+                                        ⇒ the receipt; otherwise claim REFUNDED, refund, then notify.
+                                        Any OTHER commit failure moves no money: FAILED, and the
+                                        retry reuses the charge that settled
 ```
 
 **Step 0 has to be first.** A successful purchase consumes its hold, so validating the hold first
@@ -94,6 +97,10 @@ would answer a resubmission with "your reservation expired" when the buyer alrea
 
 **Step 7 is one transaction containing only SQL.** `consumeHold` is a conditional `UPDATE` that joins
 it, so if anything fails the hold returns to `ACTIVE` and expires normally.
+
+**A gone hold is not gone seats.** Only this order can consume its hold, so a `CONSUMED` hold means
+the webhook already confirmed this same charge. Confirming and claiming a refund are both
+compare-and-sets on the `orders` row, so the two paths cannot both win (ADR-064).
 
 ## 1.4 Where each concept lives — once
 
@@ -136,7 +143,7 @@ That is what makes `noeviction` a correctness setting rather than a tuning one.
 | :--- | :--- |
 | [`README.md`](../README.md), then **this file** | first, always |
 | [`03-end-to-end-flow.md`](03-end-to-end-flow.md) | the authoritative journey and the 3–10 concurrent-sale operating envelope |
-| [`00-architecture-decisions.md`](00-architecture-decisions.md) | before changing a decision. 63 ADRs; most record a defect and its fix |
+| [`00-architecture-decisions.md`](00-architecture-decisions.md) | before changing a decision. 64 ADRs; most record a defect and its fix |
 | [`05-global-standards.md`](05-global-standards.md) | the cross-cutting contract — error registry, transaction rules, facade rules |
 | [`FE_SPEC.md`](../FE_SPEC.md) | the client contract |
 | [`modules/*.md`](modules/) | one page per module: owns / exposes / never |

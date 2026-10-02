@@ -98,8 +98,18 @@ public class PaymentService implements PaymentFacade {
             // open a second intent and risk billing twice for one authentication.
             ChargeAttempt attempt = store.beginAttempt(command); // tx1
 
+            if (attempt.settled()) {
+                // This hold was already charged, and the order's commit failed in a way that proved
+                // nothing. Charging again would bill twice for one set of seats (ADR-064).
+                log.info("Hold {} already has a settled charge; returning it instead of charging again",
+                        command.holdToken());
+                return new PaymentResult(
+                        attempt.transactionReference(), true, attempt.gatewayReference(),
+                        null, null, null, false, false);
+            }
+
             GatewayResult result = attempt.isResume() // no transaction open
-                    ? gateway.retrieve(attempt.resumableGatewayReference())
+                    ? gateway.retrieve(attempt.gatewayReference())
                     : gateway.charge(new GatewayCharge(
                             command.orderNumber(),
                             command.holdToken(),

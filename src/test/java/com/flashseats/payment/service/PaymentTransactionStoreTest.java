@@ -8,6 +8,7 @@ import com.flashseats.payment.gateway.GatewayResult;
 import com.flashseats.payment.model.PaymentStatus;
 import com.flashseats.payment.model.PaymentTransaction;
 import com.flashseats.payment.repository.PaymentTransactionRepository;
+import java.util.EnumSet;
 import java.util.Optional;
 import org.junit.jupiter.api.Test;
 import static org.mockito.ArgumentMatchers.any;
@@ -46,9 +47,9 @@ class PaymentTransactionStoreTest {
         pending.setGatewayReference("pi_existing");
         pending.setStatus(PaymentStatus.PROCESSING);
 
-        when(transactions.findFirstByHoldTokenAndStatusOrderByIdDesc(
+        when(transactions.findFirstByHoldTokenAndStatusInOrderByIdDesc(
                 "hold-42",
-                PaymentStatus.PROCESSING))
+                EnumSet.of(PaymentStatus.PROCESSING, PaymentStatus.SUCCEEDED)))
                 .thenReturn(Optional.of(pending));
 
         var command = new AuthorizeCommand(
@@ -65,13 +66,37 @@ class PaymentTransactionStoreTest {
 
         assertThat(attempt.transactionReference())
                 .isEqualTo("tx_existing");
-        assertThat(attempt.resumableGatewayReference())
+        assertThat(attempt.gatewayReference())
                 .isEqualTo("pi_existing");
         assertThat(attempt.isResume())
                 .isTrue();
+        assertThat(attempt.settled())
+                .isFalse();
 
         verify(transactions, never())
                 .save(any(PaymentTransaction.class));
+    }
+
+    @Test
+    void settledChargeIsHandedBackInsteadOfChargingAgain() {
+        PaymentTransaction settled = new PaymentTransaction();
+        settled.setTransactionReference("tx_settled");
+        settled.setGatewayReference("pi_settled");
+        settled.setStatus(PaymentStatus.SUCCEEDED);
+
+        when(transactions.findFirstByHoldTokenAndStatusInOrderByIdDesc(
+                "hold-42",
+                EnumSet.of(PaymentStatus.PROCESSING, PaymentStatus.SUCCEEDED)))
+                .thenReturn(Optional.of(settled));
+
+        ChargeAttempt attempt = store.beginAttempt(new AuthorizeCommand(
+                "order-42", "hold-42", "session-7", 7_500, "usd", "pm_card_visa", "idem-42", 1));
+
+        assertThat(attempt.settled()).isTrue();
+        assertThat(attempt.isResume()).isFalse();
+        assertThat(attempt.transactionReference()).isEqualTo("tx_settled");
+        assertThat(attempt.gatewayReference()).isEqualTo("pi_settled");
+        verify(transactions, never()).save(any(PaymentTransaction.class));
     }
     @Test
     void declineDoesNotEraseAnExistingGatewayReference() {

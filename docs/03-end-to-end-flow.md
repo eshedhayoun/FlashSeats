@@ -426,24 +426,28 @@ takes card details.
 
 ```
  0. already CONFIRMED for this hold?              → return the receipt, 200
- 1. HoldFacade.getActiveHold(holdToken, sid)      → 404/410 if missing/expired/not yours
+ 1. HoldFacade.getActiveHold(holdToken, sid)      → 404/410 if missing/expired/not yours,
+                                                    unless the webhook confirmed it since step 0
  2. CatalogFacade.getTierSummary(eventId,tierId)  → price snapshot, SERVER-SIDE (ADR-013)
  3. window gate                                   → OPEN, or CLOSED within 15 min (ADR-016)
  4. find-or-create orders row, hold_token UNIQUE, status = PENDING (ADR-002)
  ┌─ from here every exit leaves the order RESUMABLE (ADR-034) ─────────────────┐
  │ 5. HoldFacade.grantGrace(holdToken)             → once, ceiling 420s (ADR-030)
  │       └─ FAILS ⇒ ABORT with 410 HOLD_EXPIRED. Do NOT charge.       ← see below
- │ 6. PaymentFacade.authorize(...)                 ← OUTSIDE any transaction (ADR-023)
+ │ 6. PaymentFacade.authorize(...)                 ← OUTSIDE any transaction (ADR-023);
+ │                                                    a charge that already settled is reused
  │       └─ declined  ⇒ order FAILED, hold KEPT, 402 + attemptsRemaining
  │       └─ gateway   ⇒ order FAILED, hold KEPT, 503, no attempt consumed
  │ 7. @Transactional {          ← SQL ONLY. No Redis, no HTTP, no broker.
  │        UPDATE ticket_holds SET status='CONSUMED'
- │          WHERE hold_token=? AND status='ACTIVE'   → rowcount 0 ⇒ roll back + refund
- │        orders.status = CONFIRMED
+ │          WHERE hold_token=? AND status='ACTIVE'   → rowcount 0 ⇒ roll back, then ↓
+ │        orders.status = CONFIRMED   ← only from PENDING/FAILED; versioned (ADR-064)
  │        INSERT order_items
  │        INSERT outbox_events (ORDER_CONFIRMED, PENDING)
  │    }
- └─ any throw above ⇒ markAbandoned() ⇒ FAILED, which findOrCreate resumes ────┘
+ │    lost the hold or the order ⇒ claim REFUNDED on the order row (ADR-064):
+ │       claimed ⇒ refund, 409 ORDER_REFUNDED · refused (webhook CONFIRMED it) ⇒ receipt
+ └─ any other throw ⇒ markAbandoned() ⇒ FAILED, which findOrCreate resumes ─────┘
  8. AFTER_COMMIT (best-effort, safe to lose):
         HoldFacade.discardTimer(holdToken)         ← Redis cleanup only
         QueueFacade.revokeAdmission(sid, eventId)
@@ -459,6 +463,13 @@ it `PENDING` forever — and `PENDING` answered every retry with `409 DUPLICATE_
 held live seats they could no longer buy (ADR-034). `markAbandoned` only touches a row still
 `PENDING`, so a decline (already `FAILED`) and a compensated commit failure (already `REFUNDED`) pass
 through it untouched.
+
+**Only a lost hold refunds, and the order row decides even that** (ADR-064). The webhook settles the
+same charge as this request, so a hold found gone at step 7 may have been consumed by the webhook's
+own confirmation. The refund is *claimed* first, as a compare-and-set that a `CONFIRMED` order
+refuses — then the buyer gets the receipt instead. A failure that proves nothing (a pool timeout, a
+dropped connection) refunds nobody: the order is abandoned, and the retry confirms it with the charge
+that already settled.
 
 **Charge first, consume second.** Consuming before charging would require a
 `CONSUMED → RELEASED` transition the state machine forbids, and would briefly release inventory the

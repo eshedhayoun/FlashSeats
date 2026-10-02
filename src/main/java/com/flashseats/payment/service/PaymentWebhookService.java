@@ -88,7 +88,9 @@ public class PaymentWebhookService {
             events.publishEvent(new PaymentSettledEvent(
                     holdToken,
                     intent.getId(),
-                    transactions.referenceForGateway(intent.getId()).orElse(null),
+                    transactions.referenceForGateway(intent.getId())
+                            .or(() -> transactions.referenceForUnlinkedAttempt(holdToken))
+                            .orElse(null),
                     intent.getAmount() == null ? 0L : intent.getAmount(),
                     intent.getCurrency() == null ? null : intent.getCurrency().toUpperCase()));
 

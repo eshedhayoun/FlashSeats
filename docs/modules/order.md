@@ -21,12 +21,18 @@ This module owns **no Redis key at all.**
 
 | PostgreSQL | Contents |
 | :--- | :--- |
-| `orders` | order number, **`UNIQUE(hold_token)`**, session, email, receipt token, status, amount, attempts |
+| `orders` | order number, **`UNIQUE(hold_token)`**, session, email, receipt token, status, amount, attempts, `version` |
 | `order_items` | per-tier lines: tier, quantity, unit price |
 | `outbox_events` | aggregate, type, JSON payload, status, `claimed_at` |
 | `order_number_seq` | a database sequence, so three replicas cannot mint the same number |
 
 `UNIQUE(hold_token)` is the single-use guard: **one hold can never become two orders** (ADR-002).
+
+**The `orders` row decides how a settled charge ends** (ADR-064). Every status change is a
+compare-and-set — on `version` for an entity write, or a conditional update that bumps it — so the
+checkout and the webhook, settling the same charge at once, cannot both win. Confirming needs the
+order `PENDING` or `FAILED`; claiming a refund needs the same; whichever commits first leaves the
+other nothing to do.
 
 ---
 
@@ -61,8 +67,10 @@ existed with zero callers anywhere and was deleted in Pass 7.
 **Inbound event:** this module listens for `payment`'s `PaymentSettledEvent` — **the only legitimate
 inbound edge into `order`**, and the only cross-module event in the system (ADR-005). It finishes a
 purchase whose buyer never saw the response, by the same `confirm` transaction the synchronous path
-uses, and refuses to confirm an order whose seats are gone (ADR-012, ADR-053). A synchronous edge
-from `payment` would close a cycle and fail the build; the listener is the shape that does not.
+uses, and refuses to confirm an order whose seats are gone (ADR-012, ADR-053). It races the checkout
+that made the charge; a lost hold goes to the refund claim, which a confirmed order refuses (ADR-064).
+A synchronous edge from `payment` would close a cycle and fail the build; the listener is the shape
+that does not.
 
 ---
 
@@ -80,7 +88,7 @@ The sequence *is* the design (ADR-001):
 6. CHARGE                   → outside every transaction
 7. ONE TRANSACTION          → consume the hold, confirm, write items, write the outbox row
 8. AFTER_COMMIT             → best-effort cleanup, safe to lose
-9. commit failed post-charge→ refund, and say so
+9. lost the hold post-charge→ the order row decides: receipt if confirmed, else refund and say so
 ```
 
 **Step 0 must come first.** A successful purchase consumes its hold, so validating the hold first
@@ -93,6 +101,19 @@ is the real concurrency limit, so one slow gateway would throttle checkout for e
 **Step 7 is one transaction.** The hold claim joins it, so if anything below fails the hold returns
 to `ACTIVE` and expires normally. The outbox row is written *here*, not after: an order that is
 confirmed but whose ticket was never queued is not a state this system can reach.
+
+**Step 9 runs only on a lost hold, never on an ambiguous failure** (ADR-056, ADR-064). A hold gone
+after the charge is not proof the seats are gone: only this order can consume its hold, so a
+`CONSUMED` hold means the webhook already confirmed this purchase. The refund is *claimed* on the
+order row first, and a confirmed order refuses the claim — the buyer gets the receipt. Any other
+failure of step 7 — a pool timeout, a dropped connection — moves no money: the order becomes `FAILED`,
+and the retry finds the charge that settled and confirms it **without charging again**. Before
+answering `404`/`410` at step 1 or 5, checkout also looks for a confirmed order for the hold.
+
+**A refund is claimed, then made, then announced.** The claim moves the order to `REFUNDED` with the
+reason `refund pending: …`; the provider call comes after it; only a refund that went through queues
+the `ORDER_REFUNDED` notice, at most once. A refused one sends nothing and is counted in
+`flashseats.payment.refund.failed`.
 
 **`PENDING` is in-flight, never terminal** (ADR-034). The row is committed before the charge, so any
 exit that recorded no outcome would otherwise strand the buyer holding live seats behind a `409`
@@ -161,8 +182,9 @@ exactly what ADR-023 forbids.
 
 | Gap | Detail |
 | :--- | :--- |
-| **Checkout costs nine sequential transactions** | Steps 0, 1, 2, 4, 5, **both** of the payment store's `REQUIRES_NEW` transactions bracketing the gateway call, 7, and the closing read are each their own connection acquisition. ADR-049 budgets admission against this figure, so the count is load-bearing rather than trivia — it was listed as eight here and nine in `06` §9 until Pass 9 |
-| **No outbox lag metric** | `flashseats.outbox.lag.seconds` is specified in `03` §7 and not built; a stalled relay currently surfaces as buyers not receiving tickets |
+| **Checkout costs eight sequential transactions** | Steps 0, 1, 2, 4, 5, **both** of the payment store's `REQUIRES_NEW` transactions bracketing the gateway call, and 7 are each their own connection acquisition (the closing receipt read was removed in Pass 10). ADR-049 budgets admission against this figure, so the count is load-bearing rather than trivia |
+| **The stub has no webhook** | A checkout whose commit failed ambiguously after the charge is resolved by the buyer's retry, or, with Stripe, by the webhook. Under the stub gateway a charge the buyer never retries stays settled and unresolved — stub money only (ADR-064) |
+| **A refund interrupted mid-way is found by query, not by alarm** | A process killed between the refund claim and the provider call leaves an order `REFUNDED` whose reason still reads `refund pending:` (ADR-064) |
 
 ---
 
@@ -172,6 +194,8 @@ exactly what ADR-023 forbids.
 - Charge before confirming the hold extension, or consume the hold before charging.
 - Let a client value reach an amount.
 - Treat `PENDING` as terminal.
+- Read a lost hold as lost seats, or refund on an ambiguous failure — the order row decides (ADR-064).
+- Move money before the order row records why.
 - Release the hold on a decline.
 - Publish to the broker inside the outbox transaction, or mark `PROCESSED` before the broker confirms
   **and routes**.
