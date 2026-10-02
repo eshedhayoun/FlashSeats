@@ -19,10 +19,13 @@ import com.flashseats.payment.exception.PaymentErrors;
 import com.flashseats.payment.facade.PaymentResult;
 import java.time.Clock;
 import java.time.Instant;
+import java.util.EnumSet;
 import java.util.List;
+import java.util.Set;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.context.ApplicationEventPublisher;
 import org.springframework.dao.DataIntegrityViolationException;
+import org.springframework.dao.OptimisticLockingFailureException;
 import org.springframework.stereotype.Component;
 import org.springframework.transaction.annotation.Transactional;
 import tools.jackson.databind.ObjectMapper;
@@ -38,6 +41,12 @@ public class OrderCommitService {
     private static final String AGGREGATE_TYPE = "ORDER";
     static final String EVENT_ORDER_CONFIRMED = "ORDER_CONFIRMED";
     static final String EVENT_ORDER_REFUNDED = "ORDER_REFUNDED";
+
+    /** The states a settled charge can still end from: in flight, or parked after an attempt. */
+    private static final Set<OrderStatus> UNRESOLVED = EnumSet.of(OrderStatus.PENDING, OrderStatus.FAILED);
+
+    /** {@code failure_reason} is {@code VARCHAR(255)}; an exception message is not bounded. */
+    private static final int REASON_LENGTH = 255;
 
     private final OrderRepository orders;
     private final OrderItemRepository items;
@@ -100,7 +109,7 @@ public class OrderCommitService {
         if (existing != null) {
             return switch (existing.getStatus()) {
                 case CONFIRMED -> new CheckoutOrder(existing.getOrderNumber(), existing.getPaymentAttempts(), true);
-                case PENDING -> resumeIfStranded(existing, holdToken);
+                case PENDING -> resumeIfStranded(existing);
                 case REFUNDED -> throw OrderErrors.refunded();
                 case FAILED -> resumeFailed(existing);
             };
@@ -132,6 +141,10 @@ public class OrderCommitService {
      * so a failure below returns the hold to {@code ACTIVE}; that is why the claim lives in SQL rather
      * than Redis (ADR-019). Returns the receipt directly, so a successful checkout needs no second
      * pooled read.
+     *
+     * @throws OptimisticLockingFailureException if the order was already resolved, or is resolved
+     *     while this runs, by the other path settling the same charge (ADR-064). Nothing commits,
+     *     the hold included.
      */
     @Transactional
     public OrderReceiptResponse confirm(
@@ -146,6 +159,12 @@ public class OrderCommitService {
         holds.consumeHold(hold.holdToken());
 
         Order order = orders.findByOrderNumber(orderNumber).orElseThrow();
+        if (!UNRESOLVED.contains(order.getStatus())) {
+            // The webhook settled this charge first, or a refund claimed it. Confirming now would
+            // either repeat a confirmation or deliver seats for money already on its way back.
+            throw new OptimisticLockingFailureException(
+                    "Order " + orderNumber + " is already " + order.getStatus());
+        }
         order.setStatus(OrderStatus.CONFIRMED);
         order.setPaymentTransactionRef(payment.transactionReference());
         order.setGatewayReference(payment.gatewayReference());
@@ -210,27 +229,53 @@ public class OrderCommitService {
      * Ends a checkout that never reached a charge outcome (ADR-034). The order becomes {@code FAILED},
      * which {@link #findOrCreate} resumes on the same order number, and <strong>no payment attempt is
      * consumed</strong>. The hold is left {@code ACTIVE}.
+     *
+     * <p>Only a {@code PENDING} order moves, so a decline (already {@code FAILED}) and an order the
+     * other path has resolved pass through untouched.
      */
     @Transactional
     public void markAbandoned(String orderNumber, String reason) {
-        orders.findByOrderNumber(orderNumber).ifPresent(order -> {
-            if (order.getStatus() == OrderStatus.PENDING) {
-                order.setStatus(OrderStatus.FAILED);
-                order.setFailureReason(reason);
-            }
-        });
+        orders.transition(
+                orderNumber,
+                EnumSet.of(OrderStatus.PENDING),
+                OrderStatus.FAILED,
+                bounded(reason),
+                clock.instant());
     }
 
     /**
-     * Records that a settled charge was refunded because the seats could not be delivered, and
-     * queues a notice so the buyer hears it from us rather than from their bank statement (ADR-012).
+     * Claims the right to give a settled charge back (ADR-064). The claim comes <em>before</em> the
+     * money moves: it is a compare-and-set on the row {@link #confirm} writes, so once it succeeds the
+     * order can no longer be confirmed, and once the order is confirmed it can no longer be claimed.
+     *
+     * <p>The reason is written as "refund pending" until the provider answers, so an order whose
+     * process died between this claim and the refund is visible as exactly that.
+     *
+     * @return true if this caller now owns the refund; false if the order was already resolved
      */
     @Transactional
-    public void markRefunded(String orderNumber, String reason) {
-        Order order = orders.findByOrderNumber(orderNumber).orElseThrow();
-        order.setStatus(OrderStatus.REFUNDED);
-        order.setFailureReason(reason);
+    public boolean claimRefund(String orderNumber, String reason) {
+        return orders.transition(
+                        orderNumber,
+                        UNRESOLVED,
+                        OrderStatus.REFUNDED,
+                        bounded("refund pending: " + reason),
+                        clock.instant())
+                == 1;
+    }
 
+    /**
+     * The provider returned the money: record why, and queue the notice so the buyer hears it from us
+     * rather than from their bank statement (ADR-012). Queued at most once per order.
+     */
+    @Transactional
+    public void recordRefunded(String orderNumber, String reason) {
+        Order order = orders.findByOrderNumber(orderNumber).orElseThrow();
+        order.setFailureReason(bounded(reason));
+
+        if (outbox.existsByAggregateIdAndEventType(orderNumber, EVENT_ORDER_REFUNDED)) {
+            return;
+        }
         outbox.save(new OutboxEvent(
                 AGGREGATE_TYPE,
                 orderNumber,
@@ -247,6 +292,18 @@ public class OrderCommitService {
                         List.of()))));
     }
 
+    /**
+     * The refund did not happen. The order stays {@code REFUNDED}, because the seats are gone either
+     * way, but <strong>no notice is queued</strong>: telling a buyer "we've refunded you in full" about
+     * money we still hold is the one message worse than silence. The reason is what a human
+     * reconciles from.
+     */
+    @Transactional
+    public void recordRefundFailure(String orderNumber, String reason) {
+        orders.findByOrderNumber(orderNumber)
+                .ifPresent(order -> order.setFailureReason(bounded(reason)));
+    }
+
     // ----------------------------------------------------------------- helpers
 
     /**
@@ -254,7 +311,7 @@ public class OrderCommitService {
      * {@code stalePendingSeconds} a charge may still be running, so a second request gets {@code 409};
      * beyond it, the row is a crash artefact and the retry resumes it.
      */
-    private CheckoutOrder resumeIfStranded(Order order, String holdToken) {
+    private CheckoutOrder resumeIfStranded(Order order) {
         Instant strandedBefore =
                 clock.instant().minusSeconds(properties.getStalePendingSeconds());
         if (order.getUpdatedAt().isAfter(strandedBefore)) {
@@ -265,12 +322,19 @@ public class OrderCommitService {
         return resumeFailed(order);
     }
 
+    /**
+     * Back in flight on the same order number. A compare-and-set on the version read a moment ago, so
+     * of two retries that both found this order, exactly one resumes it and the other is told a charge
+     * is already in flight.
+     */
     private CheckoutOrder resumeFailed(Order order) {
         if (order.getPaymentAttempts() >= properties.getMaxPaymentAttempts()) {
             throw PaymentErrors.declined(
                     "No payment attempts remain for this reservation.", 0, null);
         }
-        order.setStatus(OrderStatus.PENDING);
+        if (orders.resume(order.getOrderNumber(), order.getVersion(), clock.instant()) != 1) {
+            throw new DuplicatePaymentException();
+        }
         return new CheckoutOrder(order.getOrderNumber(), order.getPaymentAttempts(), false);
     }
 
@@ -287,6 +351,12 @@ public class OrderCommitService {
                         tier.eventId(), tier.eventTitle(), tier.venueName(), tier.eventStartTime()),
                 List.of(new OutboxPayload.Item(
                         hold.tierId(), tier.tierName(), hold.quantity(), tier.priceCents())));
+    }
+
+    private static String bounded(String reason) {
+        return reason == null || reason.length() <= REASON_LENGTH
+                ? reason
+                : reason.substring(0, REASON_LENGTH);
     }
 
     /**

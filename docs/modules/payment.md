@@ -30,6 +30,12 @@ facade.** Adding one would make the graph cyclic, because `order → payment` al
 that sends a fresh key per retry — or none — would otherwise bypass it entirely. The hold token is
 the one value that identifies "this purchase" and that the client cannot mint.
 
+**A hold is charged at most once** (ADR-064). Opening an attempt first looks for the hold's newest
+attempt that is either authenticating or already settled: an intent awaiting 3-D Secure is resumed
+(ADR-054), and a charge that already succeeded and was not refunded is **handed back instead of
+repeated** — the case where the order's commit failed in a way that proved nothing and the buyer is
+retrying. One query covers both.
+
 **`webhook_events` is a claim, not a log** (ADR-053). The primary key *is* the replay guard: the
 insert is `ON CONFLICT DO NOTHING` and the rowcount is the whole answer. `processed_at IS NULL` means
 *in flight*, never *failed* — a settlement that throws deletes its row, so the provider's redelivery
@@ -48,7 +54,10 @@ Both are called only by `order`.
 
 **Event:** `PaymentSettledEvent` — the one cross-module event in the system (ADR-005). Published
 synchronously so a failed settlement can become a non-2xx and earn a redelivery. **Only a definite
-failure refunds**; anything unresolved propagates and is retried (ADR-056). The *type*
+failure refunds**; anything unresolved propagates and is retried (ADR-056). The event carries this
+module's reference for the charge; when the provider delivers before the checkout has linked the
+intent id, it is the hold's newest attempt still waiting for one, so a refund always has a ledger row
+to refund against (ADR-064). The *type*
 dependency runs `order → payment`, which already exists; the event is what keeps the runtime
 direction from closing the loop.
 
@@ -79,8 +88,7 @@ else.
 | :--- | :--- |
 | **A card cannot be swapped mid-challenge** | While a 3-D Secure intent is outstanding, every resubmission re-reads *that* intent, so a different card in the body is ignored until the hold expires. Accepted: the alternative is a second charge against a hold that already has one in flight (ADR-054) |
 | **Checkout does not survive a Redis outage** | It opens with `SETNX payment:inflight:{holdToken}`, which fails closed. For a payment that is the right direction, but it is a written-down limitation rather than a resilience feature |
-| **No decline-ratio metric** | `flashseats.payment.decline.ratio` is specified in `03` §7 and not built. `flashseats.payment.refund.failed` **is** built, and any non-zero value is money owed to a named buyer |
-| **A failed refund still needs a human** | It is counted and written into `failure_reason` rather than silently reported as refunded, but nothing retries it — and nothing should, automatically |
+| **A failed refund still needs a human** | It is counted in `flashseats.payment.refund.failed`, written into `failure_reason`, and the buyer is sent no "refunded" notice (ADR-064) — but nothing retries it, and nothing should, automatically |
 | **A webhook that keeps failing keeps being redelivered** | Correct, and unbounded: the claim is released every time, so a permanently broken settlement is retried on the provider's schedule until it gives up. Visible in the logs, not in a metric |
 | **Live-provider coverage is a script, not a test** | The suite runs the stub. `docker/scripts/stripe-check.sh` is the only thing that proves the real account, the real status mapping and the real webhook secret agree |
 
@@ -94,5 +102,6 @@ else.
 - Finalise an order whose seats are gone — the webhook path re-checks the hold and refunds (ADR-012).
 - Parse a webhook body before verifying its signature, or bind it to anything but a raw string.
 - Keep a webhook claim whose settlement failed (ADR-038).
-- Start a second charge for a hold whose intent is awaiting authentication (ADR-054).
+- Start a second charge for a hold whose intent is awaiting authentication (ADR-054), or whose charge
+  already settled (ADR-064).
 - Refund on anything but a **definite** failure to obtain the seats (ADR-056).

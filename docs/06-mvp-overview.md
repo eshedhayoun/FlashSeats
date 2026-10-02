@@ -212,7 +212,7 @@ Findings that cost real time and would cost it again.
 ## 8. Verification
 
 ```bash
-./mvnw test        # 228 tests: unit, modularity, concurrency, journey, recovery, queue lifecycle,
+./mvnw test        # 243 tests: unit, modularity, concurrency, journey, recovery, queue lifecycle,
                    #             pre-warm, stock rebuild, drift, Redis-restart guard, the metadata
                    #             cache's five rules, the cluster admission allowance, payment and
                    #             webhooks, bot defence, and fulfilment through a real broker.
@@ -228,6 +228,7 @@ Findings that cost real time and would cost it again.
 | `HoldLifecycleIT` | Double consume → `409`. Ten concurrent releases restore **once**. The sweeper reclaims an abandoned hold and does not keep restoring it. One hold per session. A missing counter is `503`, never "sold out". |
 | `UserJourneyIT` | The full journey over real HTTP with a real cookie; a spent pass is rejected; a decline retains the hold and the retry succeeds on the same order number; a double submit yields one order and one charge; `/sale/state` tracks the stage. |
 | `CheckoutRecoveryIT` | A gateway outage keeps the seats **and** the ability to pay for them; it costs none of the three card attempts; a charge genuinely in flight is still refused; an order stranded by a crash resumes once no charge can still be running. |
+| `SettlementArbiterIT` | **A settled charge ends exactly one way** (ADR-064). A refund attempted against a confirmed purchase moves nothing; a confirmation attempted against a refunded order takes no seats; confirm and refund raced fifteen times, staggered across the whole confirm transaction, end exactly one way every round; and a retry after a commit that proved nothing confirms the charge that settled **without a second charge**. |
 | `QueueLifecycleIT` | An un-warmed event pauses promotion rather than selling out; a closed sale ends the wait instead of freezing it; a pass for one sale is never offered to another; exhaustion reverses when seats return. |
 | `NotificationClaimIT` | The claim blocks a duplicate, is terminal once sent, and releases a dead letter for replay. |
 | `NotificationListenerIT` | **Fulfilment through a real RabbitMQ and both real listeners**, the one thing the test profile's `notification.enabled=false` had left unexercised. One ticket per order even when the message is redelivered; a malformed message or a failed send goes to the DLQ after **one** attempt (ADR-029); a replay after the outage sends exactly once (ADR-038); and mail that was sent but not recorded stays `SENT`, so a replay cannot send a second ticket (ADR-042). Checked by mutation: removing that guard fails the test. |
@@ -296,6 +297,15 @@ Honest list. None of these is hidden behind a passing test.
   **the suite proves this system's behaviour, not the provider's**: `docker/scripts/stripe-check.sh`
   is the only thing that checks the real account, the real status mapping and the real webhook secret
   agree, and it is a script someone has to run rather than a test that fails on its own.
+- **Under the stub gateway, a charge whose commit failed ambiguously is resolved only by a retry**
+  (ADR-064). Checkout no longer refunds on a failure that proves nothing — a pool timeout, a dropped
+  connection — because that refunded buyers whose seats were fine. The order becomes `FAILED`, and the
+  buyer's re-POST confirms it with the charge that already settled, never a second one. With Stripe,
+  a buyer who never retries is covered by the webhook, which redelivers for days and confirms or
+  refunds. The stub has no webhook, so there the charge stays settled and unresolved: stub money,
+  never real money, but a dev-profile ledger can show it.
+- **A refund interrupted between its claim and the provider call is found by query, not by alarm**
+  (ADR-064). The order reads `REFUNDED` with the reason `refund pending: …`.
 - ~~**No admin surface** beyond pre-warm.~~ **Built** (Stage 4, ADR-048): pause/resume, the DLQ
   listing, a ticket resend, and an operator order view. `rebuild-stock` shipped in Stage 1. Still
   a single in-memory operator account — now stored bcrypt-hashed rather than in plaintext, with a
@@ -2061,3 +2071,26 @@ too bad, and by asking which layer produced it.
 unevenly. Pass 9's ADR-057 was right, and branches that forked before it re-added exactly what it
 removed. Writing the rules as a checklist (§11) is what makes the next reviewer's job a comparison
 rather than an archaeology.
+
+### Pass 15 — submission readiness *(in progress)*
+
+- **Scope:** a five-way audit before submission — docs and cleanup, backend correctness, the buyer's
+  experience in both clients, the test inventory, and a teammate's branch
+  (`shoham-preview-fixup`), which is read for its fixes and re-applied here rather than merged.
+  This entry grows as each step lands.
+
+- **Also recorded here: PR #21** (merged just before this pass). It added the Playwright scaffold in
+  `frontend/e2e`, `FE_SPEC.md` §10, cleanup scripts, `Countdown` tone styling, and a test-profile
+  Stripe pin — and a blank first line in `docker/seed/seed.sh` that stopped its shebang working.
+
+**Changed so far:**
+
+| Change | Effect |
+| :--- | :--- |
+| **Repo hygiene** | `seed.sh` runs again from any shell; generated Playwright output, logs and `.claude/` are ignored; a cleanup script that killed every Node and Chrome process on the machine is gone; the Stripe sample keys in `.env.example` are placeholders again |
+| **Working documents retired** | A hand-off note, a duplicated design system and two coverage documents that ticked boxes no test checked are replaced by `frontend/README.md`. `REFACTORING_BLUEPRINT.md`'s Part 1 is now [`07-system-on-one-page.md`](07-system-on-one-page.md); its open items are in §11 |
+| **A settled charge ends exactly one way** (ADR-064) | Review found the checkout and the webhook could each refund a purchase the other had just confirmed, and overwrite `CONFIRMED` with `REFUNDED`; the checkout refunded on a pool timeout; a refund ran before the order recorded it; and a refused refund still emailed "refunded in full". The order row now decides: every transition is a compare-and-set (`V13` adds `version`), a refund is claimed before money moves, a lost hold asks the order, and ambiguity moves no money — the retry reuses the charge that settled. Shoham's re-read and receipt check are the seed of this; his branch also left the expiry case unrefunded, which this does not |
+
+**Verified so far:** 243/243 (228 + 15 new), including `SettlementArbiterIT`, which races confirm
+against refund fifteen times with the refund claim staggered across the confirm transaction: both
+endings occur, and every round ends exactly one way.

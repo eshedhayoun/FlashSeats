@@ -238,6 +238,11 @@ public class SaleFixture {
      * leaves this behind, and that is precisely the state ADR-034's staleness rule exists for.
      */
     public void strandPendingOrder(String holdToken, long amountCents) {
+        strandPendingOrder(holdToken, amountCents, "TK-STRANDED");
+    }
+
+    /** As {@link #strandPendingOrder(String, long)}, for tests that strand more than one order. */
+    public void strandPendingOrder(String holdToken, long amountCents, String orderNumber) {
         jdbc.update(
                 """
                 INSERT INTO orders (
@@ -254,7 +259,7 @@ public class SaleFixture {
                     created_at,
                     updated_at
                 )
-                SELECT 'TK-STRANDED',
+                SELECT ?,
                     ?,
                     h.user_session_id,
                     'stranded@example.com',
@@ -269,6 +274,7 @@ public class SaleFixture {
                 FROM ticket_holds h
                 WHERE h.hold_token = ?
                 """,
+                orderNumber,
                 holdToken,
                 amountCents,
                 holdToken);
