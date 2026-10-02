@@ -54,11 +54,12 @@ export const options = {
       startVUs: 0,
       stages: [
         { duration: '10s', target: VUS },
-        { duration: '5s', target: VUS },
-        { duration: '5s', target: 0 },
+        { duration: `${WAIT_SECONDS}s`, target: VUS },
+        { duration: '10s', target: 0 },
       ],
-      // A VU's observation deadline starts when its journey begins. Allow
-      // late-ramped VUs to finish that window instead of interrupting them.
+      // A VU's observation deadline starts when its journey begins. Keep the
+      // load phase alive for the whole observation window, then let late-ramped
+      // VUs finish theirs instead of interrupting them.
       gracefulRampDown: `${WAIT_SECONDS}s`,
     },
   },
@@ -79,6 +80,14 @@ function clientHeaders() {
 }
 
 export default function () {
+  // ramping-vus starts another iteration as soon as a VU returns. Park the VU
+  // after its one real journey, so this stays one arrival per VU rather than
+  // turning into an unbounded request loop that measures nothing.
+  if (__ITER > 0) {
+    sleep(3600);
+    return;
+  }
+
   const tag = { event: String(EVENT_ID) };
   const headers = clientHeaders();
   const deadline = Date.now() + WAIT_SECONDS * 1000;
