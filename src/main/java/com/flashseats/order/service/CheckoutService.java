@@ -218,11 +218,14 @@ public class CheckoutService {
     // ----------------------------------------------------------------- helpers
 
     /**
-     * Allows {@code OPEN}, and {@code CLOSED} within the grace window (ADR-016). A buyer who reached
-     * the payment form seconds before the sale ended should be able to finish.
+     * Allows {@code OPEN}, {@code PAUSED}, and {@code CLOSED} within the grace window (ADR-016). A
+     * buyer who reached the payment form seconds before the sale ended should be able to finish, and
+     * so should one who holds seats when an operator pauses it: their seats are already out of the
+     * counter, so paying moves no stock, while refusing would let the reservation run out under a
+     * buyer who did nothing wrong (ADR-066).
      */
     private void requireCheckoutWindow(TierSummary tier) {
-        if (tier.windowStatus() == EventWindowStatus.OPEN) {
+        if (tier.windowStatus() == EventWindowStatus.OPEN || tier.windowStatus() == EventWindowStatus.PAUSED) {
             return;
         }
         Instant graceEnds = tier.saleEndTime().plus(Duration.ofMinutes(properties.getCheckoutGraceMinutes()));

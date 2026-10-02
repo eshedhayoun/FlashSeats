@@ -6,13 +6,13 @@ Guidance for Claude Code when working in this repository.
 
 FlashSeats — a high-concurrency ticket flash-sale engine. Modular monolith, Java 21, Spring Boot
 4.1.1. The **MVP is built and running**: all nine modules, the full journey from landing page to emailed
-PDF ticket, 245 tests green in any class order. **Inventory lives in Redis** (Stage 1, ADR-046): `catalog:stock:{e}:{t}`
+PDF ticket, 251 tests green in any class order. **Inventory lives in Redis** (Stage 1, ADR-046): `catalog:stock:{e}:{t}`
 is the live count and PostgreSQL keeps no copy of it. **Payment is real** (Stage 2, ADR-052-054) —
 but `flashseats.payment.stripe.enabled` is **false by default**, so `dev`, `test`, the load harness
 and every drill still run the in-process stub through the complete journey, 3-D Secure included.
 
 **Read [`docs/00-architecture-decisions.md`](docs/00-architecture-decisions.md) before changing
-anything.** It contains 65 ADRs. Most record a defect and its fix — 034-039 come from the first
+anything.** It contains 66 ADRs. Most record a defect and its fix — 034-039 come from the first
 review pass over the built code, 040-042 from the second — and several look like over-engineering
 until you read the failure they prevent. 043-045 are the exception: forward-looking decisions about
 the operator surface, buyer accounts and what health should report, with nothing built against them
@@ -30,6 +30,8 @@ class only where a `catch` names it. Pass 14 also wrote the code conventions dow
 **064 is Pass 15**: the checkout and the webhook settle the same charge, and the `orders` row —
 compare-and-set on every transition — decides whether it ends confirmed or refunded. **065**:
 promotion writes go in one pipeline, and a metadata miss loads once however many readers miss it.
+**066**: a pause is its own window status — the line keeps forming, holds wait, payment continues,
+and nothing tells a buyer the sale has ended.
 
 **The operating envelope is 3–10 concurrent sales**, not one
 ([`03-end-to-end-flow.md`](docs/03-end-to-end-flow.md) §2). Every capacity number written before
@@ -46,7 +48,7 @@ security posture, next stages, and the review-pass log. It is the doc to update 
 ## Document precedence
 
 ```
-00-architecture-decisions.md      ← highest authority (65 ADRs)
+00-architecture-decisions.md      ← highest authority (66 ADRs)
 05-global-standards.md            ← cross-cutting contract; module docs conform to it
 FE_SPEC.md                        ← client contract (repo root)
 03-end-to-end-flow.md             ← the authoritative user journey AND the operating envelope
@@ -292,6 +294,8 @@ Do not reintroduce these — each cost a real defect in the first pass:
 | **Reading a periodic gauge more often than it is computed** | `flashseats.stock.drift` is recomputed every 60 s. `pool-pressure.sh` reached a loaded replica every ~24 s and called two reads of *one* computation "sustained drift". The ledger was exact. Sustained means across computations |
 | **A psql `\set` in a script that is also given `-v`** | `\set events 5` ran after `-v events=10` and won, so `EVENTS=10` silently seeded five sales while the script pre-warmed ten. Defaults go under `\if :{?var}` |
 | **Letting Spring Framework 7 pause cached test contexts** | When a class switches to another context, the cached one is paused and later restarted. The resumed shared context answered every `/queue` request with a bare `500` that never reached its own filters, so no application log showed anything. It looked like pollution *inside* the app for a whole pass. `spring.test.context.cache.pause=never` in `src/test/resources/spring.properties` (ADR-061). If a failure depends on how many contexts the suite has, suspect the framework's context lifecycle first |
+| **Representing a pause as the end of a sale** | Every gate read `PAUSED` as `CLOSED`, which was safe for the gates and told every waiting buyer "Sales have ended": the broadcaster sent `sale-closed`, which completes the stream, **retained** it for replay so a reconnect *after the resume* was told again, and the event dropped off `/events`. A condition that will end is not an event in the sale's history — never retain it (ADR-066) |
+| **A gate that tests for what it refuses** | `!= CLOSED` admits every status added after it was written. Test for what you admit (`== OPEN`), so a new status is refused until someone decides otherwise — that is what made adding `PAUSED` safe (ADR-066) |
 | **Reading a lost hold as lost seats** | Only this order can consume its hold, so a `CONSUMED` hold means the purchase *succeeded* — on the webhook path, which settles the same charge. `getActiveHold` reports it as expired, and both payment paths refunded purchases the other had just confirmed, then overwrote `CONFIRMED` with `REFUNDED` (ADR-064) |
 | **Refunding first and recording second** | A confirmation can land between the provider refund and the status write: the buyer keeps the seats *and* the money. Claim the refund on the order row first; move money second; announce it only after it moved (ADR-064) |
 | **Load-modify-flush on a row two paths settle** | No `@Version`, and Hibernate writes every column, so the second flush writes its stale copy over the first — a `CONFIRMED` order went back to `PENDING` and was then abandoned. A row that two writers race for needs a compare-and-set (ADR-064) |

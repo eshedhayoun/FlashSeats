@@ -1,5 +1,5 @@
 export type Availability = "PLENTY" | "LIMITED" | "SOLD_OUT" | "UNKNOWN";
-export type WindowStatus = "UPCOMING" | "OPEN" | "CLOSED";
+export type WindowStatus = "UPCOMING" | "OPEN" | "PAUSED" | "CLOSED";
 export type QueueState =
   | "NOT_JOINED"
   | "WAITING"
@@ -97,6 +97,7 @@ export type QueueStatusResponse = {
   estWaitSeconds: number | null;
   passToken: string | null;
   admissionExpiresAt: string | null;
+  paused: boolean;
   serverTime: string;
 };
 

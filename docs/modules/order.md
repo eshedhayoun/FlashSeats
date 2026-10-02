@@ -82,7 +82,7 @@ The sequence *is* the design (ADR-001):
 0. already bought?          → return the receipt          ← must be first
 1. validate the hold        → live, and this session's
 2. price server-side        → from the tier, never the request
-3. sale window              → OPEN, or CLOSED within the 15-min grace
+3. sale window              → OPEN or PAUSED, or CLOSED within the 15-min grace (ADR-066)
 4. find-or-create the order → UNIQUE(hold_token)
 5. grant the one grace      → and ABORT if it cannot be granted
 6. CHARGE                   → outside every transaction

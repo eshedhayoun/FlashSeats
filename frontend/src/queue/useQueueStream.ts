@@ -20,6 +20,7 @@ export type QueueStreamState = {
   promoted: QueuePromotedEvent | null;
   availability: TierAvailabilityEvent | null;
   terminal: SaleClosedEvent | SaleExhaustedEvent | null;
+  paused: boolean;
 };
 
 const initialState: QueueStreamState = {
@@ -29,7 +30,8 @@ const initialState: QueueStreamState = {
   estWaitSeconds: null,
   promoted: null,
   availability: null,
-  terminal: null
+  terminal: null,
+  paused: false
 };
 
 function parseEvent<T>(event: Event): T | null {
@@ -76,7 +78,8 @@ export function useQueueStream(eventId: number, onRefresh: () => void) {
               estWaitSeconds: status.estWaitSeconds,
               promoted: status.passToken
                 ? { passToken: status.passToken, expiresInSeconds: 0 }
-                : current.promoted
+                : current.promoted,
+              paused: status.paused
             }));
             if (status.passToken) onRefresh();
           })
@@ -129,8 +132,17 @@ export function useQueueStream(eventId: number, onRefresh: () => void) {
               ? update.position
               : Math.min(current.position, update.position),
           aheadOfYou: update.aheadOfYou,
-          estWaitSeconds: update.estWaitSeconds
+          estWaitSeconds: update.estWaitSeconds,
+          paused: false
         }));
+      });
+      // A pause is not terminal: the stream stays open and the place is kept (ADR-066). Positions
+      // only move again once it resumes, so any position frame also means "running".
+      stream.addEventListener("sale-paused", () => {
+        setState((current) => ({ ...current, paused: true }));
+      });
+      stream.addEventListener("sale-resumed", () => {
+        setState((current) => ({ ...current, paused: false }));
       });
       stream.addEventListener("queue-promoted", (event) => {
         const lastEventId = (event as MessageEvent).lastEventId;

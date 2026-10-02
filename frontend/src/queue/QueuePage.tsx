@@ -30,6 +30,12 @@ export function QueuePage({
           <Stack spacing={3} alignItems="center">
             <HomeButton />
             <Typography color="text.secondary">You&apos;re in the queue</Typography>
+            {stream.paused && (
+              <Typography role="status" color="warning.main" textAlign="center">
+                Sales are paused for a moment. Your place is kept, and the line moves again as soon
+                as they resume.
+              </Typography>
+            )}
             <Typography
               component="div"
               variant="h1"

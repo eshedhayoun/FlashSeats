@@ -1572,6 +1572,10 @@ current catalog would render a ticket for the event as it is *now*, not as it wa
 
 ### Decision 4 — `PAUSED` is a publication state, and it splits the event query four ways
 
+> **Amended by ADR-066.** Reading a pause as `CLOSED` told every buyer the sale had ended, closed
+> their streams and replayed that close after the resume. Pause is now also a window status; the
+> objection below is answered by every gate testing for what it admits.
+
 `EventStatus.PAUSED`. `SaleWindows.statusOf` already reads anything but `PUBLISHED` as `CLOSED`, so
 every gate — queue join, hold, checkout — shuts with **no change to `SaleWindows`**. That is the
 reason pause is a publication state rather than a fourth `EventWindowStatus`: a new window status
@@ -2753,4 +2757,56 @@ a frontend port change. The branch's waiting-room script **was** ported, as the 
 service — with its own header saying what it cannot measure. **Its ~9,000-buyer ceiling is not
 quoted:** the run that produced it shows a Sentinel failover and nginx upstream connect timeouts
 mid-run, which is the host running out of CPU, not the waiting room running out of capacity.
+
+---
+
+## ADR-066 — A pause is a pause: its own window status, and nothing ends
+
+**Status:** accepted, Pass 15. Amends ADR-048 Decision 4.
+
+**Context.** ADR-048 made pause a publication state that every gate read as `CLOSED`, precisely so no
+gate needed new code. That bought the gates and cost the buyers. A paused sale:
+
+- answered every waiting buyer's stream with `sale-closed`, which **completed the stream**, and both
+  clients rendered the terminal "Sales have ended" — to a line the operator meant to keep;
+- **retained** that `sale-closed` frame in `queue:replay`, so a buyer reconnecting *after the resume*
+  was replayed the close and left a sale that was running again;
+- vanished from `GET /events`, which reads as "over" too;
+- answered joins and holds `SALE_CLOSED` — "ended" — while `SALE_PAUSED`, the code FE_SPEC told
+  clients to expect, was actually raised only by an admin endpoint refusing to pause a draft.
+
+**Decision 1 — `PAUSED` is a fourth `EventWindowStatus`, and it exists only inside the window.** A
+paused event reads `UPCOMING` before its sale starts (nothing visible has changed yet) and `CLOSED`
+after it ends. ADR-048's objection was that a consumer which forgot a new status would keep selling.
+It is answered by construction rather than by care: **every gate tests for the statuses it admits**
+(`== OPEN`, or `OPEN || PAUSED`), never for the ones it refuses, so a gate that has not heard of
+`PAUSED` refuses it.
+
+**Decision 2 — what a pause stops, and what it does not.**
+
+| | While paused | Why |
+| :--- | :--- | :--- |
+| Promotion | **stopped** (unchanged) | that is what pause means |
+| `POST /holds` | **refused**, `409 SALE_PAUSED`, `retryable: true` | no stock moves; the buyer keeps their admission and retries on resume |
+| `POST /queue/join` | **accepted** | joining moves no stock, and a line that keeps forming stays in arrival order. Refusing would turn the resume into a race between whoever retries fastest |
+| `POST /queue/admit` | accepted (unchanged) | a pass minted just before the pause is still the buyer's |
+| Checkout | **allowed** | the seats are already out of the counter, so paying moves no stock; refusing would let the reservation run out under a buyer who did nothing wrong. It was already allowed, by accident, through the post-close grace |
+| `GET /events` | **listed**, `windowStatus: PAUSED` | the line must be able to find the sale again |
+| The drift gauge and restart guard | watching (unchanged) | ADR-048's reason |
+
+**Decision 3 — the stream says "paused", and that is not an event in the sale's history.** Each
+replica sends `sale-paused` to its own streams on every sweep while paused and on connect, and
+`sale-resumed` once on the first sweep after. Neither is fanned out over pub/sub or retained in the
+replay log: a pause is a *current* condition, and a reconnect after the resume must not be told about
+one that has ended. `GET /queue/status` reports `paused` beside a truthful phase, so the polling
+fallback hears it too.
+
+**Decision 4 — the admin refusal gets its own code.** Pausing a `DRAFT` or `CANCELLED` event is
+`409 EVENT_NOT_PAUSABLE`. `SALE_PAUSED` now means one thing, to buyers.
+
+**What a pause does not stop: the clocks.** A pass keeps its 120 s, an admission its 600 s, a hold its
+TTL. The line itself keeps every place for as long as the pause lasts, but a pause longer than an
+admission sends those buyers back to the end of the line, and one longer than a hold returns its
+seats. Freezing them would mean extending every live key on resume, under a lock, on every replica;
+pauses are minutes, and that cost is recorded in `06` §9 rather than paid.
 

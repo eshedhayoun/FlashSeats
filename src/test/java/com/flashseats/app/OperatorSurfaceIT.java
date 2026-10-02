@@ -154,8 +154,8 @@ class OperatorSurfaceIT extends IntegrationTest {
     // ------------------------------------------------------------------ pause
 
     @Test
-    @DisplayName("Pausing a sale closes every gate, and resuming reopens them with the queue intact")
-    void pausingClosesTheSaleAndResumingRestoresIt() {
+    @DisplayName("Pausing a sale reads as paused, not over, and resuming reopens it with stock intact")
+    void pausingHaltsTheSaleAndResumingRestoresIt() {
         BuyerSession buyer = new BuyerSession(port);
         buyer.get("/events/" + eventId);
 
@@ -163,9 +163,9 @@ class OperatorSurfaceIT extends IntegrationTest {
         assertThat(paused.status()).isEqualTo(200);
         assertThat(paused.json().get("status").asString()).isEqualTo("PAUSED");
 
-        // EventRow.windowStatus reads anything but PUBLISHED as CLOSED, so the gates shut with no new code.
-        assertThat(buyer.get("/events/" + eventId).text("windowStatus")).isEqualTo("CLOSED");
-        assertThat(buyer.post("/queue/join", Map.of("eventId", eventId)).status()).isNotEqualTo(202);
+        // PAUSED, not CLOSED: buyers are told the sale is paused rather than over (ADR-066). What a pause
+        // allows and refuses, gate by gate, is SalePauseIT's subject.
+        assertThat(buyer.get("/events/" + eventId).text("windowStatus")).isEqualTo("PAUSED");
 
         var resumed = new BuyerSession(port).post("/admin/events/" + eventId + "/resume", null, OPERATOR);
         assertThat(resumed.json().get("status").asString()).isEqualTo("PUBLISHED");

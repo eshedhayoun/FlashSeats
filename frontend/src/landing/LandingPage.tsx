@@ -48,7 +48,8 @@ export function LandingPage({
     return <ProblemAlert message="The event could not be loaded." />;
   }
 
-  const canJoin = event.windowStatus === "OPEN";
+  // A paused sale still takes its line in arrival order; nobody is let in until it resumes (ADR-066).
+  const canJoin = event.windowStatus === "OPEN" || event.windowStatus === "PAUSED";
 
   const handleJoin = async () => {
     setJoining(true);

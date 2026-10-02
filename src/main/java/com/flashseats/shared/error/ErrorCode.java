@@ -116,8 +116,13 @@ public enum ErrorCode {
     ADMIN_AUTH_REQUIRED(HttpStatus.UNAUTHORIZED),
     /** Authenticated, but not an operator. Same filter-chain origin as the code above. */
     ADMIN_FORBIDDEN(HttpStatus.FORBIDDEN),
-    /** The sale is paused, so it admits nobody and reserves nothing until an operator resumes it. */
+    /**
+     * The sale is paused: nothing is reserved until an operator resumes it, and every buyer keeps their
+     * place (ADR-066). Retryable, unlike {@link #SALE_CLOSED}.
+     */
     SALE_PAUSED(HttpStatus.CONFLICT),
+    /** Pause or resume asked for on an event that is neither published nor paused. Admin only. */
+    EVENT_NOT_PAUSABLE(HttpStatus.CONFLICT),
     /**
      * A resend was asked for but the original message is gone: {@code outbox_events} keeps payloads
      * for {@code flashseats.outbox.purge-after-days} and this order is past it. {@code 410}, not
