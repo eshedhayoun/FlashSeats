@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>FlashSeats</title>
+<title>FlashSeats — minimal API demo</title>
 <style>
   /* ---------------------------------------------------------------------
      One file, no build step. This page exists to make the backend walkable:
@@ -12,15 +12,16 @@
      --------------------------------------------------------------------- */
   :root {
     --paper:#f6f5f1; --surface:#fffefb; --surface-2:#edece6;
-    --ink:#1b1e1c; --ink-2:#4c534e; --ink-3:#79817b;
-    --rule:#dbd8d0; --accent:#2f6f5e; --accent-ink:#235345; --accent-soft:#e3ece8;
+    --ink:#1b1e1c; --ink-2:#4c534e; --ink-3:#5c635e;
+    --rule:#dbd8d0; --accent:#2f6f5e; --accent-ink:#235345; --accent-soft:#e3ece8; --on-accent:#ffffff;
     --warn:#93590f; --warn-soft:#f4ecdc; --crit:#93342a; --crit-soft:#f4e4e1;
   }
   @media (prefers-color-scheme: dark) {
     :root {
       --paper:#131613; --surface:#191d1a; --surface-2:#212622;
-      --ink:#e8e9e4; --ink-2:#a9b1ab; --ink-3:#7e8781;
-      --rule:#2c322e; --accent:#74bda3; --accent-ink:#8ecfb5; --accent-soft:#1c2a25;
+      --ink:#e8e9e4; --ink-2:#a9b1ab; --ink-3:#959e98;
+      /* Dark text on the light accent: white on #74bda3 is 2.2:1, this is 8:1. */
+      --rule:#2c322e; --accent:#74bda3; --accent-ink:#8ecfb5; --accent-soft:#1c2a25; --on-accent:#0f1a16;
       --warn:#d09950; --warn-soft:#2a2318; --crit:#d8877b; --crit-soft:#2c1d1a;
     }
   }
@@ -43,7 +44,10 @@
 
   button {
     font:inherit; font-weight:600; border:none; border-radius:6px; padding:11px 18px;
-    background:var(--accent); color:#fff; cursor:pointer;
+    background:var(--accent); color:var(--on-accent); cursor:pointer;
+  }
+  button:focus-visible, .tier:focus-visible, select:focus-visible, input:focus-visible {
+    outline:3px solid var(--accent); outline-offset:2px;
   }
   button:disabled { opacity:.45; cursor:not-allowed; }
   button.ghost { background:transparent; color:var(--ink-2); border:1px solid var(--rule); font-weight:500; }
@@ -64,11 +68,16 @@
      Neutral on purpose: it must not look like either "available" or "gone". */
   .badge.UNKNOWN { background:var(--surface-2);   color:var(--ink-2); }
 
-  .tier { display:flex; justify-content:space-between; align-items:center; gap:14px;
-          padding:14px 16px; border:1px solid var(--rule); border-radius:7px;
-          margin-bottom:10px; background:var(--surface); cursor:pointer; }
-  .tier[aria-selected="true"] { border-color:var(--accent); box-shadow:0 0 0 1px var(--accent); }
-  .tier[aria-disabled="true"] { opacity:.5; cursor:not-allowed; }
+  .tier { display:flex; justify-content:space-between; align-items:center; gap:14px; width:100%;
+          padding:14px 16px; border:1px solid var(--rule); border-radius:7px; text-align:left;
+          margin-bottom:10px; background:var(--surface); color:var(--ink); font-weight:400; }
+  button.tier { cursor:pointer; }
+  .tier[aria-checked="true"] { border-color:var(--accent); box-shadow:0 0 0 1px var(--accent); }
+  .tier:disabled { opacity:.5; cursor:not-allowed; }
+  .demo-banner { background:var(--surface-2); border:1px solid var(--rule); border-radius:8px;
+                 padding:10px 14px; margin-bottom:20px; font-size:13.5px; color:var(--ink-2); }
+  .picker { display:flex; gap:10px; align-items:center; margin-top:12px; }
+  .picker select { flex:1; }
   .tier .name { font-weight:600; }
 
   .bigposition { font-size:52px; font-weight:700; letter-spacing:-.03em; text-align:center;
@@ -93,13 +102,23 @@
 </head>
 <body>
 <div class="wrap">
+  <div class="demo-banner" role="note">
+    <strong>Minimal API demo.</strong> The full client is the React app in <code>frontend/</code> — served at
+    <code>:8080</code> by the cluster, or at <code>:5173</code> with <code>npm run dev</code>. This page only makes the
+    backend walkable.
+  </div>
   <header>
     <div class="brand">FlashSeats</div>
     <h1 id="ev-title">Loading…</h1>
     <p class="sub" id="ev-sub"></p>
+    <div class="picker">
+      <label for="event-picker" style="margin:0">Sale</label>
+      <select id="event-picker" aria-label="Choose a sale"></select>
+    </div>
   </header>
 
-  <div id="alert" class="alert" hidden></div>
+  <div id="alert" class="alert" role="status" hidden></div>
+  <button id="btn-retry" class="ghost full" hidden>Try again</button>
 
   <!-- V1 — landing -->
   <section id="v-landing" hidden>
@@ -138,8 +157,8 @@
         <div class="timer mono" id="admit-timer">—</div>
       </div>
     </div>
-    <h2>Choose your seats</h2>
-    <div id="select-tiers"></div>
+    <h2 id="select-heading">Choose your seats</h2>
+    <div id="select-tiers" role="radiogroup" aria-labelledby="select-heading"></div>
     <label for="qty">Quantity</label>
     <input id="qty" type="number" min="1" value="2">
     <div style="height:16px"></div>
@@ -179,8 +198,7 @@
       <div style="margin-top:14px; font-weight:600" id="r-total"></div>
     </div>
     <p class="muted">
-      We're sending your tickets to <strong id="r-email"></strong>. They usually arrive within a minute —
-      check <a href="http://localhost:8025" target="_blank" rel="noopener">Mailpit</a> to see them land.
+      We're sending your tickets to <strong id="r-email"></strong>. They usually arrive within a minute.
     </p>
     <button class="ghost full" id="btn-restart">Start again</button>
   </section>
@@ -224,17 +242,21 @@ const state = {
   admitFailed: false,
 };
 
+/* Every key is scoped by event: a buyer may be in several sales at once (FE_SPEC rule 5).
+   The admission lives in localStorage because it belongs to the session cookie every tab shares;
+   kept per tab, a second tab would be admitted on the server and refused at /holds for ever. */
+const key = (name) => `fs.${state.eventId}.${name}`;
 const store = {
-  get admission() { return sessionStorage.getItem("fs.admissionToken"); },
-  set admission(v) { v ? sessionStorage.setItem("fs.admissionToken", v) : sessionStorage.removeItem("fs.admissionToken"); },
-  get hold() { return sessionStorage.getItem("fs.holdToken"); },
-  set hold(v) { v ? sessionStorage.setItem("fs.holdToken", v) : sessionStorage.removeItem("fs.holdToken"); },
+  get admission() { return localStorage.getItem(key("admissionToken")); },
+  set admission(v) { v ? localStorage.setItem(key("admissionToken"), v) : localStorage.removeItem(key("admissionToken")); },
+  get hold() { return sessionStorage.getItem(key("holdToken")); },
+  set hold(v) { v ? sessionStorage.setItem(key("holdToken"), v) : sessionStorage.removeItem(key("holdToken")); },
   /* Generated ONCE per hold and reused on every retry — regenerating it per
      attempt would defeat the gateway-level duplicate guard. */
   idemFor(holdToken) {
-    const key = "fs.idem." + holdToken;
-    let v = sessionStorage.getItem(key);
-    if (!v) { v = crypto.randomUUID(); sessionStorage.setItem(key, v); }
+    const k = key("idem." + holdToken);
+    let v = sessionStorage.getItem(k);
+    if (!v) { v = crypto.randomUUID(); sessionStorage.setItem(k, v); }
     return v;
   },
 };
@@ -254,11 +276,16 @@ const availabilityLabel = (level) =>
 /* --- API ---------------------------------------------------------- */
 
 async function api(path, init = {}) {
-  const res = await fetch("/api/v1" + path, {
-    ...init,
-    credentials: "include",
-    headers: { "Content-Type": "application/json", ...(init.headers || {}) },
-  });
+  let res;
+  try {
+    res = await fetch("/api/v1" + path, {
+      ...init,
+      credentials: "include",
+      headers: { "Content-Type": "application/json", ...(init.headers || {}) },
+    });
+  } catch {
+    throw Object.assign(new Error("network"), { problem: { code: "NETWORK_ERROR" } });
+  }
   if (res.status === 204) return null;
   const body = await res.json().catch(() => null);
   if (!res.ok) throw Object.assign(new Error(body?.detail || res.statusText), { problem: body || {} });
@@ -282,12 +309,14 @@ function notify(message, ok = false) {
 /* --- bootstrap + rehydration -------------------------------------- */
 
 async function bootstrap() {
+  const events = await api("/events");
   if (!state.eventId) {
-    const events = await api("/events");
     const open = events.find((e) => e.windowStatus === "OPEN") || events[0];
     if (!open) { notify("No events are published yet."); return; }
     state.eventId = open.eventId;
   }
+  $("event-picker").innerHTML = events.map((e) =>
+    `<option value="${e.eventId}"${e.eventId === state.eventId ? " selected" : ""}>${escapeHtml(e.title)} — ${e.windowStatus.toLowerCase()}</option>`).join("");
 
   state.event = await api(`/events/${state.eventId}`);
   state.clockOffsetMs = Date.parse(state.event.serverTime) - Date.now();
@@ -378,7 +407,7 @@ async function join() {
   try {
     const status = await api("/queue/join", {
       method: "POST",
-      body: JSON.stringify({ eventId: state.eventId, recaptchaToken: null }),
+      body: JSON.stringify({ eventId: state.eventId }),
     });
     notify("");
     showQueue(status);
@@ -402,7 +431,8 @@ function renderPosition(position, estWaitSeconds) {
   state.displayedPosition = Math.min(state.displayedPosition, position);
   const p = state.displayedPosition;
 
-  $("q-position").textContent = p > 1000 ? "1,000+" : p < 1 ? "You're next" : `#${p}`;
+  // Position 1 is the front of the line: "You're next", never "#1" or "#0" (FE_SPEC V2).
+  $("q-position").textContent = p > 1000 ? "1,000+" : p <= 1 ? "You're next" : `#${p}`;
   if (state.startDepth === null) state.startDepth = p;
   $("q-bar").style.width = `${Math.max(0, Math.min(100, (1 - p / Math.max(state.startDepth, 1)) * 100))}%`;
 
@@ -450,10 +480,10 @@ function applyTierAvailability(tiers) {
   document.querySelectorAll("[data-tier]").forEach((el) => {
     const level = byId.get(Number(el.dataset.tier));
     if (!level) return;
-    el.setAttribute("aria-disabled", level === "SOLD_OUT");
+    el.disabled = level === "SOLD_OUT";
     if (level === "SOLD_OUT" && Number(state.tierId) === Number(el.dataset.tier)) {
       state.tierId = null;
-      el.setAttribute("aria-selected", "false");
+      el.setAttribute("aria-checked", "false");
       $("btn-reserve").disabled = true;
     }
     const badge = el.querySelector(".badge");
@@ -506,22 +536,22 @@ function showSelect(admissionExpiresAt) {
   state.admissionExpiresAt = admissionExpiresAt;
   const tiers = state.event.tiers;
 
+  /* Real buttons in a radio group, so every tier is reachable by keyboard. UNKNOWN stays
+     selectable — see availabilityLabel(). */
   $("select-tiers").innerHTML = tiers.map((t) => `
-    <div class="tier" data-tier="${t.tierId}" data-max="${t.maxPerOrder}"
-         aria-selected="false" aria-disabled="${t.availability === "SOLD_OUT"}"
-         data-comment="UNKNOWN is deliberately selectable — see availabilityLabel()">
-      <div>
-        <div class="name">${escapeHtml(t.tierName)}</div>
-        <div class="muted">${money(t.priceCents, t.currency)} each</div>
-      </div>
+    <button type="button" class="tier" role="radio" data-tier="${t.tierId}" data-max="${t.maxPerOrder}"
+         aria-checked="false"${t.availability === "SOLD_OUT" ? " disabled" : ""}>
+      <span>
+        <span class="name" style="display:block">${escapeHtml(t.tierName)}</span>
+        <span class="muted">${money(t.priceCents, t.currency)} each · up to ${t.maxPerOrder}</span>
+      </span>
       <span class="badge ${t.availability}">${availabilityLabel(t.availability)}</span>
-    </div>`).join("");
+    </button>`).join("");
 
   $("select-tiers").querySelectorAll(".tier").forEach((el) => {
     el.onclick = () => {
-      if (el.getAttribute("aria-disabled") === "true") return;
-      $("select-tiers").querySelectorAll(".tier").forEach((o) => o.setAttribute("aria-selected", "false"));
-      el.setAttribute("aria-selected", "true");
+      $("select-tiers").querySelectorAll(".tier").forEach((o) => o.setAttribute("aria-checked", "false"));
+      el.setAttribute("aria-checked", "true");
       state.tierId = Number(el.dataset.tier);
       // The server owns the limit. Never hardcode one here.
       $("qty").max = el.dataset.max;
@@ -665,10 +695,25 @@ function handleCheckoutFailure(p) {
       notify(`${p.detail} Release your seats and reserve again.`);
       return stop();
 
+    case "SERVICE_BUSY":
+    case "RATE_LIMITED":
+      // Back-pressure, not a decline: the same request is safe to send again (ADR-059).
+      notify("We're handling a lot of traffic. Your seats are still held and no attempt was used — try again in a moment.");
+      return retry("Try again");
+
     case "HOLD_EXPIRED":
+      store.hold = null;
+      notify("Your reservation ended. Nothing was charged.");
+      return setTimeout(route, 1200);
+
     case "ORDER_REFUNDED":
       store.hold = null;
       return setTimeout(route, 1200);
+
+    case "REFUND_FAILED":
+      // Never "refunded": the provider refused it and a person is returning the money (ADR-069).
+      store.hold = null;
+      return stop();
 
     default:
       return retry("Pay now");
@@ -742,7 +787,23 @@ function escapeHtml(s) {
 }
 
 $("btn-join").onclick = join;
-$("btn-leave").onclick = () => { closeStream(); showLanding(); };
+$("btn-leave").onclick = leaveQueue;
+$("btn-retry").onclick = () => { $("btn-retry").hidden = true; notify(""); bootstrap().catch(serverDown); };
+$("event-picker").onchange = (e) => { location.search = `?eventId=${e.target.value}`; };
+
+/* Really leaves: the server drops this session from the line, so rejoining is at the back. */
+async function leaveQueue() {
+  closeStream();
+  try { await api("/queue/leave", { method: "POST", body: JSON.stringify({ eventId: state.eventId }) }); }
+  catch { /* the next route() shows where the server says we are */ }
+  notify("You've left the line. If you join again, you'll start at the back.", true);
+  route();
+}
+
+function serverDown(e) {
+  notify(e?.problem?.detail || "We can't reach the FlashSeats server right now. Check that it is running, then try again.");
+  $("btn-retry").hidden = false;
+}
 $("btn-reserve").onclick = reserve;
 $("btn-pay").onclick = pay;
 $("btn-release").onclick = release;
@@ -752,6 +813,7 @@ $("btn-restart-2").onclick = restartSession;
 async function restartSession() {
   closeStream();
   sessionStorage.clear();
+  store.admission = null; // the new session will not be admitted under the old one's token
   try { await api("/session/reset", { method: "POST" }); } catch { /* reload still rehydrates safely */ }
   location.href = location.pathname;
 }
@@ -759,7 +821,7 @@ async function restartSession() {
 document.addEventListener("visibilitychange", () => { if (document.visibilityState === "visible") route(); });
 window.addEventListener("online", () => { state.attempt = 0; route(); });
 
-bootstrap().catch((e) => notify(e.problem?.detail || "Could not reach the server."));
+bootstrap().catch(serverDown);
 </script>
 </body>
 </html>

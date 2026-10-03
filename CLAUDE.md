@@ -6,13 +6,13 @@ Guidance for Claude Code when working in this repository.
 
 FlashSeats — a high-concurrency ticket flash-sale engine. Modular monolith, Java 21, Spring Boot
 4.1.1. The **MVP is built and running**: all nine modules, the full journey from landing page to emailed
-PDF ticket, 299 tests green in any class order. **Inventory lives in Redis** (Stage 1, ADR-046): `catalog:stock:{e}:{t}`
+PDF ticket, 301 tests green in any class order. **Inventory lives in Redis** (Stage 1, ADR-046): `catalog:stock:{e}:{t}`
 is the live count and PostgreSQL keeps no copy of it. **Payment is real** (Stage 2, ADR-052-054) —
 but `flashseats.payment.stripe.enabled` is **false by default**, so `dev`, `test`, the load harness
 and every drill still run the in-process stub through the complete journey, 3-D Secure included.
 
 **Read [`docs/00-architecture-decisions.md`](docs/00-architecture-decisions.md) before changing
-anything.** It contains 76 ADRs. Most record a defect and its fix — 034-039 come from the first
+anything.** It contains 78 ADRs. Most record a defect and its fix — 034-039 come from the first
 review pass over the built code, 040-042 from the second — and several look like over-engineering
 until you read the failure they prevent. 043-045 are the exception: forward-looking decisions about
 the operator surface, buyer accounts and what health should report, with nothing built against them
@@ -47,7 +47,10 @@ and the webhook records a settlement on the ledger. **075**: confirming holds th
 resolved order names the one charge it ended with, and any other settled charge for the hold goes
 back. **076**: a timer is re-armed after its read commits, an availability change is announced by one
 replica rather than each, access logs carry no query strings, and `SecretsGuard` refuses short,
-shared or unhashed secrets.
+shared or unhashed secrets. **077**: buyers can leave the line (`POST /queue/leave`), and a client
+that goes away mid-stream is a debug line, not an `ERROR` with stack traces. **078**: the browser
+suite uses only the API a buyer and an operator use; states no API can create are proven by the
+backend's integration tests and the client's unit tests.
 
 **The operating envelope is 3–10 concurrent sales**, not one
 ([`03-end-to-end-flow.md`](docs/03-end-to-end-flow.md) §2). Every capacity number written before
@@ -64,7 +67,7 @@ security posture, next stages, and the review-pass log. It is the doc to update 
 ## Document precedence
 
 ```
-00-architecture-decisions.md      ← highest authority (76 ADRs)
+00-architecture-decisions.md      ← highest authority (78 ADRs)
 05-global-standards.md            ← cross-cutting contract; module docs conform to it
 FE_SPEC.md                        ← client contract (repo root)
 03-end-to-end-flow.md             ← the authoritative user journey AND the operating envelope
@@ -304,6 +307,9 @@ Do not reintroduce these — each cost a real defect in the first pass:
 | **Failing a confirmation because the order's version moved** | A retry *resuming* a stranded order moves the version too, and the order is still this purchase. Failing on it sent a valid purchase to the refund claim, which succeeded because the order was still unresolved — and the resuming retry then charged again. Hold the row while you check it (ADR-075) |
 | **Assuming "resolved elsewhere" means "resolved by this charge"** | Once the in-flight key and the `PENDING` check expire, two checkouts for one hold can both settle. The second charge reached an order the first had resolved and had no ending at all: a buyer billed twice for one set of seats. Compare with the charge the order names (ADR-075) |
 | **Deduplicating a broadcast against one replica's memory** | Every replica sees the same change, and the fan-out reaches every replica: each frame arrived once per replica, and a change back to a state a replica had announced was never sent, because its streams had heard the others since. Keep the last announcement in one key and swap it with `SET … GET` (ADR-076) |
+| **A backstop handler that owns client disconnects** | `@ExceptionHandler(Exception.class)` caught `AsyncRequestNotUsableException` — a waiting-room tab closing — logged "Unhandled exception" with two stack traces, then failed again writing a problem document to the dead socket. The most common event in a sale became an `ERROR` flood. Name the client-gone exceptions before the backstop (ADR-077, ADR-041's lesson) |
+| **A browser test that writes to the database** | The first e2e draft created sales with SQL through `docker compose exec` and broke counters with `redis-cli`: coupled to the schema and the compose file, past every module's ownership, and wrong on its first run — a raw `UPDATE` violated `ck_events_sale_window`. Test-only endpoints are not the fix either. Drive the API buyers and operators use; prove the rest in the backend's tests (ADR-078) |
+| **`width: 1` in MUI's `sx`** | A number of 1 or less is a *fraction*: `width: 1` is 100 %. A visually-hidden live region styled that way widened every page past the viewport. Use `"1px"` |
 | **Forwarding the client's one idempotency key on every new charge** | Right for a retry of one attempt, wrong across attempts: Stripe replays a key's first answer, and refuses it with different parameters. The second card after a decline got the first card's decline, or an idempotency error counted as a provider outage. Scope the provider key to the attempt (ADR-074) |
 | **Reusing one provider idempotency key across a 3-D Secure resume** | The client mints ONE key per hold and reuses it on every retry, so a second `charge` replays the cached `requires_action` response **for ever** and the buyer can never finish. Varying the key per attempt is worse: it opens a *second* intent, so they authenticate one payment and are billed for two. Retrieve the existing intent (ADR-054) |
 | **Letting a webhook claim survive a failed settlement** | The provider redelivers, the claim says "already handled", and the buyer's settled charge never reaches an order. ADR-038's rule in a new place: `processed_at IS NULL` must mean *in flight*, and a failure must leave **no row at all** (ADR-053) |
@@ -427,6 +433,9 @@ cd frontend && npm install && npm run dev        # :5173, proxies /api to :8080.
                                                  # KEY BLANK to drive the stub gateway, which is
                                                  # what the backend runs by default
 cd frontend && npm test                          # vitest unit tests
+cd frontend && npm run test:e2e                  # the FE_SPEC §8 Playwright suite against the real
+                                                 # backend: needs an OPEN sale (dev-up.sh) on :8080;
+                                                 # E2E_ADMIN=user:pass for pause/resume (ADR-078)
 
 # Stage 2, the REAL provider. Everything else here runs the stub, deliberately
 # -- so none of it can tell you whether Stripe agrees (ADR-052).

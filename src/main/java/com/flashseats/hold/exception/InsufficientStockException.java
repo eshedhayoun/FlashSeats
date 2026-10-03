@@ -15,7 +15,9 @@ public class InsufficientStockException extends FlashSeatsException {
     public InsufficientStockException(long tierId, int requested) {
         super(
                 ErrorCode.INSUFFICIENT_STOCK,
-                "Only fewer than " + requested + " seats remain in this tier. Try another tier.");
+                requested == 1
+                        ? "Those seats just sold. Pick another tier."
+                        : "There aren't " + requested + " seats left in this tier. Try fewer seats or another tier.");
         with("retryable", false);
     }
 }

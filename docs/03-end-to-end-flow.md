@@ -50,11 +50,11 @@
 ### Facade graph (acyclic — see ADR-005, ADR-025)
 
 ```
-                    shared          ← open module: ProblemDetail, ErrorCode, SessionId
+                    shared          ← open module: problems, ErrorCode, SessionId, signed tokens
                  (everyone may depend on it)
 
-filter   ──► bot
-queue    ──► catalog
+bot      ──► shared only            ← its servlet filters run before every handler
+queue    ──► catalog, bot           ← `bot` only on join, for the challenge (ADR-055)
 hold     ──► queue, catalog
 order    ──► hold, catalog, payment, queue
 saleflow ──► queue, hold, order, catalog        ← read-only leaf; nothing depends on it
@@ -69,7 +69,7 @@ key prefixes.
 Two additions from the 2nd-pass audit:
 
 * **`shared`** — a Modulith *open module* holding the RFC 7807 machinery, the canonical error-code
-  enum, and value types (`SessionId`, `Money`). Required, not optional: without it, seven modules
+  enum, the session identity (`SessionId`), signed tokens, the ticket PDF renderer and the clock. Required, not optional: without it, seven modules
   would either duplicate error codes or take dependencies on each other that `verify()` rejects
   (ADR-021).
 * **`saleflow`** — a read-only composition module owning one endpoint,
@@ -108,7 +108,7 @@ card: what the buyer does, what authorises it, and what clock is running.
 | 0 | *(operator)* seeds counters | `POST /admin/events/{id}/prewarm` | HTTP Basic, `ROLE_ADMIN` | window must be `UPCOMING` |
 | 1 | Opens the landing page | `GET /events/{id}` | — (public) | — |
 | 2 | Joins the line | `POST /queue/join` | `fsid` cookie | window must be `OPEN` or `PAUSED` (ADR-066) |
-| 3 | Watches their position | `GET /queue/stream` (SSE)<br>`GET /queue/status` (fallback) | `fsid` cookie | stream 1 h; position pushed every 2 s |
+| 3 | Watches their position | `GET /queue/stream` (SSE)<br>`GET /queue/status` (fallback) | `fsid` cookie | stream 1 h; position pushed every 2 s. `POST /queue/leave` steps out; rejoining is at the back |
 | 4 | *(is promoted)* | — server-initiated | — | **pass TTL 120 s** |
 | 5 | Enters the sale | `POST /queue/admit` + `X-Queue-Pass-Token` | the pass, **spent here** | **admission TTL 600 s** |
 | 6 | Reserves seats | `POST /holds` + `X-Admission-Token` | the admission session | **hold TTL 300 s**, ceiling 420 s |
@@ -777,40 +777,49 @@ Rules every facade obeys — synchronous, never `@Transactional` itself, records
 module-owned exceptions only — are in
 [`05-global-standards.md`](05-global-standards.md#5-facade-contract-rules) §5.
 
+Generated from the six `*Facade` interfaces and their call sites, so every row is a call that exists:
+
 | Caller | Facade | Method | Purpose |
 | :--- | :--- | :--- | :--- |
-| filter | `BotFacade` | `authorize(ip, sid, path)` | buckets + block flags |
-| filter | `BotFacade` | `verifyCaptcha(token, action, sid)` | cached reCAPTCHA score |
-| `hold` | `QueueFacade` | `verifyAdmission(token, sid, eventId)` | live admission session (ADR-020) |
-| `hold` | `CatalogFacade` | `getTierSummary(eventId, tierId)` | validity, price, window |
+| `queue` | `BotFacade` | `verifyHuman(sid, recaptchaToken, ip)` | the join's challenge; fails open (ADR-055) |
+| `queue` | `CatalogFacade` | `getEventSummary`, `getWindowStatus` | the window gates join, admit and every stream frame |
+| `queue` | `CatalogFacade` | `findOpenEventIds`, `findManagedEventIds` | which sales the promotion tick serves |
+| `queue` | `CatalogFacade` | `getRemainingForEvent` | the admission bound; "no counter" is never zero (ADR-035) |
+| `queue` | `CatalogFacade` | `getTierAvailability` | the `tier-availability` frame (ADR-027) |
+| `hold` | `QueueFacade` | `verifyAdmission(token, sid, eventId)` | a live admission session (ADR-020) |
+| `hold` | `CatalogFacade` | `getTierSummary(eventId, tierId)` | price, limits, window |
+| `hold` | `CatalogFacade` | `tryReserve`, `restore` | the only way stock moves (ADR-046) |
 | `order` | `HoldFacade` | `getActiveHold(token, sid)` | read-only, ownership-checked |
-| `order` | `HoldFacade` | `extendHold(token, seconds)` | bounded grace; **fails ⇒ abort** |
+| `order` | `HoldFacade` | `grantGrace(token)` | the one grace extension; **fails ⇒ abort** (ADR-030) |
 | `order` | `HoldFacade` | `consumeHold(token)` | claim — **joins the caller's transaction** |
-| `order` | `HoldFacade` | `releaseHold(token, reason)` | claim |
-| `order` | `CatalogFacade` | `getTierSummary(eventId, tierId)` | price snapshot |
-| `order` | `PaymentFacade` | `authorize(orderNumber, amount, currency, pm, key)` | charge |
-| `order` | `PaymentFacade` | `refund(txnRef, amount, reason)` | compensation |
+| `order` | `HoldFacade` | `discardTimer(token)` | after a purchase, post-commit |
+| `order` | `HoldFacade` | `sumActiveQuantityForTier(tierId)` | the stock invariant and the rebuild |
+| `order` | `CatalogFacade` | `getTierSummary`, `getEventSummary` | price snapshot, ticket details |
+| `order` | `CatalogFacade` | `findManagedEventIds`, `getTierCapacities`, `getLiveCounters`, `applyRebuild` | the drift gauge and the rebuild (ADR-046) |
+| `order` | `PaymentFacade` | `authorize(command)` | one charge attempt, outside every transaction |
+| `order` | `PaymentFacade` | `hasChargeFor(holdToken)` | whether to skip the time gate for a charge that exists (ADR-074) |
+| `order` | `PaymentFacade` | `refund(txnRef, amount, reason)` | compensation, after the claim (ADR-064) |
 | `order` | `QueueFacade` | `revokeAdmission(sid, eventId)` | after `CONFIRMED`, post-commit |
 | `saleflow` | `QueueFacade` | `getQueueState(sid, eventId)` | rehydration (ADR-025) |
 | `saleflow` | `HoldFacade` | `findActiveHold(sid, eventId)` | rehydration |
-| `saleflow` | `OrderFacade` | `findPendingOrder(sid, eventId)` | rehydration |
-| `saleflow` | `CatalogFacade` | `getEventDetail(eventId)` | rehydration |
-| admin | `NotificationFacade` | `resend(orderNumber, kind)` | DLQ replay |
+| `saleflow` | `OrderFacade` | `findLatestOrder(sid, eventId)` | rehydration — the latest order whatever its status (ADR-037) |
+| `saleflow` | `CatalogFacade` | `getEventSummary(eventId)` | rehydration |
 
-`verifyPassToken` / `revokePassToken` moved off `hold` and onto the `POST /api/v1/queue/admit`
-handler inside `queue` itself — the pass is now exchanged for an admission session rather than
-consumed at hold creation (ADR-020).
+`notification` exposes no facade: its operator surface (`/api/v1/admin/notifications/dlq`) is its own
+controller, and a resend is a new outbox row written by `order`.
 
 Events — the only asynchronous couplings:
 
 | Event | Publisher | Consumer | Transport |
 | :--- | :--- | :--- | :--- |
-| `PaymentSettledEvent` | `payment` (webhook only) | `order` | Spring in-process |
+| `PaymentSettledEvent` | `payment` (webhook only) | `order` | Spring in-process — the only cross-module event |
 | `ORDER_CONFIRMED` | `order` | `notification` | outbox → RabbitMQ |
 | `ORDER_REFUNDED` | `order` | `notification` | outbox → RabbitMQ |
-| `EventPrewarmedEvent` | `catalog` | monitoring | Spring in-process |
-| `TicketHoldExpiredEvent` | `hold` | monitoring | Spring in-process |
-| `BotAttackDetectedEvent` | `bot` | monitoring | Spring in-process |
+
+Every other application event is internal to its module and consumed `AFTER_COMMIT`, which is how a
+side effect waits for the transaction that justifies it (invariant 9): `hold`'s `TicketHeldEvent`,
+`TicketHoldSettledEvent` and `HoldTimerFiredEarlyEvent`; `order`'s `OrderConfirmedEvent`; `catalog`'s
+`EventMetadataChanged`.
 
 ---
 

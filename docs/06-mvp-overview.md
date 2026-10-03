@@ -212,7 +212,7 @@ Findings that cost real time and would cost it again.
 ## 8. Verification
 
 ```bash
-./mvnw test        # 299 tests: unit, modularity, concurrency, journey, recovery, queue lifecycle,
+./mvnw test        # 301 tests: unit, modularity, concurrency, journey, recovery, queue lifecycle,
                    #             pre-warm, stock rebuild, drift, Redis-restart guard, the metadata
                    #             cache's five rules, the cluster admission allowance, payment and
                    #             webhooks, bot defence, and fulfilment through a real broker.
@@ -649,10 +649,10 @@ A console is presentation and can wait. The endpoints are the capability.
   keyless stub-payment mode so decline, outage and 3-D Secure are walkable in a browser (ADR-058).
   **Wired into the cluster in Pass 15** (ADR-068): the nginx image builds it, and
   `docker/scripts/professor-demo.sh` starts the whole stack with two seeded sales in one command.
-- **The Playwright suite specified in `FE_SPEC.md` §8.** Every one of the four client rules is a
-  browser behaviour — a skewed clock, a real reload, a live `EventSource` — so none of them is
-  reachable from the API suite, and the twelve reload points are checked by hand today. Two of the
-  defects Pass 1 fixed were reload-path defects. The spec is written; the implementation is not.
+- ~~**The Playwright suite specified in `FE_SPEC.md` §8.**~~ **Built in Pass 15:** 27 specs in
+  `frontend/e2e` drive the real backend through the journey, the stub's checkout failures, the reload
+  points, the stream, two tabs, two sales, a skewed clock, back-off and a phone layout, using only the
+  API buyers and operators use (ADR-078).
 
 ### Stage 4c — Correctness cleanup and concurrent sales (Pass 7 findings)
 
@@ -1107,8 +1107,7 @@ a correctness defect; each is legibility or tidiness.
 - **Two unused indexes.** `idx_pay_order` and `idx_orders_intent` are read by no query. `V12` left
   them while `payment_transactions` was being built; drop them in a new migration once it settles.
   (`idx_pay_hold` backs the 3-D Secure resume lookup — keep it.)
-- **The FE_SPEC §8 Playwright suite.** `frontend/e2e` holds a scaffold, not that suite: no spec yet
-  drives queue → hold → checkout in the browser (`frontend/README.md`).
+- ~~**The FE_SPEC §8 Playwright suite.**~~ Built in Pass 15 (`frontend/README.md`).
 - **Optional doc consolidation.** Move the superseded ADRs (003, 006, 028) to `docs/archive/` behind
   forward-pointing stubs, split §13 below into its own file, and fold `01`/`02` into `03`.
 
@@ -1139,9 +1138,10 @@ Ordered by expected value. The first three are where this build is most likely t
    and a failure without one is a client that cannot branch.
 8. **Backpressure.** Where does the system queue when it is overloaded — Hikari, the SSE registry, the
    broker? Under virtual threads nothing errors, so this has to be measured rather than observed.
-9. **The demo client against `FE_SPEC.md`.** It implements the four rules and the recovery matrix
-   informally. Walk the twelve reload points by hand — or build the Playwright suite specified in
-   `FE_SPEC.md` §8, which exists to stop that being a manual job.
+9. **The React client against `FE_SPEC.md`.** `frontend/e2e` covers the four rules and the reload
+   points that a browser can reach on one replica. What it cannot: a network handover mid-queue, and a
+   promotion delivered across replicas to a stream another replica holds — walk the first by hand, and
+   prove the second with `docker/scripts/fanout-check.sh`.
 
 ---
 
@@ -2112,6 +2112,9 @@ rather than an archaeology.
 | **k6 keys are unique per run** | The stub ignores the checkout idempotency key, but Stripe keeps one for 24 hours and would answer a reused key with the previous run's response. The waiting-room drill also parks each VU after its one journey (a fix from the teammate's last commit), so it measures arrivals rather than a request loop |
 | **Failures are classified by what they prove** (ADR-067) | A reserve whose hold transaction never began — a pool timeout, the common failure under pressure — now gives its seats back instead of hiding them until a rebuild. An unknown path is `404 NOT_FOUND`, not `500`. The rate limiter fails open (counted in `flashseats.bot.limiter.unavailable`) instead of answering every call a bare `500` when Redis is down. Request fields are bounded by their columns, and only the hold-token constraint reads as a concurrent checkout |
 | **The cluster serves the React client; one command starts the demo** (ADR-068) | Ported from the teammate's final commits. The nginx image builds the SPA and serves it at `:8080` with a deep-link fallback, replacing nginx's own 404. `docker/scripts/professor-demo.sh` needs only Docker: secrets, build, health, and two seeded, pre-warmed sales |
+| **The client, finished and redesigned** (Step 9) | Every FE_SPEC view rebuilt on a new design system — light and dark themes, AA-checked; a shell with a skip link and "My tickets"; skeletons; one `Notice`, `ErrorState` and copy table for every error code. Behaviour fixed on the way: refreshes happen behind the content instead of wiping it (the typed email survives one, and a reload mid-charge says a payment may be finishing); the buyer is told what happened to their seats and money after an expiry, a release, a refund or a lost turn — even across a reload; the grace extension shows on the timer; the pre-sale page opens itself at T-0; a failed pass cannot loop; back-pressure is retried a bounded number of times on `Retry-After`; no request is ever made for `/events/NaN`. A sold-out sale says so on the event page. The static page is labelled a minimal API demo, with real keyboard-selectable tiers, per-event storage, a working "Leave queue", an event picker and AA contrast in dark mode |
+| **Leaving the line, and quiet disconnects** (ADR-077) | `POST /queue/leave` takes a buyer out of the line and drops an unspent pass — FE_SPEC's "Leave queue" had nothing to call. A client that goes away mid-stream is now a debug line: the `Exception` backstop had logged every closed waiting-room tab as an `ERROR` with two stack traces, then failed again writing to the dead socket. Two server messages rewritten to FE_SPEC §7's tone |
+| **The browser suite** (ADR-078) | 27 Playwright specs replace the scaffold, driving only the API buyers and operators use: the journey to a downloaded ticket, every stub-reachable checkout failure, the reload points, pause and resume on the stream, the polling fallback, leaving the line, two tabs, two sales, a skewed clock, back-off, dead links and a phone layout. A first draft seeded with SQL and `redis-cli`; what no API can create is proven by the backend's integration tests and the client's unit tests instead. `dev-up.sh` also now names any open sale whose counters an earlier Redis vouched for, with the rebuild that repairs it, instead of calling it walkable |
 | **Confirming holds the order row; a second charge goes back** (ADR-075) | A retry that resumed a stranded order moved its version, and `confirm` treated that as losing: a valid purchase went to the refund claim — which succeeded, the order being still unresolved — and the retry then charged again. `confirm` now locks the row it checks. And two checkouts for one hold, possible once the in-flight guards expire, left the second charge with no ending; every resolved order now names its charge, and any other settled charge for the hold is refunded and counted in `flashseats.payment.charge.stray` |
 | **Small gaps** (ADR-076) | An early hold timer was re-armed inside its read transaction; it waits for the commit now. Each availability change reached every stream once per replica and was retained as many times; one replica announces it, via `queue:availability:{e}`, and `sale-closed` is retained once via `queue:closed:{e}`. nginx no longer logs query strings, which carried 90-day receipt tokens. `SecretsGuard` refuses short or shared signing keys and any admin password that is not an adaptive hash — the compose default `admin` used to start cleanly and fail every login |
 | **The provider path, fixed where the stub cannot see** (ADR-074) | The client's one idempotency key went to Stripe unchanged on every new charge, so a second card after a decline got the first decline replayed or an idempotency error counted as an outage; it is now scoped to the attempt. Finishing 3-D Secure close to expiry is no longer refused as a new charge. A charge settled by webhook is recorded as `SUCCEEDED` on the ledger instead of staying `PROCESSING`. Still wants a run of `stripe-check.sh` with a real test key |
@@ -2122,6 +2125,6 @@ rather than an archaeology.
 | **Money owed and mail stranded are states, not silences** (ADR-069) | A refused refund is `REFUND_FAILED` and answers `409 REFUND_FAILED` — never "refunded in full". A notification claim stranded by a process that died mid-send is dead-lettered by a sweep after 10 minutes, so it shows in the operator's DLQ and a resend works; it used to be acknowledged and never sent |
 | **A pause is a pause** (ADR-066) | A paused sale used to read `CLOSED`: buyers were told it had ended, their streams were closed, the close was **replayed after the resume**, and the event left `/events`. `PAUSED` is now a window status inside the sale window: the line keeps forming in arrival order, nobody is promoted, holds answer `409 SALE_PAUSED` (retryable), a buyer already holding seats can still pay, and `sale-paused` / `sale-resumed` are sent to each replica's own streams and never retained. The admin refusal to pause a draft is `EVENT_NOT_PAUSABLE`. A review then found two things that keep moving while paused: sold-out now un-derives during the pause when expiring holds return seats, and no wait estimate is shown while the line is not moving |
 
-**Verified so far:** 299/299 (228 + 71 new), including `SettlementArbiterIT`, which races confirm
+**Verified so far:** 301/301 (228 + 73 new) backend, 58 vitest and 27 Playwright specs, including `SettlementArbiterIT`, which races confirm
 against refund fifteen times with the refund claim staggered across the confirm transaction: both
 endings occur, and every round ends exactly one way. Its resume race — a retry resuming the order while it is being confirmed — failed on its second round until `confirm` held the row (ADR-075). `OutboxRecoveryIT` was also made immune to the context's own relay, which could claim a row in the moment a test left it `PENDING`.

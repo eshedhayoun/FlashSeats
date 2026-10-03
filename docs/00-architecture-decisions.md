@@ -3199,3 +3199,63 @@ retains) and ADR-039/ADR-048 (what `SecretsGuard` accepts).
 
 **Cost.** One Redis `SET … GET` per watched sale per sweep per replica — fifteen a second for ten
 sales on three replicas — in exchange for a third of the availability traffic on every stream.
+
+---
+
+## ADR-077 — What the rebuilt client needed from the server: a way out of the line, and quiet disconnects
+
+**Status:** accepted, Pass 15 (Step 9). Amends ADR-007 (the stream's lifecycle) and FE_SPEC V2/V6.
+
+**Context.** Rebuilding the React client against the whole of FE_SPEC found three things the server
+did not do:
+
+- **Leaving the line was a button with nothing behind it.** FE_SPEC V2 shows "Leave queue" and V6 has
+  a `QUEUE_LEFT` state, but no endpoint existed; the demo page's button only closed its own stream,
+  so the buyer stayed in line and was promoted later into a sale they had left.
+- **Every closed waiting-room tab logged an `ERROR` with two stack traces.** A client that goes away
+  mid-stream surfaces as `AsyncRequestNotUsableException`; the `Exception` backstop owned it, logged
+  "Unhandled exception", then failed again writing a problem document to the dead socket. Closing a
+  tab is the most common event in a sale, so at ten thousand waiting buyers this is a log flood that
+  costs I/O on the hot path and buries every real failure. `StreamDisconnectIT` reproduces it.
+- **Two server messages broke FE_SPEC §7's tone**: "Only fewer than N seats remain" and "Too many
+  requests. Please slow down".
+
+**Decision.**
+
+1. `POST /api/v1/queue/leave` (`{eventId}` → `204`, idempotent) removes the session from
+   `queue:waiting:{e}` and drops an unspent pass, so a promotion already on its way cannot let in a
+   buyer who left, and an unredeemed pass stops holding back the admission allowance. An admission is
+   left alone: a buyer choosing seats ends that by buying or letting it run out. Joining again is
+   `ZADD NX` with a fresh score — the back of the line — and the client says so before and after.
+2. `AsyncRequestNotUsableException` and `AsyncRequestTimeoutException` have their own handler: a
+   debug line, nothing written. ADR-041's lesson again: a backstop must not own exceptions that are
+   not faults.
+3. The two messages are rewritten: "There aren't 4 seats left in this tier. Try fewer seats or
+   another tier." and "We're handling a lot of traffic right now. Please try again in a moment."
+
+**Cost.** One endpoint, three Redis commands per leave.
+
+---
+
+## ADR-078 — The browser suite uses the API a buyer and an operator use, and nothing else
+
+**Status:** accepted, Pass 15 (Step 9).
+
+**Context.** The first draft of the FE_SPEC §8 suite created its sales with SQL through
+`docker compose exec postgres` and broke counters with `redis-cli`. That coupled the frontend's tests
+to the backend's schema and container names, and wrote past the modules that own those tables and
+keys: its first run failed on `ck_events_sale_window`, because a raw `UPDATE` ended a sale before it
+had started. Moving the same actions into `@Profile("dev")` fixture endpoints was the second draft,
+and it was rejected too: six classes and a test of production code whose only caller is a test, for
+scenarios the backend suite already proves.
+
+**Decision.** The browser suite drives only what exists for buyers and operators: the public API, and
+the operator's pause and resume. It discovers an open sale from `GET /events` and makes a fresh buyer
+per test with a new browser context. **What no API can create** — a sale ending mid-test, a hold
+expiring or running short of time, a counter lost, a sale selling out — is not a browser test: the
+server's half is proven by the integration tests (`HoldExpiryTimerIT`, `QueueLifecycleIT`,
+`SalePauseIT`, `CheckoutServiceTest`), and the client's half by unit tests of the pure functions that
+decide what it shows (`routeFor`, `noticeForTransition`, `checkoutErrorState`, the availability chip).
+
+**Cost.** The suite needs a backend with an open sale (`docker/scripts/dev-up.sh` guarantees one, and
+the concurrent-sales specs skip without two), and each run buys a few tickets from it.

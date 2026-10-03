@@ -156,7 +156,8 @@ export type OrderReceipt = {
 export type PositionUpdateEvent = {
   position: number;
   aheadOfYou: number;
-  estWaitSeconds: number;
+  /** `null` while the server has no drain rate to estimate from — never a `-1` sentinel. */
+  estWaitSeconds: number | null;
 };
 
 export type QueuePromotedEvent = {
@@ -176,5 +177,5 @@ export type SaleExhaustedEvent = {
 };
 
 export type SaleClosedEvent = {
-  saleEndTime: string;
+  closedAt: string;
 };

@@ -23,6 +23,8 @@ import org.springframework.web.bind.MissingRequestHeaderException;
 import org.springframework.web.bind.MissingServletRequestParameterException;
 import org.springframework.web.bind.annotation.ExceptionHandler;
 import org.springframework.web.bind.annotation.RestControllerAdvice;
+import org.springframework.web.context.request.async.AsyncRequestNotUsableException;
+import org.springframework.web.context.request.async.AsyncRequestTimeoutException;
 import org.springframework.web.method.annotation.MethodArgumentTypeMismatchException;
 import org.springframework.web.servlet.NoHandlerFoundException;
 import org.springframework.web.servlet.resource.NoResourceFoundException;
@@ -139,6 +141,18 @@ public class GlobalExceptionHandler {
         return ResponseEntity.status(ErrorCode.SERVICE_BUSY.status())
                 .header(HttpHeaders.RETRY_AFTER, Integer.toString(BUSY_RETRY_AFTER_SECONDS))
                 .body(problem);
+    }
+
+    /**
+     * A client that went away mid-response: a waiting-room tab closed, a phone changed networks, a
+     * stream ended by its own timeout. Routine, and there is no one left to answer. The backstop below
+     * used to own it, so every closed tab wrote an {@code ERROR} with two stack traces, and then a
+     * second failure trying to write a problem document to a dead socket — thousands a minute in a
+     * busy waiting room, burying the errors that matter (ADR-077).
+     */
+    @ExceptionHandler({AsyncRequestNotUsableException.class, AsyncRequestTimeoutException.class})
+    public void onClientGone(Exception ex) {
+        log.debug("Client went away mid-response: {}", ex.getMessage());
     }
 
     /**

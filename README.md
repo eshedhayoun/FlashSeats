@@ -16,14 +16,14 @@ Read in this order:
 | Document | What it covers |
 | :--- | :--- |
 | [`docs/07-system-on-one-page.md`](docs/07-system-on-one-page.md) | **Read first.** The whole system on one page — journey, module graph, checkout sequence, where each concept lives, and what looks removable but is not |
-| [`docs/00-architecture-decisions.md`](docs/00-architecture-decisions.md) | 76 ADRs — every non-obvious decision and the failure it prevents. Read before changing a decision |
+| [`docs/00-architecture-decisions.md`](docs/00-architecture-decisions.md) | 78 ADRs — every non-obvious decision and the failure it prevents. Read before changing a decision |
 | [`docs/01-system-architecture.md`](docs/01-system-architecture.md) | Stack, module map, dependency graph, deployment |
 | [`docs/02-high-level-design.md`](docs/02-high-level-design.md) | Infrastructure and the concurrency model |
 | [`docs/03-end-to-end-flow.md`](docs/03-end-to-end-flow.md) | **The authoritative user journey**, step by step |
 | [`docs/04-implementation-roadmap.md`](docs/04-implementation-roadmap.md) | Four phases, each with exit criteria |
 | [`docs/05-global-standards.md`](docs/05-global-standards.md) | **Cross-cutting contract** — RFC 7807, error registry, idempotency, transaction rules, facade rules |
 | [`docs/06-mvp-overview.md`](docs/06-mvp-overview.md) | **What is actually built** — scope, security posture, next stages, review-pass log |
-| [`FE_SPEC.md`](FE_SPEC.md) | **Front-end specification** — view state machine, API map, storage, SSE, timers, copy, and the planned Playwright suite |
+| [`FE_SPEC.md`](FE_SPEC.md) | **Front-end specification** — view state machine, API map, storage, SSE, timers, copy, design system, and the Playwright suite |
 | [`docs/modules/`](docs/modules/) | Per-module specs — `catalog`, `queue`, `hold`, `bot`, `payment`, `order`, `notification`, `saleflow`, `shared` |
 
 When a module spec disagrees with an ADR, **the ADR wins** and the module spec is stale.
@@ -163,7 +163,7 @@ recovery is an explicit locked rebuild from PostgreSQL. See ADR-004.
 | **Ops** | Actuator + Micrometer/Prometheus, Flyway, Testcontainers 1.21.3 |
 | **Phase 3** | Spring Security, Bucket4j 8.14.0 (Redis-backed), Stripe Java 29.2.0, Resilience4j 2.3.0 |
 | **Phase 4** | PDFBox 3.0.7, Mailpit, Nginx, k6 |
-| **Frontend** | A single-file demo client at `/`; `EventSource` for the waiting room. The React SPA in [`FE_SPEC.md`](FE_SPEC.md) is specified, not built |
+| **Frontend** | **The React client in [`frontend/`](frontend/)** (React 18, MUI 6, Vite, Playwright) — the deliverable, built to [`FE_SPEC.md`](FE_SPEC.md). A single-file API demo is served at `/` by the backend for walking the API with no build step |
 
 All dependencies are declared in [`pom.xml`](pom.xml), grouped by phase. Thymeleaf is **not** among
 them — email bodies are text blocks in `EmailComposer` — and four more were removed in Pass 10 for
@@ -247,7 +247,9 @@ cd frontend
 npm install
 cp .env.example .env.local          # leave the Stripe key BLANK to drive the stub gateway
 npm run dev                         # http://localhost:5173, /api proxied to :8080
-npm test                            # vitest
+npm test                            # vitest unit tests
+npm run test:e2e                    # the FE_SPEC §8 Playwright suite against the real backend;
+                                    # needs `./mvnw spring-boot:run` (the dev profile) on :8080
 ```
 
 With no `VITE_STRIPE_PUBLISHABLE_KEY` the checkout offers the stub's outcomes directly — succeed,
@@ -256,7 +258,7 @@ browser. Set a `pk_test_` key, and start the backend with `STRIPE_ENABLED=true`,
 provider.
 
 ```bash
-./mvnw test                         # 299 tests, green in any class order (ADR-061). Needs Docker:
+./mvnw test                         # 301 tests, green in any class order (ADR-061). Needs Docker:
                                     # every integration test runs real PostgreSQL, Redis and,
                                     # for fulfilment, RabbitMQ containers
 ```

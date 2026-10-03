@@ -1,22 +1,21 @@
 # FlashSeats — Front-End Design Specification
 
-**Stack:** React 18 + TypeScript (Vite) · MUI v5 · native `EventSource`
+**Stack:** React 18 + TypeScript (Vite) · MUI 6 · native `EventSource` · Playwright for §8
 **Backend contract:** [`docs/03-end-to-end-flow.md`](docs/03-end-to-end-flow.md) ·
 [`docs/05-global-standards.md`](docs/05-global-standards.md) ·
 [`docs/00-architecture-decisions.md`](docs/00-architecture-decisions.md)
 
-> **Read this first if you are new.** This is the **target**, not a description of what exists. What
-> ships today is a single hand-written `src/main/resources/static/index.html` (~700 lines of vanilla
-> JS) that implements the four rules in §0 informally and covers the happy path. It is a demo, not
-> the deliverable. Where this document describes something the server does not offer yet, it says
-> **"specified, not built"** — build against the contract, not against the demo client.
+> **Read this first if you are new.** The client this document specifies is **built**: the React app
+> in `frontend/` (served at `:8080` by the cluster's nginx image, or at `:5173` with `npm run dev`).
+> `src/main/resources/static/index.html` is a minimal API demo that makes the backend walkable with no
+> build step; it says so on screen and is not the deliverable. Where this document describes something
+> the server does not offer, it says **"specified, not built"**.
 >
-> **Two things changed in the Sept 2026 plan-correctness pass, and they change the client:**
+> Two facts shape every client decision here:
 >
-> 1. **The system now targets 3–10 concurrent sales** ([`03`](docs/03-end-to-end-flow.md) §2). Every
->    piece of client state must therefore be **scoped by `eventId`** — see rule 5. The current demo
->    client is single-sale and would corrupt itself with two tabs on two sales.
-> 2. **A ticket is retrievable, not only emailed** (ADR-050) — built. V5 gains a download.
+> 1. **The system targets 3–10 concurrent sales** ([`03`](docs/03-end-to-end-flow.md) §2), so every
+>    piece of client state is **scoped by `eventId`** — rule 5.
+> 2. **A ticket is retrievable, not only emailed** (ADR-050): V5 offers a download.
 
 ---
 
@@ -86,6 +85,11 @@ unmounts, never a shared singleton reassigned to whichever sale was opened last.
 This list **is** the router, and it is **ordered**. Evaluate top to bottom and take the first match.
 Do not derive the view from navigation history — a buyer who reloads, hits Back, or opens a second
 tab must land on the view the server says they are in.
+
+**The address is `/events/:eventId`, and nothing after it chooses the view.** The per-view routes
+below name the screens; the built client renders whichever view `routeFor` picks at
+`/events/:eventId` and at any path beneath it, so a bookmarked or stale `…/checkout` still lands
+where the server says the buyer is.
 
 **It is evaluated per event, against that event's own state** (rule 5). `routeFor` is a function of
 one `SaleState`, and a buyer in three sales has three independent answers — there is no single
@@ -283,9 +287,9 @@ card is being charged is the worst possible message, and it would be false.
 
 ```ts
 const key = (name: string) => `fs.${eventId}.${name}`;      // rule 5
-const idempotencyKey = sessionStorage.getItem(key('idem'))
+const idempotencyKey = sessionStorage.getItem(key(`idem.${holdToken}`))
   ?? crypto.randomUUID();                   // generated ONCE per hold, reused on every retry
-sessionStorage.setItem(key('idem'), idempotencyKey);
+sessionStorage.setItem(key(`idem.${holdToken}`), idempotencyKey);
 setPaymentInFlight(true);                   // disables CTA and freezes the expiry branch
 ```
 
@@ -406,6 +410,7 @@ Base `/api/v1`. `fsid` is an `HttpOnly` cookie — **JavaScript never reads or s
 | all | `GET` | `/sale/{eventId}/state` | — | — | `200` | `EVENT_NOT_FOUND` |
 | V1→V2 | `POST` | `/queue/join` | — | `{eventId}` | `202` | `SALE_NOT_OPEN`, `SALE_CLOSED`, `RATE_LIMITED`. A **paused** sale accepts the join — the line keeps its arrival order while nobody is let out (ADR-066) |
 | V2 | `GET` | `/queue/stream?eventId=&lastEventId=` | `Accept: text/event-stream`, `Last-Event-ID` | — | SSE | — |
+| V2 | `POST` | `/queue/leave` | — | `{eventId}` | `204` | — Idempotent. The session leaves the line and an unspent pass is dropped; joining again starts **at the back**, and the copy must say so |
 | V2 | `GET` | `/queue/status?eventId=` | — | — | `200` | — (a session that never joined is `phase: NOT_JOINED`, not an error). `paused: true` while an operator has paused the sale; the phase stays truthful beside it |
 | V2→V3 | `POST` | `/queue/admit` | `X-Queue-Pass-Token` | `{eventId}` | `200` | `QUEUE_PASS_INVALID`, `VALIDATION_FAILED` |
 | V3 | `POST` | `/holds` | `X-Admission-Token` | `{eventId, tierId, quantity}` | `201` | `INSUFFICIENT_STOCK`, `QUANTITY_EXCEEDS_LIMIT`, `HOLD_LIMIT_EXCEEDED`, `ADMISSION_EXPIRED`, `INVENTORY_UNAVAILABLE`, `SALE_PAUSED` (retryable: keep the buyer on V3 and let them try again once the sale resumes) |
@@ -481,21 +486,31 @@ not context the tab happens to remember.
 
 | Key | Contents | Lifetime |
 | :--- | :--- | :--- |
-| `fs.{eventId}.admissionToken` | admission token (V3–V4) | until admission expires |
 | `fs.{eventId}.holdToken` | active hold | until settled |
-| `fs.{eventId}.idem` | idempotency key, **one per hold** | until settled |
+| `fs.{eventId}.idem.{holdToken}` | idempotency key, **one per hold** | until settled |
+| `fs.{eventId}.email.{holdToken}` | the email typed at checkout, so a reload does not empty the form | until settled |
+| `fs.{eventId}.paying.{holdToken}` | set while a payment is on its way; still set after a reload means "a payment may be finishing", never "nothing happened" | until an answer arrives |
 | `fs.{eventId}.lastEventId` | SSE `Last-Event-ID` | per tab |
+| `fs.{eventId}.queueStart` | the position first seen in line, which the progress bar measures from | while waiting |
+| `fs.{eventId}.view` | the last view, so "your reservation ended while you were away" survives a reload | per tab |
 | `fs.clockOffsetMs` | server-clock delta | per tab |
 
-`fs.clockOffsetMs` is the **one** deliberately global key: there is a single server clock, and every
-`serverTime` in every response refreshes the same offset.
+`fs.clockOffsetMs` is the **one** deliberately global session key: there is a single server clock,
+and every `serverTime` in every response refreshes the same offset.
+
+**The one per-sale key in `localStorage`: `fs.{eventId}.admissionToken`.** An admission belongs to the
+session — the `fsid` cookie every tab shares — and `/holds` accepts only a request that carries it.
+Kept per tab, a second tab of the same buyer in the same sale would be admitted on the server and
+refused at `/holds` with `ADMISSION_REQUIRED`, looping. It is still namespaced by event, and cleared
+the moment rehydration says the admission is over.
 
 There is still no `fs.pi`, and 3-D Secure does not need one. The `clientSecret` arrives on the
 `402` and is used immediately by `handleNextAction`; the retry is a re-POST of the same body, so
 nothing about the challenge has to survive a reload. The intent id lives on the server, keyed by the
 hold (ADR-054). Persisting a client secret would be storing a bearer value for no reason.
 
-**`localStorage`:** only `fs.recentOrders` — a list of `{orderNumber, receiptToken, eventTitle}` so a
+**`localStorage`, otherwise:** `fs.theme` (light / dark / system — a preference about the person, not
+a sale), and `fs.recentOrders` — a list of `{orderNumber, receiptToken, eventTitle}` so a
 returning buyer can find their tickets across sales. It is keyed by nothing because it spans
 everything, and it is the only client state that is *meant* to outlive a tab. Nothing
 security-sensitive beyond the receipt tokens it exists to hold — treat it accordingly (§3.1).
@@ -616,7 +631,7 @@ function connect(eventId: number) {
     const d = JSON.parse(e.data);
     setPosition(p => Math.min(p ?? d.position, d.position));   // monotonic
     setEstWait(d.estWaitSeconds);
-    sessionStorage.setItem('fs.lastEventId', (e as MessageEvent).lastEventId);
+    sessionStorage.setItem(`fs.${eventId}.lastEventId`, (e as MessageEvent).lastEventId);
   });
 
   es.addEventListener('queue-promoted',    e => admit(JSON.parse(e.data).passToken));
@@ -686,13 +701,16 @@ Browsers cap ~6 connections per origin: **one `EventSource` per tab**, closed on
 
 ## 5. Abuse defence — what the client actually does
 
-**There is no reCAPTCHA.** No challenge provider is integrated, `/queue/join` accepts no
-`recaptchaToken`, and no property for one exists. An earlier draft of this document specified a full
-reCAPTCHA v3 integration; building against it would send a field the server ignores and branch on a
-code it never returns.
+**reCAPTCHA v3 on join, failing open** (ADR-055). With `VITE_RECAPTCHA_SITE_KEY` set, the client loads
+the provider's script **on the "Join the sale" press, never on page load** — tokens are short-lived,
+so one minted early is stale for anyone who reads the page first — and sends `recaptchaToken` with
+`/queue/join` only. With no key, a script that will not load, or a provider slower than 3 s, it sends
+the join **without** a token, and the server falls back to rate limits. No sale may close because a
+third-party script did not load. `BOT_VERIFICATION_FAILED` is the one refusal: the provider actively
+scored the browser below the threshold.
 
-Defence today is **session-first rate limiting with an IP backstop** (ADR-011), enforced in a servlet
-filter before any handler. The client's entire responsibility is to handle being limited well.
+Underneath, defence is **session-first rate limiting with an IP backstop** (ADR-011), enforced in a
+servlet filter before any handler. The client's responsibility is to handle being limited well.
 
 ### Handling `429 RATE_LIMITED`
 
@@ -709,17 +727,12 @@ const delay = Math.random() * Math.min(30_000, 500 * 2 ** attempt);
   shared corporate gateway or a carrier NAT can trip the IP bucket through no fault of the buyer,
   which is exactly why that bucket is deliberately loose.
 
-The same copy rule will apply to whatever code a challenge provider raises if one ever ships
-(`BOT_VERIFICATION_FAILED` was removed from the registry as unreachable): never accuse a paying
-customer. False positives are real, and accusing one is worse than admitting a few
-scripts.
+The same copy rule applies to `BOT_VERIFICATION_FAILED`: never accuse a paying customer — "We couldn't
+verify your browser. Reload the page and try again." False positives are real, and accusing one is
+worse than admitting a few scripts.
 
-### When it ships (Stage 2)
-
-A challenge is executed **on the "Join Flash Sale" press, never on page load** — tokens are
-short-lived, so executing early yields a stale one for anyone who reads the page first. It applies to
-`/queue/join` only, and **if the provider script fails to load, submit anyway**: the server falls back
-to rate limits, and no sale should be blocked on a third-party script.
+The built client retries a `429` (and `503 SERVICE_BUSY`) at most twice on reads and joins and three
+times on checkout, honouring `Retry-After`, then shows the copy above with a working "Try again".
 
 ---
 
@@ -797,13 +810,13 @@ tell thousands of buyers the sale ended when it had not.
 
 ## 8. End-to-end tests — Playwright
 
-> **Status: specified, not built.** Nothing in this section exists yet. It is written down now
-> because the decisions below are cheap to make while the contract is fresh and expensive to
-> retrofit onto a suite someone has already started.
+> **Status: built.** `frontend/e2e`, 27 specs across 10 files, green against the real backend. Run it
+> with an open sale on `:8080` (`docker/scripts/dev-up.sh && ./mvnw spring-boot:run`), then
+> `cd frontend && npm run test:e2e`. Playwright starts the Vite dev server itself.
 
 ### Why a real browser is required here
 
-The backend suite (`./mvnw test`, 53 tests) already proves the things that live in SQL and Redis: no
+The backend suite (`./mvnw test`) already proves the things that live in SQL and Redis: no
 overbooking, restore-exactly-once, one order per hold, the queue's terminal states. It drives the API
 over real HTTP with a real cookie jar. What it cannot touch is **every one of the four rules in §0**,
 because all four are browser behaviours:
@@ -821,291 +834,180 @@ of §4 — and a fake DOM stops being a shortcut and starts being a different sy
 ### Shape
 
 ```
-e2e/
-├── playwright.config.ts     webServer: docker compose + spring-boot:run, reuse locally
-├── fixtures/
-│   ├── sale.ts              seed an event via SQL, return its ids  (mirrors SaleFixture)
-│   └── buyer.ts             a browser context = one buyer = one fsid cookie
-└── specs/
-    ├── journey.spec.ts      landing → queue → admit → hold → pay → receipt
-    ├── recovery.spec.ts     the twelve reload points of §3
-    ├── router.spec.ts       the ordered precedence of §1
-    ├── checkout-errors.spec.ts  one case per row of the §3 error matrix
-    └── sse.spec.ts          promotion frame, heartbeat, reconnect, polling fallback
+frontend/
+├── playwright.config.ts     one worker (one shared backend); desktop Chrome + a Pixel 7 project
+└── e2e/
+    ├── support/
+    │   ├── backend.ts       the public API and the operator's pause/resume — nothing else (ADR-078)
+    │   └── fixtures.ts      `sale` (an open sale with seats), `twoSales`, `newBuyer` (a context = an fsid)
+    └── specs/
+        ├── journey.spec.ts          landing → line → turn → hold → pay → receipt → PDF; My tickets
+        ├── checkout-errors.spec.ts  decline ×3, outage + Retry-After, 3-D Secure, release
+        ├── recovery.spec.ts         reload in line, choosing, at checkout, after buying; two tabs
+        ├── router.spec.ts           confirmed below the queue states; sub-paths
+        ├── sse.spec.ts              pause → resume on the stream; polling fallback; leave the line
+        ├── clock.spec.ts            a device four minutes fast still sees the whole hold
+        ├── concurrent.spec.ts       two sales: two tabs, and one tab moving between them
+        ├── ratelimit.spec.ts        429 backoff, then stop without blaming the buyer
+        ├── deeplinks.spec.ts        unknown page, malformed id never requested, missing event/order
+        └── mobile.spec.ts           the journey on a phone, nothing scrolling sideways
 ```
 
 **One browser context per buyer, never one page.** The `fsid` cookie *is* the identity (ADR-010), so
 two contexts are two buyers and two pages in one context are two tabs of the same buyer. Both cases
-need testing and conflating them tests neither.
+are tested and conflating them tests neither.
 
-### What it must cover, and what it must not
+### What it reaches through the API, and what it leaves to the other suites
 
-**Must** — everything the API suite structurally cannot reach:
+The suite drives only what exists for buyers and operators: the public API, and the operator's pause
+and resume (ADR-078). It never writes to a database or Redis, and the backend has no endpoint that
+exists for it. That draws the line:
 
-- The **recovery matrix** (§3). Twelve rows, twelve `page.reload()` calls. This is the single
-  highest-value spec: two shipped defects were reload-path defects, and both were invisible to a
-  test that never reloaded.
-- The **router precedence** (§1), especially the two ordering rules that are load-bearing: a live
-  hold outranking a closed window, and a confirmed order sitting *below* the queue states.
-- The **checkout error matrix** (§3) — one case per row, asserting the pay button's state as well as
-  the copy. Two rows were missing entirely and fell to a default that re-enabled a button the server
-  would refuse.
-- **SSE**: the promotion frame arriving on a live stream, heartbeats keeping an idle stream open,
-  reconnect with full-jitter backoff, and the polling fallback taking over.
-- **Two tabs converge**, and a purchase in one is visible in the other after a rehydrate.
+| Through the browser | Proven elsewhere, because no API creates the state |
+| :--- | :--- |
+| the journey, the stub's checkout failures, reloads, the stream, pause and resume, two tabs, two sales, the clock, back-off, dead links, a phone | a hold expiring or short of time, a sale ending mid-checkout, a lost counter, a sell-out — server side in `HoldExpiryTimerIT`, `QueueLifecycleIT`, `SalePauseIT`, `CheckoutServiceTest`; client side in `routeFor`, `noticeForTransition`, `checkoutErrorState` and the availability-chip unit tests |
 
 **Must not** — anything already proven cheaper elsewhere. No overbooking races, no restore-once, no
 settle-claim concurrency. A browser is the slowest, flakiest place to assert a database invariant,
 and `StockReserveConcurrencyIT` already does it in 100 ms.
 
-### The four hard parts, decided in advance
+### The four hard parts, as decided and built
 
-**1. Never sleep; wait on a condition.** Promotion is a real 1 s worker, so a buyer's pass appears
-when it appears. Wait for the UI state or poll `/queue/status`, with a generous timeout — never
-`waitForTimeout`. Shrink `flashseats.queue.promotion-interval-ms` for the test profile instead of
-waiting longer.
+**1. Never sleep; wait on a condition.** Promotion is a real 1 s worker, so a buyer's turn arrives
+when it arrives: every spec waits on the UI with a generous timeout. The two exceptions measure time
+itself (a reload must not reset a clock).
 
-**2. Skew the clock deliberately.** Rule §0.1 is only testable if the browser's clock disagrees with
-the server's. Use `page.clock` to install a fixed offset, then assert the countdown still tracks
-`serverTime`. A suite whose browser clock happens to match the server's proves nothing about the
-rule it thinks it is testing.
+**2. Skew the clock deliberately.** `clock.spec.ts` installs `page.clock` four minutes fast and checks
+the hold still reads about five minutes on the server's clock.
 
-**3. Drive the payment branches by card token, not by mocking.** `pm_card_visa`, `pm_card_declined`
-and `pm_card_error` already select success, decline and outage in `StubPaymentGateway`, and the
-select on V4 exposes all three. Route-intercepting `/orders/checkout` to fake a response would test
-the client against a fiction — and the two worst checkout defects were in what the *server* actually
-returned, which an intercept would have hidden.
+**3. Drive the payment branches by card token, not by mocking.** `pm_card_visa`, `pm_card_declined`,
+`pm_card_error` and `pm_card_authenticationRequired` select success, decline, outage and 3-D Secure in
+`StubPaymentGateway`, and V4's demo-payments picker exposes all four. Nothing intercepts
+`/orders/checkout`. The one intercept in the suite is `ratelimit.spec.ts`, because a real `429` needs
+hundreds of requests from one address — a load test, not a browser test — and what is under test
+there is the client's back-off.
 
-**4. Seed per spec, and reset Redis with PostgreSQL.** Truncating tables while `queue:waiting:1`
-survives is how one spec's queue becomes the next spec's starting state. `SaleFixture.reset()` learned
-this the hard way; the fixture here must flush both. Prefer a fresh event id per spec over sharing
-one.
+**4. A fresh buyer per test.** Every spec runs in its own browser context, so it holds its own session,
+place, admission and hold; the sale is shared, and the suite buys a few tickets from it per run.
 
-### Not in scope for the first cut
+### Not covered yet
 
-Visual regression, axe/accessibility assertions and mobile viewport matrices. Worth doing; not worth
-blocking recovery-matrix coverage on.
-
-**Multi-replica runs behind the `cluster` profile are now in scope**, and so are the concurrent-sales
-boxes in §9. Both were deferred when the target was one sale on one instance. They are the two places
-a client can be correct on a developer's laptop and wrong in front of buyers: promotion fan-out only
-exists across replicas (ADR-007), and per-event state isolation only fails once there are two sales
-to confuse. `docker/seed/seed.sh` seeds the sale; the concurrent-sales drill seeds five.
+Visual regression and automated accessibility assertions (axe). Multi-replica browser runs: the suite
+can point at the cluster (`E2E_API=http://localhost:8080 E2E_BASE_URL=http://localhost:8080`, and the
+operator's password in `E2E_ADMIN`), but promotion fan-out across replicas is proven by
+`docker/scripts/fanout-check.sh`.
 
 ---
 
 ## 9. Definition of done
 
-- [ ] Every countdown derives from `serverTime` + `expiresAt`; no local decrementing counters
-- [ ] `maxPerOrder` and all TTLs come from the API; no hardcoded limits
-- [ ] `GET /sale/{eventId}/state` on mount, `online`, `visibilitychange`, and SSE reconnect
-- [ ] All twelve rows of the recovery matrix (§3) verified by hand
-- [ ] Queue position clamped monotonic
-- [ ] SSE reconnect uses full-jitter backoff; polling fallback after 3 failures
-- [ ] Wi-Fi → cellular handover mid-queue keeps position and reconnects
-- [ ] Timer at `00:00` **asks the server**; never navigates on a local timer
-- [ ] "Completing your purchase…" shown when the timer expires mid-charge — never "expired"
-- [ ] Idempotency key generated once per hold, reused across retries
-- [ ] `userSessionId` appears in no request anywhere
-- [ ] All errors switch on `problem.code`, never on `detail` or status alone
-- [ ] `503 INVENTORY_UNAVAILABLE` never renders as sold out
-- [ ] `tabular-nums` on every live-updating numeric; zero layout shift
-- [ ] `aria-live` announces thresholds, not every tick
-- [ ] `prefers-reduced-motion` respected
-- [ ] Pay button disabled on click, not debounced
-- [ ] Two tabs on the same session **and the same sale** converge on the same view
+Ticked where `frontend/e2e` or the unit suite checks it; the rest is checked by hand in Step 11.
 
-**Concurrent sales** (rule 5 — the current demo client fails every box below):
+- [x] Every countdown derives from `serverTime` + `expiresAt`; no local decrementing counters (`clock.spec`)
+- [x] `maxPerOrder` and all TTLs come from the API; no hardcoded limits
+- [x] `GET /sale/{eventId}/state` on mount, `online`, `visibilitychange`, and after every stream frame that changes the view
+- [x] The recovery matrix's reload points that the API can reach (`recovery.spec`); expiry while away by unit test (`notices`)
+- [x] Queue position clamped monotonic (unit + `recovery.spec`)
+- [x] SSE reconnect uses full-jitter backoff; polling fallback after 3 failures (`sse.spec`)
+- [ ] Wi-Fi → cellular handover mid-queue keeps position and reconnects — by hand
+- [x] Timer at `00:00` **asks the server**; never navigates on a local timer
+- [x] "Completing your purchase…" shown when the timer expires mid-charge — never "expired"
+- [x] Idempotency key generated once per hold, reused across retries (unit)
+- [x] `userSessionId` appears in no request anywhere
+- [x] All errors switch on `problem.code`, never on `detail` or status alone (unit: `problemCopy`, `checkoutErrorState`)
+- [x] `503 INVENTORY_UNAVAILABLE` never renders as sold out (unit: `problemCopy`, `checkoutErrorState`, `AvailabilityChip`)
+- [x] `tabular-nums` on every live-updating numeric
+- [x] `aria-live` announces thresholds, not every tick
+- [x] `prefers-reduced-motion` respected (every animation and transition off)
+- [x] Pay button disabled on click, not debounced
+- [x] Two tabs on the same session **and the same sale** converge on the same view (`recovery.spec`)
 
-- [ ] Every `sessionStorage` key is namespaced `fs.{eventId}.*`; the only global one is
-      `fs.clockOffsetMs`
-- [ ] One `EventSource` per event, closed on unmount — never a singleton reassigned between sales
-- [ ] Queued for sale A **and** holding seats in sale B, in two tabs, corrupts neither
-- [ ] The same journey in **one** tab, navigating between two sales, corrupts neither
-- [ ] Two concurrent holds in two different sales each run their own countdown
-- [ ] `fs.recentOrders` lists tickets across sales and survives a tab close
-- [ ] A promotion in sale A while the tab is showing sale B is not lost — it is in Redis, and
-      rehydrating A recovers it
+**Concurrent sales** (rule 5):
+
+- [x] Every per-sale key is namespaced `fs.{eventId}.*`; the global ones are `fs.clockOffsetMs`, `fs.theme` and `fs.recentOrders` (`concurrent.spec`)
+- [x] One `EventSource` per event, closed on unmount — never a singleton reassigned between sales
+- [x] Holding seats in sale A **and** choosing in sale B, in two tabs, corrupts neither (`concurrent.spec`)
+- [x] The same journey in **one** tab, navigating between two sales, corrupts neither (`concurrent.spec`)
+- [ ] Two concurrent holds in two different sales each run their own countdown — by hand
+- [x] `fs.recentOrders` lists tickets across sales and survives a tab close (`journey.spec`)
+- [ ] A promotion in sale A while the tab is showing sale B is not lost — by hand
 
 **Contract honesty:**
 
-- [ ] `partial` from `/sale/state` renders as degraded, never as absent
-- [ ] Retries re-POST `/orders/checkout`; no client invents a resume endpoint
-- [ ] No `recaptchaToken` is sent; `RATE_LIMITED` backs off with full jitter and a ceiling
-- [ ] `receiptToken` never reaches history, `Referer`, a log, or an analytics call (§3.1)
-- [ ] The buyer's email is legible on V5, and a ticket download exists once ADR-050 ships
-
-**Not yet covered by any automated test.** Every box above is verified by hand today. §8 specifies
-the Playwright suite that should own them; until it exists, this list is a checklist a person walks,
-and the reload points are the ones most likely to rot between passes. The concurrent-sales boxes are
-the newest and the least exercised — they are where a new client is most likely to be quietly wrong.
-
+- [x] `partial` from `/sale/state` renders as degraded, never as absent (unit: `routeFor`)
+- [x] Retries re-POST `/orders/checkout`; no client invents a resume endpoint
+- [x] `recaptchaToken` only on join, only with a site key, and the join goes ahead without one; `RATE_LIMITED` backs off with full jitter and a ceiling (`ratelimit.spec`)
+- [x] `receiptToken` never reaches a URL the app navigates to by itself, a log, or an analytics call (`journey.spec`; `<meta name="referrer" content="same-origin">`)
+- [x] The buyer's email is legible on V5, and the ticket downloads (`journey.spec`)
 
 ---
 
 ## 10. Design System
 
-FlashSeats uses a cohesive, dark-mode-first design with warm mint-greens that feels contemporary and calm during high-stress moments. This section specifies the visual foundation: colour tokens, type scale, and component patterns that maintain consistency across all views.
+The client is calm under a running clock: one indigo brand, generous space, and urgency said in
+words as well as colour. Built with MUI 6 in `frontend/src/app/theme.ts`; the shared components are in
+`frontend/src/ui`.
 
-### Palette tokens
+### Themes and palette
 
-**Primary brand colour**
-- `#65d391` — Mint green, used for CTAs, positive states, success indicators
-- Contrast text: `#102017` (near-black, ensures WCAG AA on mint backgrounds)
+Light and dark, following the system setting, with a header toggle (light / dark / system) remembered
+as `fs.theme`. Every text/background pair is **WCAG AA** — body text at least 4.5:1 on every surface
+it sits on, the availability and status chips at least 6:1.
 
-**Secondary colour**
-- `#9be7b2` — Lighter mint, used for supporting elements, secondary CTAs
+| Token | Light | Dark |
+| :--- | :--- | :--- |
+| background / paper / subtle | `#F6F7FB` / `#FFFFFF` / `#EEF0F7` | `#0D0F1A` / `#161927` / `#1E2234` |
+| text / secondary | `#151826` / `#4B5165` | `#ECEEF8` / `#A6ACC4` |
+| primary | `#4338CA`, white text | `#A5B4FC`, `#111427` text |
+| success / warning / error / info | `#15803D` / `#B45309` / `#B91C1C` / `#0369A1` | `#4ADE80` / `#FBBF24` / `#F87171` / `#38BDF8` |
+| brand gradient (hero, logo) | `#4338CA → #6D28D9 → #BE185D`, white text ≥ 6:1 at every stop | same |
 
-**Background**
-- Default: `#252a27` — Deep grey-green, page background
-- Paper/Card: `#303732` — Slightly lighter grey-green, cards/panels
+Chips are tinted (12–16 % of their colour) with darkened text in light mode.
 
-**Text**
-- Primary: `#b9f2c8` — Light mint, body text, high contrast on dark backgrounds
-- Secondary: `#a8c5b1` — Muted mint, labels, hints, secondary copy
+### Type, shape, space, motion
 
-**Semantic colours**
-- Error: `#ff6b6b` — Red, for errors and critical states
-- Warning: `#ffd93d` — Amber, for warnings and caution states (e.g., hold expiry approaching)
-- Success: `#65d391` — Mint (same as primary)
-- Info: `#4ecdc4` — Cyan, for informational states
+- **Type:** the system font stack — nothing to download, and a cluster may have no internet. Headings
+  700–800 with tight tracking; `h1` scales from 2.25 rem on a phone to 3 rem. Every live number is
+  `tabular-nums`.
+- **Shape and space:** an 8 px grid; radius 12 (cards 16); large buttons 48 px tall, sentence case.
+- **Motion:** 150–250 ms ease-out; the queue position fades over 400 ms; the hold timer pulses gently
+  (≤ 1 Hz) under a minute and stops pulsing in the last ten seconds. `prefers-reduced-motion` turns
+  every animation and transition off.
+- **Formatting:** money, dates and times through `Intl`, in the buyer's locale and time zone.
 
-**Divider/border**
-- `#4a5d50` — Mid-tone grey-green, used for dividers and subtle borders
+### Countdown timers — tone and words
 
-### Type scale
+| Timer | Neutral | Warning | Critical |
+| :--- | :--- | :--- | :--- |
+| Hold (V4) | > 2 min — "Take your time" | 1–2 min, amber — "Complete your purchase soon" | < 1 min, red, gentle pulse — "Less than a minute remaining" |
+| Admission (V3) | — | < 1 min, amber | never: running out costs a place, not money |
+| Pre-sale (V1) | always | — | — |
 
-All typography uses the system font stack: `system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif`
+A screen reader hears the threshold crossings only — "Two minutes left…", then "Less than a minute
+left…" (assertive) — never every second. The hold timer is sticky at the top of V4 and is its own
+component, so it re-renders every second and the payment form never does.
 
-| Scale | Size | Weight | Usage |
-|-------|------|--------|-------|
-| **h1** | 48px | 600 | Page titles ("Aurora Fest 2026"), queue position ("#128") |
-| **h2** | 36px | 600 | Section headers ("Tiers", "Live availability") |
-| **h3** | 28px | 600 | Subheadings, modal titles |
-| **h4** | 24px | 600 | Card titles ("Complete your purchase") |
-| **h5** | 20px | 500 | Subsection headers |
-| **h6** | 16px | 500 | Small headers, form labels |
-| **body1** | 16px | 400 | Body text, default paragraph text |
-| **body2** | 14px | 400 | Secondary body, supporting text |
-| **subtitle1** | 16px | 500 | Intro text, emphasis |
-| **subtitle2** | 14px | 500 | Category labels, section subtitles |
-| **caption** | 12px | 400 | Timestamps, helper text, fine print |
-| **overline** | 11px | 600 | All-caps labels (rare) |
+### Components
 
-**Line height**: 1.5 for body text, 1.2 for headings (ensures readability on dark backgrounds)
+`AppShell` (skip link, sticky header with the brand, "My tickets" and the theme toggle, `<main>`,
+footer naming the payment mode) · `PageTitle` (the view's `h1`, focused when the view appears, so every
+view change is announced) · `Notice` (the one banner; errors are `role="alert"`, everything else
+`role="status"`) · `ErrorState` (problem → copy, Try again, Back to all events, and a support reference
+on a `5xx`) · `EmptyState` · `LoadingState` (skeletons in the shape of what is coming, before the
+first answer only) · `AvailabilityChip` / `WindowChip` · `Countdown` · `QueuePosition` (`#N`,
+`1,000+`, "You're next") · `ConnectionIndicator` · `TierOption` (a radio card — arrow keys move between
+tiers) and `TierRow` (display only) · `QuantityStepper` · `ConfirmDialog` (release seats, leave the
+line) · `CopyButton`.
 
-**Letter spacing**: No additional tracking except for overline (+0.1em)
+### Copy
 
-### Countdown timers — tone-based styling
+One table, `frontend/src/copy/problemCopy.ts`, gives every buyer-reachable code in the `05` §2
+registry a title and a message that say what happened, what it means for the seats and the money, and
+what to do next. A unit test keeps it complete. §7's rules hold throughout: never "error", never a
+status number, never "sold out" for a fault, never an accusation for a rate limit.
 
-The `<Countdown />` component emits urgency through colour and animation. This is the single most important visual pattern for managing buyer anxiety during checkout.
+### Accessibility and layout
 
-| Tone | Time remaining | Colour | Animation | Purpose |
-|------|----------------|--------|-----------|---------|
-| **neutral** | > 2 min | Secondary text (`#a8c5b1`) | None | Early stages, no urgency |
-| **warning** | 1–2 min | Warning (`#ffd93d`) | None | Visible colour shift, invites attention |
-| **critical** | < 1 min | Error (`#ff6b6b`) | Gentle pulse (opacity 0.7 at 50%) | Urgent, demands focus |
-
-**Pulse animation** — only on `critical` tone:
-```css
-@keyframes pulse {
-  0%, 100% { opacity: 1; }
-  50% { opacity: 0.7; }
-}
-```
-
-**Accessibility**: Respects `prefers-reduced-motion` — no animation on critical tone if user has set that preference. Colour alone does not convey state; accompanying text like "**< 1 min remaining**" must always be present.
-
-### Component patterns
-
-#### Button states
-
-| State | Background | Text | Border | Cursor | Usage |
-|-------|-----------|------|--------|--------|-------|
-| **enabled** | `#65d391` | `#102017` | None | pointer | Primary CTAs |
-| **hover** | `#55c381` | `#102017` | None | pointer | Visual feedback |
-| **active/pressed** | `#45b371` | `#102017` | None | pointer | Click feedback |
-| **disabled** | `#4a5d50` | `#808a84` | None | not-allowed | Inactive (e.g., form incomplete) |
-| **loading** | `#65d391` | `#102017` | None | wait | Spinner overlays button text |
-
-**Outlined buttons**: No fill, `#65d391` border, same text colour.
-
-#### Form inputs
-
-- **Border**: `#4a5d50` (divider colour)
-- **Focus**: `#65d391` border, +2px width
-- **Placeholder**: `#a8c5b1` (secondary text)
-- **Text**: `#b9f2c8` (primary text)
-- **Error**: Red border + error message in red
-- **Disabled**: Greyed-out text and border
-
-#### Cards
-
-- **Background**: `#303732` (paper)
-- **Padding**: 24px (standard Material Design)
-- **Border**: 1px `#4a5d50`
-- **Shadow**: Subtle (elevation 1): `0 2px 4px rgba(0, 0, 0, 0.3)`
-
-#### Status badges
-
-| Status | Colour | Example |
-|--------|--------|---------|
-| Available/Success | `#65d391` | "Available" (tier badge) |
-| Limited | `#ffd93d` | "Limited" (tier badge) |
-| Sold Out | `#a8c5b1` (secondary/disabled) | "Sold Out" (tier badge) |
-| Unknown/Checking | `#4ecdc4` | "Checking…" (tier badge) |
-| Error | `#ff6b6b` | "Connection lost" (status indicator) |
-
-#### Queue position display
-
-- **Font**: h1 (48px, 600 weight), `tabular-nums` variant
-- **Colour**: Primary text (`#b9f2c8`)
-- **Layout**: Centered, 1em top/bottom padding
-- **Update animation**: 400ms opacity fade on position change (not instant snap)
-
-#### Waiting room (V2)
-
-- **Title**: h3, secondary text colour (`#a8c5b1`)
-- **Position**: h1, primary text
-- **Timer**: body1, tertiary text, 400ms update fade
-- **Connection status**: subtitle2, muted, italic ("Reconnecting — your place is saved")
-- **Tier availability**: Each tier name in secondary text, level in colour (available/limited/sold out)
-
-### Layout & spacing
-
-**Container max-width**: `640px` (sm) for single-column flows (landing, queue, checkout)
-
-**Spacing scale**:
-- 8px (1 unit) — micro interactions
-- 16px (2 units) — component internal padding
-- 24px (3 units) — card padding, standard block spacing
-- 32px (4 units) — section spacing
-- 64px (8 units) — page vertical padding
-
-**Stack gaps**: Use consistent 24px between major sections, 16px between minor items
-
-### Accessibility requirements
-
-1. **Contrast**: All text meets WCAG AA (4.5:1 for body text, 3:1 for large text)
-   - Test each mint-on-grey combination
-   - Error and warning colours tested against white and dark backgrounds
-
-2. **Focus indicators**: 2px border in mint (`#65d391`), visible on all interactive elements
-
-3. **Motion**: `prefers-reduced-motion` disables all animations except page transitions
-
-4. **Icons**: Paired with text labels; no icon-only buttons on critical paths
-
-5. **Typography**: No text smaller than 14px (except captions at 12px)
-
-### Implementation notes
-
-The theme is built with **Material-UI (MUI) createTheme()** in `frontend/src/app/theme.ts`. Extend the theme file to override component defaults (button styles, card elevation, etc.).
-
-**Countdown tone colours**: The Countdown component reads theme colours via `useTheme()` and applies tone-based styling inline (error/warning/neutral). The component respects `prefers-reduced-motion` for animations.
-
-**Dark mode only**: No light mode variant is currently designed. If light mode is required in future, create a complementary palette with sufficient contrast.
-
----
-
-**Design system approved for Phase 4 Stage 4b. Mint palette, warm dark mode, countdown urgency tones, and accessible components are production-ready.**
+Keyboard reaches everything in DOM order; dialogs trap focus and return it. Colour never carries
+meaning alone. Layouts are designed at 375 px first; checkout becomes two columns from `md`, with the
+order summary beside the form. No view scrolls sideways on a phone (`mobile.spec`).

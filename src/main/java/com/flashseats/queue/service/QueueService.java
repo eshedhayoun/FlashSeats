@@ -97,6 +97,20 @@ public class QueueService implements QueueFacade {
     }
 
     /**
+     * Takes a session out of the line and drops a pass it has not spent. The pass goes too because a
+     * buyer who left should not be let in a moment later by a promotion already on its way, and an
+     * unspent pass holds back the admission allowance until it expires (ADR-049). An admission is left
+     * alone: a buyer choosing seats ends that by buying or by letting it run out.
+     *
+     * <p>Joining again is {@code ZADD NX} with a fresh score, so it is at the back of the line.
+     */
+    public void leave(String sessionId, long eventId) {
+        redis.opsForZSet().remove(QueueKeys.waiting(eventId), sessionId);
+        redis.delete(QueueKeys.pass(eventId, sessionId));
+        redis.opsForZSet().remove(QueueKeys.passes(eventId), sessionId);
+    }
+
+    /**
      * The ZSET score, which is the ordering (ADR-024).
      *
      * <p>{@code FIFO} is arrival epoch-millis: intuitive, explicable, and decided by whoever has the

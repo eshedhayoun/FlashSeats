@@ -3,10 +3,18 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <meta name="theme-color" content="#2f6f5e" />
+    <meta name="description" content="FlashSeats — fair, fast ticket sales. Join the line, get your turn, choose your seats." />
+    <meta name="theme-color" content="#4338CA" />
+    <!--
+      Same-origin only: the receipt link carries a bearer token in its query string (FE_SPEC §3.1),
+      and no third party — the payment provider's frame included — may see it in a Referer.
+    -->
+    <meta name="referrer" content="same-origin" />
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
     <title>FlashSeats</title>
   </head>
   <body>
+    <noscript>FlashSeats needs JavaScript to run the waiting room and checkout.</noscript>
     <div id="root"></div>
     <script type="module" src="/src/main.tsx"></script>
   </body>
