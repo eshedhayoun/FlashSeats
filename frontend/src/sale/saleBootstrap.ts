@@ -1,18 +1,14 @@
 import { getSaleState } from "../api/endpoints";
 import type { SaleState } from "../api/types";
-import {
-  getHoldToken,
-  removeAdmissionToken,
-  removeSaleValue,
-  setHoldToken
-} from "./storage";
 import { routeFor, type SaleRoute } from "./routeFor";
+import { clearHoldStorage, getHoldToken, removeAdmissionToken, removeQueueStart, setHoldToken } from "./storage";
 
 export type BootstrappedSale = {
   state: SaleState;
   route: SaleRoute;
 };
 
+/** The recovery protocol (FE_SPEC §3): ask the server, align the tab's hints with it, route. */
 export async function bootstrapSale(
   eventId: number,
   options: { buyMore?: boolean } = {}
@@ -26,33 +22,27 @@ export async function bootstrapSale(
   };
 }
 
+/**
+ * Drops what the server says is over, and only that. A section the server could not read is left
+ * alone: "no hold" and "could not read holds" are different facts (FE_SPEC §3, `partial`).
+ */
 function synchronizeStorage(eventId: number, state: SaleState): void {
-  const holdUnreadable = state.partial.includes("hold");
-  const queueUnreadable = state.partial.includes("queue");
-  const existingHoldToken = getHoldToken(eventId);
-
-  if (holdUnreadable) {
-    return;
-  }
-
-  if (state.hold) {
-    setHoldToken(eventId, state.hold.holdToken);
-  } else {
-    removeSaleValue(eventId, "holdToken");
-    if (existingHoldToken) {
-      removeSaleValue(eventId, `idem.${existingHoldToken}`);
+  if (!state.partial.includes("hold")) {
+    const stored = getHoldToken(eventId);
+    if (state.hold) {
+      setHoldToken(eventId, state.hold.holdToken);
+    } else if (stored) {
+      clearHoldStorage(eventId, stored);
     }
   }
 
-  if (queueUnreadable) return;
+  if (state.partial.includes("queue")) return;
 
-  if (
-    !state.queue ||
-    state.queue.state === "NOT_JOINED" ||
-    state.queue.state === "WAITING" ||
-    state.queue.state === "EXHAUSTED" ||
-    state.queue.state === "CLOSED"
-  ) {
+  const phase = state.queue?.state ?? "NOT_JOINED";
+  if (phase !== "ADMITTED" && phase !== "PROMOTED") {
     removeAdmissionToken(eventId);
+  }
+  if (phase !== "WAITING") {
+    removeQueueStart(eventId);
   }
 }

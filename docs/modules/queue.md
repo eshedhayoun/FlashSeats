@@ -72,6 +72,7 @@ in line, which is a fairness failure, not a correctness one.
 | `POST` | `/api/v1/queue/join` | `fsid` cookie | `202`. Idempotent — rejoining preserves position. Accepted while the sale is **paused**, so the line keeps its arrival order (ADR-066) |
 | `GET` | `/api/v1/queue/status` | `fsid` cookie | polling fallback; returns the pass if one was minted, and `paused` while an operator has paused the sale |
 | `POST` | `/api/v1/queue/admit` | `fsid` + `X-Queue-Pass-Token` | spends the pass, mints the admission session |
+| `POST` | `/api/v1/queue/leave` | `fsid` cookie | `204`. Takes the session out of the line and drops an unspent pass; an admission is left to run out. Idempotent. Joining again starts at the back |
 | `GET` | `/api/v1/queue/stream` | `fsid` cookie | SSE, 1 h timeout |
 
 `eventId` arrives in the **body** on both `POST`s, per `FE_SPEC.md` §2.

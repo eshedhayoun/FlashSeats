@@ -1,221 +1,200 @@
 import { useEffect, useRef, useState } from "react";
 import { getQueueStatus } from "../api/endpoints";
-import type {
-  PositionUpdateEvent,
-  QueuePromotedEvent,
-  SaleClosedEvent,
-  SaleExhaustedEvent,
-  SaleQueueState,
-  TierAvailabilityEvent
-} from "../api/types";
+import type { Availability, PositionUpdateEvent, QueuePromotedEvent, TierAvailabilityEvent } from "../api/types";
 import { getLastEventId, setLastEventId } from "../sale/storage";
-
-type ConnectionState = "connecting" | "open" | "reconnecting";
+import type { ConnectionState } from "../ui/ConnectionIndicator";
 
 export type QueueStreamState = {
   connection: ConnectionState;
+  /** The latest position heard, clamped so it never rises (FE_SPEC V2). */
   position: number | null;
-  aheadOfYou: number | null;
   estWaitSeconds: number | null;
-  promoted: QueuePromotedEvent | null;
-  availability: TierAvailabilityEvent | null;
-  terminal: SaleClosedEvent | SaleExhaustedEvent | null;
+  /** Per-tier availability heard since connecting, by tier id. Seed from the event, update from this. */
+  availability: Record<number, Availability>;
   paused: boolean;
 };
 
-const initialState: QueueStreamState = {
-  connection: "connecting",
-  position: null,
-  aheadOfYou: null,
-  estWaitSeconds: null,
-  promoted: null,
-  availability: null,
-  terminal: null,
-  paused: false
-};
+/** Failed connection attempts before polling `/queue/status` starts alongside the retries (FE_SPEC §4). */
+const POLL_AFTER_FAILURES = 3;
+const POLL_INTERVAL_MS = 5_000;
 
-function parseEvent<T>(event: Event): T | null {
+function parse<T>(event: Event): T | null {
   try {
-    const data = JSON.parse((event as MessageEvent).data) as unknown;
-    return data as T;
+    return JSON.parse((event as MessageEvent).data) as T;
   } catch {
     return null;
   }
 }
 
-export function useQueueStream(eventId: number, onRefresh: () => void) {
-  const [state, setState] = useState<QueueStreamState>(initialState);
-  const attempt = useRef(0);
-  const reconnectTimer = useRef<number | null>(null);
-  const pollingTimer = useRef<number | null>(null);
+/**
+ * One `EventSource` for one sale, closed when the view unmounts (FE_SPEC §0 rule 5, §4).
+ *
+ * Anything that changes which view the buyer belongs on — a promotion, the sale selling out or ending —
+ * is answered by `onRefresh`, so the view is always the server's verdict and never this hook's guess.
+ * Reconnects use full-jitter backoff; after three failures `/queue/status` is polled while the
+ * stream keeps retrying, so a promotion is never lost to a dead socket (ADR-007).
+ */
+export function useQueueStream(
+  eventId: number,
+  onRefresh: () => void,
+  initialPaused: boolean
+): QueueStreamState {
+  const [state, setState] = useState<QueueStreamState>({
+    connection: "connecting",
+    position: null,
+    estWaitSeconds: null,
+    availability: {},
+    paused: initialPaused
+  });
+  const refresh = useRef(onRefresh);
+  refresh.current = onRefresh;
 
   useEffect(() => {
     let disposed = false;
     let stream: EventSource | null = null;
+    let failures = 0;
+    let reconnectTimer: number | null = null;
+    let pollTimer: number | null = null;
 
-    const clearPolling = () => {
-      if (pollingTimer.current !== null) {
-        window.clearInterval(pollingTimer.current);
-        pollingTimer.current = null;
+    const clampPosition = (current: number | null, incoming: number | null) =>
+      incoming === null ? current : current === null ? incoming : Math.min(current, incoming);
+
+    const stopPolling = () => {
+      if (pollTimer !== null) {
+        window.clearInterval(pollTimer);
+        pollTimer = null;
       }
     };
 
     const startPolling = () => {
-      if (pollingTimer.current !== null) return;
-      pollingTimer.current = window.setInterval(() => {
+      if (pollTimer !== null) return;
+      setState((current) => ({ ...current, connection: "polling" }));
+      pollTimer = window.setInterval(() => {
         void getQueueStatus(eventId)
           .then((status) => {
             if (disposed) return;
             setState((current) => ({
               ...current,
-              position:
-                status.position === null
-                  ? current.position
-                  : current.position === null
-                    ? status.position
-                    : Math.min(current.position, status.position),
-              aheadOfYou: status.aheadOfYou,
+              position: clampPosition(current.position, status.position),
               estWaitSeconds: status.estWaitSeconds,
-              promoted: status.passToken
-                ? { passToken: status.passToken, expiresInSeconds: 0 }
-                : current.promoted,
               paused: status.paused
             }));
-            if (status.passToken) onRefresh();
+            if (status.phase !== "WAITING") refresh.current();
           })
           .catch(() => undefined);
-      }, 5000);
+      }, POLL_INTERVAL_MS);
+    };
+
+    const remember = (event: Event) => {
+      // Only replayable frames carry an id; the rest leave the browser's last-event-id alone (ADR-058).
+      const id = (event as MessageEvent).lastEventId;
+      if (id) setLastEventId(eventId, id);
+    };
+
+    const scheduleReconnect = () => {
+      if (disposed || reconnectTimer !== null) return;
+      failures += 1;
+      if (failures >= POLL_AFTER_FAILURES) startPolling();
+      // Full jitter: ten thousand clients reconnecting in step after a blip is a self-inflicted DDoS.
+      const delay = Math.random() * Math.min(30_000, 1_000 * 2 ** failures);
+      reconnectTimer = window.setTimeout(() => {
+        reconnectTimer = null;
+        connect();
+      }, delay);
     };
 
     const connect = () => {
       if (disposed) return;
-      setState((current) => ({ ...current, connection: "connecting" }));
+      stream?.close();
       const lastEventId = getLastEventId(eventId);
-      const replayQuery = lastEventId
-        ? `&lastEventId=${encodeURIComponent(lastEventId)}`
-        : "";
-      stream = new EventSource(`/api/v1/queue/stream?eventId=${eventId}${replayQuery}`, {
-        withCredentials: true
-      });
+      const replay = lastEventId ? `&lastEventId=${encodeURIComponent(lastEventId)}` : "";
+      stream = new EventSource(`/api/v1/queue/stream?eventId=${eventId}${replay}`, { withCredentials: true });
 
       stream.onopen = () => {
-        attempt.current = 0;
-        clearPolling();
+        failures = 0;
+        stopPolling();
         setState((current) => ({ ...current, connection: "open" }));
       };
       stream.onerror = () => {
         stream?.close();
-        setState((current) => ({ ...current, connection: "reconnecting" }));
-        if (attempt.current >= 2) startPolling();
-        const delay = Math.random() * Math.min(30_000, 1_000 * 2 ** attempt.current++);
-        reconnectTimer.current = window.setTimeout(() => {
-          reconnectTimer.current = null;
-          connect();
-        }, delay);
-      };
-      stream.addEventListener("message", (event) => {
-        const lastEventId = (event as MessageEvent).lastEventId;
-        if (lastEventId) setLastEventId(eventId, lastEventId);
-      });
-      stream.addEventListener("position-update", (event) => {
-        const lastEventId = (event as MessageEvent).lastEventId;
-        if (lastEventId) setLastEventId(eventId, lastEventId);
-        const update = parseEvent<PositionUpdateEvent>(event);
-        if (!update) {
-          onRefresh();
-          return;
-        }
         setState((current) => ({
           ...current,
-          position:
-            current.position === null
-              ? update.position
-              : Math.min(current.position, update.position),
-          aheadOfYou: update.aheadOfYou,
+          connection: current.connection === "polling" ? "polling" : "reconnecting"
+        }));
+        scheduleReconnect();
+      };
+
+      stream.addEventListener("position-update", (event) => {
+        remember(event);
+        const update = parse<PositionUpdateEvent>(event);
+        if (!update) return;
+        setState((current) => ({
+          ...current,
+          position: clampPosition(current.position, update.position),
           estWaitSeconds: update.estWaitSeconds,
+          // Positions only move while the sale runs, so one is also a resume (FE_SPEC V6).
           paused: false
         }));
       });
-      // A pause is not terminal: the stream stays open and the place is kept (ADR-066). Positions
-      // only move again once it resumes, so any position frame also means "running".
-      stream.addEventListener("sale-paused", () => {
-        setState((current) => ({ ...current, paused: true }));
-      });
-      stream.addEventListener("sale-resumed", () => {
-        setState((current) => ({ ...current, paused: false }));
-      });
-      stream.addEventListener("queue-promoted", (event) => {
-        const lastEventId = (event as MessageEvent).lastEventId;
-        if (lastEventId) setLastEventId(eventId, lastEventId);
-        const promoted = parseEvent<QueuePromotedEvent>(event);
-        if (!promoted) {
-          onRefresh();
-          return;
-        }
-        setState((current) => ({ ...current, promoted }));
-        stream?.close();
-        onRefresh();
-      });
+      // A pause is not an ending: the stream stays open and the place is kept (ADR-066).
+      stream.addEventListener("sale-paused", () => setState((current) => ({ ...current, paused: true })));
+      stream.addEventListener("sale-resumed", () => setState((current) => ({ ...current, paused: false })));
       stream.addEventListener("tier-availability", (event) => {
-        const lastEventId = (event as MessageEvent).lastEventId;
-        if (lastEventId) setLastEventId(eventId, lastEventId);
-        const availability = parseEvent<TierAvailabilityEvent>(event);
-        if (!availability) {
-          onRefresh();
-          return;
-        }
-        setState((current) => ({ ...current, availability }));
+        remember(event);
+        const frame = parse<TierAvailabilityEvent>(event);
+        if (!frame) return;
+        setState((current) => ({
+          ...current,
+          availability: {
+            ...current.availability,
+            ...Object.fromEntries(frame.tiers.map((tier) => [tier.tierId, tier.level]))
+          }
+        }));
       });
-      stream.addEventListener("sale-exhausted", (event) => {
-        const lastEventId = (event as MessageEvent).lastEventId;
-        if (lastEventId) setLastEventId(eventId, lastEventId);
-        const terminal = parseEvent<SaleExhaustedEvent>(event);
-        if (!terminal) {
-          onRefresh();
-          return;
-        }
-        setState((current) => ({ ...current, terminal }));
+      const routeChanging = (event: Event) => {
+        remember(event);
         stream?.close();
-        onRefresh();
+        refresh.current();
+      };
+      stream.addEventListener("queue-promoted", (event) => {
+        const promoted = parse<QueuePromotedEvent>(event);
+        if (promoted) routeChanging(event);
       });
-      stream.addEventListener("sale-closed", (event) => {
-        const lastEventId = (event as MessageEvent).lastEventId;
-        if (lastEventId) setLastEventId(eventId, lastEventId);
-        const terminal = parseEvent<SaleClosedEvent>(event);
-        if (!terminal) {
-          onRefresh();
-          return;
-        }
-        setState((current) => ({ ...current, terminal }));
-        stream?.close();
-        onRefresh();
-      });
+      stream.addEventListener("sale-exhausted", routeChanging);
+      stream.addEventListener("sale-closed", routeChanging);
     };
 
-    const onOnline = () => {
-      attempt.current = 0;
-      onRefresh();
-      stream?.close();
+    const reconnectNow = () => {
+      if (reconnectTimer !== null) {
+        window.clearTimeout(reconnectTimer);
+        reconnectTimer = null;
+      }
+      failures = 0;
       connect();
     };
-    const onOffline = () =>
-      setState((current) => ({ ...current, connection: "reconnecting" }));
+
+    // The previous backoff measured a dead network, not a busy server (FE_SPEC §4).
+    const onOnline = () => reconnectNow();
+    const onOffline = () => setState((current) => ({ ...current, connection: "reconnecting" }));
+    const onVisible = () => {
+      if (document.visibilityState === "visible" && stream?.readyState === EventSource.CLOSED) reconnectNow();
+    };
 
     window.addEventListener("online", onOnline);
     window.addEventListener("offline", onOffline);
+    document.addEventListener("visibilitychange", onVisible);
     connect();
 
     return () => {
       disposed = true;
       stream?.close();
-      clearPolling();
-      if (reconnectTimer.current !== null) {
-        window.clearTimeout(reconnectTimer.current);
-      }
+      stopPolling();
+      if (reconnectTimer !== null) window.clearTimeout(reconnectTimer);
       window.removeEventListener("online", onOnline);
       window.removeEventListener("offline", onOffline);
+      document.removeEventListener("visibilitychange", onVisible);
     };
-  }, [eventId, onRefresh]);
+  }, [eventId]);
 
   return state;
 }

@@ -2,13 +2,18 @@ import { beforeEach, describe, expect, it } from "vitest";
 import {
   clearHoldStorage,
   getAdmissionToken,
+  getCheckoutEmail,
   getHoldToken,
   getIdempotencyKey,
+  getRecentOrders,
   getSaleValue,
+  markPaymentInFlight,
+  rememberOrder,
   removeAdmissionToken,
   setAdmissionToken,
+  setCheckoutEmail,
   setHoldToken,
-  setSaleValue
+  wasPaymentInFlight
 } from "./storage";
 
 describe("event-scoped storage", () => {
@@ -55,5 +60,34 @@ describe("event-scoped storage", () => {
     expect(getHoldToken(1)).toBeNull();
     expect(getHoldToken(2)).toBe("hold-b");
     expect(getSaleValue(2, "idem.hold-b")).not.toBeNull();
+  });
+
+  it("clears everything a settled hold kept, and nothing of another hold", () => {
+    setHoldToken(1, "hold-a");
+    getIdempotencyKey(1, "hold-a");
+    setCheckoutEmail(1, "hold-a", "b@example.com");
+    markPaymentInFlight(1, "hold-a");
+
+    clearHoldStorage(1, "hold-a");
+
+    expect(getSaleValue(1, "idem.hold-a")).toBeNull();
+    expect(getCheckoutEmail(1, "hold-a")).toBe("");
+    expect(wasPaymentInFlight(1, "hold-a")).toBe(false);
+  });
+
+  it("leaves a newer hold's token alone when clearing an older one", () => {
+    setHoldToken(1, "hold-new");
+
+    clearHoldStorage(1, "hold-old");
+
+    expect(getHoldToken(1)).toBe("hold-new");
+  });
+
+  it("lists recent orders newest first, once each", () => {
+    rememberOrder({ orderNumber: "TK-1", receiptToken: "r1" }, "Sale A");
+    rememberOrder({ orderNumber: "TK-2", receiptToken: "r2" }, "Sale B");
+    rememberOrder({ orderNumber: "TK-1", receiptToken: "r1" }, "Sale A");
+
+    expect(getRecentOrders().map((order) => order.orderNumber)).toEqual(["TK-1", "TK-2"]);
   });
 });

@@ -180,7 +180,7 @@ public class RateLimitFilter extends OncePerRequestFilter {
         writeProblem(
                 response,
                 ErrorCode.RATE_LIMITED,
-                "Too many requests. Please slow down and try again shortly.",
+                "We're handling a lot of traffic right now. Please try again in a moment.",
                 Map.of("retryable", true, "retryAfterSeconds", RETRY_AFTER_SECONDS));
     }
 

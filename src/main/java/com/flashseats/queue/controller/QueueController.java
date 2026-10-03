@@ -3,6 +3,7 @@ package com.flashseats.queue.controller;
 import com.flashseats.queue.dto.AdmitRequest;
 import com.flashseats.queue.dto.AdmitResponse;
 import com.flashseats.queue.dto.JoinQueueRequest;
+import com.flashseats.queue.dto.LeaveQueueRequest;
 import com.flashseats.queue.dto.QueueStatusResponse;
 import com.flashseats.queue.service.QueueBroadcaster;
 import com.flashseats.queue.service.QueueService;
@@ -42,6 +43,16 @@ public class QueueController {
             @Valid @RequestBody JoinQueueRequest request, SessionId session, HttpServletRequest http) {
         return queue.join(
                 session.value(), request.eventId(), request.recaptchaToken(), ClientAddress.of(http));
+    }
+
+    /**
+     * Steps out of the line. Idempotent, and joining again starts at the back, which is what leaving
+     * means (FE_SPEC V2).
+     */
+    @PostMapping("/leave")
+    @ResponseStatus(HttpStatus.NO_CONTENT)
+    public void leave(@Valid @RequestBody LeaveQueueRequest request, SessionId session) {
+        queue.leave(session.value(), request.eventId());
     }
 
     @GetMapping("/status")

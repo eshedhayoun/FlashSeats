@@ -1,16 +1,29 @@
-import { BrowserRouter } from "react-router-dom";
-import { AppRoutes } from "./routes";
-import { appTheme } from "./theme";
-import { ThemeProvider } from "@mui/material/styles";
 import CssBaseline from "@mui/material/CssBaseline";
+import { ThemeProvider } from "@mui/material/styles";
+import { useMemo } from "react";
+import { BrowserRouter } from "react-router-dom";
+import { AppShell } from "./AppShell";
+import { ColorModeProvider } from "./colorMode";
+import { ErrorBoundary } from "./ErrorBoundary";
+import { AppRoutes } from "./routes";
+import { createAppTheme, type ColorMode } from "./theme";
 
-export function App() {
+function Themed({ mode }: { mode: ColorMode }) {
+  const theme = useMemo(() => createAppTheme(mode), [mode]);
   return (
-    <ThemeProvider theme={appTheme}>
-      <CssBaseline />
+    <ThemeProvider theme={theme}>
+      <CssBaseline enableColorScheme />
       <BrowserRouter>
-        <AppRoutes />
+        <AppShell>
+          <ErrorBoundary>
+            <AppRoutes />
+          </ErrorBoundary>
+        </AppShell>
       </BrowserRouter>
     </ThemeProvider>
   );
+}
+
+export function App() {
+  return <ColorModeProvider>{(mode) => <Themed mode={mode} />}</ColorModeProvider>;
 }
