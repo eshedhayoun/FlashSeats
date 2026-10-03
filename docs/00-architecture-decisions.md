@@ -3259,3 +3259,94 @@ decide what it shows (`routeFor`, `noticeForTransition`, `checkoutErrorState`, t
 
 **Cost.** The suite needs a backend with an open sale (`docker/scripts/dev-up.sh` guarantees one, and
 the concurrent-sales specs skip without two), and each run buys a few tickets from it.
+
+---
+
+## ADR-079 — Ten thousand buyers: what the hot path was paying for that nobody asked for
+
+**Status:** accepted, Pass 15 (Step 11). Amends ADR-065 (promotion writes are a script, not a
+pipeline), ADR-035 and ADR-008 (when `EXHAUSTED` is derived) and ADR-047 (the harness).
+
+**Context.** A teammate's 10,000-VU run of the concurrent-sales drill sold 22 % of 2,500 seats. Re-run
+here, the k6 container was killed by the Docker VM's OOM killer two minutes in, with 28 % sold,
+`GET /queue/status` averaging 16–57 s, the replicas at 120–280 % CPU — and Redis at 20 %, HikariCP's
+pending gauge at zero, and not one error. Nothing was failing; everything was busy. Profiling found
+that most of the work was neither the sale nor anything anyone reads:
+
+- **Every status poll opened two TCP connections.** Lettuce runs every command on one shared,
+  multiplexed connection *except* a pipeline or a transaction, which needs a connection of its own.
+  No pool is configured, so Spring opened a fresh one for each call — after asking Sentinel where the
+  primary was — and closed it after. `GET /queue/status`, the most-called path in the system, was a
+  pipeline, and so was the promotion tick. On the cluster, 60 polls opened 63 connections to the
+  primary and 67 to the sentinels.
+- **Every Lua call re-read its script's timestamp out of the jar.** `DefaultRedisScript` over a
+  `ClassPathResource` asks whether the script changed on every call, under a lock, and inside the
+  packaged jar that opens a URL connection into the nested jar. It was the largest single item in the
+  status request's profile.
+- **Two observations on by default, read by nobody.** Spring Security wrapped each filter of its
+  chain in an observation — a quarter of all CPU samples were Micrometer — and Lettuce observed every
+  Redis command on its event loop, over a third of the samples on the one thread every reply in the
+  replica comes back through.
+- **Rate-limit buckets never expired.** One drill left 1.1 million `bot:rate:*` keys with no TTL. Under
+  `noeviction` that growth ends with Redis refusing writes — the stock counters included.
+- **The line was told "sold out" up to ten minutes late.** `EXHAUSTED` waited for every pass and
+  admission to lapse, though nobody past the line can buy a seat that is not there. In a 5,000-buyer
+  run, 4,241 waits ran to the harness's 180 s limit in a sale that had already sold out.
+- **The harness measured itself.** Told `EXHAUSTED`, a VU started its next journey at once — landing,
+  join, status, no think time — for the rest of the run: 240,000 iterations at 300 VUs. Each k6 VU is a
+  JavaScript runtime, and 10,000 took 2.6 GiB, which is what the OOM killer ended. And it polled every
+  1–2 s, where the browser streams and polls only as a fallback, every 5 s (FE_SPEC §4).
+
+**Decision.**
+
+1. **Nothing opens a connection per call.** The status read is `queue_state.lua` and the promotion
+   writes are `queue_promote.lua`: one round trip each, on the shared connection. The read is now a
+   snapshot as well, which a pipeline only happened to be. No pool was added instead: once nothing
+   pipelines, nothing needs a dedicated connection, and a pool would be one more dependency and one
+   more lock on the hottest path. `QueueRedisConnectionsIT` counts the driver's own connection
+   events: 201 status reads opened 201 connections and now open none; promoting ten buyers opened 21
+   and now opens none.
+2. **Scripts are read once.** `LuaScript.load` (in `shared`) holds the text and its SHA1; nothing on
+   the call path touches the classpath. The executor still falls back to `EVAL` on `NOSCRIPT`, so a
+   restart or a failover re-registers a script unnoticed.
+3. **The unread observations are off**: `management.observations.enable.spring.security=false` and
+   `management.observations.enable.lettuce=false`. `http.server.requests` stays — it is the latency
+   every drill reads. `RequestObservationsIT` holds both halves.
+4. **A bucket expires once it would be full again, plus 10 s** — Bucket4j's
+   `basedOnTimeForRefillingBucketUpToMax`. A full bucket and no bucket are the same bucket.
+   `BotDefenceIT.bucketsExpire`.
+5. **`EXHAUSTED` is derived from stock alone**: set when the sale's remaining stock is zero, cleared
+   the moment it is not, exactly as reversible as before (ADR-035). Passes and admissions still bound
+   promotion; they no longer hold back the news. Buyers holding one see their own phase first, as
+   before.
+6. **The harness drives buyers, not VUs.** `VUS` counts buyers; each k6 VU drives `BUYERS_PER_VU` of
+   them (default 10), each with its own cookie jar and its own `X-Forwarded-For`, so the cluster sees
+   the same traffic as before. A buyer told `EXHAUSTED` stays in line as the browser does; one offered
+   fewer seats than it asked for takes one, as the client tells it to; the poll interval is
+   `POLL_SECONDS`, default 5, the client's own fallback cadence.
+
+**Measured** on the ten-core laptop, everything on one Docker VM, five sales of 500
+(`06-mvp-overview.md` §9 and the Pass 15 log):
+
+| Buyers | Polling | Sold | Checkout p50 / p99 | Status p50 / p99 | Before |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| 2,000 | every 1–2 s | 2,499 / 2,500 | — / 232 ms | — / 60 ms | checkout p99 6.1 s (Pass 13) |
+| 10,000 | every 5 s | 2,500 / 2,500 | 0.3 s / 5.8 s | 0.4 s / 15 s | 22–28 % sold; the load generator killed |
+
+No oversell and no drift in any run, and at 10,000 no buyer gave up waiting. The status read costs
+about 0.9 ms of CPU at 2,000 buyers. **What is left at 10,000 is the host.** Its ten cores run k6 (2–3.5 of them on
+its own), three JVMs, nginx, Redis and PostgreSQL; machine CPU averaged 93 %; G1's young pauses
+stretched to 150–430 ms while its threads waited for a core; and the replicas render 1,600-odd PDF
+tickets during the sale they are serving. The tail is CPU starvation, and measuring the system rather
+than the laptop needs the load generator on another machine.
+
+**Rejected.**
+
+- **Tomcat's `processor-cache=-1`.** JFR showed 12 s of threads blocked on
+  `ConnectionHandler.register` in a 30 s window at 10,000 buyers, but an unlimited cache left the same
+  contention — it is the cost of the number in flight *growing*, which only throughput fixes — and
+  moved no percentile.
+- **A CPU limit per replica** (`cpus: 3`), so each JVM sizes its GC and carrier threads for its
+  share. Status p99 fell to 7 s, but checkout p99 rose to 11.8 s and its median to 2.4 s: a replica
+  that cannot burst queues its checkouts behind its polls.
+- **A connection pool**, for the reasons in 1.

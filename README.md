@@ -16,7 +16,7 @@ Read in this order:
 | Document | What it covers |
 | :--- | :--- |
 | [`docs/07-system-on-one-page.md`](docs/07-system-on-one-page.md) | **Read first.** The whole system on one page — journey, module graph, checkout sequence, where each concept lives, and what looks removable but is not |
-| [`docs/00-architecture-decisions.md`](docs/00-architecture-decisions.md) | 78 ADRs — every non-obvious decision and the failure it prevents. Read before changing a decision |
+| [`docs/00-architecture-decisions.md`](docs/00-architecture-decisions.md) | 79 ADRs — every non-obvious decision and the failure it prevents. Read before changing a decision |
 | [`docs/01-system-architecture.md`](docs/01-system-architecture.md) | Stack, module map, dependency graph, deployment |
 | [`docs/02-high-level-design.md`](docs/02-high-level-design.md) | Infrastructure and the concurrency model |
 | [`docs/03-end-to-end-flow.md`](docs/03-end-to-end-flow.md) | **The authoritative user journey**, step by step |
@@ -258,7 +258,7 @@ browser. Set a `pk_test_` key, and start the backend with `STRIPE_ENABLED=true`,
 provider.
 
 ```bash
-./mvnw test                         # 301 tests, green in any class order (ADR-061). Needs Docker:
+./mvnw test                         # 306 tests, green in any class order (ADR-061). Needs Docker:
                                     # every integration test runs real PostgreSQL, Redis and,
                                     # for fulfilment, RabbitMQ containers
 ```

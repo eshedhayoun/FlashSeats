@@ -42,6 +42,7 @@ build/
 
 # Load-test output
 docker/k6/summary.json
+docker/k6/summary-concurrent.json
 
 # Frontend local dependencies, build output and TypeScript build metadata.
 # All of it was committed once — 7,805 files and 57 MB of node_modules — because

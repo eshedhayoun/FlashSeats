@@ -212,7 +212,7 @@ Findings that cost real time and would cost it again.
 ## 8. Verification
 
 ```bash
-./mvnw test        # 301 tests: unit, modularity, concurrency, journey, recovery, queue lifecycle,
+./mvnw test        # 306 tests: unit, modularity, concurrency, journey, recovery, queue lifecycle,
                    #             pre-warm, stock rebuild, drift, Redis-restart guard, the metadata
                    #             cache's five rules, the cluster admission allowance, payment and
                    #             webhooks, bot defence, and fulfilment through a real broker.
@@ -261,15 +261,19 @@ Honest list. None of these is hidden behind a passing test.
 - ~~**No load test run.**~~ **Run** (Stage 3), at 300 and 2,000 VUs: exactly 500 sold, zero
   overbooking, zero inventory 503s, zero rate-limited requests, `stock.drift` `0.0` on every
   replica. The harness needed four fixes first, all in ADR-047.
-- **The 10,000-VU run has not happened, and the limit is the host's CPU — not its memory.** This was
-  recorded as a memory ceiling ("three JVMs take ~6 GB of the 7.65 GB this machine gives Docker"); the
-  Pass 8 runs measured it and that is **wrong**. Each replica uses **~350 MiB**, about 1 GB between
-  them, while each sits at **114–142 % of one core** with a 2,000-VU k6 competing for the same ten.
-  2,000 VUs is still the ceiling here, but a 32 GB machine would not move it — a machine where the
-  load generator is not sharing cores with the system under test would.
+- **10,000 buyers sell out on this laptop; their tail latency is the laptop's** (ADR-079). Five sales
+  of 500, 10,000 buyers polling at the client's 5 s cadence: 2,500 / 2,500 sold, no oversell, no
+  drift, nobody gave up waiting; checkout p50 0.3 s and p99 5.8 s, status p50 0.4 s and p99 15 s. It
+  was 22–28 % with the load generator OOM-killed before ADR-079, which found the hot path opening two
+  TCP connections per poll and paying for observations nobody reads. The tail now is CPU starvation:
+  machine CPU averaged 93 %, k6 alone took 2–3.5 of the ten cores, G1's young pauses stretched to
+  150–430 ms waiting for a core, and the replicas render the tickets of the sale they are serving. A
+  host where the load generator is not sharing cores with the system under test is what would measure
+  the system.
 - **Checkout p99 meets the 200 ms criterion up to about 600 VUs across five sales, on this
-  laptop.** The Pass 13 sweep (§11) measured 145 ms at 600, 201 ms at 300 VUs across *ten* sales,
-  207 ms at 1,000 across five, and 6.1 s at 2,000. Each is a single run with visible variance.
+  laptop** — and since ADR-079, 232 ms at 2,000 buyers polling every 1–2 s, warm. The Pass 13 sweep
+  (§11) measured 145 ms at 600, 201 ms at 300 VUs across *ten* sales, 207 ms at 1,000 across five,
+  and 6.1 s at 2,000. Each is a single run with visible variance.
   **The limit is host CPU, not the pool**: `hikaricp_connections_pending` was 0 on every sample of
   every run, while the three replicas and k6 took all ten cores. The earlier five-sale figures —
   9.3 s, 6.4 s and 4.8 s — were measured with other work on the same machine. Finding the pool's
@@ -585,7 +589,8 @@ to run, and would have rate-limited its own load harness to nothing.
   Redis's `run_id`, so `StockEpoch` distrusts every managed event and the sale stops until an
   operator rebuilds. That is ADR-046 working as designed, and it is untested end to end.
   **No capacity number in this document has been re-measured through Sentinel.**
-- **The 10,000-VU run and the p99 number.** Both need a host where the load generator is not
+- ~~**The 10,000-VU run.**~~ **Run** (ADR-079): 10,000 buyers sell all 2,500 seats on this laptop,
+  correctly. **The p99 number** at that size still needs a host where the load generator is not
   competing with the system under test; see §9.
 - ~~The `hold:{token}` timer and the `__keyevent@0__:expired` listener.~~ **Built in Stage 4**, and
   proven on the rig Stage 3 left behind: restored exactly once, in 339 ms, across three replicas.
@@ -2115,6 +2120,7 @@ rather than an archaeology.
 | **The client, finished and redesigned** (Step 9) | Every FE_SPEC view rebuilt on a new design system — light and dark themes, AA-checked; a shell with a skip link and "My tickets"; skeletons; one `Notice`, `ErrorState` and copy table for every error code. Behaviour fixed on the way: refreshes happen behind the content instead of wiping it (the typed email survives one, and a reload mid-charge says a payment may be finishing); the buyer is told what happened to their seats and money after an expiry, a release, a refund or a lost turn — even across a reload; the grace extension shows on the timer; the pre-sale page opens itself at T-0; a failed pass cannot loop; back-pressure is retried a bounded number of times on `Retry-After`; no request is ever made for `/events/NaN`. A sold-out sale says so on the event page. The static page is labelled a minimal API demo, with real keyboard-selectable tiers, per-event storage, a working "Leave queue", an event picker and AA contrast in dark mode |
 | **Leaving the line, and quiet disconnects** (ADR-077) | `POST /queue/leave` takes a buyer out of the line and drops an unspent pass — FE_SPEC's "Leave queue" had nothing to call. A client that goes away mid-stream is now a debug line: the `Exception` backstop had logged every closed waiting-room tab as an `ERROR` with two stack traces, then failed again writing to the dead socket. Two server messages rewritten to FE_SPEC §7's tone |
 | **The browser suite** (ADR-078) | 27 Playwright specs replace the scaffold, driving only the API buyers and operators use: the journey to a downloaded ticket, every stub-reachable checkout failure, the reload points, pause and resume on the stream, the polling fallback, leaving the line, two tabs, two sales, a skewed clock, back-off, dead links and a phone layout. A first draft seeded with SQL and `redis-cli`; what no API can create is proven by the backend's integration tests and the client's unit tests instead. `dev-up.sh` also now names any open sale whose counters an earlier Redis vouched for, with the rebuild that repairs it, instead of calling it walkable |
+| **Ten thousand buyers** (ADR-079) | The concurrent-sales drill at 10,000 buyers sold 22–28 % and the load generator was OOM-killed. Nothing errored; the hot path was paying for things nobody asked for. Every status poll opened two TCP connections — a Lettuce pipeline cannot share the multiplexed connection and no pool is configured — so the status read and the promotion writes are now Lua scripts on the shared connection (201 reads opened 201 connections; now none). Every script call re-read its file's timestamp out of the jar under a lock; scripts are read once. Spring Security's per-filter and Lettuce's per-command observations, read by nobody, are off. Rate-limit buckets expire (one drill left 1.1 million keys under `noeviction`). "Sold out" is told when stock is gone, not up to ten minutes later when the last admission lapses. The harness drives ten buyers per k6 VU, stays in line when told sold out, takes one seat when two are not there, and polls at the client's 5 s. Result: 10,000 buyers, 2,500 / 2,500 sold; 2,000 buyers, checkout p99 232 ms (was 6.1 s) |
 | **Confirming holds the order row; a second charge goes back** (ADR-075) | A retry that resumed a stranded order moved its version, and `confirm` treated that as losing: a valid purchase went to the refund claim — which succeeded, the order being still unresolved — and the retry then charged again. `confirm` now locks the row it checks. And two checkouts for one hold, possible once the in-flight guards expire, left the second charge with no ending; every resolved order now names its charge, and any other settled charge for the hold is refunded and counted in `flashseats.payment.charge.stray` |
 | **Small gaps** (ADR-076) | An early hold timer was re-armed inside its read transaction; it waits for the commit now. Each availability change reached every stream once per replica and was retained as many times; one replica announces it, via `queue:availability:{e}`, and `sale-closed` is retained once via `queue:closed:{e}`. nginx no longer logs query strings, which carried 90-day receipt tokens. `SecretsGuard` refuses short or shared signing keys and any admin password that is not an adaptive hash — the compose default `admin` used to start cleanly and fail every login |
 | **The provider path, fixed where the stub cannot see** (ADR-074) | The client's one idempotency key went to Stripe unchanged on every new charge, so a second card after a decline got the first decline replayed or an idempotency error counted as an outage; it is now scoped to the attempt. Finishing 3-D Secure close to expiry is no longer refused as a new charge. A charge settled by webhook is recorded as `SUCCEEDED` on the ledger instead of staying `PROCESSING`. Still wants a run of `stripe-check.sh` with a real test key |
@@ -2125,6 +2131,6 @@ rather than an archaeology.
 | **Money owed and mail stranded are states, not silences** (ADR-069) | A refused refund is `REFUND_FAILED` and answers `409 REFUND_FAILED` — never "refunded in full". A notification claim stranded by a process that died mid-send is dead-lettered by a sweep after 10 minutes, so it shows in the operator's DLQ and a resend works; it used to be acknowledged and never sent |
 | **A pause is a pause** (ADR-066) | A paused sale used to read `CLOSED`: buyers were told it had ended, their streams were closed, the close was **replayed after the resume**, and the event left `/events`. `PAUSED` is now a window status inside the sale window: the line keeps forming in arrival order, nobody is promoted, holds answer `409 SALE_PAUSED` (retryable), a buyer already holding seats can still pay, and `sale-paused` / `sale-resumed` are sent to each replica's own streams and never retained. The admin refusal to pause a draft is `EVENT_NOT_PAUSABLE`. A review then found two things that keep moving while paused: sold-out now un-derives during the pause when expiring holds return seats, and no wait estimate is shown while the line is not moving |
 
-**Verified so far:** 301/301 (228 + 73 new) backend, 58 vitest and 27 Playwright specs, including `SettlementArbiterIT`, which races confirm
+**Verified so far:** 306/306 (228 + 78 new) backend, 58 vitest and 27 Playwright specs, including `SettlementArbiterIT`, which races confirm
 against refund fifteen times with the refund claim staggered across the confirm transaction: both
 endings occur, and every round ends exactly one way. Its resume race — a retry resuming the order while it is being confirmed — failed on its second round until `confirm` held the row (ADR-075). `OutboxRecoveryIT` was also made immune to the context's own relay, which could claim a row in the moment a test left it `PENDING`.

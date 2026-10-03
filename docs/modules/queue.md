@@ -127,8 +127,8 @@ if remaining == COUNTER_UNAVAILABLE:  pause this event, promote nobody
 
 trim + re-expire queue:passes:{e}, queue:admissions:{e}, queue:waiting:{e}
 
-if remaining > 0:                          DEL queue:exhausted:{e}
-elif no live passes and no live admissions: SETNX queue:exhausted:{e}; publish once; stop
+if remaining > 0:   DEL queue:exhausted:{e}
+else:               SETNX queue:exhausted:{e}; publish once; stop      ← ADR-079
 
 admittable = min(promotionBatchSize,
                  floor(remaining × oversubscribeFactor) − pendingPasses − liveAdmissions)
@@ -137,7 +137,7 @@ front    = ZRANGE queue:waiting:{e} 0 admittable-1
 granted  = claim(queue:budget, want = |front|)       ← cluster-wide, atomic, fails closed
 if granted == 0: promote nobody
 
-in ONE pipeline, for sid in first `granted` of front:      ← ADR-065
+in ONE script (queue_promote.lua), for sid in first `granted` of front:   ← ADR-065, ADR-079
     mint pass → SET queue:pass:{e}:{sid} EX 120
     ZADD queue:passes:{e} <expiry> <sid>
     ZREM queue:waiting:{e} <sid>
@@ -158,16 +158,21 @@ then, once every pass exists:
   pass, and that pass expires in 120 s — capacity returns on its own. Evicting on a missed heartbeat
   deleted live buyers during an ordinary Wi-Fi → cellular handover (ADR-026).
 - **Exhaustion is derived, never destructive.** The waiting ZSET is left intact: the trigger is a
-  live inventory read, and a released hold makes it wrong seconds later (ADR-035).
+  live inventory read, and a released hold makes it wrong seconds later (ADR-035). It is derived from
+  stock alone: waiting for every pass and admission to lapse as well kept the line on `WAITING`,
+  going nowhere, for up to ten minutes after the last seat went (ADR-079).
 - **`PUBLISH` is what reaches the browser.** The promoter runs on one replica; the buyer's emitter
   lives in another's heap. Without fan-out, roughly two-thirds of promotions vanish on three
   replicas — and the bug is invisible on one (ADR-007).
-- **The writes are one pipeline, and the publishes follow it.** Three round trips per buyer made the
+- **The writes are one script, and the publishes follow it.** Three round trips per buyer made the
   tick's cost grow with every buyer it admitted, and the tick has to finish inside its own 900 ms
-  lock. Publishing only after the pipeline means no browser is told about a pass it cannot redeem
-  yet (ADR-065).
+  lock. Publishing only after the script means no browser is told about a pass it cannot redeem
+  yet (ADR-065). A script, not a pipeline: a pipeline cannot share the multiplexed connection, and
+  with no pool it opened a fresh one, through Sentinel, every tick (ADR-079).
 
-**A session's state is one Redis round trip**, not four. `GET /queue/status` runs this code and is the
+**A session's state is one Redis round trip**, not four — `queue_state.lua`, which reads all four keys
+at one instant on the shared connection. It was a pipeline, and a pipeline opened two TCP connections
+per poll (ADR-079). `GET /queue/status` runs this code and is the
 most-called endpoint in the system by roughly 80× — ~90,000 calls per replica in a 300-VU five-sale run
 — so the round trips there dominate the cluster's CPU in a way nothing else does. `CLOSED` is answered
 before the read, so a finished sale's polling clients cost no Redis at all.
@@ -227,7 +232,7 @@ Closing the draw at a fixed moment is the answer and is not built.
 
 | Gap | Detail |
 | :--- | :--- |
-| ~~**3 Redis round trips per connection per tick**~~ | **Closed.** One pipelined round trip: admission `GET` + `TTL`, pass `GET`, waiting `ZRANK`, and the exhausted `EXISTS` when a caller has not hoisted it. The reads were always independent — only the state machine is ordered, and it now decides over the values instead of between the calls |
+| ~~**3 Redis round trips per connection per tick**~~ | **Closed.** One round trip, `queue_state.lua`: admission `GET` + `TTL`, pass `GET`, waiting `ZRANK` and the exhausted `EXISTS`, read at one instant on the shared connection (ADR-079). The reads were always independent — only the state machine is ordered, and it decides over the values instead of between the calls |
 | **No per-event queue metrics** | `flashseats.queue.admissions` and `flashseats.queue.admission.budget.denied` are built and **untagged**, so they answer "is the cluster promoting?" and not "is *this* sale promoting?". Depth and active SSE connections are still unbuilt (`03` §7) |
 | ~~**No `Last-Event-ID` replay**~~ | **Closed** (ADR-058). Broadcast frames are retained in `queue:replay:{e}` and replayed on reconnect; per-session state is re-derived on connect rather than replayed, because the only session frame carries a capability |
 
