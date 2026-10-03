@@ -28,8 +28,8 @@ mint/verify half a package away from its type/resolve half. The environment vari
 
 | Redis key | TTL | Purpose |
 | :--- | :--- | :--- |
-| `bot:rate:session:{sid}` | rolling | the primary rate-limit bucket |
-| `bot:rate:ip:{address}` | rolling | a coarse flood backstop |
+| `bot:rate:session:{sid}` | until full again, + 10 s | the primary rate-limit bucket |
+| `bot:rate:ip:{address}` | until full again, + 10 s | a coarse flood backstop |
 | `bot:verified:{sid}` | 900 s | one challenge verification, remembered for the session |
 
 | PostgreSQL | Contents |

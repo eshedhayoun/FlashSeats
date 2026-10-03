@@ -216,6 +216,38 @@ class QueueLifecycleIT extends IntegrationTest {
     }
 
     @Test
+    @DisplayName("Selling out tells the line at once, while the buyers it let in are still choosing")
+    void exhaustionDoesNotWaitForAdmissionsToLapse() {
+        long eventId = fixture.openEvent("Last Seat");
+        long tierId = fixture.tier(eventId, "Only", 9_900, 1);
+
+        BuyerSession first = new BuyerSession(port);
+        first.get("/events/" + eventId);
+        first.post("/queue/join", Map.of("eventId", eventId));
+        String pass = await().atMost(PATIENCE)
+                .until(() -> first.get("/queue/status?eventId=" + eventId).text("passToken"),
+                        token -> token != null);
+        String admission = first
+                .post("/queue/admit", Map.of("eventId", eventId), Map.of("X-Queue-Pass-Token", pass))
+                .text("admissionToken");
+        first.post(
+                "/holds",
+                Map.of("eventId", eventId, "tierId", tierId, "quantity", 1),
+                Map.of("X-Admission-Token", admission));
+
+        // The first buyer's admission lives on until they pay or it runs out, ten minutes by default.
+        // The line used to wait for it: no promotion was possible, and nobody was told why (ADR-079).
+        BuyerSession second = new BuyerSession(port);
+        second.get("/events/" + eventId);
+        second.post("/queue/join", Map.of("eventId", eventId));
+
+        await().atMost(PATIENCE).untilAsserted(() -> assertThat(
+                        second.get("/queue/status?eventId=" + eventId).text("phase"))
+                .isEqualTo("EXHAUSTED"));
+        assertThat(first.get("/queue/status?eventId=" + eventId).text("phase")).isEqualTo("ADMITTED");
+    }
+
+    @Test
     @DisplayName("RANDOM ordering is stable for one buyer and orders the queue by the draw")
     void randomOrderingUsesStablePerEventDraw() {
         properties.setOrdering(QueueOrdering.RANDOM);

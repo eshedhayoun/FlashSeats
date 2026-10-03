@@ -4,7 +4,6 @@ import com.flashseats.catalog.facade.CatalogFacade;
 import com.flashseats.queue.config.QueueProperties;
 import io.micrometer.core.instrument.Counter;
 import io.micrometer.core.instrument.MeterRegistry;
-import java.nio.charset.StandardCharsets;
 import java.time.Clock;
 import java.time.Duration;
 import java.time.Instant;
@@ -15,10 +14,8 @@ import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
 import lombok.extern.slf4j.Slf4j;
-import org.springframework.data.redis.connection.RedisStringCommands.SetOption;
-import org.springframework.data.redis.core.RedisCallback;
 import org.springframework.data.redis.core.StringRedisTemplate;
-import org.springframework.data.redis.core.types.Expiration;
+import org.springframework.data.redis.core.script.RedisScript;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Component;
 import tools.jackson.databind.ObjectMapper;
@@ -38,6 +35,7 @@ public class PromotionWorker {
     private static final String NODE_ID = UUID.randomUUID().toString();
 
     private final StringRedisTemplate redis;
+    private final RedisScript<Long> promotionScript;
     private final CatalogFacade catalog;
     private final QueueTokens tokens;
     private final QueueProperties properties;
@@ -51,6 +49,7 @@ public class PromotionWorker {
 
     public PromotionWorker(
             StringRedisTemplate redis,
+            RedisScript<Long> promotionScript,
             CatalogFacade catalog,
             QueueTokens tokens,
             QueueProperties properties,
@@ -60,6 +59,7 @@ public class PromotionWorker {
             Clock clock,
             MeterRegistry meters) {
         this.redis = redis;
+        this.promotionScript = promotionScript;
         this.catalog = catalog;
         this.tokens = tokens;
         this.properties = properties;
@@ -157,18 +157,20 @@ public class PromotionWorker {
         expireWithSale(QueueKeys.admissions(eventId), now, saleEndTime);
         expireWithSale(QueueKeys.waiting(eventId), now, saleEndTime);
 
-        long pendingPasses = count(QueueKeys.passes(eventId), nowMillis);
-        long liveAdmissions = count(QueueKeys.admissions(eventId), nowMillis);
-
         if (remaining > 0) {
             // Exhaustion is derived, so it un-derives: a released hold or a rebuilt counter puts
             // seats back and the waiting room resumes exactly where it was (ADR-035).
             redis.delete(QueueKeys.exhausted(eventId));
-        } else if (pendingPasses == 0 && liveAdmissions == 0) {
+        } else {
+            // Even with passes and admissions still out: those buyers are past the line and will find
+            // the same empty tiers. Waiting for their claims to lapse kept everyone still in line on
+            // WAITING, going nowhere, for up to the admission TTL after the last seat went (ADR-079).
             exhaust(eventId, now);
             return;
         }
 
+        long pendingPasses = count(QueueKeys.passes(eventId), nowMillis);
+        long liveAdmissions = count(QueueKeys.admissions(eventId), nowMillis);
         long admittable = Math.min(
                 properties.getPromotionBatchSize(),
                 (long) Math.floor(remaining * properties.getOversubscribeFactor())
@@ -206,10 +208,10 @@ public class PromotionWorker {
     /**
      * Mints the passes, moves the buyers out of the line, and tells them.
      *
-     * <p>The writes go in one pipeline: three commands per buyer as separate round trips made the
-     * tick's cost grow with every buyer it admitted, and the tick has to finish inside its own lock
-     * (ADR-032). The byte-level API, because the connection inside a pipeline is a proxy that does not
-     * cast to {@code StringRedisConnection}.
+     * <p>The writes go in one script: three commands per buyer as separate round trips made the tick's
+     * cost grow with every buyer it admitted, and the tick has to finish inside its own lock (ADR-032).
+     * It was a pipeline until a pipeline turned out to cost a fresh connection per call, because it
+     * cannot share the multiplexed one and no pool is configured (ADR-079).
      *
      * <p>The {@code PUBLISH} comes after every pass exists, so no browser is told about a pass it
      * cannot yet redeem. It is what actually reaches the browser: this worker runs on one replica, the
@@ -217,24 +219,18 @@ public class PromotionWorker {
      * connections (ADR-007).
      */
     private void issuePasses(long eventId, List<Promotion> promotions, Instant now) {
-        byte[] passes = utf8(QueueKeys.passes(eventId));
-        byte[] waiting = utf8(QueueKeys.waiting(eventId));
-        double expiresAt = now.plusSeconds(properties.getPassTtlSeconds()).toEpochMilli();
-        Expiration passTtl = Expiration.seconds(properties.getPassTtlSeconds());
-
-        redis.executePipelined((RedisCallback<Object>) connection -> {
-            for (Promotion promotion : promotions) {
-                byte[] sessionId = utf8(promotion.sessionId());
-                connection.stringCommands().set(
-                        utf8(QueueKeys.pass(eventId, promotion.sessionId())),
-                        utf8(promotion.passToken()),
-                        passTtl,
-                        SetOption.UPSERT);
-                connection.zSetCommands().zAdd(passes, expiresAt, sessionId);
-                connection.zSetCommands().zRem(waiting, sessionId);
-            }
-            return null;
-        });
+        List<String> keys = new ArrayList<>(promotions.size() + 2);
+        keys.add(QueueKeys.passes(eventId));
+        keys.add(QueueKeys.waiting(eventId));
+        List<Object> args = new ArrayList<>(promotions.size() * 2 + 2);
+        args.add(String.valueOf(properties.getPassTtlSeconds()));
+        args.add(String.valueOf(now.plusSeconds(properties.getPassTtlSeconds()).toEpochMilli()));
+        for (Promotion promotion : promotions) {
+            keys.add(QueueKeys.pass(eventId, promotion.sessionId()));
+            args.add(promotion.sessionId());
+            args.add(promotion.passToken());
+        }
+        redis.execute(promotionScript, keys, args.toArray());
 
         for (Promotion promotion : promotions) {
             publish(
@@ -245,10 +241,10 @@ public class PromotionWorker {
     }
 
     /**
-     * Stock is gone and nobody holds a claim on it: say so once, and change nothing else. The waiting
-     * set stays intact (ADR-035). The trigger is a live inventory read that a released hold can
-     * reverse a second later. The {@code SETNX} marker makes {@code EXHAUSTED} a derived state, cleared
-     * by the next tick with stock, and publishes the frame once.
+     * Stock is gone: say so once, and change nothing else. The waiting set stays intact (ADR-035). The
+     * trigger is a live inventory read that a released hold can reverse a second later. The {@code SETNX}
+     * marker makes {@code EXHAUSTED} a derived state, cleared by the next tick with stock, and publishes
+     * the frame once.
      */
     private void exhaust(long eventId, Instant now) {
         Boolean firstToSee = redis.opsForValue()
@@ -288,10 +284,6 @@ public class PromotionWorker {
                         NODE_ID,
                         Duration.ofMillis(properties.getPromotionIntervalMs() * 9 / 10));
         return Boolean.TRUE.equals(acquired);
-    }
-
-    private static byte[] utf8(String value) {
-        return value.getBytes(StandardCharsets.UTF_8);
     }
 
     private record Promotion(String sessionId, String passToken) {}

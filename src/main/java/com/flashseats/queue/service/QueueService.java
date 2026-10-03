@@ -13,7 +13,6 @@ import com.flashseats.queue.exception.QueueErrors;
 import com.flashseats.queue.facade.QueueFacade;
 import com.flashseats.queue.facade.QueuePhase;
 import com.flashseats.queue.facade.QueueState;
-import java.nio.charset.StandardCharsets;
 import java.time.Clock;
 import java.time.Duration;
 import java.time.Instant;
@@ -22,8 +21,8 @@ import java.util.OptionalDouble;
 import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.TimeUnit;
 import lombok.extern.slf4j.Slf4j;
-import org.springframework.data.redis.core.RedisCallback;
 import org.springframework.data.redis.core.StringRedisTemplate;
+import org.springframework.data.redis.core.script.RedisScript;
 import org.springframework.stereotype.Service;
 
 /**
@@ -39,6 +38,7 @@ import org.springframework.stereotype.Service;
 public class QueueService implements QueueFacade {
 
     private final StringRedisTemplate redis;
+    private final RedisScript<List<Object>> stateScript;
     private final CatalogFacade catalog;
     private final QueueTokens tokens;
     private final QueueDrainRateTracker drainRate;
@@ -48,6 +48,7 @@ public class QueueService implements QueueFacade {
 
     public QueueService(
             StringRedisTemplate redis,
+            RedisScript<List<Object>> queueStateScript,
             CatalogFacade catalog,
             QueueTokens tokens,
             QueueDrainRateTracker drainRate,
@@ -55,6 +56,7 @@ public class QueueService implements QueueFacade {
             Clock clock,
             BotFacade bots) {
         this.redis = redis;
+        this.stateScript = queueStateScript;
         this.catalog = catalog;
         this.tokens = tokens;
         this.drainRate = drainRate;
@@ -163,7 +165,7 @@ public class QueueService implements QueueFacade {
     /**
      * Seconds left on this session's promotion pass, or {@code null} when it holds none.
      *
-     * <p>Deliberately not folded into the pipelined read behind {@link #getQueueState}. That read
+     * <p>Deliberately not folded into the scripted read behind {@link #getQueueState}. That read
      * serves {@code GET /queue/status}, which is the single largest consumer of the cluster's CPU at
      * roughly 90,000 calls per replica per run; this answer is wanted only when a buyer reconnects
      * already promoted, so it costs one round trip on a rare path rather than a command on the
@@ -209,36 +211,30 @@ public class QueueService implements QueueFacade {
      * most-called path in the system. Reading eagerly does not change the answer: only {@link #decide}
      * is ordered.
      *
-     * @param exhausted pre-resolved by a caller sweeping many sessions of one event, since it is per
-     *     event, not per session
+     * <p>A script, never a pipeline. A pipeline takes a connection of its own, and with no pool Spring
+     * opened one for every call, after asking Sentinel where the primary is, and closed it again: two
+     * TCP handshakes per poll, on the path 10,000 buyers poll (ADR-079). The script runs on the shared
+     * connection, and reads all four keys at one instant.
+     *
+     * @param exhausted pre-resolved by a caller sweeping many sessions of one event, so the whole
+     *     sweep agrees on it; {@code null} takes the script's own reading
      */
     private Snapshot read(String sessionId, long eventId, Boolean exhausted) {
-        String admissionKey = QueueKeys.admission(eventId, sessionId);
-        String passKey = QueueKeys.pass(eventId, sessionId);
-        String waitingKey = QueueKeys.waiting(eventId);
-        String exhaustedKey = QueueKeys.exhausted(eventId);
+        List<Object> replies = redis.execute(
+                stateScript,
+                List.of(
+                        QueueKeys.admission(eventId, sessionId),
+                        QueueKeys.pass(eventId, sessionId),
+                        QueueKeys.waiting(eventId),
+                        QueueKeys.exhausted(eventId)),
+                sessionId);
 
-        // The byte-level API rather than a StringRedisConnection cast: inside a pipeline the
-        // connection is a proxy, and the cast throws ClassCastException at runtime while compiling
-        // perfectly. Replies come back through the template's own String serializer.
-        List<Object> replies = redis.executePipelined((RedisCallback<Object>) connection -> {
-            connection.stringCommands().get(utf8(admissionKey));
-            connection.keyCommands().ttl(utf8(admissionKey));
-            connection.stringCommands().get(utf8(passKey));
-            connection.zSetCommands().zRank(utf8(waitingKey), utf8(sessionId));
-            if (exhausted == null) {
-                connection.keyCommands().exists(utf8(exhaustedKey));
-            }
-            return null;
-        });
-
-        int expected = exhausted == null ? 5 : 4;
-        if (replies.size() != expected) {
-            // Positional reads are only safe while the positions are known. Adding a command above
-            // without shifting the indices below would otherwise read a neighbour's value and answer
+        if (replies == null || replies.size() != 5) {
+            // Positional reads are only safe while the positions are known. A script edited without
+            // shifting the indices below would otherwise read a neighbour's value and answer
             // confidently with the wrong phase.
             throw new IllegalStateException(
-                    "Expected " + expected + " pipelined replies, got " + replies.size());
+                    "Expected 5 replies from queue_state.lua, got " + (replies == null ? "none" : replies.size()));
         }
 
         return new Snapshot(
@@ -272,10 +268,6 @@ public class QueueService implements QueueFacade {
         }
 
         return QueueState.notJoined();
-    }
-
-    private static byte[] utf8(String value) {
-        return value.getBytes(StandardCharsets.UTF_8);
     }
 
     /**

@@ -6,13 +6,13 @@ Guidance for Claude Code when working in this repository.
 
 FlashSeats — a high-concurrency ticket flash-sale engine. Modular monolith, Java 21, Spring Boot
 4.1.1. The **MVP is built and running**: all nine modules, the full journey from landing page to emailed
-PDF ticket, 301 tests green in any class order. **Inventory lives in Redis** (Stage 1, ADR-046): `catalog:stock:{e}:{t}`
+PDF ticket, 306 tests green in any class order. **Inventory lives in Redis** (Stage 1, ADR-046): `catalog:stock:{e}:{t}`
 is the live count and PostgreSQL keeps no copy of it. **Payment is real** (Stage 2, ADR-052-054) —
 but `flashseats.payment.stripe.enabled` is **false by default**, so `dev`, `test`, the load harness
 and every drill still run the in-process stub through the complete journey, 3-D Secure included.
 
 **Read [`docs/00-architecture-decisions.md`](docs/00-architecture-decisions.md) before changing
-anything.** It contains 78 ADRs. Most record a defect and its fix — 034-039 come from the first
+anything.** It contains 79 ADRs. Most record a defect and its fix — 034-039 come from the first
 review pass over the built code, 040-042 from the second — and several look like over-engineering
 until you read the failure they prevent. 043-045 are the exception: forward-looking decisions about
 the operator surface, buyer accounts and what health should report, with nothing built against them
@@ -50,16 +50,21 @@ replica rather than each, access logs carry no query strings, and `SecretsGuard`
 shared or unhashed secrets. **077**: buyers can leave the line (`POST /queue/leave`), and a client
 that goes away mid-stream is a debug line, not an `ERROR` with stack traces. **078**: the browser
 suite uses only the API a buyer and an operator use; states no API can create are proven by the
-backend's integration tests and the client's unit tests.
+backend's integration tests and the client's unit tests. **079** is the 10,000-buyer drill: nothing
+opens a Redis connection per call (the status read and the promotion writes are scripts, not
+pipelines), scripts are read once, two unread observations are off, rate-limit buckets expire,
+`EXHAUSTED` is derived from stock alone, and the harness drives buyers rather than one k6 VU each.
 
 **The operating envelope is 3–10 concurrent sales**, not one
 ([`03-end-to-end-flow.md`](docs/03-end-to-end-flow.md) §2). Every capacity number written before
 ADR-049 silently assumed a single sale. Check which assumption a limit rests on before trusting it.
 **Ten concurrent sales sell out** — 4,997 of 5,000 at 300 VUs, no oversell, and
 `hikaricp_connections_pending` at zero on every sample up to 2,000 VUs (`06-mvp-overview.md` §11,
-Pass 13). Checkout p99 meets its 200 ms criterion up to about 600 VUs across five sales on the dev
-laptop, and it collapses to 6 s at 2,000. **The limit there is host CPU, not the pool**: k6 shares
-the ten cores with the system it measures.
+Pass 13). **10,000 buyers sell out five sales on the dev laptop** — 2,500 of 2,500, no oversell
+(ADR-079) — with checkout p99 232 ms at 2,000 buyers and 5.8 s at 10,000. **The limit at 10,000 is
+host CPU, not the pool**: k6 alone takes 2–3.5 of the ten cores it shares with the system it
+measures. Before ADR-079 the same drill sold 22–28 %, because the hottest path opened two TCP
+connections per request.
 
 **For what is actually built**, read [`docs/06-mvp-overview.md`](docs/06-mvp-overview.md) — scope,
 security posture, next stages, and the review-pass log. It is the doc to update after every pass.
@@ -67,7 +72,7 @@ security posture, next stages, and the review-pass log. It is the doc to update 
 ## Document precedence
 
 ```
-00-architecture-decisions.md      ← highest authority (78 ADRs)
+00-architecture-decisions.md      ← highest authority (79 ADRs)
 05-global-standards.md            ← cross-cutting contract; module docs conform to it
 FE_SPEC.md                        ← client contract (repo root)
 03-end-to-end-flow.md             ← the authoritative user journey AND the operating envelope
@@ -309,6 +314,12 @@ Do not reintroduce these — each cost a real defect in the first pass:
 | **Deduplicating a broadcast against one replica's memory** | Every replica sees the same change, and the fan-out reaches every replica: each frame arrived once per replica, and a change back to a state a replica had announced was never sent, because its streams had heard the others since. Keep the last announcement in one key and swap it with `SET … GET` (ADR-076) |
 | **A backstop handler that owns client disconnects** | `@ExceptionHandler(Exception.class)` caught `AsyncRequestNotUsableException` — a waiting-room tab closing — logged "Unhandled exception" with two stack traces, then failed again writing a problem document to the dead socket. The most common event in a sale became an `ERROR` flood. Name the client-gone exceptions before the backstop (ADR-077, ADR-041's lesson) |
 | **A browser test that writes to the database** | The first e2e draft created sales with SQL through `docker compose exec` and broke counters with `redis-cli`: coupled to the schema and the compose file, past every module's ownership, and wrong on its first run — a raw `UPDATE` violated `ck_events_sale_window`. Test-only endpoints are not the fix either. Drive the API buyers and operators use; prove the rest in the backend's tests (ADR-078) |
+| **A Redis pipeline with no connection pool** | Lettuce runs every command on one shared, multiplexed connection *except* a pipeline or a transaction, which needs one of its own. With no pool, Spring opened it per call — after asking Sentinel where the primary is — and closed it after. `GET /queue/status` was a pipeline: two TCP handshakes per poll on the most-called path, and at 10,000 buyers the cluster spent its CPU connecting while Redis sat at 20 %. Use a script; `QueueRedisConnectionsIT` counts the driver's connections (ADR-079) |
+| **`DefaultRedisScript` over a `ClassPathResource`** | It asks the resource whether it changed on every call, under a lock, and inside the packaged jar that opens a URL connection into the nested jar. Every script call paid it, serialised per script; on the status read it was the largest single cost. `LuaScript.load` reads once (ADR-079) |
+| **Observations nobody reads, on every request** | Spring Security observes each filter in its chain and Lettuce observes every Redis command, both by default: a quarter of all CPU samples were Micrometer, and over a third of the Lettuce event loop's — the one thread every Redis reply comes back through. Turn off what no drill or alarm reads; keep `http.server.requests` (ADR-079) |
+| **A rate-limit bucket with no expiry** | Bucket4j keeps every session's and every address's bucket for ever unless told otherwise. One drill left 1.1 million `bot:rate:*` keys with no TTL — and under `noeviction` a full Redis refuses writes, the stock counters included. A bucket full again is no bucket; expire it then (ADR-079) |
+| **Holding "sold out" until every claim lapses** | `EXHAUSTED` waited for every pass and admission to run out too, though nobody past the line can buy a seat that is not there. The line stood on `WAITING`, going nowhere, for up to ten minutes after the last seat; in a 5,000-buyer run 4,241 waits ran to the 180 s limit. Derive it from stock alone; it reverses when stock returns (ADR-079) |
+| **A load harness that measures itself** | Three ways at once. Told `EXHAUSTED`, a VU started its next journey with no think time — 240,000 iterations at 300 VUs. Each k6 VU is a JavaScript runtime: 10,000 took 2.6 GiB and the VM's OOM killer ended the drill before the cluster was the limit. And it polled every 1–2 s, where the browser streams and falls back to 5 s. Stay in line, drive ten buyers per VU, poll like the client (ADR-079) |
 | **`width: 1` in MUI's `sx`** | A number of 1 or less is a *fraction*: `width: 1` is 100 %. A visually-hidden live region styled that way widened every page past the viewport. Use `"1px"` |
 | **Forwarding the client's one idempotency key on every new charge** | Right for a retry of one attempt, wrong across attempts: Stripe replays a key's first answer, and refuses it with different parameters. The second card after a decline got the first card's decline, or an idempotency error counted as a provider outage. Scope the provider key to the attempt (ADR-074) |
 | **Reusing one provider idempotency key across a 3-D Secure resume** | The client mints ONE key per hold and reuses it on every retry, so a second `charge` replays the cached `requires_action` response **for ever** and the buyer can never finish. Varying the key per attempt is worse: it opens a *second* intent, so they authenticate one payment and are billed for two. Retrieve the existing intent (ADR-054) |
@@ -365,7 +376,7 @@ rather than one module's corner:
 | `queue:budget` | `queue` | String | one tick | **the cluster-wide admission allowance**, shared by every open sale. The one key here deliberately *not* scoped by event; its TTL is the window, so replicas need not agree on the time (ADR-049) |
 | `queue:exhausted:{e}` | `queue` | String | sale end | derived sold-out marker; deleted the moment stock returns (ADR-035) |
 | `payment:inflight:{holdToken}` | `payment` | String | 90 s | duplicate-charge guard, anchored to the hold (ADR-014) |
-| `bot:rate:*` | `bot` | Bucket4j | rolling | session-first rate limiting, IP as a coarse backstop (ADR-011) |
+| `bot:rate:*` | `bot` | Bucket4j | until full again + 10 s | session-first rate limiting, IP as a coarse backstop (ADR-011). A full bucket and no bucket are the same bucket; without the expiry one drill left 1.1 million keys under `noeviction` (ADR-079) |
 | `bot:verified:{sid}` | `bot` | String | 900 s | one challenge verification, remembered per session (ADR-055) |
 | `hold:{token}` | `hold` | String | hold TTL | expiry timer. A **hint, never an authority** — the listener re-reads the row and the settle-once claim is what makes three replicas restore once (ADR-048) |
 
@@ -463,6 +474,12 @@ docker/scripts/pool-pressure.sh 300 &            # THE instrument. Without it th
                                                  # two samples inside one interval are the SAME
                                                  # computation read twice (ADR-046: sustained)
 docker compose --profile loadtest run --rm -e VUS=300 k6-concurrent
+                                                 # VUS is BUYERS: each k6 VU drives BUYERS_PER_VU of
+                                                 # them (default 10), each with its own session and
+                                                 # address. 10,000 one-buyer VUs took 2.6 GiB and the
+                                                 # VM's OOM killer ended the run (ADR-079). Buyers poll
+                                                 # every POLL_SECONDS (default 5, the client's own
+                                                 # fallback); VUS=10000 runs on this laptop.
                                                  # The FIRST run after a replica restart measures
                                                  # JIT warm-up: 513 ms p99 cold vs 64 ms warm, same
                                                  # build (Pass 14). Discard it, or warm up first
@@ -476,9 +493,9 @@ docker/scripts/sold-count.sh                     # what was ACTUALLY sold, and t
                                                  # k6's count is what the CLIENT saw: it abandons
                                                  # in-flight requests at 60s and at ramp-down, and
                                                  # under-reported by 8x in the worst Pass 8 run.
-                                                 # VUS=300, not 2000, on a ten-core host -- at 2000 the
-                                                 # load generator competes with the three JVMs and the
-                                                 # same build sells 6% instead of 76%
+                                                 # On a ten-core host the load generator competes
+                                                 # with the three JVMs: at 10,000 buyers the tail
+                                                 # latency is the laptop's, not the system's
 ```
 
 Changing the compose network's `ipam` recreates the network, and containers created against the
