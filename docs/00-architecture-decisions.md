@@ -3421,13 +3421,16 @@ that most of the work was neither the sale nor anything anyone reads:
 **Measured** on the ten-core laptop, everything on one Docker VM, five sales of 500
 (`06-mvp-overview.md` §9 and the Pass 15 log):
 
-| Buyers | Polling | Sold | Checkout p50 / p99 | Status p50 / p99 | Before |
-| :--- | :--- | :--- | :--- | :--- | :--- |
-| 2,000 | every 1–2 s | 2,499 / 2,500 | — / 232 ms | — / 60 ms | checkout p99 6.1 s (Pass 13) |
-| 10,000 | every 5 s | 2,500 / 2,500 | 0.3 s / 5.8 s | 0.4 s / 15 s | 22–28 % sold; the load generator killed |
+| Buyers | Sold | Checkout p50 / p99 | Status p50 / p99 | Before |
+| :--- | :--- | :--- | :--- | :--- |
+| 300 | 2,500 / 2,500 | 10 ms / 70 ms | 2 ms / 11 ms | |
+| 2,000 | 2,500 / 2,500 | 14 ms / 195 ms | 1 ms / 18 ms | checkout p99 6.1 s (Pass 13) |
+| 10,000 | 2,500 / 2,500 | 1.2 s / 7.6 s | 45 ms / 5.1 s | 22–28 % sold; the load generator killed |
 
-No oversell and no drift in any run, and at 10,000 no buyer gave up waiting. The status read costs
-about 0.9 ms of CPU at 2,000 buyers. **What is left at 10,000 is the host.** Its ten cores run k6 (2–3.5 of them on
+The final build, buyers polling every 5 s, one discarded warm-up run first.
+
+No oversell and no drift in any run, and no buyer gave up waiting. Position frames kept their 2 s
+cadence at 10,000 (median gap 2.3 s). The status read costs about 0.9 ms of CPU at 2,000 buyers. **What is left at 10,000 is the host.** Its ten cores run k6 (2–3.5 of them on
 its own), three JVMs, nginx, Redis and PostgreSQL; machine CPU averaged 93 %; G1's young pauses
 stretched to 150–430 ms while its threads waited for a core; and the replicas render 1,600-odd PDF
 tickets during the sale they are serving. The tail is CPU starvation, and measuring the system rather
