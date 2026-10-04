@@ -111,6 +111,7 @@ tells the client a state.
 | `VALIDATION_FAILED` | 400 | shared | Fix `violations` and resubmit |
 | `INTERNAL_ERROR` | 500 | shared | Show `traceId`, offer retry |
 | `SERVICE_BUSY` | 503 | shared | **Back-pressure, not a fault**: no database connection came free inside `connection-timeout`. Carries `Retry-After` and `retryAfterSeconds`; re-send the same request after it — checkout is find-or-create, so that is always safe. Seats, if any, are untouched (ADR-059) |
+| `NOT_FOUND` | 404 | shared | No endpoint or resource at this path — a caller's mistake, never a server fault. It used to be `500 INTERNAL_ERROR` (ADR-041's trap, ADR-067) |
 | `RATE_LIMITED` | 429 | bot | Back off `retryAfterSeconds` |
 | `BOT_VERIFICATION_FAILED` | 403 | bot | The challenge scored below the threshold. Reload for a fresh token and retry — **never** returned for a provider timeout or outage, which fail open (ADR-011, ADR-055) |
 | `IP_BLOCKED` | 403 | bot | A standing operator decision on this address. Terminal for the client — `retryable` is false; contact support (ADR-055) |
@@ -121,13 +122,14 @@ tells the client a state.
 | `SALE_CLOSED` | 409 | catalog | Terminal |
 | `INVENTORY_UNAVAILABLE` | 503 | catalog | **Fault** — retry; alarm fires server-side |
 | `PREWARM_WINDOW_CLOSED` | 409 | catalog | Admin only |
+| `STOCK_REBUILD_IN_PROGRESS` | 503 | catalog | Admin only. Another rebuild holds this event's lock; retry, never force — two rebuilds computing from a moving ledger is how a recovery makes things worse (ADR-046). Raised by `order`, which runs the rebuild |
 | `QUEUE_PASS_INVALID` | 401 | queue | Rejoin |
 | `ADMISSION_EXPIRED` | 410 | queue | Rejoin the queue |
 | `ADMISSION_REQUIRED` | 401 | queue | Not admitted to the sale |
 | `INSUFFICIENT_STOCK` | 409 | hold | Choose another tier |
 | `HOLD_NOT_FOUND` | 404 | hold | — |
 | `HOLD_EXPIRED` | 410 | hold | Reservation gone; nothing charged |
-| `HOLD_ALREADY_SETTLED` | 409 | hold | Already consumed or released |
+| `HOLD_ALREADY_SETTLED` | 409 | hold | Already consumed or released. **Not reachable over HTTP**: checkout routes it to the order row, which answers with a receipt or `ORDER_REFUNDED` (ADR-064) |
 | `HOLD_LIMIT_EXCEEDED` | 409 | hold | Release the existing hold first |
 | `QUANTITY_EXCEEDS_LIMIT` | 422 | hold | Max 6 per order |
 | `PAYMENT_DECLINED` | 402 | payment | Retry — see `attemptsRemaining` |
@@ -140,8 +142,10 @@ tells the client a state.
 | `CHECKOUT_WINDOW_CLOSED` | 409 | order | Past the 15-minute grace |
 | `INSUFFICIENT_TIME_REMAINING` | 409 | order | Too little of the hold left to start a charge that could finish (ADR-030). Nothing charged; the order is left resumable |
 | `ORDER_REFUNDED` | 409 | order | A settled charge was refunded because the seats could not be delivered (ADR-012). Distinct from `HOLD_EXPIRED`, whose promise that nothing was charged would be false |
+| `REFUND_FAILED` | 409 | order | A settled charge could not become a purchase, **and the provider refused the refund**. Money owed to the buyer, now with a person: counted in `flashseats.payment.refund.failed` and never announced as refunded (ADR-069) |
 | `TICKET_NOT_AVAILABLE` | 409 | order | The order is the caller's and has no ticket (ADR-050). Only a `CONFIRMED` order does; rendering for any other status would mint a document indistinguishable from a real ticket. Returned **only** to a caller who has already proved ownership, so it can afford to say why — an unauthorised one still gets `ORDER_NOT_FOUND`. `retryable` is true for `PENDING` and false for everything else |
-| `SALE_PAUSED` | 409 | catalog | Pause or resume asked for on an event that is `DRAFT` or `CANCELLED`, where neither means anything (ADR-048) |
+| `SALE_PAUSED` | 409 | catalog | An operator has paused the sale: no hold is created until it resumes. **Retryable** (`retryable: true`), and not terminal — the buyer keeps their place in line and any hold they already have. An admission keeps its own clock, so a pause longer than it sends that buyer back to the line (ADR-066) |
+| `EVENT_NOT_PAUSABLE` | 409 | catalog | Admin only. Pause or resume asked for on an event that is `DRAFT` or `CANCELLED`, where neither means anything (ADR-048). It used `SALE_PAUSED` until that code began meaning something to buyers (ADR-066) |
 | `NOTIFICATION_PAYLOAD_UNAVAILABLE` | 410 | order | A resend was asked for past `flashseats.outbox.purge-after-days`, so the stored message is gone. `410`, not `404`: the order existed and so did its message — they aged out, and a `404` would send an operator hunting a typo |
 | `ADMIN_AUTH_REQUIRED` | 401 | shared | No operator credentials, or the wrong ones |
 | `ADMIN_FORBIDDEN` | 403 | shared | Authenticated, but not an operator |
@@ -403,20 +407,23 @@ business change, it does not belong there.
 
 ## 9. Observability
 
-Metric naming: `flashseats.<module>.<subject>.<unit>`. Every module exposes at minimum its own
-error rate by `code`, and the latency of any external call it makes.
+Metric naming: `flashseats.<module>.<subject>.<unit>`. Every module should expose its own error rate
+by `code` and the latency of any external call it makes — **specified, not built** as a per-module
+series: today `http.server.requests` carries status and URI, and the payment gateway's latency is in
+the Resilience4j series. [`03-end-to-end-flow.md`](03-end-to-end-flow.md) §7 is the full list of what
+is built and what is specified.
 
 Required alarms:
 
 | Metric | Alarm | Why |
 | :--- | :--- | :--- |
-| `flashseats.stock.drift` | **any non-zero** | inventory accounting has diverged — page |
+| `flashseats.stock.drift` | **sustained** non-zero — across consecutive 60 s computations, not one sample | inventory accounting has diverged — page. Redis and PostgreSQL are not read in one snapshot, so a single sample can catch a hold in flight (ADR-046) |
 | `hikaricp_connections_pending` | > 0 sustained | the real saturation signal under virtual threads |
 | `flashseats.outbox.lag.seconds` | > 60 | fulfilment is stalling |
 | `flashseats.dlq.depth` | > 0 | tickets are not reaching buyers |
-| `flashseats.queue.promotion.rate` | 0 while depth > 0 | the queue has stalled |
+| `flashseats.queue.admissions` | zero while a waiting room has depth | the queue has stalled. Specified as `queue.promotion.rate`; built as this untagged counter, so it answers "is the cluster promoting?", not "is this sale?" |
 | `flashseats.payment.attempts{outcome}` | declined share > 0.2 over 5 m | gateway or configuration problem. A counter, not a lifetime ratio, which cannot show a spike |
-| `jvm.threads.pinned` | > 0 | virtual-thread pinning (§7) |
+| `jvm.threads.pinned` | > 0 | virtual-thread pinning (§7). **Specified, not built** |
 
 `stock.drift` compares the live counter against
 `total_capacity − confirmed_sold − active_holds` every 60 s. It is the system's canary.

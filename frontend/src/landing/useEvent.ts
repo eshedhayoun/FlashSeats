@@ -1,85 +1,70 @@
-import { useEffect, useRef, useState } from "react";
-import { ApiError } from "../api/errors";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { getEvent } from "../api/endpoints";
+import { asApiError, type ApiError } from "../api/errors";
 import type { EventDetails } from "../api/types";
 import { serverClock } from "../clock/serverClock";
 
-type EventStatus = "loading" | "ready" | "error";
+export type UseEventResult = {
+  event: EventDetails | null;
+  error: ApiError | null;
+  loading: boolean;
+  /** A fresh read — after `INSUFFICIENT_STOCK`, or on entering seat selection, where availability matters. */
+  reload: () => Promise<void>;
+};
 
-export function useEvent(eventId: number) {
-  const [status, setStatus] = useState<EventStatus>("loading");
+/**
+ * How long to wait before asking again while the sale has not opened (FE_SPEC V1): every 30 s, every
+ * 10 s in the final minute, then just after the opening instant, then every 2 s until the server agrees.
+ */
+export function upcomingPollDelayMs(remainingMs: number): number {
+  if (remainingMs > 60_000) return Math.min(30_000, remainingMs - 60_000 + 250);
+  if (remainingMs > 0) return Math.min(10_000, remainingMs + 250);
+  return 2_000;
+}
+
+/** One event's details. Refreshes in the background: once loaded, it never empties the screen. */
+export function useEvent(eventId: number): UseEventResult {
   const [event, setEvent] = useState<EventDetails | null>(null);
   const [error, setError] = useState<ApiError | null>(null);
-  const openingRefresh = useRef<string | null>(null);
+  const mounted = useRef(true);
 
-  useEffect(() => {
-    let active = true;
-    setStatus("loading");
-    setError(null);
-
-    void getEvent(eventId)
-      .then((nextEvent) => {
-        if (!active) return;
-        setEvent(nextEvent);
-        setStatus("ready");
-      })
-      .catch((cause: unknown) => {
-        if (!active) return;
-
-        setError(
-          cause instanceof ApiError
-            ? cause
-            : new ApiError({
-                type: "about:blank",
-                title: "Event unavailable",
-                status: 0,
-                detail: "The event could not be loaded.",
-                code: "CLIENT_ERROR"
-              })
-        );
-
-        setStatus("error");
-      });
-
-    return () => {
-      active = false;
-    };
+  const reload = useCallback(async () => {
+    try {
+      const next = await getEvent(eventId);
+      if (!mounted.current) return;
+      setEvent(next);
+      setError(null);
+    } catch (cause) {
+      if (!mounted.current) return;
+      setError(asApiError(cause, "The event could not be loaded."));
+    }
   }, [eventId]);
 
   useEffect(() => {
-    if (
-      !event ||
-      event.windowStatus !== "UPCOMING" ||
-      serverClock.remainingMs(event.saleStartTime) > 0 ||
-      openingRefresh.current === event.saleStartTime
-    ) {
-      return;
-    }
+    mounted.current = true;
+    void reload();
+    return () => {
+      mounted.current = false;
+    };
+  }, [reload]);
 
-    openingRefresh.current = event.saleStartTime;
+  // Before the sale opens, keep asking — so the page opens itself at T-0 with no reload (U-4).
+  useEffect(() => {
+    if (!event || event.windowStatus !== "UPCOMING") return;
+    const timer = window.setTimeout(
+      () => void reload(),
+      upcomingPollDelayMs(serverClock.remainingMs(event.saleStartTime))
+    );
+    return () => window.clearTimeout(timer);
+  }, [event, reload]);
 
-    void getEvent(eventId)
-      .then((nextEvent) => {
-        setEvent(nextEvent);
-        setError(null);
-        setStatus("ready");
-      })
-      .catch((cause: unknown) => {
-        openingRefresh.current = null;
+  useEffect(() => {
+    const onVisible = () => {
+      if (document.visibilityState === "visible") void reload();
+    };
+    document.addEventListener("visibilitychange", onVisible);
+    return () => document.removeEventListener("visibilitychange", onVisible);
+  }, [reload]);
 
-        setError(
-          cause instanceof ApiError
-            ? cause
-            : new ApiError({
-                type: "about:blank",
-                title: "Event unavailable",
-                status: 0,
-                detail: "The event could not be refreshed.",
-                code: "CLIENT_ERROR"
-              })
-        );
-      });
-  }, [event, eventId]);
-
-  return { status, event, error };
+  return { event, error, loading: event === null && error === null, reload };
 }

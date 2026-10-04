@@ -120,6 +120,55 @@ class PaymentWebhookIT extends IntegrationTest {
                                 .isEqualTo(1));
     }
 
+    /**
+     * A 3-D Secure charge parks its ledger row in PROCESSING. When the buyer never comes back to finish,
+     * the webhook confirms the order, and the ledger used to stay PROCESSING for ever (ADR-074).
+     */
+    @Test
+    @DisplayName("A charge settled through 3-D Secure is recorded as succeeded on the ledger")
+    void aSettledChallengeIsRecordedOnTheLedger() {
+        BuyerSession buyer = admittedBuyer();
+        String holdToken = reserve(buyer, 1);
+
+        fixture.strandPendingOrder(holdToken, 7_500);
+        String transactionReference = seedSettledPayment(holdToken, "pi_challenged", 7_500);
+        jdbc.update("UPDATE payment_transactions SET status = 'PROCESSING' WHERE transaction_reference = ?",
+                transactionReference);
+
+        String body = StripeWebhooks.settledBody(eventId(), "pi_challenged", holdToken, 7_500);
+        assertThat(post(body, StripeWebhooks.signature(body)).status()).isEqualTo(200);
+
+        assertThat(fixture.orderStatus(holdToken)).isEqualTo("CONFIRMED");
+        assertThat(paymentStatus(transactionReference)).isEqualTo("SUCCEEDED");
+    }
+
+    /**
+     * The provider can deliver before the checkout that made the charge has recorded the intent id. The
+     * attempt row exists from the start, so the webhook finds it by the hold (ADR-064, ADR-074).
+     */
+    @Test
+    @DisplayName("A webhook that outruns the ledger still finds its charge, and links it")
+    void aWebhookAheadOfTheLedgerFindsItsAttempt() {
+        BuyerSession buyer = admittedBuyer();
+        String holdToken = reserve(buyer, 1);
+
+        fixture.strandPendingOrder(holdToken, 7_500);
+        String transactionReference = seedSettledPayment(holdToken, "pi_unused", 7_500);
+        jdbc.update("UPDATE payment_transactions SET status = 'INITIATED', stripe_payment_intent_id = NULL"
+                + " WHERE transaction_reference = ?", transactionReference);
+
+        String body = StripeWebhooks.settledBody(eventId(), "pi_early", holdToken, 7_500);
+        assertThat(post(body, StripeWebhooks.signature(body)).status()).isEqualTo(200);
+
+        assertThat(fixture.orderStatus(holdToken)).isEqualTo("CONFIRMED");
+        assertThat(paymentReferenceOnOrder(holdToken)).isEqualTo(transactionReference);
+        assertThat(paymentStatus(transactionReference)).isEqualTo("SUCCEEDED");
+        assertThat(jdbc.queryForObject(
+                        "SELECT stripe_payment_intent_id FROM payment_transactions WHERE transaction_reference = ?",
+                        String.class, transactionReference))
+                .isEqualTo("pi_early");
+    }
+
     @Test
     @DisplayName("The same delivery twice settles once")
     void replaysAreClaimedOnce() {

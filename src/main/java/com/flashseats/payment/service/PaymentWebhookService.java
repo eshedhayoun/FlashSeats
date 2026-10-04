@@ -85,10 +85,18 @@ public class PaymentWebhookService {
         }
 
         try {
+            String transactionReference = transactions.referenceForGateway(intent.getId())
+                    .or(() -> transactions.referenceForUnlinkedAttempt(holdToken))
+                    .orElse(null);
+            if (transactionReference != null) {
+                // The ledger hears it from the provider too, or a 3-D Secure charge the buyer never came
+                // back to finish stays PROCESSING for ever (ADR-074).
+                transactions.recordSettled(transactionReference, intent.getId());
+            }
             events.publishEvent(new PaymentSettledEvent(
                     holdToken,
                     intent.getId(),
-                    transactions.referenceForGateway(intent.getId()).orElse(null),
+                    transactionReference,
                     intent.getAmount() == null ? 0L : intent.getAmount(),
                     intent.getCurrency() == null ? null : intent.getCurrency().toUpperCase()));
 

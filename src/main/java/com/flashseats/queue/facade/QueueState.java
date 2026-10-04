@@ -18,4 +18,12 @@ public record QueueState(
     public static QueueState notJoined() {
         return new QueueState(QueuePhase.NOT_JOINED, null, null, null, null);
     }
+
+    /**
+     * The same state with no wait estimate. While a sale is paused the line does not move, so any
+     * estimate is fiction — and the drain rate behind it is frozen at its pre-pause value (ADR-066).
+     */
+    public QueueState withoutEstimate() {
+        return new QueueState(phase, position, null, admissionExpiresAt, passToken);
+    }
 }

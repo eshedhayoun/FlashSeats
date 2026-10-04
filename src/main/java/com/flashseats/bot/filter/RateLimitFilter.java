@@ -17,6 +17,8 @@ import jakarta.servlet.http.HttpServletRequest;
 import jakarta.servlet.http.HttpServletResponse;
 import java.io.IOException;
 import java.util.Map;
+import java.util.concurrent.atomic.AtomicLong;
+import lombok.extern.slf4j.Slf4j;
 import org.springframework.core.Ordered;
 import org.springframework.core.annotation.Order;
 import org.springframework.http.MediaType;
@@ -29,11 +31,17 @@ import tools.jackson.databind.ObjectMapper;
  * {@link SessionIdentityFilter}, so every request has an identity to charge. The rule lookup is a
  * memory read, never a query (ADR-055).
  */
+@Slf4j
 @Component
 @Order(Ordered.HIGHEST_PRECEDENCE + 30)
 public class RateLimitFilter extends OncePerRequestFilter {
 
     private static final int RETRY_AFTER_SECONDS = 2;
+
+    /** At most one warning per replica per interval while the limiter is failing open. */
+    private static final long WARN_INTERVAL_MILLIS = 10_000;
+
+    private final AtomicLong lastLimiterWarning = new AtomicLong();
 
     private final RateLimitService rateLimits;
     private final IpRuleService ipRules;
@@ -97,8 +105,22 @@ public class RateLimitFilter extends OncePerRequestFilter {
         // an office, a partner's proxy — where hundreds of real buyers share one address and the
         // coarse flood backstop would throttle all of them. It is not a statement that the traffic
         // is trusted, so the per-session control still applies to every one of them.
-        boolean sessionOk = sessionId == null || rateLimits.allowSession(sessionId.toString());
-        boolean allowed = sessionOk && (rule == IpRuleAction.ALLOW || rateLimits.allowIp(clientIp));
+        boolean sessionOk;
+        boolean allowed;
+        try {
+            sessionOk = sessionId == null || rateLimits.allowSession(sessionId.toString());
+            allowed = sessionOk && (rule == IpRuleAction.ALLOW || rateLimits.allowIp(clientIp));
+        } catch (RuntimeException limiterDown) {
+            // The buckets live in Redis. Unreachable, the choice is a bare 500 on every API call —
+            // thrown here, below the exception handlers, so with no code at all — or letting the
+            // request through to handlers that answer with codes of their own. Fail open, as the
+            // challenge does (ADR-055): the connection pool still bounds the load, and nothing that
+            // sells works without Redis anyway. Counted, so "rate limiting is off" is visible (ADR-067).
+            metrics.recordLimiterUnavailable();
+            warnLimiterUnavailable(limiterDown);
+            chain.doFilter(request, response);
+            return;
+        }
 
         if (!allowed) {
             metrics.recordRefusal(BotOutcome.RATE_LIMITED);
@@ -119,6 +141,11 @@ public class RateLimitFilter extends OncePerRequestFilter {
      * {@code X-Forwarded-For} is client-supplied, so it is honoured only from
      * {@code flashseats.bot.trusted-proxies}, which is empty by default. Trusting it blindly gave anyone
      * unlimited fresh IP buckets.
+     *
+     * <p><strong>The right-most entry that is not itself a trusted proxy</strong> (ADR-071). Each proxy
+     * <em>appends</em> the address it saw, so entries to the left of the last trusted hop are whatever
+     * the client chose to send. Reading the left-most one — as this did — let any caller behind nginx
+     * mint a fresh IP bucket per request by sending its own header.
      */
     private String clientIpOf(HttpServletRequest request) {
         String peer = request.getRemoteAddr();
@@ -126,10 +153,25 @@ public class RateLimitFilter extends OncePerRequestFilter {
             return peer;
         }
         String forwarded = request.getHeader("X-Forwarded-For");
-        if (forwarded != null && !forwarded.isBlank()) {
-            return forwarded.split(",")[0].trim();
+        if (forwarded == null || forwarded.isBlank()) {
+            return peer;
+        }
+        String[] hops = forwarded.split(",");
+        for (int hop = hops.length - 1; hop >= 0; hop--) {
+            String address = hops[hop].trim();
+            if (!address.isEmpty() && !rateLimits.isTrustedProxy(address)) {
+                return address;
+            }
         }
         return peer;
+    }
+
+    private void warnLimiterUnavailable(RuntimeException cause) {
+        long now = System.currentTimeMillis();
+        long last = lastLimiterWarning.get();
+        if (now - last >= WARN_INTERVAL_MILLIS && lastLimiterWarning.compareAndSet(last, now)) {
+            log.warn("Rate-limit buckets unreadable; letting requests through until they are back", cause);
+        }
     }
 
     /** Written directly: a filter runs before the exception handlers can see it. */
@@ -138,7 +180,7 @@ public class RateLimitFilter extends OncePerRequestFilter {
         writeProblem(
                 response,
                 ErrorCode.RATE_LIMITED,
-                "Too many requests. Please slow down and try again shortly.",
+                "We're handling a lot of traffic right now. Please try again in a moment.",
                 Map.of("retryable", true, "retryAfterSeconds", RETRY_AFTER_SECONDS));
     }
 

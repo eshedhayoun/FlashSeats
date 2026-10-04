@@ -36,6 +36,12 @@ class HoldPostCommitTasks {
         timers.arm(event.holdToken(), event.expiresAt());
     }
 
+    /** A timer that fired before its hold ended, armed again for the expiry the row actually holds. */
+    @TransactionalEventListener(phase = TransactionPhase.AFTER_COMMIT, fallbackExecution = true)
+    void onTimerFiredEarly(HoldTimerFiredEarlyEvent event) {
+        timers.arm(event.holdToken(), event.expiresAt());
+    }
+
     /**
      * {@code fallbackExecution} so a settle outside a transaction still restores rather than vanishing.
      * Must never throw: after-commit callbacks run in a loop with no {@code try/catch}, and one failure

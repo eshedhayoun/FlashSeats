@@ -1,266 +1,253 @@
-import { useEffect, useMemo, useRef, useState } from "react";
-
+import { useCallback, useEffect, useRef, useState } from "react";
 import { checkout, releaseHold } from "../api/endpoints";
-import { ApiError } from "../api/errors";
-import type { ActiveHold, EventDetails } from "../api/types";
-import { serverClock } from "../clock/serverClock";
-import { useClockTick } from "../clock/useClockTick";
-import { checkoutErrorState } from "./checkoutErrorState";
-import { decideTimerZero } from "./checkoutTimer";
+import { NETWORK_ERROR, asApiError, type ApiError } from "../api/errors";
+import type { ActiveHold, CheckoutRequest, OrderReceipt } from "../api/types";
+import type { SaleNoticeKind } from "../sale/notices";
 import {
   clearHoldStorage,
-  getHoldToken,
-  getIdempotencyKey
+  clearPaymentInFlight,
+  getCheckoutEmail,
+  getIdempotencyKey,
+  markPaymentInFlight,
+  setCheckoutEmail,
+  wasPaymentInFlight
 } from "../sale/storage";
+import { checkoutErrorState, type CheckoutErrorState } from "./checkoutErrorState";
+import { decideTimerZero } from "./checkoutTimer";
 
 /**
- * How a payment method is obtained, and how a bank challenge is answered.
- *
- * <p>The two implementations — Stripe's PaymentElement and the stub's magic
- * tokens — differ only in these two steps. Everything after them is the same
- * journey and lives here: one POST, the 3-D Secure re-post, and the error table
- * every `problem.code` maps through.
+ * How a payment method is obtained, and how a bank challenge is answered. Stripe's element and the
+ * stub's outcome picker differ only in these two steps; everything after them is one journey.
  */
 export type PaymentDriver = {
-  /** True once the driver can take a payment. */
   ready: boolean;
-  /** Resolves a provider payment-method id, or a message to show the buyer. */
-  createPaymentMethod(
-    email: string
-  ): Promise<{ paymentMethodId?: string; error?: string }>;
+  createPaymentMethod(email: string): Promise<{ paymentMethodId?: string; error?: string }>;
   /**
-   * Answers the bank challenge for a `PAYMENT_ACTION_REQUIRED`.
-   *
-   * The stub has no bank page: re-posting the same body IS the retry, and the
-   * server retrieves the pending intent rather than opening a second one
-   * (ADR-054). So its implementation resolves without doing anything.
+   * Answers a `PAYMENT_ACTION_REQUIRED`. The stub has no bank page — re-posting the same body is the
+   * whole retry, and the server retrieves the waiting intent (ADR-054) — so it resolves at once.
    */
   authenticate(clientSecret: string): Promise<{ error?: string }>;
 };
 
+/**
+ * - `ready` — the form is the buyer's.
+ * - `paying` — a payment is on its way; Pay is disabled, never debounced (FE_SPEC §6).
+ * - `verifying` — the bank's challenge is open. Still in flight: the expiry branch stays frozen.
+ * - `finishing` — a payment may be completing elsewhere (a duplicate, or a reload mid-charge).
+ */
+export type CheckoutPhase = "ready" | "paying" | "verifying" | "finishing";
+
+export type CheckoutMessage = { severity: "error" | "warning" | "info"; title: string; text: string };
+
+/** Checked for shape only: it catches `foo@@bar`, never `jhon@gmial.com` (FE_SPEC V4). */
+const EMAIL_SHAPE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+const DUPLICATE_POLL_MS = 2_000;
+/** How long a payment that may be finishing is waited for before the buyer may try again. */
+const FINISHING_PATIENCE_MS = 30_000;
+
+export function isEmailShaped(email: string): boolean {
+  return EMAIL_SHAPE.test(email.trim()) && email.trim().length <= 255;
+}
+
 export function useCheckoutSubmit({
-  event,
   eventId,
   hold,
   driver,
   onRefresh,
-  onCompleted
+  onCompleted,
+  onEnded,
+  onReleased
 }: {
-  event: EventDetails;
   eventId: number;
   hold: ActiveHold;
   driver: PaymentDriver;
-  onRefresh: () => void;
-  onCompleted: (orderNumber: string) => void;
+  onRefresh: () => Promise<void>;
+  onCompleted: (receipt: OrderReceipt) => void;
+  onEnded: (notice: SaleNoticeKind) => Promise<void>;
+  onReleased: () => Promise<void>;
 }) {
-  useClockTick();
+  const holdToken = hold.holdToken;
 
-  const tier = event.tiers.find(
-    (candidate) => candidate.tierId === hold.tierId
+  const [email, setEmailValue] = useState(() => getCheckoutEmail(eventId, holdToken));
+  const [emailTouched, setEmailTouched] = useState(false);
+  const [phase, setPhase] = useState<CheckoutPhase>(() =>
+    wasPaymentInFlight(eventId, holdToken) ? "finishing" : "ready"
   );
-
-  const [email, setEmail] = useState("");
-  const [submitting, setSubmitting] = useState(false);
-  const [message, setMessage] = useState<string | null>(null);
-  const [messageSeverity, setMessageSeverity] = useState<"error" | "info">(
-    "error"
+  const [failure, setFailure] = useState<CheckoutErrorState | null>(null);
+  const [message, setMessage] = useState<CheckoutMessage | null>(() =>
+    wasPaymentInFlight(eventId, holdToken)
+      ? {
+          severity: "info",
+          title: "Checking on the payment you started",
+          text: "If it went through, your order will appear in a moment. Please don't pay again yet."
+        }
+      : null
   );
-  const [payDisabled, setPayDisabled] = useState(false);
-  const [duplicatePayment, setDuplicatePayment] = useState(false);
+  const [expiresAt, setExpiresAt] = useState(hold.expiresAt);
+  const [retryAt, setRetryAt] = useState<number | null>(null);
+  const [releasing, setReleasing] = useState(false);
+  const [releaseError, setReleaseError] = useState<ApiError | null>(null);
+  const inFlight = useRef(false);
 
-  const timerCheckForHold = useRef<string | null>(null);
+  // The server's expiry wins whenever it speaks: a refresh, or a 402/409 carrying the grace (U-12).
+  useEffect(() => setExpiresAt(hold.expiresAt), [hold.expiresAt]);
 
-  const total = useMemo(
-    () => (tier ? (tier.priceCents * hold.quantity) / 100 : null),
-    [hold.quantity, tier]
-  );
+  const setEmail = (value: string) => {
+    setEmailValue(value);
+    setCheckoutEmail(eventId, holdToken, value);
+  };
 
+  // A payment that may be finishing elsewhere: ask every 2 s, and after a while let the buyer try
+  // again — the retry is the same request, so it cannot charge twice (ADR-064).
   useEffect(() => {
-    if (!duplicatePayment) return;
+    if (phase !== "finishing") return;
+    const poll = window.setInterval(() => void onRefresh(), DUPLICATE_POLL_MS);
+    const patience = window.setTimeout(() => {
+      clearPaymentInFlight(eventId, holdToken);
+      setFailure(null);
+      setMessage({
+        severity: "info",
+        title: "Your last payment hasn't finished yet",
+        text: "You can try again now. If the first one went through, you won't be charged twice."
+      });
+      setPhase("ready");
+    }, FINISHING_PATIENCE_MS);
+    return () => {
+      window.clearInterval(poll);
+      window.clearTimeout(patience);
+    };
+  }, [phase, eventId, holdToken, onRefresh]);
 
-    const timer = window.setInterval(onRefresh, 2000);
+  const emailValid = isEmailShaped(email);
 
-    return () => window.clearInterval(timer);
-  }, [duplicatePayment, onRefresh]);
-
-  useEffect(() => {
-    if (serverClock.remainingMs(hold.expiresAt) > 0) {
-      timerCheckForHold.current = null;
+  const submit = useCallback(async () => {
+    if (inFlight.current) return; // disabled on click, never debounced (FE_SPEC §6)
+    if (!emailValid) {
+      setEmailTouched(true);
       return;
     }
+    if (!driver.ready) return;
 
-    const paymentInFlight = submitting || duplicatePayment;
-
-    if (decideTimerZero(paymentInFlight) === "complete-payment") {
-      setMessage("Completing your purchase…");
-      setMessageSeverity("info");
-      setPayDisabled(true);
-      return;
-    }
-
-    if (timerCheckForHold.current === hold.holdToken) return;
-
-    timerCheckForHold.current = hold.holdToken;
-    setMessage("Checking your reservation…");
-    setMessageSeverity("info");
-
-    void onRefresh();
-  }, [
-    duplicatePayment,
-    hold.expiresAt,
-    hold.holdToken,
-    onRefresh,
-    submitting
-  ]);
-
-  const submit = async () => {
-    const holdToken = getHoldToken(eventId) ?? hold.holdToken;
-
-    if (!holdToken || !email.trim()) {
-      setMessage("Enter the email address for your tickets.");
-      setMessageSeverity("error");
-      return;
-    }
-
-    if (!driver.ready) {
-      setMessage("The payment form is still loading. Please try again.");
-      setMessageSeverity("error");
-      return;
-    }
-
-    setSubmitting(true);
-    setPayDisabled(true);
-    setDuplicatePayment(false);
+    inFlight.current = true;
+    setPhase("paying");
+    setFailure(null);
     setMessage(null);
-    setMessageSeverity("error");
 
     try {
-      const { paymentMethodId, error } = await driver.createPaymentMethod(
-        email.trim()
-      );
-
-      if (error || !paymentMethodId) {
-        setMessage(error ?? "Your payment details could not be processed.");
-        setPayDisabled(false);
+      const method = await driver.createPaymentMethod(email.trim());
+      if (method.error || !method.paymentMethodId) {
+        setMessage({
+          severity: "error",
+          title: "Check your payment details",
+          text: method.error ?? "Your payment details couldn't be processed."
+        });
+        setPhase("ready");
         return;
       }
 
-      /*
-       * ONE key per hold, reused across every retry of that hold — FE_SPEC §3.
-       *
-       * A fresh key per attempt would open a SECOND PaymentIntent, so a buyer
-       * could authenticate one payment and be billed for two. Re-posting the
-       * same key is safe because the server retrieves the pending intent by
-       * hold instead of charging again (ADR-054).
-       */
-      const idempotencyKey = getIdempotencyKey(eventId, holdToken);
-
-      const checkoutRequest = {
+      // ONE idempotency key per hold, reused by every retry of it (FE_SPEC V4, ADR-054).
+      const request: CheckoutRequest = {
         holdToken,
         userEmail: email.trim(),
-        paymentMethodId,
-        idempotencyKey
+        paymentMethodId: method.paymentMethodId,
+        idempotencyKey: getIdempotencyKey(eventId, holdToken)
       };
+      markPaymentInFlight(eventId, holdToken);
 
-      let receipt;
-
+      let receipt: OrderReceipt;
       try {
-        receipt = await checkout(checkoutRequest);
+        receipt = await checkout(request);
       } catch (cause) {
-        if (
-          !(cause instanceof ApiError) ||
-          cause.code !== "PAYMENT_ACTION_REQUIRED"
-        ) {
-          throw cause;
-        }
+        const error = asApiError(cause);
+        const clientSecret = error.problem.clientSecret;
+        if (error.code !== "PAYMENT_ACTION_REQUIRED" || !clientSecret) throw error;
 
-        const clientSecret = cause.problem.clientSecret;
-
-        if (!clientSecret) {
-          setMessage(
-            "Your bank requires verification, but the payment could not continue."
-          );
-          setPayDisabled(false);
+        // 3-D Secure: still in flight for the whole challenge, so the expiry branch stays frozen,
+        // and no attempt is used (FE_SPEC V4).
+        if (error.problem.expiresAt) setExpiresAt(error.problem.expiresAt);
+        setPhase("verifying");
+        const challenge = await driver.authenticate(clientSecret);
+        if (challenge.error) {
+          clearPaymentInFlight(eventId, holdToken);
+          setMessage({
+            severity: "error",
+            title: "Your bank couldn't verify the payment",
+            text: `${challenge.error} Your seats are still held, and no attempt was used.`
+          });
+          setPhase("ready");
           return;
         }
-
-        // Keep payment disabled while the bank challenge is active.
-        setMessage("Your bank is verifying the payment…");
-        setMessageSeverity("info");
-        setPayDisabled(true);
-        setSubmitting(true);
-
-        const { error: actionError } = await driver.authenticate(clientSecret);
-
-        if (actionError) {
-          setMessage(actionError);
-          setMessageSeverity("error");
-          setPayDisabled(false);
-          return;
-        }
-
-        /*
-         * Re-post the EXACT SAME body. There is no resume endpoint and the
-         * client must not invent one (ADR-054, FE_SPEC §2).
-         */
-        receipt = await checkout(checkoutRequest);
+        setPhase("paying");
+        // The SAME body. There is no resume endpoint, and the client must not invent one (ADR-054).
+        receipt = await checkout(request);
       }
 
       clearHoldStorage(eventId, holdToken);
-      onCompleted(receipt.orderNumber);
+      onCompleted(receipt);
     } catch (cause) {
-      if (!(cause instanceof ApiError)) {
-        setMessage("That payment could not be completed. Please try again.");
-        setMessageSeverity("error");
-        setPayDisabled(false);
+      const error = asApiError(cause, "That payment couldn't be completed. Please try again.");
+      // A dropped connection is the one failure with no answer: the charge may still be finishing,
+      // so the flag stays and a reload says so.
+      if (error.code !== NETWORK_ERROR) clearPaymentInFlight(eventId, holdToken);
+      if (error.problem.expiresAt) setExpiresAt(error.problem.expiresAt);
+
+      const next = checkoutErrorState(error);
+      if (next.ended) {
+        clearHoldStorage(eventId, holdToken);
+        await onEnded(next.ended);
         return;
       }
-
-      const next = checkoutErrorState(cause);
-
-      setMessage(next.message);
-      setMessageSeverity(next.severity);
-      setPayDisabled(next.payDisabled);
-      setDuplicatePayment(next.duplicatePayment);
-
-      if (next.clearHold) {
-        clearHoldStorage(eventId, hold.holdToken);
-      }
-
-      if (next.refreshSale) {
-        onRefresh();
-      }
+      setFailure(next);
+      setRetryAt(next.waitSeconds ? Date.now() + next.waitSeconds * 1000 : null);
+      setPhase(next.duplicatePayment ? "finishing" : "ready");
     } finally {
-      setSubmitting(false);
+      inFlight.current = false;
     }
-  };
+  }, [driver, email, emailValid, eventId, holdToken, onCompleted, onEnded]);
 
-  const release = async () => {
-    const holdToken = getHoldToken(eventId) ?? hold.holdToken;
+  /** At 00:00: a payment in flight will finish and must not be told otherwise; anything else asks. */
+  const onTimerZero = useCallback(() => {
+    if (decideTimerZero(phase !== "ready") === "complete-payment") {
+      setMessage({ severity: "info", title: "Completing your purchase…", text: "Please keep this page open." });
+      return;
+    }
+    setMessage({ severity: "info", title: "Checking your reservation…", text: "One moment." });
+    void onRefresh();
+  }, [phase, onRefresh]);
 
+  const release = useCallback(async () => {
+    setReleasing(true);
+    setReleaseError(null);
     try {
       await releaseHold(holdToken);
     } catch (cause) {
-      if (!(cause instanceof ApiError) || cause.code !== "HOLD_NOT_FOUND") {
-        setMessage("The seats could not be released. Please try again.");
+      const error = asApiError(cause);
+      // Already gone is what the buyer asked for.
+      if (error.code !== "HOLD_NOT_FOUND" && error.code !== "HOLD_EXPIRED") {
+        setReleaseError(error);
+        setReleasing(false);
         return;
       }
     }
-
     clearHoldStorage(eventId, holdToken);
-    onRefresh();
-  };
+    await onReleased();
+  }, [eventId, holdToken, onReleased]);
 
   return {
-    tier,
-    total,
     email,
     setEmail,
+    emailValid,
+    emailTouched,
+    touchEmail: () => setEmailTouched(true),
+    phase,
+    failure,
     message,
-    messageSeverity,
-    submitting,
-    payDisabled,
+    expiresAt,
+    retryAt,
     submit,
-    release
+    onTimerZero,
+    release,
+    releasing,
+    releaseError
   };
 }

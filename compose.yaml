@@ -43,8 +43,14 @@ x-app: &app
     SPRING_MAIL_HOST: mailpit
     SPRING_MAIL_PORT: 1025
     # Behind Nginx the client IP arrives in X-Forwarded-For. The bot module
-    # rate-limits on it, so Spring must be told to trust the proxy.
-    SERVER_FORWARD_HEADERS_STRATEGY: framework
+    # rate-limits on it, so Spring must be told to trust the proxy — and NATIVE,
+    # not `framework` (ADR-071). Spring's ForwardedHeaderFilter takes the LEFT-
+    # most X-Forwarded-For entry from anyone, and nginx APPENDS to whatever the
+    # client sent, so `framework` let every caller choose its own address and
+    # mint a fresh IP bucket per request. Tomcat's RemoteIpValve trusts only
+    # internal proxies and walks right to left, stopping at the first address
+    # that is not one: the real client, whatever it sent.
+    SERVER_FORWARD_HEADERS_STRATEGY: native
     # ...and so must the rate limiter, which reads the header itself and
     # therefore does its own trust check (ADR-039). Without an entry here the
     # header is ignored and every request shares nginx's single IP bucket.
@@ -319,7 +325,9 @@ services:
   app-3: { <<: *app, container_name: flashseats-app-3 }
 
   nginx:
-    image: nginx:1.27-alpine
+    build:
+      context: .
+      dockerfile: docker/nginx/Dockerfile
     container_name: flashseats-nginx
     profiles: ["cluster"]
     restart: unless-stopped
@@ -399,6 +407,25 @@ services:
     volumes:
       - ./docker/k6:/scripts
     entrypoint: ["k6", "run", "/scripts/concurrent-sales.js"]
+    networks: [flashseats]
+
+  # The waiting room alone: a simultaneous arrival that browses, joins and polls,
+  # with no holds or checkouts (header of waiting-room.js). One event, seeded by
+  # docker/seed/seed.sh.
+  #
+  #   docker compose --profile loadtest run --rm -e VUS=2000 k6-waiting-room
+  k6-waiting-room:
+    image: grafana/k6:latest
+    profiles: ["loadtest"]
+    environment:
+      BASE_URL: ${K6_BASE_URL:-http://nginx:80}
+      EVENT_ID: ${K6_EVENT_ID:-9001}
+      VUS: ${K6_VUS:-10000}
+      WAIT_SECONDS: ${K6_WAIT_SECONDS:-180}
+      POLL_SECONDS: ${K6_POLL_SECONDS:-2}
+    volumes:
+      - ./docker/k6:/scripts
+    entrypoint: ["k6", "run", "/scripts/waiting-room.js"]
     networks: [flashseats]
 
   # ===================================================================

@@ -98,15 +98,25 @@ public class PaymentService implements PaymentFacade {
             // open a second intent and risk billing twice for one authentication.
             ChargeAttempt attempt = store.beginAttempt(command); // tx1
 
+            if (attempt.settled()) {
+                // This hold was already charged, and the order's commit failed in a way that proved
+                // nothing. Charging again would bill twice for one set of seats (ADR-064).
+                log.info("Hold {} already has a settled charge; returning it instead of charging again",
+                        command.holdToken());
+                return new PaymentResult(
+                        attempt.transactionReference(), true, attempt.gatewayReference(),
+                        null, null, null, false, false);
+            }
+
             GatewayResult result = attempt.isResume() // no transaction open
-                    ? gateway.retrieve(attempt.resumableGatewayReference())
+                    ? gateway.retrieve(attempt.gatewayReference())
                     : gateway.charge(new GatewayCharge(
                             command.orderNumber(),
                             command.holdToken(),
                             command.amountCents(),
                             command.currency(),
                             command.paymentMethodId(),
-                            command.clientIdempotencyKey()));
+                            providerKey(command)));
 
             store.recordOutcome(attempt.transactionReference(), result); // tx2
             attemptsByOutcome.get(result.outcome()).increment();
@@ -144,6 +154,27 @@ public class PaymentService implements PaymentFacade {
                         releaseFailed);
             }
         }
+    }
+
+    /**
+     * The key the provider sees: the client's one key for the hold, scoped to the attempt (ADR-074).
+     *
+     * <p>The client keeps one key for the life of a hold, which is right for a retry of the <em>same</em>
+     * attempt — a re-POST after a dropped response replays the provider's answer instead of charging
+     * twice. But Stripe keeps a key's first answer for 24 hours and refuses the key with different
+     * parameters, so after a decline the buyer's next card got the same decline replayed, or an
+     * idempotency error that read as a provider outage and counted against the breaker. A decline
+     * consumes an attempt, so scoping the key to the attempt gives each new card its own; an outage
+     * consumes none, so its retry keeps the same key.
+     */
+    static String providerKey(AuthorizeCommand command) {
+        String key = command.clientIdempotencyKey();
+        return key == null || key.isBlank() ? null : key + ":" + command.attemptNumber();
+    }
+
+    @Override
+    public boolean hasChargeFor(String holdToken) {
+        return store.hasChargeFor(holdToken);
     }
 
     @Override

@@ -13,6 +13,8 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.transaction.support.TransactionTemplate;
 import java.util.List;
 
 /**
@@ -30,6 +32,12 @@ class OutboxRecoveryIT extends IntegrationTest {
 
     @Autowired
     private SaleFixture fixture;
+
+    @Autowired
+    private JdbcTemplate jdbc;
+
+    @Autowired
+    private TransactionTemplate transactions;
 
     @BeforeEach
     void resetDatabase() {
@@ -50,15 +58,20 @@ class OutboxRecoveryIT extends IntegrationTest {
 
         outbox.saveAndFlush(event);
 
-        int released = store.releaseStaleClaims();
+        // Checked under the row lock: once PENDING, the context's own relay would claim it within a poll.
+        transactions.executeWithoutResult(status -> {
+            jdbc.queryForObject("SELECT id FROM outbox_events WHERE id = ? FOR UPDATE", Object.class, event.getId());
 
-        assertThat(released).isEqualTo(1);
+            int released = store.releaseStaleClaims();
 
-        OutboxEvent recovered = outbox.findById(event.getId()).orElseThrow();
+            assertThat(released).isEqualTo(1);
 
-        assertThat(recovered.getStatus()).isEqualTo(OutboxStatus.PENDING);
-        assertThat(recovered.getClaimedAt()).isNull();
-        assertThat(recovered.getRetryCount()).isEqualTo(1);
+            OutboxEvent recovered = outbox.findById(event.getId()).orElseThrow();
+
+            assertThat(recovered.getStatus()).isEqualTo(OutboxStatus.PENDING);
+            assertThat(recovered.getClaimedAt()).isNull();
+            assertThat(recovered.getRetryCount()).isEqualTo(1);
+        });
     }
 
     @Test
@@ -102,19 +115,26 @@ class OutboxRecoveryIT extends IntegrationTest {
 
         outbox.saveAndFlush(event);
 
-        // Relay A dies. Recovery returns the row to PENDING and increments retry_count.
-        assertThat(store.releaseStaleClaims()).isEqualTo(1);
+        // Recovery and relay B's claim happen under one row lock. Between them the row is PENDING, and
+        // the context's own relay polls every 500 ms: unlocked, it could claim and publish the row in
+        // that window and the test would be watching the wrong relay. It claims with SKIP LOCKED, so the
+        // lock keeps it out.
+        transactions.executeWithoutResult(status -> {
+            jdbc.queryForObject("SELECT id FROM outbox_events WHERE id = ? FOR UPDATE", Object.class, event.getId());
 
-        OutboxEvent afterRecovery = outbox.findById(event.getId()).orElseThrow();
+            // Relay A dies. Recovery returns the row to PENDING and increments retry_count.
+            assertThat(store.releaseStaleClaims()).isEqualTo(1);
 
-        assertThat(afterRecovery.getStatus()).isEqualTo(OutboxStatus.PENDING);
-        assertThat(afterRecovery.getRetryCount()).isEqualTo(1);
+            OutboxEvent afterRecovery = outbox.findById(event.getId()).orElseThrow();
 
-        // Relay B now claims the same row.
-        OutboxEvent newerClaim = outbox.findById(event.getId()).orElseThrow();
-        newerClaim.setStatus(OutboxStatus.PROCESSING);
-        newerClaim.setClaimedAt(Instant.now());
-        outbox.saveAndFlush(newerClaim);
+            assertThat(afterRecovery.getStatus()).isEqualTo(OutboxStatus.PENDING);
+            assertThat(afterRecovery.getRetryCount()).isEqualTo(1);
+
+            // Relay B now claims the same row.
+            afterRecovery.setStatus(OutboxStatus.PROCESSING);
+            afterRecovery.setClaimedAt(Instant.now());
+            outbox.saveAndFlush(afterRecovery);
+        });
 
         // Relay A wakes up and reports its original successful publish.
         // Its retry_count is still 0, so it no longer owns this claim.

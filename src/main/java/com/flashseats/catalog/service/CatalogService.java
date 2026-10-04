@@ -61,10 +61,14 @@ public class CatalogService implements CatalogFacade {
 
     // ---------------------------------------------------------------- browse
 
+    /**
+     * Every published event, and every paused one, marked as such. A paused sale stays listed: the
+     * buyers in its line must be able to find it again, and a sale that vanished from the landing page
+     * reads as over (ADR-066).
+     */
     public List<EventListItemResponse> listEvents() {
         Instant now = clock.instant();
         return metadata.selectableEvents().stream()
-                .filter(event -> event.status() == EventStatus.PUBLISHED)
                 .map(event -> new EventListItemResponse(
                         event.id(),
                         event.title(),
@@ -193,7 +197,7 @@ public class CatalogService implements CatalogFacade {
      * Idempotent. The cache eviction is published {@code AFTER_COMMIT}, so a concurrent reader cannot
      * re-cache the row before this change lands.
      *
-     * @throws com.flashseats.shared.error.FlashSeatsException {@code SALE_PAUSED} if the event is
+     * @throws com.flashseats.shared.error.FlashSeatsException {@code EVENT_NOT_PAUSABLE} if the event is
      *     {@code DRAFT} or {@code CANCELLED}
      */
     @Transactional

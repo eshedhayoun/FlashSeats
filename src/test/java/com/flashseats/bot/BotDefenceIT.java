@@ -19,6 +19,7 @@ import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.web.server.LocalServerPort;
+import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.test.context.TestPropertySource;
 import org.junit.jupiter.api.MethodOrderer;
 import org.junit.jupiter.api.Order;
@@ -54,6 +55,9 @@ class BotDefenceIT extends IntegrationTest {
 
     @Autowired
     private BotProperties botProperties;
+
+    @Autowired
+    private StringRedisTemplate redis;
 
     private long eventId;
 
@@ -147,6 +151,23 @@ class BotDefenceIT extends IntegrationTest {
             assertThat(entries).containsOnly("IP_BLOCKED");
         });
     }
+
+    @Test
+    @DisplayName("Every rate-limit bucket expires once refilled, so buckets cannot accumulate under noeviction")
+    void bucketsExpire() {
+        BuyerSession buyer = new BuyerSession(port);
+        buyer.get("/events/" + eventId);
+        buyer.get("/events/" + eventId);
+
+        var keys = redis.keys("bot:rate:*");
+        assertThat(keys).isNotEmpty();
+        for (String key : keys) {
+            Long ttl = redis.getExpire(key);
+            // The IP bucket, capacity 10 at 1/s, refills in 10 s, plus the 10 s grace. Never -1 (ADR-079).
+            assertThat(ttl).as("TTL of %s", key).isPositive().isLessThanOrEqualTo(25L);
+        }
+    }
+
     @Test 
     @DisplayName("The session bucket returns 429 when one session sends too many requests") 
     void sessionRateLimitIsEnforced(){

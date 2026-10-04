@@ -28,8 +28,8 @@ mint/verify half a package away from its type/resolve half. The environment vari
 
 | Redis key | TTL | Purpose |
 | :--- | :--- | :--- |
-| `bot:rate:session:{sid}` | rolling | the primary rate-limit bucket |
-| `bot:rate:ip:{address}` | rolling | a coarse flood backstop |
+| `bot:rate:session:{sid}` | until full again, + 10 s | the primary rate-limit bucket |
+| `bot:rate:ip:{address}` | until full again, + 10 s | a coarse flood backstop |
 | `bot:verified:{sid}` | 900 s | one challenge verification, remembered for the session |
 
 | PostgreSQL | Contents |
@@ -72,7 +72,9 @@ spike this system exists to serve.
 | session | 20 | 10/s |
 | IP | 300 | 150/s |
 
-**`X-Forwarded-For` is believed only from a trusted peer** (ADR-039), and the trusted set is
+**`X-Forwarded-For` is read right to left** (ADR-071): a proxy appends the address it saw, so the
+client is the right-most entry that is not itself a trusted proxy — never the left-most, which the
+client wrote. **And it is believed only from a trusted peer** (ADR-039), and the trusted set is
 **empty by default — trust nobody**. Trusting the header unconditionally let any caller mint unlimited
 fresh IP buckets by rotating a fake address; combined with a session bucket that is free to mint by
 dropping a cookie, that left the backstop enforcing nothing at all.
@@ -91,6 +93,12 @@ backstop would throttle all of them. It is not a statement that the traffic is t
 ---
 
 ## 3a. Verification fails open, and that is the decision
+
+**So does the rate limiter** (ADR-067). The buckets live in Redis; when they cannot be read, the
+filter used to throw below every exception handler, and every API call answered a bare `500` with no
+`code`. It now lets the request through and counts it in `flashseats.bot.limiter.unavailable` — any
+non-zero rate means rate limiting is off right now. The connection pool still bounds the load, and
+nothing that sells works without Redis anyway.
 
 `POST /queue/join` is the one place a challenge is worth its cost: it is the front of the line, it is
 cheap to repeat, and a session id costs nothing to mint — so ADR-011's per-session bucket does not

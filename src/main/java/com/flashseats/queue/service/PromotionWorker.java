@@ -15,6 +15,7 @@ import java.util.Set;
 import java.util.UUID;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.data.redis.core.StringRedisTemplate;
+import org.springframework.data.redis.core.script.RedisScript;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Component;
 import tools.jackson.databind.ObjectMapper;
@@ -34,6 +35,7 @@ public class PromotionWorker {
     private static final String NODE_ID = UUID.randomUUID().toString();
 
     private final StringRedisTemplate redis;
+    private final RedisScript<Long> promotionScript;
     private final CatalogFacade catalog;
     private final QueueTokens tokens;
     private final QueueProperties properties;
@@ -47,6 +49,7 @@ public class PromotionWorker {
 
     public PromotionWorker(
             StringRedisTemplate redis,
+            RedisScript<Long> promotionScript,
             CatalogFacade catalog,
             QueueTokens tokens,
             QueueProperties properties,
@@ -56,6 +59,7 @@ public class PromotionWorker {
             Clock clock,
             MeterRegistry meters) {
         this.redis = redis;
+        this.promotionScript = promotionScript;
         this.catalog = catalog;
         this.tokens = tokens;
         this.properties = properties;
@@ -95,6 +99,31 @@ public class PromotionWorker {
                 log.error("Promotion tick failed for event {}", eventId, failure);
             }
         }
+
+        Set<Long> open = Set.copyOf(openEvents);
+        for (long eventId : catalog.findManagedEventIds()) {
+            if (!open.contains(eventId)) {
+                try {
+                    refreshExhaustion(eventId);
+                } catch (RuntimeException failure) {
+                    log.warn("Could not re-check exhaustion for paused event {}", eventId, failure);
+                }
+            }
+        }
+    }
+
+    /**
+     * A paused sale promotes nobody, but its stock still moves: an unpaid hold that expires during the
+     * pause gives its seats back. Exhaustion is derived from that stock, so it must un-derive while
+     * paused too, or a buyer who joins during the pause is told the sale has sold out — and the first
+     * broadcaster sweep after the resume repeats it to everyone in line (ADR-035, ADR-066). Nothing is
+     * ever marked exhausted here: no seat can be taken while paused.
+     */
+    private void refreshExhaustion(long eventId) {
+        if (Boolean.TRUE.equals(redis.hasKey(QueueKeys.exhausted(eventId)))
+                && catalog.getRemainingForEvent(eventId) > 0) {
+            redis.delete(QueueKeys.exhausted(eventId));
+        }
     }
 
     private void promote(long eventId) {
@@ -128,18 +157,20 @@ public class PromotionWorker {
         expireWithSale(QueueKeys.admissions(eventId), now, saleEndTime);
         expireWithSale(QueueKeys.waiting(eventId), now, saleEndTime);
 
-        long pendingPasses = count(QueueKeys.passes(eventId), nowMillis);
-        long liveAdmissions = count(QueueKeys.admissions(eventId), nowMillis);
-
         if (remaining > 0) {
             // Exhaustion is derived, so it un-derives: a released hold or a rebuilt counter puts
             // seats back and the waiting room resumes exactly where it was (ADR-035).
             redis.delete(QueueKeys.exhausted(eventId));
-        } else if (pendingPasses == 0 && liveAdmissions == 0) {
+        } else {
+            // Even with passes and admissions still out: those buyers are past the line and will find
+            // the same empty tiers. Waiting for their claims to lapse kept everyone still in line on
+            // WAITING, going nowhere, for up to the admission TTL after the last seat went (ADR-079).
             exhaust(eventId, now);
             return;
         }
 
+        long pendingPasses = count(QueueKeys.passes(eventId), nowMillis);
+        long liveAdmissions = count(QueueKeys.admissions(eventId), nowMillis);
         long admittable = Math.min(
                 properties.getPromotionBatchSize(),
                 (long) Math.floor(remaining * properties.getOversubscribeFactor())
@@ -165,49 +196,55 @@ public class PromotionWorker {
             return;
         }
 
-        long promoted = 0;
-        for (String sessionId : front) {
-            if (promoted >= budgeted) {
-                break;
-            }
-            issuePass(eventId, sessionId, now);
-            promoted++;
-        }
-        admitted.increment(promoted);
-        log.debug("Promoted {} session(s) for event {}", promoted, eventId);
+        List<Promotion> promotions = front.stream()
+                .limit(budgeted)
+                .map(sessionId -> new Promotion(sessionId, tokens.mintPass(eventId, sessionId)))
+                .toList();
+        issuePasses(eventId, promotions, now);
+        admitted.increment(promotions.size());
+        log.debug("Promoted {} session(s) for event {}", promotions.size(), eventId);
     }
 
     /**
-     * Mints a pass, moves the buyer out of the line, and tells them.
+     * Mints the passes, moves the buyers out of the line, and tells them.
      *
-     * <p>The {@code PUBLISH} is what actually reaches the browser. This worker runs on one replica;
-     * the buyer's stream may be held by another. Every replica subscribes and delivers to its own
+     * <p>The writes go in one script: three commands per buyer as separate round trips made the tick's
+     * cost grow with every buyer it admitted, and the tick has to finish inside its own lock (ADR-032).
+     * It was a pipeline until a pipeline turned out to cost a fresh connection per call, because it
+     * cannot share the multiplexed one and no pool is configured (ADR-079).
+     *
+     * <p>The {@code PUBLISH} comes after every pass exists, so no browser is told about a pass it
+     * cannot yet redeem. It is what actually reaches the browser: this worker runs on one replica, the
+     * buyer's stream may be held by another, and every replica subscribes and delivers to its own
      * connections (ADR-007).
      */
-    private void issuePass(long eventId, String sessionId, Instant now) {
-        String passToken = tokens.mintPass(eventId, sessionId);
-        Instant expiresAt = now.plusSeconds(properties.getPassTtlSeconds());
+    private void issuePasses(long eventId, List<Promotion> promotions, Instant now) {
+        List<String> keys = new ArrayList<>(promotions.size() + 2);
+        keys.add(QueueKeys.passes(eventId));
+        keys.add(QueueKeys.waiting(eventId));
+        List<Object> args = new ArrayList<>(promotions.size() * 2 + 2);
+        args.add(String.valueOf(properties.getPassTtlSeconds()));
+        args.add(String.valueOf(now.plusSeconds(properties.getPassTtlSeconds()).toEpochMilli()));
+        for (Promotion promotion : promotions) {
+            keys.add(QueueKeys.pass(eventId, promotion.sessionId()));
+            args.add(promotion.sessionId());
+            args.add(promotion.passToken());
+        }
+        redis.execute(promotionScript, keys, args.toArray());
 
-        redis.opsForValue()
-                .set(
-                        QueueKeys.pass(eventId, sessionId),
-                        passToken,
-                        Duration.ofSeconds(properties.getPassTtlSeconds()));
-        redis.opsForZSet()
-                .add(QueueKeys.passes(eventId), sessionId, (double) expiresAt.toEpochMilli());
-        redis.opsForZSet().remove(QueueKeys.waiting(eventId), sessionId);
-
-        publish(
-                eventId,
-                QueueChannelMessage.promotion(
-                        sessionId, passToken, properties.getPassTtlSeconds()));
+        for (Promotion promotion : promotions) {
+            publish(
+                    eventId,
+                    QueueChannelMessage.promotion(
+                            promotion.sessionId(), promotion.passToken(), properties.getPassTtlSeconds()));
+        }
     }
 
     /**
-     * Stock is gone and nobody holds a claim on it: say so once, and change nothing else. The waiting
-     * set stays intact (ADR-035). The trigger is a live inventory read that a released hold can
-     * reverse a second later. The {@code SETNX} marker makes {@code EXHAUSTED} a derived state, cleared
-     * by the next tick with stock, and publishes the frame once.
+     * Stock is gone: say so once, and change nothing else. The waiting set stays intact (ADR-035). The
+     * trigger is a live inventory read that a released hold can reverse a second later. The {@code SETNX}
+     * marker makes {@code EXHAUSTED} a derived state, cleared by the next tick with stock, and publishes
+     * the frame once.
      */
     private void exhaust(long eventId, Instant now) {
         Boolean firstToSee = redis.opsForValue()
@@ -248,6 +285,8 @@ public class PromotionWorker {
                         Duration.ofMillis(properties.getPromotionIntervalMs() * 9 / 10));
         return Boolean.TRUE.equals(acquired);
     }
+
+    private record Promotion(String sessionId, String passToken) {}
 
     private long count(String zsetKey, double fromMillis) {
         Long count = redis.opsForZSet().count(zsetKey, fromMillis, Double.POSITIVE_INFINITY);

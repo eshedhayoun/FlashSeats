@@ -50,6 +50,65 @@ public class QueueReplayService {
         }
     }
 
+    /**
+     * Publishes a broadcast frame unless it repeats the last one announced under {@code announcedKey}
+     * (ADR-076). Every replica watching a sale sees the same change. {@code SET ... GET} swaps this
+     * frame in and returns what was announced before, atomically, so one of them announces it and the
+     * rest find it said. Each replica comparing against its own memory would deliver every change to
+     * every stream once per replica, retain it as many times, and miss a change back to a state that
+     * replica last announced itself, since its streams have heard the others since.
+     */
+    public void publishIfChanged(long eventId, String announcedKey, QueueChannelMessage message) {
+        String content = encode(message);
+        String previous = redis.opsForValue().setGet(announcedKey, content, retention());
+        if (!content.equals(previous)) {
+            publishOrForget(eventId, announcedKey, message);
+        }
+    }
+
+    /**
+     * Publishes a frame that should be said once per sale, from whichever replica claims it first
+     * (ADR-076).
+     *
+     * @return false if another replica already announced it, and this one published nothing
+     */
+    public boolean publishOnce(long eventId, String announcedKey, QueueChannelMessage message) {
+        if (!Boolean.TRUE.equals(redis.opsForValue().setIfAbsent(announcedKey, "1", retention()))) {
+            return false;
+        }
+        publishOrForget(eventId, announcedKey, message);
+        return true;
+    }
+
+    /**
+     * The claim goes if the frame did not: a key saying "announced" over a frame nobody received would
+     * stop every replica from ever announcing it (ADR-038's rule). The next sweep tries again.
+     */
+    private void publishOrForget(long eventId, String announcedKey, QueueChannelMessage message) {
+        try {
+            publishAndFanOut(eventId, message);
+        } catch (RuntimeException failed) {
+            try {
+                redis.delete(announcedKey);
+            } catch (RuntimeException alsoFailed) {
+                failed.addSuppressed(alsoFailed);
+            }
+            throw failed;
+        }
+    }
+
+    private Duration retention() {
+        return Duration.ofSeconds(properties.getKeyRetentionAfterSaleSeconds());
+    }
+
+    private String encode(QueueChannelMessage message) {
+        try {
+            return json.writeValueAsString(message);
+        } catch (Exception failure) {
+            throw new IllegalStateException("Could not encode queue frame", failure);
+        }
+    }
+
     private QueueChannelMessage retain(long eventId, QueueChannelMessage message) {
         Long sequence = redis.opsForValue().increment(QueueKeys.replaySequence(eventId));
         if (sequence == null) {
@@ -61,9 +120,8 @@ public class QueueReplayService {
             String encoded = json.writeValueAsString(persisted);
             redis.opsForZSet().add(QueueKeys.replay(eventId), encoded, sequence);
             redis.opsForZSet().removeRange(QueueKeys.replay(eventId), 0, -MAX_FRAMES - 1);
-            Duration retention = Duration.ofSeconds(properties.getKeyRetentionAfterSaleSeconds());
-            redis.expire(QueueKeys.replay(eventId), retention);
-            redis.expire(QueueKeys.replaySequence(eventId), retention);
+            redis.expire(QueueKeys.replay(eventId), retention());
+            redis.expire(QueueKeys.replaySequence(eventId), retention());
             return persisted;
         } catch (Exception failure) {
             throw new IllegalStateException("Could not persist queue replay frame", failure);

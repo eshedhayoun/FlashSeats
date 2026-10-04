@@ -23,6 +23,8 @@ public enum ErrorCode {
      * {@code Retry-After} header. Checkout is find-or-create, so re-POSTing the same body is safe.
      */
     SERVICE_BUSY(HttpStatus.SERVICE_UNAVAILABLE),
+    /** No endpoint or resource at this path. A caller's mistake, never a server fault (ADR-067). */
+    NOT_FOUND(HttpStatus.NOT_FOUND),
 
     // --- bot ----------------------------------------------------------------
     RATE_LIMITED(HttpStatus.TOO_MANY_REQUESTS),
@@ -48,6 +50,12 @@ public enum ErrorCode {
      * computing from a ledger that is moving under them is how a recovery makes things worse.
      */
     STOCK_REBUILD_IN_PROGRESS(HttpStatus.SERVICE_UNAVAILABLE),
+    /**
+     * The charge settled, the seats could not be delivered, and the provider refused the refund. Money
+     * owed to the buyer, now with a person (ADR-069). Never {@link #ORDER_REFUNDED}, which says the
+     * money is back.
+     */
+    REFUND_FAILED(HttpStatus.CONFLICT),
 
     // --- queue --------------------------------------------------------------
     QUEUE_PASS_INVALID(HttpStatus.UNAUTHORIZED),
@@ -116,8 +124,13 @@ public enum ErrorCode {
     ADMIN_AUTH_REQUIRED(HttpStatus.UNAUTHORIZED),
     /** Authenticated, but not an operator. Same filter-chain origin as the code above. */
     ADMIN_FORBIDDEN(HttpStatus.FORBIDDEN),
-    /** The sale is paused, so it admits nobody and reserves nothing until an operator resumes it. */
+    /**
+     * The sale is paused: nothing is reserved until an operator resumes it, and every buyer keeps their
+     * place (ADR-066). Retryable, unlike {@link #SALE_CLOSED}.
+     */
     SALE_PAUSED(HttpStatus.CONFLICT),
+    /** Pause or resume asked for on an event that is neither published nor paused. Admin only. */
+    EVENT_NOT_PAUSABLE(HttpStatus.CONFLICT),
     /**
      * A resend was asked for but the original message is gone: {@code outbox_events} keeps payloads
      * for {@code flashseats.outbox.purge-after-days} and this order is past it. {@code 410}, not

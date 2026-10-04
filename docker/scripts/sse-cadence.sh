@@ -9,19 +9,19 @@
 #   Is QueueBroadcaster's sweep finishing inside its own interval?
 #
 # WHY THIS IS THE MEASUREMENT THAT MATTERS. The sweep calls getQueueState once
-# per connection per tick, and that is four sequential Redis round trips — the
-# admission GET, the pass GET, the exhausted EXISTS and the waiting ZRANK. The
-# cost is therefore linear in CONNECTIONS, not in events, and the interval it
-# has to fit inside is fixed at flashseats.queue.sse-position-interval-ms
-# (2000 ms). Past some connection count the sweep simply cannot finish in time,
-# and the symptom is not an error anywhere — it is buyers watching a counter
-# that updates more and more slowly.
+# per connection per tick: one Redis round trip each, the queue_state.lua script
+# (ADR-079; it was four sequential reads, then a pipeline that opened a
+# connection per call). The cost is therefore linear in CONNECTIONS, not in
+# events, and the interval it has to fit inside is fixed at
+# flashseats.queue.sse-position-interval-ms (2000 ms). Past some connection
+# count the sweep simply cannot finish in time, and the symptom is not an error
+# anywhere — it is buyers watching a counter that updates more and more slowly.
 #
 # So the instrument is a client-side one: hold a few streams open and time the
 # gaps between position-update frames. A median at or near the configured
 # interval means the sweep is keeping up. A median well above it is the
-# overrun, measured rather than assumed, and it is what justifies replacing the
-# per-connection reads with one pipelined round trip per event per tick.
+# overrun, measured rather than assumed, and it is what would justify one read
+# per event per tick instead of one per connection.
 #
 # Deliberately opens only a handful of connections. It is measuring the load the
 # run is already applying, and must not add meaningfully to it.
@@ -98,8 +98,8 @@ if [[ "$MEDIAN" -le $((INTERVAL_MS * 2)) ]]; then
     echo "  OK    the sweep is keeping up with its interval"
 else
     echo "  SLOW  the sweep is overrunning its ${INTERVAL_MS} ms interval."
-    echo "        QueueBroadcaster.sweep does 4 sequential Redis round trips"
-    echo "        per connection per tick. Batch them into one pipelined call"
-    echo "        per event per tick."
+    echo "        QueueBroadcaster.sweep makes one Redis round trip per"
+    echo "        connection per tick (queue_state.lua). One read per event per"
+    echo "        tick is the next step -- as a script, never a pipeline (ADR-079)."
 fi
 echo "=========================================================="

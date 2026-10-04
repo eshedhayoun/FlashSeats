@@ -8,6 +8,7 @@ import jakarta.persistence.GeneratedValue;
 import jakarta.persistence.GenerationType;
 import jakarta.persistence.Id;
 import jakarta.persistence.Table;
+import jakarta.persistence.Version;
 import java.time.Instant;
 import lombok.Getter;
 import lombok.NoArgsConstructor;
@@ -83,6 +84,14 @@ public class Order {
     @UpdateTimestamp
     @Column(name = "updated_at", nullable = false)
     private Instant updatedAt;
+
+    /**
+     * Optimistic lock (ADR-064). The checkout and the webhook can settle one charge at once; this makes
+     * the second writer fail rather than write its stale copy over the first.
+     */
+    @Version
+    @Column(nullable = false)
+    private long version;
 
     public Order(
             String orderNumber,

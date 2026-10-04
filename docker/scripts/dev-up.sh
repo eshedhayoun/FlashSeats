@@ -135,9 +135,9 @@ events="$(psql_q "SELECT count(*) FROM events" || echo 0)"
 if [[ "$events" == "0" ]]; then
     ok "database is empty — CatalogDevSeeder seeds an open sale on the next boot"
 else
-    # PUBLISHED, not ACTIVE. SaleWindows.statusOf answers CLOSED for anything
-    # that is not PUBLISHED — that is how an operator's pause closes a sale for
-    # free — so PUBLISHED is exactly the set that can be open.
+    # PUBLISHED, not ACTIVE. EventRow.windowStatus answers OPEN only for a
+    # PUBLISHED event inside its window — a paused one reads PAUSED (ADR-066) —
+    # so PUBLISHED is exactly the set that can be open.
     open_now="$(psql_q "
         SELECT count(*) FROM events
          WHERE status = 'PUBLISHED'
@@ -188,6 +188,31 @@ else
     fi
 fi
 
+# ------------------------------------------------- 5b. counters this Redis trusts
+# A counter is trusted only by the Redis instance that derived it: a restarted or
+# re-created Redis has a new run_id, so the app refuses holds on every event it
+# did not vouch for (ADR-046) — an INVENTORY_UNAVAILABLE on every reserve, on a
+# sale this script just called walkable. Nothing here rewrites a counter; it
+# names the event and the one legal repair.
+stale=()
+if [[ "$events" != "0" ]]; then
+    current_run="$(redis_q INFO server | tr -d '\r' | awk -F: '/^run_id:/ { print $2 }')"
+    for id in $(psql_q "
+            SELECT id FROM events
+             WHERE status IN ('PUBLISHED', 'PAUSED')
+               AND sale_start_time <= now() AND sale_end_time > now()
+             ORDER BY id" | tr -d '\r'); do
+        vouched="$(redis_q GET "catalog:vouch:${id}" | tr -d '\r')"
+        if [[ -n "$vouched" && "$vouched" != "$current_run" ]]; then
+            stale+=("$id")
+        fi
+    done
+    if (( ${#stale[@]} )); then
+        warn "event(s) ${stale[*]}: counters were derived by an earlier Redis run, so every hold"
+        warn "will answer 503 INVENTORY_UNAVAILABLE until they are rebuilt from the ledger (ADR-046)"
+    fi
+fi
+
 # ------------------------------------------------------------------- 6. go
 say "Ready"
 
@@ -203,3 +228,11 @@ cat <<EOF
   Leave VITE_STRIPE_PUBLISHABLE_KEY blank to drive the stub gateway, which is
   what the backend runs by default.
 EOF
+
+if (( ${#stale[@]} )); then
+    echo "  Once the backend is up, rebuild the distrusted counters from the ledger:"
+    for id in "${stale[@]}"; do
+        echo "      curl -u admin:admin -X POST http://localhost:${APP_PORT}/api/v1/admin/events/${id}/rebuild-stock"
+    done
+    echo
+fi

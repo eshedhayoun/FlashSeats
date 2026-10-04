@@ -49,8 +49,8 @@ class PaymentMetricsTest {
     @Test
     void countsEachOutcomeSeparately() {
         when(store.beginAttempt(any())).thenReturn(
-                new ChargeAttempt("tx_success", null),
-                new ChargeAttempt("tx_declined", null));
+                ChargeAttempt.fresh("tx_success"),
+                ChargeAttempt.fresh("tx_declined"));
         when(gateway.charge(any()))
                 .thenReturn(GatewayResult.succeeded("ch_success"))
                 .thenReturn(GatewayResult.declined("card_declined", "declined"));
@@ -64,7 +64,7 @@ class PaymentMetricsTest {
 
     @Test
     void countsAGatewayErrorAsAnError_notADecline() {
-        when(store.beginAttempt(any())).thenReturn(new ChargeAttempt("tx_error", null));
+        when(store.beginAttempt(any())).thenReturn(ChargeAttempt.fresh("tx_error"));
         when(gateway.charge(any())).thenReturn(GatewayResult.error("unavailable", "offline"));
 
         assertThatThrownBy(() -> payments.authorize(command("order-1", "hold-1")))
@@ -80,7 +80,7 @@ class PaymentMetricsTest {
     @Test
     void redisCleanupFailureDoesNotReplaceASuccessfulPaymentResult() {
         when(store.beginAttempt(any()))
-                .thenReturn(new ChargeAttempt("tx_success", null));
+                .thenReturn(ChargeAttempt.fresh("tx_success"));
 
         when(gateway.charge(any()))
                 .thenReturn(GatewayResult.succeeded("ch_success"));
@@ -110,7 +110,7 @@ class PaymentMetricsTest {
     @Test
     void forwardsTheExactChargeAndIdempotencyDataToTheGateway() {
         when(store.beginAttempt(any()))
-                .thenReturn(new ChargeAttempt("tx_success", null));
+                .thenReturn(ChargeAttempt.fresh("tx_success"));
 
         when(gateway.charge(any()))
                 .thenReturn(GatewayResult.succeeded("ch_success"));
@@ -139,12 +139,13 @@ class PaymentMetricsTest {
         assertThat(charge.amountCents()).isEqualTo(7_500);
         assertThat(charge.currency()).isEqualTo("usd");
         assertThat(charge.paymentMethodId()).isEqualTo("pm_card_visa");
-        assertThat(charge.clientIdempotencyKey()).isEqualTo("client-idem-42");
+        // Scoped to the attempt, so a second card after a decline is a new request to the provider (ADR-074).
+        assertThat(charge.idempotencyKey()).isEqualTo("client-idem-42:1");
     }
     @Test
     void failedResumeRetrievalDoesNotStartASecondCharge() {
         when(store.beginAttempt(any()))
-                .thenReturn(new ChargeAttempt("tx_existing", "pi_existing"));
+                .thenReturn(ChargeAttempt.resume("tx_existing", "pi_existing"));
 
         when(gateway.retrieve("pi_existing"))
                 .thenReturn(
@@ -164,5 +165,14 @@ class PaymentMetricsTest {
     private static AuthorizeCommand command(String orderNumber, String holdToken) {
         return new AuthorizeCommand(
                 orderNumber, holdToken, "session-1", 1_000, "usd", "pm_card", "idem-" + orderNumber, 1);
+    }
+
+    /** Each attempt is its own request to the provider; a retry of one attempt is the same request (ADR-074). */
+    @Test
+    void theProviderKeyIsScopedToTheAttempt() {
+        var second = new com.flashseats.payment.facade.AuthorizeCommand(
+                "order-42", "hold-42", "session-7", 7_500, "usd", "pm_card_visa", "client-idem-42", 2);
+
+        assertThat(PaymentService.providerKey(second)).isEqualTo("client-idem-42:2");
     }
 }

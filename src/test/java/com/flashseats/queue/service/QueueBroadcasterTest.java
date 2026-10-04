@@ -1,7 +1,14 @@
 package com.flashseats.queue.service;
 
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyInt;
+import static org.mockito.ArgumentMatchers.anyLong;
+import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.when;
 
 import com.flashseats.catalog.facade.CatalogFacade;
@@ -64,8 +71,52 @@ class QueueBroadcasterTest {
         verify(queue).getQueueState("a", 1L, EventWindowStatus.OPEN, true);
         verify(queue).getQueueState("b", 1L, EventWindowStatus.OPEN, true);
         verify(queue).getQueueState("c", 1L, EventWindowStatus.OPEN, true);
-        verify(emitters).send("a", "sale-exhausted", Map.of("soldOutAt", "2026-09-12T16:12:00Z"));
-        verify(emitters).send("b", "sale-exhausted", Map.of("soldOutAt", "2026-09-12T16:12:00Z"));
-        verify(emitters).send("c", "sale-exhausted", Map.of("soldOutAt", "2026-09-12T16:12:00Z"));
+        verify(emitters).send("a", 1L, "sale-exhausted", Map.of("soldOutAt", "2026-09-12T16:12:00Z"));
+        verify(emitters).send("b", 1L, "sale-exhausted", Map.of("soldOutAt", "2026-09-12T16:12:00Z"));
+        verify(emitters).send("c", 1L, "sale-exhausted", Map.of("soldOutAt", "2026-09-12T16:12:00Z"));
+    }
+
+    /**
+     * A pause is not an ending (ADR-066). It must not reach the replay log, where a reconnect after the
+     * resume would be handed a pause that is over, and it must not close anyone's stream.
+     */
+    @Test
+    @DisplayName("A paused sale says so on every stream, retains nothing, and says once when it resumes")
+    void pauseIsAnnouncedLocallyAndResumeOnce() {
+        SseEmitterRegistry emitters = mock(SseEmitterRegistry.class);
+        QueueService queue = mock(QueueService.class);
+        CatalogFacade catalog = mock(CatalogFacade.class);
+        StringRedisTemplate redis = mock(StringRedisTemplate.class);
+        @SuppressWarnings("unchecked")
+        ZSetOperations<String, String> zsets = mock(ZSetOperations.class);
+        QueueReplayService replay = mock(QueueReplayService.class);
+        Clock clock = Clock.fixed(Instant.parse("2026-10-02T12:00:00Z"), ZoneOffset.UTC);
+
+        when(emitters.watchedEventIds()).thenReturn(Set.of(1L));
+        when(emitters.sessionsWatching(1L)).thenReturn(Set.of("a", "b"));
+        when(catalog.getTierAvailability(1L)).thenReturn(List.of());
+        when(redis.opsForZSet()).thenReturn(zsets);
+        when(queue.getQueueState(anyString(), anyLong(), any(), any()))
+                .thenReturn(new QueueState(QueuePhase.WAITING, 3, null, null, null));
+        when(catalog.getWindowStatus(1L))
+                .thenReturn(EventWindowStatus.PAUSED, EventWindowStatus.PAUSED, EventWindowStatus.OPEN,
+                        EventWindowStatus.OPEN);
+
+        QueueBroadcaster broadcaster =
+                new QueueBroadcaster(emitters, queue, mock(QueueDrainRateTracker.class), catalog, redis, clock, replay);
+
+        broadcaster.pushPositions();
+        broadcaster.pushPositions();
+
+        verify(emitters, times(2)).broadcast(1L, "sale-paused", Map.of());
+        verify(emitters, never()).sendPosition(anyString(), anyLong(), anyInt(), any());
+        verify(emitters, never()).closeAll(anyLong(), anyString(), any());
+        verifyNoInteractions(replay);
+
+        broadcaster.pushPositions();
+        broadcaster.pushPositions();
+
+        verify(emitters, times(1)).broadcast(1L, "sale-resumed", Map.of());
+        verify(emitters, times(2)).sendPosition("a", 1L, 3, null);
     }
 }

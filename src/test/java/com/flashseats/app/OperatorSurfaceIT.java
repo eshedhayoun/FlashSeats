@@ -8,7 +8,13 @@ import com.flashseats.app.support.IntegrationTest;
 import com.flashseats.app.support.SaleFixture;
 import com.flashseats.notification.model.NotificationKind;
 import com.flashseats.notification.service.NotificationLogService;
+import java.net.URI;
+import java.net.http.HttpClient;
+import java.net.http.HttpRequest;
+import java.net.http.HttpResponse;
+import java.nio.charset.StandardCharsets;
 import java.time.Duration;
+import java.util.Base64;
 import java.util.Map;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
@@ -69,6 +75,51 @@ class OperatorSurfaceIT extends IntegrationTest {
 
         assertThat(response.status()).isEqualTo(401);
         assertThat(response.errorCode()).isEqualTo("ADMIN_AUTH_REQUIRED");
+    }
+
+    // ------------------------------------------------------- bot audit, actuator
+
+    @Test
+    @DisplayName("The bot audit is the operator's, paged, and a huge page size is capped rather than trusted")
+    void botAuditIsPagedAndCapped() {
+        assertThat(new BuyerSession(port).get("/admin/bot/audit").errorCode())
+                .isEqualTo("ADMIN_AUTH_REQUIRED");
+
+        var audit = new BuyerSession(port).get("/admin/bot/audit?page=0&size=100000", OPERATOR);
+
+        assertThat(audit.status()).isEqualTo(200);
+        assertThat(audit.number("page")).isZero();
+        assertThat(audit.number("size")).isEqualTo(200);
+        assertThat(audit.json().get("entries").isArray()).isTrue();
+    }
+
+    @Test
+    @DisplayName("Health is open to the load balancer; metrics are the operator's alone")
+    void actuatorAccessRules() throws Exception {
+        assertThat(actuator("/actuator/health", null).statusCode()).isEqualTo(200);
+
+        // A live read on how the sale is going — stock, queue depth, pool pressure — is a useful one to
+        // anyone attacking it.
+        for (String path : new String[] {"/actuator/prometheus", "/actuator/metrics"}) {
+            HttpResponse<String> anonymous = actuator(path, null);
+            assertThat(anonymous.statusCode()).as(path).isEqualTo(401);
+            assertThat(anonymous.body()).as(path).contains("ADMIN_AUTH_REQUIRED");
+            assertThat(actuator(path, "admin:admin").statusCode()).as(path).isEqualTo(200);
+        }
+        assertThat(actuator("/actuator/prometheus", "admin:admin").body()).contains("http_server_requests");
+    }
+
+    /** The actuator lives outside {@code /api/v1}, where {@link BuyerSession} points. */
+    private HttpResponse<String> actuator(String path, String credentials) throws Exception {
+        HttpRequest.Builder request = HttpRequest.newBuilder(URI.create("http://localhost:" + port + path))
+                .timeout(Duration.ofSeconds(20));
+        if (credentials != null) {
+            request.header("Authorization", "Basic " + Base64.getEncoder()
+                    .encodeToString(credentials.getBytes(StandardCharsets.UTF_8)));
+        }
+        try (HttpClient http = HttpClient.newHttpClient()) {
+            return http.send(request.GET().build(), HttpResponse.BodyHandlers.ofString());
+        }
     }
 
     // -------------------------------------------------------------------- dlq
@@ -154,8 +205,8 @@ class OperatorSurfaceIT extends IntegrationTest {
     // ------------------------------------------------------------------ pause
 
     @Test
-    @DisplayName("Pausing a sale closes every gate, and resuming reopens them with the queue intact")
-    void pausingClosesTheSaleAndResumingRestoresIt() {
+    @DisplayName("Pausing a sale reads as paused, not over, and resuming reopens it with stock intact")
+    void pausingHaltsTheSaleAndResumingRestoresIt() {
         BuyerSession buyer = new BuyerSession(port);
         buyer.get("/events/" + eventId);
 
@@ -163,9 +214,9 @@ class OperatorSurfaceIT extends IntegrationTest {
         assertThat(paused.status()).isEqualTo(200);
         assertThat(paused.json().get("status").asString()).isEqualTo("PAUSED");
 
-        // EventRow.windowStatus reads anything but PUBLISHED as CLOSED, so the gates shut with no new code.
-        assertThat(buyer.get("/events/" + eventId).text("windowStatus")).isEqualTo("CLOSED");
-        assertThat(buyer.post("/queue/join", Map.of("eventId", eventId)).status()).isNotEqualTo(202);
+        // PAUSED, not CLOSED: buyers are told the sale is paused rather than over (ADR-066). What a pause
+        // allows and refuses, gate by gate, is SalePauseIT's subject.
+        assertThat(buyer.get("/events/" + eventId).text("windowStatus")).isEqualTo("PAUSED");
 
         var resumed = new BuyerSession(port).post("/admin/events/" + eventId + "/resume", null, OPERATOR);
         assertThat(resumed.json().get("status").asString()).isEqualTo("PUBLISHED");

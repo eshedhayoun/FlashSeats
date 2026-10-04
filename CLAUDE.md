@@ -6,13 +6,13 @@ Guidance for Claude Code when working in this repository.
 
 FlashSeats — a high-concurrency ticket flash-sale engine. Modular monolith, Java 21, Spring Boot
 4.1.1. The **MVP is built and running**: all nine modules, the full journey from landing page to emailed
-PDF ticket, 228 tests green in any class order. **Inventory lives in Redis** (Stage 1, ADR-046): `catalog:stock:{e}:{t}`
+PDF ticket, 311 tests green in any class order. **Inventory lives in Redis** (Stage 1, ADR-046): `catalog:stock:{e}:{t}`
 is the live count and PostgreSQL keeps no copy of it. **Payment is real** (Stage 2, ADR-052-054) —
 but `flashseats.payment.stripe.enabled` is **false by default**, so `dev`, `test`, the load harness
 and every drill still run the in-process stub through the complete journey, 3-D Secure included.
 
 **Read [`docs/00-architecture-decisions.md`](docs/00-architecture-decisions.md) before changing
-anything.** It contains 63 ADRs. Most record a defect and its fix — 034-039 come from the first
+anything.** It contains 79 ADRs. Most record a defect and its fix — 034-039 come from the first
 review pass over the built code, 040-042 from the second — and several look like over-engineering
 until you read the failure they prevent. 043-045 are the exception: forward-looking decisions about
 the operator surface, buyer accounts and what health should report, with nothing built against them
@@ -27,15 +27,44 @@ cached test contexts are never paused (the cause of the order-dependent suite), 
 has a memory limit with the JVM flags owned by the image alone. **063 is Pass 14**: an exception
 class only where a `catch` names it. Pass 14 also wrote the code conventions down —
 [`05-global-standards.md`](docs/05-global-standards.md) §11 — read that before adding a class.
+**064 is Pass 15**: the checkout and the webhook settle the same charge, and the `orders` row —
+compare-and-set on every transition — decides whether it ends confirmed or refunded. **065**:
+promotion writes go in one pipeline, and a metadata miss loads once however many readers miss it.
+**066**: a pause is its own window status — the line keeps forming, holds wait, payment continues,
+and nothing tells a buyer the sale has ended. **067**: a failure that proves nothing happened is
+compensated (a reserve whose transaction never began gives its seats back), and a caller's mistake is
+never a `500`. **068**: the cluster's nginx image builds and serves the React client, and
+`docker/scripts/professor-demo.sh` starts the whole demo in one command. **069**: a refused refund is
+`REFUND_FAILED` (never "refunded"), and a notification claim stranded by a dead process is
+dead-lettered for an operator instead of silently never sent. **070**: live streams are per tab and
+per sale, and a frame reaches only the sale it is about. **071**: the client's address is the
+right-most `X-Forwarded-For` entry nobody we trust appended — `native` forward headers, never
+`framework`. **072**: a charge is tried once inside the hold's clock (25 s worst case under the 45 s
+guarantee); only a refund is retried in-process. **073**: Sentinel and the data nodes agree on the
+primary after every start, and a replica stranded on a demoted node reconnects by itself. **074**:
+the provider's idempotency key is scoped to the attempt, finishing a charge is never refused for time,
+and the webhook records a settlement on the ledger. **075**: confirming holds the order row, every
+resolved order names the one charge it ended with, and any other settled charge for the hold goes
+back. **076**: a timer is re-armed after its read commits, an availability change is announced by one
+replica rather than each, access logs carry no query strings, and `SecretsGuard` refuses short,
+shared or unhashed secrets. **077**: buyers can leave the line (`POST /queue/leave`), and a client
+that goes away mid-stream is a debug line, not an `ERROR` with stack traces. **078**: the browser
+suite uses only the API a buyer and an operator use; states no API can create are proven by the
+backend's integration tests and the client's unit tests. **079** is the 10,000-buyer drill: nothing
+opens a Redis connection per call (the status read and the promotion writes are scripts, not
+pipelines), scripts are read once, two unread observations are off, rate-limit buckets expire,
+`EXHAUSTED` is derived from stock alone, and the harness drives buyers rather than one k6 VU each.
 
 **The operating envelope is 3–10 concurrent sales**, not one
 ([`03-end-to-end-flow.md`](docs/03-end-to-end-flow.md) §2). Every capacity number written before
 ADR-049 silently assumed a single sale. Check which assumption a limit rests on before trusting it.
 **Ten concurrent sales sell out** — 4,997 of 5,000 at 300 VUs, no oversell, and
 `hikaricp_connections_pending` at zero on every sample up to 2,000 VUs (`06-mvp-overview.md` §11,
-Pass 13). Checkout p99 meets its 200 ms criterion up to about 600 VUs across five sales on the dev
-laptop, and it collapses to 6 s at 2,000. **The limit there is host CPU, not the pool**: k6 shares
-the ten cores with the system it measures.
+Pass 13). **10,000 buyers sell out five sales on the dev laptop** — 2,500 of 2,500, no oversell
+(ADR-079) — with checkout p99 195 ms at 2,000 buyers and 7.6 s at 10,000. **The limit at 10,000 is
+host CPU, not the pool**: k6 alone takes 2–3.5 of the ten cores it shares with the system it
+measures. Before ADR-079 the same drill sold 22–28 %, because the hottest path opened two TCP
+connections per request.
 
 **For what is actually built**, read [`docs/06-mvp-overview.md`](docs/06-mvp-overview.md) — scope,
 security posture, next stages, and the review-pass log. It is the doc to update after every pass.
@@ -43,7 +72,7 @@ security posture, next stages, and the review-pass log. It is the doc to update 
 ## Document precedence
 
 ```
-00-architecture-decisions.md      ← highest authority (63 ADRs)
+00-architecture-decisions.md      ← highest authority (79 ADRs)
 05-global-standards.md            ← cross-cutting contract; module docs conform to it
 FE_SPEC.md                        ← client contract (repo root)
 03-end-to-end-flow.md             ← the authoritative user journey AND the operating envelope
@@ -51,8 +80,9 @@ FE_SPEC.md                        ← client contract (repo root)
 docs/modules/*.md                 ← lowest; one page per module: owns / exposes / never
 ```
 
-**ADR-019 supersedes ADR-003**, **ADR-020 amends ADR-006**, **ADR-049 amends ADR-028** — the
-originals are kept for the record but do not describe the current design.
+**ADR-019 supersedes ADR-003**, **ADR-020 amends ADR-006**, **ADR-049 amends ADR-028**, **ADR-058
+supersedes ADR-047 Decision 5**, **ADR-064 amends ADR-053 and ADR-056**, **ADR-066 amends ADR-016 and
+ADR-048 Decision 4** — the originals are kept for the record but do not describe the current design.
 
 When a module spec contradicts an ADR, the ADR wins and the module spec is stale — fix the module
 spec rather than the code.
@@ -107,11 +137,12 @@ describing superseded designs. That is the failure mode this rule exists to stop
   deferral). `dev`, `test` and the plain `docker compose up -d` stack stay standalone. **A failover
   stops every sale**: the promoted replica is a new process with a new `run_id`, so `StockEpoch`
   distrusts every managed event until an operator rebuilds it. That is ADR-046 working, not a bug.
-  **Failover state survives `down`**: it lives in the sentinel volumes. After
-  `sentinel-failover-check.sh`, the next `up` can leave every app replica connected to a node that
-  Sentinel then demotes, and every request answers a bare `500` with `READONLY` in the logs.
-  `docker compose --profile cluster restart app-1 app-2 app-3` fixes it (`06` §9, not yet fixed in
-  code).
+  **A failover no longer survives `down` as a trap** (ADR-073): the sentinels derive the primary from
+  the data nodes on every start instead of trusting the failover recorded in their volumes, and each
+  replica's `RedisPrimaryWatchdog` reconnects through Sentinel if it ever finds itself on a node that
+  is not the primary (`flashseats.redis.primary.reconnects`). Before that, the next `up` after
+  `sentinel-failover-check.sh` left every app replica writing to a demoted node — `READONLY`, a bare
+  `500` on every request — until restarted by hand.
 - The **transactional outbox is hand-rolled** in `order`. The Spring Modulith event-publication
   starters were deliberately removed; only `spring-modulith-starter-core` and `-starter-test`
   remain, purely for `ApplicationModules.verify()` (ADR-009). Do not re-add them casually.
@@ -194,6 +225,12 @@ Rules:
 12. **Every Redis write fails toward under-counting** (ADR-046). Invisible seats are lost revenue a
     rebuild recovers; phantom seats are an oversell nothing recovers. Where both orderings look
     defensible, take the one that under-counts.
+13. **A settled charge ends exactly one way — confirmed or refunded — and the `orders` row decides**
+    (ADR-064). Every order transition is a compare-and-set (`version`, or a conditional update that
+    bumps it); `confirm` holds the row while it checks (ADR-075). A refund is *claimed* on that row
+    before any money moves; a confirmed order refuses the claim. A lost hold is not lost seats: only
+    this order can consume its hold. A resolved order names the one charge it ended with, and any
+    other settled charge for its hold is returned (ADR-075).
 
 ## Traps this design already stepped in once
 
@@ -231,6 +268,7 @@ Do not reintroduce these — each cost a real defect in the first pass:
 | A claim that survives the failure of the work it guarded | The DLQ replay finds the claim taken and acknowledges without sending (ADR-038) |
 | `saveAndFlush` + catch `DataIntegrityViolationException` + **return** | The transaction is rollback-only; the return throws `UnexpectedRollbackException` at commit. Use `ON CONFLICT DO NOTHING` and a rowcount (ADR-038) |
 | Trusting `X-Forwarded-For` without a trusted-proxy check | Unlimited fresh IP buckets from one caller, and with a free-to-mint session bucket that is no rate limiting at all (ADR-039) |
+| **Reading the left-most `X-Forwarded-For` entry** | A proxy *appends* the address it saw, so the left-most entry is whatever the client sent. Spring's `framework` forward-headers strategy and `RateLimitFilter` both read it, and every caller behind nginx could choose its own IP bucket. Walk right to left and stop at the first address that is not a proxy you run (ADR-071) |
 | Filtering rehydration to "in flight" states | A completed purchase vanishes on reload and the buyer is invited to re-buy what they own (ADR-037) |
 | `Math.max(remaining, 0)` on a counter that can return `-1` | Clamps the *fault code* into a *number*. A missing counter is published as `SOLD_OUT` on the landing page, and the client renders that tier unclickable (ADR-040) |
 | A `@RestControllerAdvice` catching `Exception` without naming Spring's binding exceptions first | `ExceptionHandlerExceptionResolver` runs before `DefaultHandlerExceptionResolver`, so the backstop owns them: a missing query param answers `500 INTERNAL_ERROR` with no `code` (ADR-041) |
@@ -271,6 +309,20 @@ Do not reintroduce these — each cost a real defect in the first pass:
 | **Writing an audit row synchronously on a refusal path** | Every row is written on a path an attacker controls the rate of, so a synchronous insert lets them convert their own `429`s into database load during the sale. Bounded queue, **discard** policy: evidence is not worth an outage (ADR-055) |
 | **Refusing a request because the challenge provider was unreachable** | It fails at peak load, because that is when the provider is busiest too — so the failure mode is "the sale closes at exactly the wrong moment". Fail open and audit the degradation (ADR-011, ADR-055) |
 | **Deriving a "random" queue draw from the session id** | Idempotent and *precomputable*: ids are free to mint, so a bot grinds candidates offline until it holds a low draw. `ZADD NX` already makes a fresh draw idempotent (ADR-024) |
+| **Failing a confirmation because the order's version moved** | A retry *resuming* a stranded order moves the version too, and the order is still this purchase. Failing on it sent a valid purchase to the refund claim, which succeeded because the order was still unresolved — and the resuming retry then charged again. Hold the row while you check it (ADR-075) |
+| **Assuming "resolved elsewhere" means "resolved by this charge"** | Once the in-flight key and the `PENDING` check expire, two checkouts for one hold can both settle. The second charge reached an order the first had resolved and had no ending at all: a buyer billed twice for one set of seats. Compare with the charge the order names (ADR-075) |
+| **Deduplicating a broadcast against one replica's memory** | Every replica sees the same change, and the fan-out reaches every replica: each frame arrived once per replica, and a change back to a state a replica had announced was never sent, because its streams had heard the others since. Keep the last announcement in one key and swap it with `SET … GET` (ADR-076) |
+| **A backstop handler that owns client disconnects** | `@ExceptionHandler(Exception.class)` caught `AsyncRequestNotUsableException` — a waiting-room tab closing — logged "Unhandled exception" with two stack traces, then failed again writing a problem document to the dead socket. The most common event in a sale became an `ERROR` flood. Name the client-gone exceptions before the backstop (ADR-077, ADR-041's lesson) |
+| **A browser test that writes to the database** | The first e2e draft created sales with SQL through `docker compose exec` and broke counters with `redis-cli`: coupled to the schema and the compose file, past every module's ownership, and wrong on its first run — a raw `UPDATE` violated `ck_events_sale_window`. Test-only endpoints are not the fix either. Drive the API buyers and operators use; prove the rest in the backend's tests (ADR-078) |
+| **A Redis pipeline with no connection pool** | Lettuce runs every command on one shared, multiplexed connection *except* a pipeline or a transaction, which needs one of its own. With no pool, Spring opened it per call — after asking Sentinel where the primary is — and closed it after. `GET /queue/status` was a pipeline: two TCP handshakes per poll on the most-called path, and at 10,000 buyers the cluster spent its CPU connecting while Redis sat at 20 %. Use a script; `QueueRedisConnectionsIT` counts the driver's connections (ADR-079) |
+| **`DefaultRedisScript` over a `ClassPathResource`** | It asks the resource whether it changed on every call, under a lock, and inside the packaged jar that opens a URL connection into the nested jar. Every script call paid it, serialised per script; on the status read it was the largest single cost. `LuaScript.load` reads once (ADR-079) |
+| **Observations nobody reads, on every request** | Spring Security observes each filter in its chain and Lettuce observes every Redis command, both by default: a quarter of all CPU samples were Micrometer, and over a third of the Lettuce event loop's — the one thread every Redis reply comes back through. Turn off what no drill or alarm reads; keep `http.server.requests` (ADR-079) |
+| **A rate-limit bucket with no expiry** | Bucket4j keeps every session's and every address's bucket for ever unless told otherwise. One drill left 1.1 million `bot:rate:*` keys with no TTL — and under `noeviction` a full Redis refuses writes, the stock counters included. A bucket full again is no bucket; expire it then (ADR-079) |
+| **Holding "sold out" until every claim lapses** | `EXHAUSTED` waited for every pass and admission to run out too, though nobody past the line can buy a seat that is not there. The line stood on `WAITING`, going nowhere, for up to ten minutes after the last seat; in a 5,000-buyer run 4,241 waits ran to the 180 s limit. Derive it from stock alone; it reverses when stock returns (ADR-079) |
+| **A load harness that measures itself** | Three ways at once. Told `EXHAUSTED`, a VU started its next journey with no think time — 240,000 iterations at 300 VUs. Each k6 VU is a JavaScript runtime: 10,000 took 2.6 GiB and the VM's OOM killer ended the drill before the cluster was the limit. And it polled every 1–2 s, where the browser streams and falls back to 5 s. Stay in line, drive ten buyers per VU, poll like the client (ADR-079) |
+| **Trusting a first-run script that has only ever run on a machine it already set up** | `professor-demo.sh` read `.env` before creating it — under `set -euo pipefail` a failed `grep` in a command substitution ends the script, silently, exit 2 — and cut the printed operator password one column late, so every operator call after it was a `401`. Both invisible on any machine that already had a `.env`. Run the evaluator's path from a fresh clone (Pass 15) |
+| **`width: 1` in MUI's `sx`** | A number of 1 or less is a *fraction*: `width: 1` is 100 %. A visually-hidden live region styled that way widened every page past the viewport. Use `"1px"` |
+| **Forwarding the client's one idempotency key on every new charge** | Right for a retry of one attempt, wrong across attempts: Stripe replays a key's first answer, and refuses it with different parameters. The second card after a decline got the first card's decline, or an idempotency error counted as a provider outage. Scope the provider key to the attempt (ADR-074) |
 | **Reusing one provider idempotency key across a 3-D Secure resume** | The client mints ONE key per hold and reuses it on every retry, so a second `charge` replays the cached `requires_action` response **for ever** and the buyer can never finish. Varying the key per attempt is worse: it opens a *second* intent, so they authenticate one payment and are billed for two. Retrieve the existing intent (ADR-054) |
 | **Letting a webhook claim survive a failed settlement** | The provider redelivers, the claim says "already handled", and the buyer's settled charge never reaches an order. ADR-038's rule in a new place: `processed_at IS NULL` must mean *in flight*, and a failure must leave **no row at all** (ADR-053) |
 | **Binding a webhook body to a DTO before verifying its signature** | The signature is over the *bytes*, not the meaning. Jackson round-tripping an equivalent object changes key order and whitespace, so every legitimate delivery fails verification — and the fix looks like a provider bug for as long as you believe the JSON is the same |
@@ -285,6 +337,14 @@ Do not reintroduce these — each cost a real defect in the first pass:
 | **Reading a periodic gauge more often than it is computed** | `flashseats.stock.drift` is recomputed every 60 s. `pool-pressure.sh` reached a loaded replica every ~24 s and called two reads of *one* computation "sustained drift". The ledger was exact. Sustained means across computations |
 | **A psql `\set` in a script that is also given `-v`** | `\set events 5` ran after `-v events=10` and won, so `EVENTS=10` silently seeded five sales while the script pre-warmed ten. Defaults go under `\if :{?var}` |
 | **Letting Spring Framework 7 pause cached test contexts** | When a class switches to another context, the cached one is paused and later restarted. The resumed shared context answered every `/queue` request with a bare `500` that never reached its own filters, so no application log showed anything. It looked like pollution *inside* the app for a whole pass. `spring.test.context.cache.pause=never` in `src/test/resources/spring.properties` (ADR-061). If a failure depends on how many contexts the suite has, suspect the framework's context lifecycle first |
+| **Leaving a transaction that never began to drift** | `createHold` decrements Redis first and compensated only on a constraint rejection, so a pool timeout — thrown before any SQL — kept the seats out of the counter until an operator rebuilt it. Under pressure that is the common failure, and the sale read as sold out early. "Nothing reached the database" is as certain as a constraint rejection: compensate it (ADR-067) |
+| **A filter that throws when its store is down** | The rate limiter's buckets are in Redis and the check runs below every exception handler, so a Redis outage answered every API call a bare `500` with no `code`. A load-shedding component fails open, counted (ADR-067) |
+| **Keying live connections by session** | One stream per session made a second tab — or a buyer queued in two sales — close the first, and the two reconnected over each other for ever. And a session-addressed frame went to whichever sale's stream the session held last, so a pass for one sale was spent on another. Key streams by event *and* session, and address a frame to the event it is about (ADR-070) |
+| **Representing a pause as the end of a sale** | Every gate read `PAUSED` as `CLOSED`, which was safe for the gates and told every waiting buyer "Sales have ended": the broadcaster sent `sale-closed`, which completes the stream, **retained** it for replay so a reconnect *after the resume* was told again, and the event dropped off `/events`. A condition that will end is not an event in the sale's history — never retain it (ADR-066) |
+| **A gate that tests for what it refuses** | `!= CLOSED` admits every status added after it was written. Test for what you admit (`== OPEN`), so a new status is refused until someone decides otherwise — that is what made adding `PAUSED` safe (ADR-066) |
+| **Reading a lost hold as lost seats** | Only this order can consume its hold, so a `CONSUMED` hold means the purchase *succeeded* — on the webhook path, which settles the same charge. `getActiveHold` reports it as expired, and both payment paths refunded purchases the other had just confirmed, then overwrote `CONFIRMED` with `REFUNDED` (ADR-064) |
+| **Refunding first and recording second** | A confirmation can land between the provider refund and the status write: the buyer keeps the seats *and* the money. Claim the refund on the order row first; move money second; announce it only after it moved (ADR-064) |
+| **Load-modify-flush on a row two paths settle** | No `@Version`, and Hibernate writes every column, so the second flush writes its stale copy over the first — a `CONFIRMED` order went back to `PENDING` and was then abandoned. A row that two writers race for needs a compare-and-set (ADR-064) |
 | **Classifying a failure by its Spring wrapper** | `CannotCreateTransactionException` means "the pool is busy" *and* "the database is down". Only the first should tell a client to retry in a second. Look for `SQLTransientConnectionException` in the cause chain (ADR-059) |
 
 ## Implementation order
@@ -311,11 +371,13 @@ rather than one module's corner:
 | `queue:events:{e}` | `queue` | Pub/Sub | — | promotion fan-out to whichever replica holds the SSE connection (ADR-007) |
 | `queue:replay:{e}` | `queue` | ZSET | sale end | the last 256 **broadcast** frames, scored by sequence, so a reconnect can be handed what it missed. A session-targeted frame is **never** retained here — the one that exists carries a pass token (ADR-058) |
 | `queue:replay-seq:{e}` | `queue` | String | sale end | the monotonic sequence behind those frames; it is the only SSE `id` the system issues |
+| `queue:availability:{e}` | `queue` | String | retention | the last `tier-availability` frame announced, swapped with `SET … GET` so one replica announces a change rather than each (ADR-076) |
+| `queue:closed:{e}` | `queue` | String | retention | claimed with `SET NX` by the one replica that announces and retains `sale-closed`; every replica still closes its own streams (ADR-076) |
 | `queue:promote:{e}` | `queue` | String | 900 ms | makes the promotion tick a singleton across replicas (ADR-032) |
 | `queue:budget` | `queue` | String | one tick | **the cluster-wide admission allowance**, shared by every open sale. The one key here deliberately *not* scoped by event; its TTL is the window, so replicas need not agree on the time (ADR-049) |
 | `queue:exhausted:{e}` | `queue` | String | sale end | derived sold-out marker; deleted the moment stock returns (ADR-035) |
 | `payment:inflight:{holdToken}` | `payment` | String | 90 s | duplicate-charge guard, anchored to the hold (ADR-014) |
-| `bot:rate:*` | `bot` | Bucket4j | rolling | session-first rate limiting, IP as a coarse backstop (ADR-011) |
+| `bot:rate:*` | `bot` | Bucket4j | until full again + 10 s | session-first rate limiting, IP as a coarse backstop (ADR-011). A full bucket and no bucket are the same bucket; without the expiry one drill left 1.1 million keys under `noeviction` (ADR-079) |
 | `bot:verified:{sid}` | `bot` | String | 900 s | one challenge verification, remembered per session (ADR-055) |
 | `hold:{token}` | `hold` | String | hold TTL | expiry timer. A **hint, never an authority** — the listener re-reads the row and the settle-once claim is what makes three replicas restore once (ADR-048) |
 
@@ -372,13 +434,20 @@ docker/scripts/sentinel-failover-check.sh        # PROVE Sentinel promotes a rep
 docker/scripts/redis-master-cli.sh               # redis-cli against whichever node Sentinel calls
                                                  # the primary right now
 
-# The SPA. Dev-only: nginx serves no static root and there is no compose
-# service, so the cluster still serves src/main/resources/static (ADR-058).
+# The evaluator's one command: secrets, cluster build, health wait, two seeded
+# and pre-warmed sales (9101, 9102). Needs only Docker and a POSIX shell.
+docker/scripts/professor-demo.sh                 # --reset wipes the volumes first (ADR-068)
+
+# The SPA. The cluster's nginx image builds it and serves it at :8080 (ADR-068);
+# for development run it on its own:
 cd frontend && npm install && npm run dev        # :5173, proxies /api to :8080.
                                                  # cp .env.example .env.local and LEAVE THE STRIPE
                                                  # KEY BLANK to drive the stub gateway, which is
                                                  # what the backend runs by default
 cd frontend && npm test                          # vitest unit tests
+cd frontend && npm run test:e2e                  # the FE_SPEC §8 Playwright suite against the real
+                                                 # backend: needs an OPEN sale (dev-up.sh) on :8080;
+                                                 # E2E_ADMIN=user:pass for pause/resume (ADR-078)
 
 # Stage 2, the REAL provider. Everything else here runs the stub, deliberately
 # -- so none of it can tell you whether Stripe agrees (ADR-052).
@@ -406,16 +475,28 @@ docker/scripts/pool-pressure.sh 300 &            # THE instrument. Without it th
                                                  # two samples inside one interval are the SAME
                                                  # computation read twice (ADR-046: sustained)
 docker compose --profile loadtest run --rm -e VUS=300 k6-concurrent
+                                                 # VUS is BUYERS: each k6 VU drives BUYERS_PER_VU of
+                                                 # them (default 10), each with its own session and
+                                                 # address. 10,000 one-buyer VUs took 2.6 GiB and the
+                                                 # VM's OOM killer ended the run (ADR-079). Buyers poll
+                                                 # every POLL_SECONDS (default 5, the client's own
+                                                 # fallback); VUS=10000 runs on this laptop.
                                                  # The FIRST run after a replica restart measures
                                                  # JIT warm-up: 513 ms p99 cold vs 64 ms warm, same
                                                  # build (Pass 14). Discard it, or warm up first
+docker compose --profile loadtest run --rm -e VUS=2000 k6-waiting-room
+                                                 # the waiting room alone: browse, join, poll.
+                                                 # No holds, no checkout, so promotion stops once
+                                                 # unredeemed passes fill the oversubscription. It
+                                                 # measures the front door, not sale throughput.
+                                                 # A run showing a Sentinel failover measured the host
 docker/scripts/sold-count.sh                     # what was ACTUALLY sold, and the invariant per tier.
                                                  # k6's count is what the CLIENT saw: it abandons
                                                  # in-flight requests at 60s and at ramp-down, and
                                                  # under-reported by 8x in the worst Pass 8 run.
-                                                 # VUS=300, not 2000, on a ten-core host -- at 2000 the
-                                                 # load generator competes with the three JVMs and the
-                                                 # same build sells 6% instead of 76%
+                                                 # On a ten-core host the load generator competes
+                                                 # with the three JVMs: at 10,000 buyers the tail
+                                                 # latency is the laptop's, not the system's
 ```
 
 Changing the compose network's `ipam` recreates the network, and containers created against the
