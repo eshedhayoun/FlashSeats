@@ -1,42 +1,35 @@
 import { createContext, useCallback, useContext, useEffect, useMemo, useState, type ReactNode } from "react";
-import useMediaQuery from "@mui/material/useMediaQuery";
 import type { ColorMode } from "./theme";
-
-export type ColorPreference = ColorMode | "system";
 
 const PREFERENCE_KEY = "fs.theme";
 
 type ColorModeContextValue = {
-  preference: ColorPreference;
   mode: ColorMode;
-  cyclePreference: () => void;
+  toggleMode: () => void;
 };
 
 const ColorModeContext = createContext<ColorModeContextValue | null>(null);
 
 /**
- * Light, dark, or whatever the system says. The one global UI preference, kept in `localStorage`
- * because it is about the person, not about a sale or a tab.
+ * Light or dark. The system setting picks the first one; after that the buyer's choice wins. The one
+ * global UI preference, kept in `localStorage` because it is about the person, not a sale or a tab.
  */
 export function ColorModeProvider({ children }: { children: (mode: ColorMode) => ReactNode }) {
-  const prefersDark = useMediaQuery("(prefers-color-scheme: dark)", { noSsr: true });
-  const [preference, setPreference] = useState<ColorPreference>(readPreference);
+  const [mode, setMode] = useState<ColorMode>(readMode);
 
   useEffect(() => {
     try {
-      localStorage.setItem(PREFERENCE_KEY, preference);
+      localStorage.setItem(PREFERENCE_KEY, mode);
     } catch {
       // A preference that cannot be stored still applies for this visit.
     }
-  }, [preference]);
+  }, [mode]);
 
-  const mode: ColorMode = preference === "system" ? (prefersDark ? "dark" : "light") : preference;
-
-  const cyclePreference = useCallback(() => {
-    setPreference((current) => (current === "system" ? "light" : current === "light" ? "dark" : "system"));
+  const toggleMode = useCallback(() => {
+    setMode((current) => (current === "light" ? "dark" : "light"));
   }, []);
 
-  const value = useMemo(() => ({ preference, mode, cyclePreference }), [preference, mode, cyclePreference]);
+  const value = useMemo(() => ({ mode, toggleMode }), [mode, toggleMode]);
 
   return <ColorModeContext.Provider value={value}>{children(mode)}</ColorModeContext.Provider>;
 }
@@ -47,11 +40,13 @@ export function useColorMode(): ColorModeContextValue {
   return value;
 }
 
-function readPreference(): ColorPreference {
+function readMode(): ColorMode {
   try {
     const stored = localStorage.getItem(PREFERENCE_KEY);
-    return stored === "light" || stored === "dark" || stored === "system" ? stored : "system";
+    if (stored === "light" || stored === "dark") return stored;
   } catch {
-    return "system";
+    // Fall through to the system setting.
   }
+  // Nothing chosen yet, or the old "system" value from before the toggle had two states.
+  return typeof window !== "undefined" && window.matchMedia?.("(prefers-color-scheme: dark)").matches ? "dark" : "light";
 }

@@ -55,9 +55,11 @@ Running the jar directly therefore requires a profile, which is the intended fai
 | [`FE_SPEC.md`](../FE_SPEC.md) §2 | The API contract. There is no generated `/docs` page — springdoc described the shapes and none of the meaning |
 | `http://localhost:15672` | RabbitMQ (`flashseats` / `flashseats`) |
 
-The seeder creates two events: **Aurora Fest 2026**, open immediately with 700 seats across three
-tiers, and **Midnight Sessions**, still `UPCOMING` and un-warmed so the countdown and the admin
-pre-warm path stay demonstrable. It runs only on an empty database, so a restart never disturbs a
+The seeder creates three events: **Coldplay: Music of the Spheres**, open immediately with 700
+seats across three tiers; **Arctic Monkeys: Live**, open with 200; and **Billie Eilish: Hit Me Hard
+and Soft**, still `UPCOMING` and un-warmed so the countdown and the admin pre-warm path stay
+demonstrable. Every seeded sale (dev, demo, load and concurrent) uses a real artist and venue; the
+shows themselves are fictional. It runs only on an empty database, so a restart never disturbs a
 sale in progress.
 
 **Driving the payment branches.** The stub gateway reads the payment method id, mirroring a real

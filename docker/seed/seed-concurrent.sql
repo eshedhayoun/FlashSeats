@@ -69,9 +69,19 @@ INSERT INTO events (
 )
 SELECT
     :first_id + n,
-    'Concurrent Sale ' || (n + 1),
-    'One of ' || :events || ' sales opening at the same instant (ADR-049 drill).',
-    'Compose Arena ' || (n + 1),
+    -- Ten headliners, reused with a night number past ten. Each sale still opens at the same
+    -- instant as the others (ADR-049 drill).
+    (ARRAY['Dua Lipa: Radical Optimism', 'The Weeknd: After Hours til Dawn',
+           'Radiohead: In Rainbows Live', 'Kendrick Lamar: Grand National',
+           'Foo Fighters: Everything or Nothing at All', 'Adele: Weekends with Adele',
+           'Bruno Mars: 24K Magic Live', 'Ed Sheeran: Mathematics Tour',
+           'Beyonce: Cowboy Carter Tour', 'Imagine Dragons: Loom World Tour'])[n % 10 + 1]
+        || CASE WHEN n >= 10 THEN ' (Night ' || (n / 10 + 1) || ')' ELSE '' END,
+    'One of ' || :events || ' headline shows going on sale at the same moment.',
+    (ARRAY['The O2, London', 'Rogers Centre, Toronto', 'Madison Square Garden, New York',
+           'Soldier Field, Chicago', 'Wembley Stadium, London', 'Colosseum at Caesars Palace, Las Vegas',
+           'Accor Arena, Paris', 'Croke Park, Dublin', 'MetLife Stadium, New Jersey',
+           'Allegiant Stadium, Las Vegas'])[n % 10 + 1],
     now() + interval '30 days',
     now() + interval '2 minutes',   -- UPCOMING, so pre-warm is legal (ADR-004)
     now() + interval '2 hours',

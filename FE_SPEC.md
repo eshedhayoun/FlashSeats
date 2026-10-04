@@ -510,7 +510,7 @@ There is still no `fs.pi`, and 3-D Secure does not need one. The `clientSecret` 
 nothing about the challenge has to survive a reload. The intent id lives on the server, keyed by the
 hold (ADR-054). Persisting a client secret would be storing a bearer value for no reason.
 
-**`localStorage`, otherwise:** `fs.theme` (light / dark / system — a preference about the person, not
+**`localStorage`, otherwise:** `fs.theme` (light / dark — a preference about the person, not
 a sale), and `fs.recentOrders` — a list of `{orderNumber, receiptToken, eventTitle}` so a
 returning buyer can find their tickets across sales. It is keyed by nothing because it spans
 everything, and it is the only client state that is *meant* to outlive a tab. Nothing
@@ -951,8 +951,8 @@ words as well as colour. Built with MUI 6 in `frontend/src/app/theme.ts`; the sh
 
 ### Themes and palette
 
-Light and dark, following the system setting, with a header toggle (light / dark / system) remembered
-as `fs.theme`. Every text/background pair is **WCAG AA** — body text at least 4.5:1 on every surface
+Light and dark, with a header toggle between the two remembered as `fs.theme`. The system setting
+picks the mode only until the buyer first toggles. Every text/background pair is **WCAG AA** — body text at least 4.5:1 on every surface
 it sits on, the availability and status chips at least 6:1.
 
 | Token | Light | Dark |
