@@ -51,7 +51,7 @@ Running the jar directly therefore requires a profile, which is the intended fai
 | Where | What |
 | :--- | :--- |
 | `http://localhost:8080` | Under the cluster, the React client served by nginx (ADR-068). Under `spring-boot:run`, a minimal API demo page — the React client is then on `:5173` |
-| `http://localhost:8025` | Mailpit — the ticket emails land here |
+| `http://localhost:8025` | Mailpit — local-only ticket inbox; preview/production uses the configured SMTP relay |
 | [`FE_SPEC.md`](../FE_SPEC.md) §2 | The API contract. There is no generated `/docs` page — springdoc described the shapes and none of the meaning |
 | `http://localhost:15672` | RabbitMQ (`flashseats` / `flashseats`) |
 
@@ -2134,6 +2134,21 @@ too bad, and by asking which layer produced it.
 unevenly. Pass 9's ADR-057 was right, and branches that forked before it re-added exactly what it
 removed. Writing the rules as a checklist (§11) is what makes the next reviewer's job a comparison
 rather than an archaeology.
+
+### Pass 16 — email and environment readiness
+
+- **SMTP is environment-driven.** The cluster no longer hard-codes `mailpit:1025`. Local Compose
+  keeps Mailpit as the safe default, while preview/production must set `SMTP_HOST`, `SMTP_PORT`,
+  credentials, authentication/STARTTLS flags, and `SMTP_FROM` for the team's real relay. This keeps
+  local email observable without allowing a final deployment to silently discard mail into a
+  development sink.
+- **A clean checkout is self-describing.** The required SMTP variables are now in `.env.example`
+  and the README states which values must be replaced before preview deployment. The private `.env`
+  remains ignored and is not required as a source of configuration. `professor-demo.sh` creates the
+  ignored file automatically on a fresh clone, then generates the cluster secrets; Mailpit remains
+  the default and Resend is documented as an optional real-email demonstration. The template also
+  documents the optional memory, load-test, metadata-cache and admission-budget overrides used by
+  Compose.
 
 ### Pass 15 — submission readiness
 

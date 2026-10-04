@@ -13,8 +13,20 @@ set -euo pipefail
 
 cd "$(dirname "$0")/../.."
 
-# A fresh clone has no .env yet. Reading it unguarded made grep fail, and under
-# `set -euo pipefail` that ended this script on its first line: exit 2, no output.
+# Bootstrap the ignored environment file before reading any settings. The
+# committed template keeps the first run Mailpit-only and does not contain
+# credentials, while gen-env.sh below replaces the development secrets.
+if [[ ! -f .env ]]; then
+    if [[ ! -f .env.example ]]; then
+        echo "error: .env.example not found; run this from the repository." >&2
+        exit 1
+    fi
+    cp .env.example .env
+    echo "Created .env from .env.example."
+fi
+
+# Read the local port without sourcing .env: values such as bcrypt hashes may
+# contain dollar signs that Compose intentionally interprets later.
 if [[ -z "${HTTP_PORT:-}" && -f .env ]]; then
     HTTP_PORT="$(grep -E '^HTTP_PORT=' .env | head -1 | cut -d= -f2-)" || HTTP_PORT=""
 fi
@@ -68,15 +80,10 @@ cleanup() {
 }
 trap cleanup EXIT
 
-if [[ ! -f .env ]]; then
-    echo "Creating local secrets..."
+stored_password="$(grep -E '^FLASHSEATS_ADMIN_PASSWORD=' .env | head -1 | cut -d= -f2- || true)"
+if [[ "$stored_password" == '{noop}admin' || "$stored_password" == 'admin' ]]; then
+    echo "Generating local secrets..."
     bash docker/secrets/gen-env.sh | tee "$password_file"
-else
-    stored_password="$(grep -E '^FLASHSEATS_ADMIN_PASSWORD=' .env | head -1 | cut -d= -f2- || true)"
-    if [[ "$stored_password" == '{noop}admin' || "$stored_password" == 'admin' ]]; then
-        echo "Refreshing local secrets..."
-        bash docker/secrets/gen-env.sh | tee "$password_file"
-    fi
 fi
 
 # gen-env.sh prints the password after "  #    ". This took substr($0, 9), one column

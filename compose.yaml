@@ -40,8 +40,15 @@ x-app: &app
     SPRING_RABBITMQ_PORT: 5672
     SPRING_RABBITMQ_USERNAME: ${RABBITMQ_USER:-flashseats}
     SPRING_RABBITMQ_PASSWORD: ${RABBITMQ_PASSWORD:-flashseats}
-    SPRING_MAIL_HOST: mailpit
-    SPRING_MAIL_PORT: 1025
+    # Local .env.example values target Mailpit. Preview/production must set
+    # these to the real SMTP relay; Mailpit remains a local-only sink.
+    SPRING_MAIL_HOST: ${SMTP_HOST:-mailpit}
+    SPRING_MAIL_PORT: ${SMTP_PORT:-1025}
+    SPRING_MAIL_USERNAME: ${SMTP_USERNAME:-}
+    SPRING_MAIL_PASSWORD: ${SMTP_PASSWORD:-}
+    SPRING_MAIL_PROPERTIES_MAIL_SMTP_AUTH: ${SMTP_AUTH:-false}
+    SPRING_MAIL_PROPERTIES_MAIL_SMTP_STARTTLS_ENABLE: ${SMTP_STARTTLS:-false}
+    FLASHSEATS_MAIL_FROM: ${SMTP_FROM:-tickets@flashseats.dev}
     # Behind Nginx the client IP arrives in X-Forwarded-For. The bot module
     # rate-limits on it, so Spring must be told to trust the proxy — and NATIVE,
     # not `framework` (ADR-071). Spring's ForwardedHeaderFilter takes the LEFT-
