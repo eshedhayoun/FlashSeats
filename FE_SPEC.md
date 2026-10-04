@@ -408,12 +408,12 @@ Base `/api/v1`. `fsid` is an `HttpOnly` cookie — **JavaScript never reads or s
 | V1 | `GET` | `/events` | — | — | `200` | — |
 | V1 | `GET` | `/events/{eventId}` | — | — | `200` | `EVENT_NOT_FOUND` |
 | all | `GET` | `/sale/{eventId}/state` | — | — | `200` | `EVENT_NOT_FOUND` |
-| V1→V2 | `POST` | `/queue/join` | — | `{eventId}` | `202` | `SALE_NOT_OPEN`, `SALE_CLOSED`, `RATE_LIMITED`. A **paused** sale accepts the join — the line keeps its arrival order while nobody is let out (ADR-066) |
+| V1→V2 | `POST` | `/queue/join` | — | `{eventId, recaptchaToken?}` — the token at most 4,096 characters, sent only with a site key (§5) | `202` | `SALE_NOT_OPEN`, `SALE_CLOSED`, `EVENT_NOT_FOUND`, `RATE_LIMITED`, `BOT_VERIFICATION_FAILED` (§5), `VALIDATION_FAILED`. A **paused** sale accepts the join — the line keeps its arrival order while nobody is let out (ADR-066) |
 | V2 | `GET` | `/queue/stream?eventId=&lastEventId=` | `Accept: text/event-stream`, `Last-Event-ID` | — | SSE | — |
 | V2 | `POST` | `/queue/leave` | — | `{eventId}` | `204` | — Idempotent. The session leaves the line and an unspent pass is dropped; joining again starts **at the back**, and the copy must say so |
 | V2 | `GET` | `/queue/status?eventId=` | — | — | `200` | — (a session that never joined is `phase: NOT_JOINED`, not an error). `paused: true` while an operator has paused the sale; the phase stays truthful beside it |
 | V2→V3 | `POST` | `/queue/admit` | `X-Queue-Pass-Token` | `{eventId}` | `200` | `QUEUE_PASS_INVALID`, `VALIDATION_FAILED` |
-| V3 | `POST` | `/holds` | `X-Admission-Token` | `{eventId, tierId, quantity}` | `201` | `INSUFFICIENT_STOCK`, `QUANTITY_EXCEEDS_LIMIT`, `HOLD_LIMIT_EXCEEDED`, `ADMISSION_EXPIRED`, `INVENTORY_UNAVAILABLE`, `SALE_PAUSED` (retryable: keep the buyer on V3 and let them try again once the sale resumes) |
+| V3 | `POST` | `/holds` | `X-Admission-Token` | `{eventId, tierId, quantity}` | `201` | `INSUFFICIENT_STOCK`, `QUANTITY_EXCEEDS_LIMIT`, `HOLD_LIMIT_EXCEEDED`, `ADMISSION_REQUIRED`, `ADMISSION_EXPIRED`, `INVENTORY_UNAVAILABLE`, `TIER_NOT_FOUND`, `SALE_CLOSED`, `SALE_PAUSED` (retryable: keep the buyer on V3 and let them try again once the sale resumes) |
 | V4 | `GET` | `/holds/{holdToken}` | — | — | `200` | `HOLD_NOT_FOUND`, `HOLD_EXPIRED` |
 | V4 | `DELETE` | `/holds/{holdToken}` | — | — | `204` | `HOLD_NOT_FOUND` |
 | V4 | `POST` | `/orders/checkout` | — | `{holdToken, userEmail, paymentMethodId, idempotencyKey}` — at most 64, 255, 255 and 64 characters (`400 VALIDATION_FAILED` beyond) | `201`/`200` | `PAYMENT_DECLINED`, `PAYMENT_ATTEMPTS_EXHAUSTED`, `HOLD_EXPIRED`, `DUPLICATE_PAYMENT`, `PAYMENT_GATEWAY_UNAVAILABLE`, `CHECKOUT_WINDOW_CLOSED`, `INSUFFICIENT_TIME_REMAINING`, `ORDER_REFUNDED`, `REFUND_FAILED`, `SERVICE_BUSY` |
@@ -440,8 +440,9 @@ is the whole retry mechanism; do not build a second one.
 
 **`PAYMENT_ACTION_REQUIRED` is now reachable** and a client must branch on it — see V4 above.
 `WEBHOOK_SIGNATURE_INVALID` is reachable too, but only on the provider's own callback; no browser
-will ever see it. **`BOT_VERIFICATION_FAILED` remains unreachable** (no challenge provider — §5);
-handle it defensively as a generic failure.
+will ever see it. **`BOT_VERIFICATION_FAILED` is reachable on join only, and only when a challenge
+provider is configured**: the provider actively scored the browser below the threshold. Without a
+provider, or when it is unreachable, the join goes ahead (§5, ADR-055).
 
 ### Error envelope — RFC 7807
 

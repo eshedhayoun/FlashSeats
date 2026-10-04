@@ -407,20 +407,23 @@ business change, it does not belong there.
 
 ## 9. Observability
 
-Metric naming: `flashseats.<module>.<subject>.<unit>`. Every module exposes at minimum its own
-error rate by `code`, and the latency of any external call it makes.
+Metric naming: `flashseats.<module>.<subject>.<unit>`. Every module should expose its own error rate
+by `code` and the latency of any external call it makes — **specified, not built** as a per-module
+series: today `http.server.requests` carries status and URI, and the payment gateway's latency is in
+the Resilience4j series. [`03-end-to-end-flow.md`](03-end-to-end-flow.md) §7 is the full list of what
+is built and what is specified.
 
 Required alarms:
 
 | Metric | Alarm | Why |
 | :--- | :--- | :--- |
-| `flashseats.stock.drift` | **any non-zero** | inventory accounting has diverged — page |
+| `flashseats.stock.drift` | **sustained** non-zero — across consecutive 60 s computations, not one sample | inventory accounting has diverged — page. Redis and PostgreSQL are not read in one snapshot, so a single sample can catch a hold in flight (ADR-046) |
 | `hikaricp_connections_pending` | > 0 sustained | the real saturation signal under virtual threads |
 | `flashseats.outbox.lag.seconds` | > 60 | fulfilment is stalling |
 | `flashseats.dlq.depth` | > 0 | tickets are not reaching buyers |
-| `flashseats.queue.promotion.rate` | 0 while depth > 0 | the queue has stalled |
+| `flashseats.queue.admissions` | zero while a waiting room has depth | the queue has stalled. Specified as `queue.promotion.rate`; built as this untagged counter, so it answers "is the cluster promoting?", not "is this sale?" |
 | `flashseats.payment.attempts{outcome}` | declined share > 0.2 over 5 m | gateway or configuration problem. A counter, not a lifetime ratio, which cannot show a spike |
-| `jvm.threads.pinned` | > 0 | virtual-thread pinning (§7) |
+| `jvm.threads.pinned` | > 0 | virtual-thread pinning (§7). **Specified, not built** |
 
 `stock.drift` compares the live counter against
 `total_capacity − confirmed_sold − active_holds` every 60 s. It is the system's canary.

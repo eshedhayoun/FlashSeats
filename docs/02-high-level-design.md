@@ -103,10 +103,15 @@ In Phase 2 the same guarantee moves into a Lua script, which is single-threaded 
 Redis's execution model:
 
 ```lua
-if stock == false then return -2 end          -- FAULT: counter missing
-if tonumber(stock) < qty then return -1 end   -- genuinely sold out
-DECRBY stock qty;  HSET hold:{token} …;  EXPIRE 300
+local stock = redis.call('GET', KEYS[1])        -- catalog:stock:{e}:{t}, the only key it touches
+if not stock then return -2 end                 -- FAULT: counter missing
+if tonumber(stock) < quantity then return -1 end  -- genuinely sold out
+redis.call('DECRBY', KEYS[1], quantity)
+return 1
 ```
+
+That is `stock_reserve.lua` as built. The hold itself is a row in PostgreSQL, written after the
+reserve; there is no hold hash in Redis (ADR-019, ADR-046).
 
 The `-2` branch is the most important line in the system. The original design treated a missing
 counter as a cache miss and repopulated it from `total_capacity` — which, after any Redis eviction
@@ -168,8 +173,7 @@ their place (ADR-020).
 ## 4. Module charters
 
 ### `bot` — gatekeeping
-Issues the signed `fsid` cookie that every other module treats as identity. Enforces Redis-backed
-Bucket4j limits, **session bucket primary, IP bucket as a coarse flood backstop** — a tight per-IP
+Enforces Redis-backed Bucket4j limits, **session bucket primary, IP bucket as a coarse flood backstop** — a tight per-IP
 limit is fatal for carrier-grade NAT during exactly the spike this system exists to serve
 (ADR-011). Verifies reCAPTCHA v3 on `POST /queue/join` only, caching the verdict per session.
 Fails open if Google is unreachable: a deliberate availability-over-security trade, with the rate
@@ -188,10 +192,12 @@ Mints single-use HMAC passes (120 s), exchanges them for **600 s admission sessi
 promotions to the right replica over Redis Pub/Sub. Stores nothing in PostgreSQL.
 
 ### `hold` — reservations
-Atomically moves stock and creates a 300 s reservation in one Lua script. Owns the hold state
-machine, whose authority is `ticket_holds` in PostgreSQL — Redis holds only the timer. Runs a keyspace-expiry listener as a latency optimisation and a
-30 s reconciliation sweeper as the correctness guarantee — keyspace pub/sub is at-most-once, so the
-sweeper, not the listener, is what makes expiry reliable.
+Creates a 300 s reservation: stock moves first, through `CatalogFacade` (catalog's
+`stock_reserve.lua` is one atomic step), then the `ticket_holds` row is written. Owns the hold state
+machine, whose authority is that row — Redis holds only the timer. Seats go back after the
+settle-once claim commits, never before (ADR-046). Runs a keyspace-expiry listener as a latency
+optimisation and a 10 s reconciliation sweeper as the correctness guarantee — keyspace pub/sub is
+at-most-once, so the sweeper, not the listener, is what makes expiry reliable.
 
 ### `payment` — gateway
 Stripe behind Resilience4j. Idempotency anchored to the hold, not to a client-chosen string
@@ -204,8 +210,10 @@ recover its full position after a tab reload. No storage, no writes, and nothing
 (ADR-025).
 
 ### `shared` — the kernel
-A Modulith *open module*: RFC 7807 machinery, the canonical `ErrorCode` enum, `SessionId`, `Money`,
-and the global fallback advice. No entities, no business rules (ADR-021).
+A Modulith *open module*: RFC 7807 machinery, the canonical `ErrorCode` enum and the global
+fallback advice; the signed `fsid` cookie that every module treats as identity, and the signed-token
+primitive; the injected clock; the PDF ticket renderer; and Lua-script loading. No entities, no
+business rules (ADR-021).
 
 ### `order` — the ledger and the orchestrator
 The single checkout entry point. Validates the hold, prices server-side, reserves the
@@ -214,8 +222,8 @@ The single checkout entry point. Validates the hold, prices server-side, reserve
 reconciliation.
 
 ### `notification` — fulfilment
-Drains the outbox with `FOR UPDATE SKIP LOCKED`, publishes to RabbitMQ, renders PDF and HTML, sends
-via SMTP. Idempotent by `UNIQUE(order_number, kind)` with insert-then-send. Handles both
+Consumes what `order`'s outbox relay publishes to RabbitMQ (the relay drains `outbox_events` with
+`FOR UPDATE SKIP LOCKED`), renders the PDF ticket and an HTML body, and sends via SMTP. Idempotent by `UNIQUE(order_number, kind)` with insert-then-send. Handles both
 `TICKET_DELIVERY` and `REFUND_NOTICE`. Receives a complete payload snapshot and calls no facades.
 
 ---

@@ -289,8 +289,8 @@ Two things are load-bearing here:
 
 * **`admittable` is bounded by real capacity.** The original design promoted users into a sold-out
   sale, so buyers waited twenty minutes to be handed a `409 INSUFFICIENT_STOCK`. When
-  `remainingStock` hits zero with no holds outstanding, the queue broadcasts `sale-exhausted` and
-  drains instead (ADR-008).
+  `remainingStock` hits zero the queue broadcasts `sale-exhausted` and promotes nobody (ADR-008),
+  until stock returns (ADR-035, ADR-079).
 * **`PUBLISH` is how the pass reaches the browser.** The promoter runs on one replica; the
   `SseEmitter` lives in another replica's heap. Every replica subscribes to `queue:events:{eventId}`
   and delivers to its own local emitters. Without this, behind three round-robin replicas roughly
@@ -748,13 +748,15 @@ was what left a closed sale's waiting room reporting `WAITING` forever with noth
 say otherwise.
 
 **Exhaustion is derived and reversible.** The promotion worker sets `queue:exhausted:{eventId}` when
-stock is zero with no live pass or admission, publishes `sale-exhausted` once, and **deletes the
-marker on the next tick with stock**. Nothing deletes the waiting set.
+the sale's stock is zero, publishes `sale-exhausted` once, and **deletes the marker on the next tick
+with stock**. Nothing deletes the waiting set. It is derived from stock alone: it used to wait for
+every live pass and admission to lapse too, which kept the line on `WAITING`, going nowhere, for up
+to ten minutes after the last seat went (ADR-079).
 
 | Condition | Reported phase | Waiting set | Reverses? |
 | :--- | :--- | :--- | :--- |
 | Window closed | `CLOSED` | expires with the sale | no |
-| Stock zero, no claims held | `EXHAUSTED` | untouched, positions intact | **yes** — a released hold or a rebuilt counter clears it |
+| Stock zero | `EXHAUSTED` (a buyer holding a pass or an admission sees their own phase first) | untouched, positions intact | **yes** — a released hold or a rebuilt counter clears it |
 | Counter unreadable | promotion **pauses**; phase unchanged | untouched | yes, on pre-warm or rebuild |
 | Sale paused by an operator | phase unchanged, `paused: true`, no wait estimate | untouched, still accepting joins | **yes** — on resume. Exhaustion keeps un-deriving while paused, since expiring holds still return seats (ADR-066) |
 
@@ -864,7 +866,8 @@ Every value below is a named property in `application.properties`.
 | Trusted proxies | **empty by default — trust nobody** | **039** |
 | HikariCP pool | 30 max, 10 idle, 3 s timeout | std §7 |
 | Availability buckets | `SOLD_OUT` 0 · `LIMITED` < 10 % · `PLENTY` · **`UNKNOWN` = no counter** | **027 / 040** |
-
+| Rate-limit bucket expiry | once the bucket would be full again, **+ 10 s** — a full bucket and no bucket are the same bucket | **079** |
+| `EXHAUSTED` | derived from stock alone: set when the sale's remaining stock is 0, cleared the tick it is not | **035 / 079** |
 | reCAPTCHA on join | `flashseats.bot.recaptcha.*` — **blank secret means OFF**, and off allows | **011 / 055** |
 | Challenge score threshold | 0.5; provider timeouts 1 s connect / 2 s read, both **correctness** | **055** |
 | Verification remembered per session | 900 s, `bot:verified:{sid}` | **055** |

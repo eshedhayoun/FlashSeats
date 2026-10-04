@@ -7,6 +7,21 @@ The problem it solves: **10,000 people want 500 tickets and they all arrive in t
 Exactly 500 must sell. Nobody may be charged for a seat they do not get. The 9,500 who miss out must
 find out quickly.
 
+### Run it
+
+Needs only Docker and a POSIX shell (Git Bash on Windows):
+
+```bash
+docker/scripts/professor-demo.sh     # secrets, a three-replica cluster, two open sales; prints the admin password
+open http://localhost:8080           # the React client: the event page, the waiting room, checkout, the PDF ticket
+open http://localhost:8025           # Mailpit, where the ticket emails land
+```
+
+At checkout, the card selector drives every branch with no account: success, a decline that **keeps
+your seats**, a provider outage, and 3-D Secure. **What is not done, and why, is listed in
+[`docs/06-mvp-overview.md`](docs/06-mvp-overview.md) §9.** Development setup is under
+[Getting started](#getting-started).
+
 ---
 
 ## Documentation
@@ -179,13 +194,14 @@ having no reference at all; the pom records why beside each gap.
 
 ## Getting started
 
-Prerequisites: JDK 21 and Docker.
+Prerequisites: JDK 21 and Docker, plus Node 22 and npm to run the React client outside Docker (the
+cluster's nginx image builds it with `node:22-alpine`).
 
 ```bash
 cp .env.example .env
 docker/scripts/dev-up.sh            # preflight + infrastructure + a sale that is actually open
-./mvnw spring-boot:run
-open http://localhost:8080          # walk the whole journey in a browser
+./mvnw spring-boot:run              # the API on :8080, with a minimal API demo page at /
+cd frontend && npm install && npm run dev   # the React client on :5173
 ```
 
 ### Environment files
@@ -232,9 +248,11 @@ conflict rather than killing a process that might not be ours. `--reset` wipes t
 clean seeded sale. It never writes a stock counter — seeding one from `total_capacity` resurrects
 every sold ticket (ADR-004).
 
-The demo client at `/` takes you from the event page through the waiting room to a PDF ticket. Use
-the card selector on the checkout screen to drive the interesting branches: `pm_card_declined`
-declines and **keeps your seats**, `pm_card_error` fails the provider. The email lands in Mailpit at
+Under `spring-boot:run`, `:8080` serves only the API and a minimal single-file demo page — enough to
+walk the journey with no build step, and labelled as such. The client to use is the React one, on
+`:5173` in development and on `:8080` under the cluster. In either, the checkout's card selector
+drives the interesting branches: `pm_card_declined` declines and **keeps your seats**,
+`pm_card_error` fails the provider. The email lands in Mailpit at
 [localhost:8025](http://localhost:8025).
 
 ### The React client
@@ -258,7 +276,7 @@ browser. Set a `pk_test_` key, and start the backend with `STRIPE_ENABLED=true`,
 provider.
 
 ```bash
-./mvnw test                         # 306 tests, green in any class order (ADR-061). Needs Docker:
+./mvnw test                         # 311 tests, green in any class order (ADR-061). Needs Docker:
                                     # every integration test runs real PostgreSQL, Redis and,
                                     # for fulfilment, RabbitMQ containers
 ```
@@ -275,12 +293,20 @@ provider.
 
 ```bash
 docker compose --profile cluster up -d --build     # Nginx + 3 app replicas on :8080
-docker compose --profile loadtest run --rm k6      # 10k virtual buyers
+docker/seed/seed.sh                                 # one sale of 500, pre-warmed
+docker compose --profile loadtest run --rm -e VUS=300 k6               # one sale
+docker/seed/seed-concurrent.sh                      # five sales of 500
+docker compose --profile loadtest run --rm -e VUS=10000 k6-concurrent  # five at once
+docker/scripts/sold-count.sh                        # what actually sold, and the invariant per tier
 ```
 
-Each replica has a 1.5 GiB memory limit (`APP_MEM_LIMIT` to change it). Without a limit, the JVMs
-size their heaps against the whole Docker VM and get OOM-killed under load (ADR-062). The load
-drill and what it measured are in [`docs/06-mvp-overview.md`](docs/06-mvp-overview.md) §11.
+`VUS` counts **buyers**: each k6 VU drives ten of them, each with its own session and address, and
+they poll at the client's own 5 s fallback cadence (ADR-079). On a ten-core laptop, 10,000 buyers
+sell all 2,500 seats of five concurrent sales with no oversell; the latency tail at that size is the
+laptop, where k6 takes 2–3.5 of the ten cores. Each replica has a 1.5 GiB memory limit
+(`APP_MEM_LIMIT` to change it): without one, the JVMs size their heaps against the whole Docker VM
+and get OOM-killed under load (ADR-062). What the drills measured is in
+[`docs/06-mvp-overview.md`](docs/06-mvp-overview.md) §9 and §11.
 
 **Test with three replicas, not one.** Promotion pub/sub fan-out (ADR-007) and settle-once stock
 restoration (ADR-003) both behave perfectly on a single instance and break on three if implemented
@@ -299,7 +325,16 @@ docker/seed/                    seed.sh (one sale) · seed-concurrent.sh (five, 
 docker/k6/flash-sale.js         load harness; asserts zero overbooking
 docker/k6/concurrent-sales.js   E sales at once (ADR-049); pair with pool-pressure.sh
 docker/k6/waiting-room.js       the waiting room alone: join and poll, no checkout
-docker/scripts/                 dev-up, fan-out / expiry / failover checks, pool-pressure, sold-count
+docker/scripts/professor-demo.sh   the evaluator's one command (ADR-068)
+docker/scripts/dev-up.sh        the local development entry point
+docker/scripts/fanout-check.sh  promotion fan-out across replicas, 30/30 or it fails
+docker/scripts/hold-expiry-check.sh   expiry restores seats once, across replicas
+docker/scripts/sentinel-failover-check.sh   Sentinel promotes a replica and the old primary rejoins
+docker/scripts/redis-master-cli.sh    redis-cli against whichever node is primary now
+docker/scripts/pool-pressure.sh pending connections and drift per replica, during a drill
+docker/scripts/sse-cadence.sh   how fast position frames actually arrive, during a drill
+docker/scripts/sold-count.sh    what actually sold, and the stock invariant per tier
+docker/scripts/stripe-check.sh  a real Stripe charge, 3-D Secure and a redelivered webhook
 ```
 
 Two config files carry correctness requirements, not tuning preferences:
@@ -334,8 +369,8 @@ never retrofitted — that is how overbooking bugs are born.
 5. Stock restored **exactly once** per hold.
 6. `ApplicationModules.verify()` passes.
 
-Invariant 1 is the `flashseats.stock.drift` metric. It is wired in Phase 1 and must never go
-non-zero.
+Invariant 1 is the `flashseats.stock.drift` metric. Alarm on **sustained** non-zero: Redis and
+PostgreSQL are not read in one snapshot, so a single sample can catch a hold in flight (ADR-046).
 
 ---
 
@@ -346,7 +381,7 @@ a test suite that proves the guarantees rather than asserting them —
 [`docs/06-mvp-overview.md`](docs/06-mvp-overview.md) is the reference for what exists, what is
 deliberately deferred, where the security gaps are, and what comes next.
 
-The design behind it took four passes:
+The design behind it took four passes before any code:
 
 - **Pass 1 — correctness.** ADR-001…018: overbooking holes, contradictory checkout flows,
   cross-replica bugs, missing constraints.
@@ -360,4 +395,7 @@ The design behind it took four passes:
   lock that could not guard a Redis-only worker, and one exception advice in place of seven. Plus
   the defects the build itself surfaced, recorded in the MVP overview.
 
-33 ADRs record every decision and the failure it prevents.
+Fifteen review passes over the built code followed — correctness, the Redis fast path, the
+three-replica cluster, the operator surface, real payments, concurrent sales, the React client and
+the 10,000-buyer drill — each logged in [`docs/06-mvp-overview.md`](docs/06-mvp-overview.md) §13.
+79 ADRs record every decision and the failure it prevents.
