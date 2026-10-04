@@ -61,7 +61,7 @@ ADR-049 silently assumed a single sale. Check which assumption a limit rests on 
 **Ten concurrent sales sell out** — 4,997 of 5,000 at 300 VUs, no oversell, and
 `hikaricp_connections_pending` at zero on every sample up to 2,000 VUs (`06-mvp-overview.md` §11,
 Pass 13). **10,000 buyers sell out five sales on the dev laptop** — 2,500 of 2,500, no oversell
-(ADR-079) — with checkout p99 232 ms at 2,000 buyers and 5.8 s at 10,000. **The limit at 10,000 is
+(ADR-079) — with checkout p99 195 ms at 2,000 buyers and 7.6 s at 10,000. **The limit at 10,000 is
 host CPU, not the pool**: k6 alone takes 2–3.5 of the ten cores it shares with the system it
 measures. Before ADR-079 the same drill sold 22–28 %, because the hottest path opened two TCP
 connections per request.
