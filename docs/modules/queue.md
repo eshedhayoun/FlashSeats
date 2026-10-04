@@ -38,6 +38,8 @@ correctness-neutral: delete the whole module and the sale is still correct, just
 | `queue:events:{e}` | Pub/Sub | — | promotion fan-out to whichever replica holds the SSE connection (ADR-007) |
 | `queue:replay:{e}` | ZSET, score = sequence | sale end + retention | the last 256 **broadcast** frames, so a reconnecting client can be handed what it missed (ADR-058) |
 | `queue:replay-seq:{e}` | String | sale end + retention | the monotonic sequence behind those frames |
+| `queue:availability:{e}` | String | retention, refreshed per sweep | the `tier-availability` frame last announced, swapped with `SET … GET` so a change is announced by one replica, not each (ADR-076) |
+| `queue:closed:{e}` | String | retention | claimed with `SET NX` by the replica that announces `sale-closed`, so it is retained once; every replica still closes its own streams (ADR-076) |
 
 **The replay log retains broadcast frames only** — `tier-availability`, `sale-closed`,
 `sale-exhausted`. It is one key per *event*, shared by everyone watching that sale and outliving the
@@ -67,9 +69,10 @@ in line, which is a fairness failure, not a correctness one.
 
 | Method | Path | Auth | Notes |
 | :--- | :--- | :--- | :--- |
-| `POST` | `/api/v1/queue/join` | `fsid` cookie | `202`. Idempotent — rejoining preserves position |
-| `GET` | `/api/v1/queue/status` | `fsid` cookie | polling fallback; returns the pass if one was minted |
+| `POST` | `/api/v1/queue/join` | `fsid` cookie | `202`. Idempotent — rejoining preserves position. Accepted while the sale is **paused**, so the line keeps its arrival order (ADR-066) |
+| `GET` | `/api/v1/queue/status` | `fsid` cookie | polling fallback; returns the pass if one was minted, and `paused` while an operator has paused the sale |
 | `POST` | `/api/v1/queue/admit` | `fsid` + `X-Queue-Pass-Token` | spends the pass, mints the admission session |
+| `POST` | `/api/v1/queue/leave` | `fsid` cookie | `204`. Takes the session out of the line and drops an unspent pass; an admission is left to run out. Idempotent. Joining again starts at the back |
 | `GET` | `/api/v1/queue/stream` | `fsid` cookie | SSE, 1 h timeout |
 
 `eventId` arrives in the **body** on both `POST`s, per `FE_SPEC.md` §2.
@@ -83,9 +86,17 @@ in line, which is a fairness failure, not a correctness one.
 | `tier-availability` | `{tiers:[{tierId, level}]}` | on change — each replica diffs the buckets it last sent (ADR-027) |
 | `sale-exhausted` | `{soldOutAt}` | when derived — **not terminal**, it un-derives if stock returns |
 | `sale-closed` | `{closedAt}` | terminal; the stream is completed |
+| `sale-paused` | `{}` | every sweep while paused, and on connect — **not terminal**, never retained or replayed (ADR-066) |
+| `sale-resumed` | `{}` | once, on the first sweep after a pause ends; any `position-update` also means running |
 | *(comment)* | `:hb` | 15 s |
 
 `estWaitSeconds` is `null` when unknown, never a `-1` sentinel.
+
+**Streams are per tab** (ADR-070). Each replica keeps its streams per event and per session, so one
+buyer may hold several — two tabs on a sale, or one in each of two sales. A frame addressed to a
+session is delivered to that session's streams **for the event it belongs to** and no other, so a
+pass for one sale can never reach another sale's tab. A session may hold five streams per sale; a
+sixth closes its oldest.
 
 **Only the replayable frames carry an `id:`**, and they are exactly the broadcast ones the replay log
 retains. A reconnect sends that sequence back as `Last-Event-ID` — as a header, or as a
@@ -116,8 +127,8 @@ if remaining == COUNTER_UNAVAILABLE:  pause this event, promote nobody
 
 trim + re-expire queue:passes:{e}, queue:admissions:{e}, queue:waiting:{e}
 
-if remaining > 0:                          DEL queue:exhausted:{e}
-elif no live passes and no live admissions: SETNX queue:exhausted:{e}; publish once; stop
+if remaining > 0:   DEL queue:exhausted:{e}
+else:               SETNX queue:exhausted:{e}; publish once; stop      ← ADR-079
 
 admittable = min(promotionBatchSize,
                  floor(remaining × oversubscribeFactor) − pendingPasses − liveAdmissions)
@@ -126,14 +137,15 @@ front    = ZRANGE queue:waiting:{e} 0 admittable-1
 granted  = claim(queue:budget, want = |front|)       ← cluster-wide, atomic, fails closed
 if granted == 0: promote nobody
 
-for sid in first `granted` of front:
+in ONE script (queue_promote.lua), for sid in first `granted` of front:   ← ADR-065, ADR-079
     mint pass → SET queue:pass:{e}:{sid} EX 120
     ZADD queue:passes:{e} <expiry> <sid>
     ZREM queue:waiting:{e} <sid>
-    PUBLISH queue:events:{e}
+then, once every pass exists:
+    PUBLISH queue:events:{e}  (one per promoted buyer)
 ```
 
-**Five things here are load-bearing:**
+**Six things here are load-bearing:**
 
 - **The shuffle.** Every replica reads the open events in the same ascending order and claims the
   shared allowance as it reaches each sale, so a fixed order lets the lowest event id take the whole
@@ -146,12 +158,21 @@ for sid in first `granted` of front:
   pass, and that pass expires in 120 s — capacity returns on its own. Evicting on a missed heartbeat
   deleted live buyers during an ordinary Wi-Fi → cellular handover (ADR-026).
 - **Exhaustion is derived, never destructive.** The waiting ZSET is left intact: the trigger is a
-  live inventory read, and a released hold makes it wrong seconds later (ADR-035).
+  live inventory read, and a released hold makes it wrong seconds later (ADR-035). It is derived from
+  stock alone: waiting for every pass and admission to lapse as well kept the line on `WAITING`,
+  going nowhere, for up to ten minutes after the last seat went (ADR-079).
 - **`PUBLISH` is what reaches the browser.** The promoter runs on one replica; the buyer's emitter
   lives in another's heap. Without fan-out, roughly two-thirds of promotions vanish on three
   replicas — and the bug is invisible on one (ADR-007).
+- **The writes are one script, and the publishes follow it.** Three round trips per buyer made the
+  tick's cost grow with every buyer it admitted, and the tick has to finish inside its own 900 ms
+  lock. Publishing only after the script means no browser is told about a pass it cannot redeem
+  yet (ADR-065). A script, not a pipeline: a pipeline cannot share the multiplexed connection, and
+  with no pool it opened a fresh one, through Sentinel, every tick (ADR-079).
 
-**A session's state is one Redis round trip**, not four. `GET /queue/status` runs this code and is the
+**A session's state is one Redis round trip**, not four — `queue_state.lua`, which reads all four keys
+at one instant on the shared connection. It was a pipeline, and a pipeline opened two TCP connections
+per poll (ADR-079). `GET /queue/status` runs this code and is the
 most-called endpoint in the system by roughly 80× — ~90,000 calls per replica in a 300-VU five-sale run
 — so the round trips there dominate the cluster's CPU in a way nothing else does. `CLOSED` is answered
 before the read, so a finished sale's polling clients cost no Redis at all.
@@ -211,7 +232,7 @@ Closing the draw at a fixed moment is the answer and is not built.
 
 | Gap | Detail |
 | :--- | :--- |
-| ~~**3 Redis round trips per connection per tick**~~ | **Closed.** One pipelined round trip: admission `GET` + `TTL`, pass `GET`, waiting `ZRANK`, and the exhausted `EXISTS` when a caller has not hoisted it. The reads were always independent — only the state machine is ordered, and it now decides over the values instead of between the calls |
+| ~~**3 Redis round trips per connection per tick**~~ | **Closed.** One round trip, `queue_state.lua`: admission `GET` + `TTL`, pass `GET`, waiting `ZRANK` and the exhausted `EXISTS`, read at one instant on the shared connection (ADR-079). The reads were always independent — only the state machine is ordered, and it decides over the values instead of between the calls |
 | **No per-event queue metrics** | `flashseats.queue.admissions` and `flashseats.queue.admission.budget.denied` are built and **untagged**, so they answer "is the cluster promoting?" and not "is *this* sale promoting?". Depth and active SSE connections are still unbuilt (`03` §7) |
 | ~~**No `Last-Event-ID` replay**~~ | **Closed** (ADR-058). Broadcast frames are retained in `queue:replay:{e}` and replayed on reconnect; per-session state is re-derived on connect rather than replayed, because the only session frame carries a capability |
 

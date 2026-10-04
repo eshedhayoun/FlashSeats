@@ -33,7 +33,10 @@ rules make it safe to have at all. The **TTL is the cross-replica invalidation**
 reaches only the replica that served the operator's call — so the event TTL is the bound on how long a
 paused sale can still answer `OPEN` elsewhere, and it is a correctness setting rather than a
 performance one. And the **window status is never cached**: it is derived from the row and the clock on
-every call, since it flips with no write to evict on.
+every call, since it flips with no write to evict on. **A miss loads once**: readers that miss the same
+key together wait for the load already running instead of each taking a connection — every entry
+expires on a timer, so a polled event would otherwise spike the pool on every TTL boundary. A load
+that an eviction overtakes is not stored (ADR-065).
 
 **There is no copy of the count in PostgreSQL.** `tier_inventory` was dropped in `V7` — it had
 become a write-only copy of a number that had moved to Redis, with a stale column named `remaining`
@@ -53,7 +56,7 @@ policy, and evicting a live counter is the worst failure this system has.
 
 | Method | Path | Auth |
 | :--- | :--- | :--- |
-| `GET` | `/api/v1/events` | public — published events only |
+| `GET` | `/api/v1/events` | public — published and paused events, each with its window status |
 | `GET` | `/api/v1/events/{eventId}` | public — the landing page |
 | `POST` | `/api/v1/admin/events/{eventId}/prewarm` | `ROLE_ADMIN` |
 | `POST` | `/api/v1/admin/events/{eventId}/pause` | `ROLE_ADMIN` |
@@ -71,6 +74,13 @@ gone" — ADR-004's failure mode reaching the landing page (ADR-040).
 Reads: `getEventSummary`, `getWindowStatus`, `getTierSummary`, `findOpenEventIds`,
 `findManagedEventIds`, `getRemainingForEvent`, `getLiveCounters`, `getTierCapacities`.
 Movement: `tryReserve`, `restore`, `applyRebuild`.
+
+**The window status has four values** — `UPCOMING`, `OPEN`, `PAUSED`, `CLOSED` — derived from the row
+and the clock on every call. `PAUSED` exists only inside the window: an event paused before its sale
+starts still reads `UPCOMING`, and one past its end reads `CLOSED`. A paused sale stays in the public
+event list, marked as such, so the buyers in its line can find it again (ADR-066). Every gate tests
+for the statuses it admits, never for the ones it refuses, so a gate that has not heard of a status
+refuses it — which is what made adding one safe (ADR-048's objection, answered in ADR-066).
 
 **`findOpenEventIds` and `findManagedEventIds` are not interchangeable.** *Managed* means open **or
 paused** — what an operator is still answerable for. Pausing is what an operator does *while*

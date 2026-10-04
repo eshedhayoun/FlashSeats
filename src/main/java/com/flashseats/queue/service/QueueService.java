@@ -13,7 +13,6 @@ import com.flashseats.queue.exception.QueueErrors;
 import com.flashseats.queue.facade.QueueFacade;
 import com.flashseats.queue.facade.QueuePhase;
 import com.flashseats.queue.facade.QueueState;
-import java.nio.charset.StandardCharsets;
 import java.time.Clock;
 import java.time.Duration;
 import java.time.Instant;
@@ -22,8 +21,8 @@ import java.util.OptionalDouble;
 import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.TimeUnit;
 import lombok.extern.slf4j.Slf4j;
-import org.springframework.data.redis.core.RedisCallback;
 import org.springframework.data.redis.core.StringRedisTemplate;
+import org.springframework.data.redis.core.script.RedisScript;
 import org.springframework.stereotype.Service;
 
 /**
@@ -39,6 +38,7 @@ import org.springframework.stereotype.Service;
 public class QueueService implements QueueFacade {
 
     private final StringRedisTemplate redis;
+    private final RedisScript<List<Object>> stateScript;
     private final CatalogFacade catalog;
     private final QueueTokens tokens;
     private final QueueDrainRateTracker drainRate;
@@ -48,6 +48,7 @@ public class QueueService implements QueueFacade {
 
     public QueueService(
             StringRedisTemplate redis,
+            RedisScript<List<Object>> queueStateScript,
             CatalogFacade catalog,
             QueueTokens tokens,
             QueueDrainRateTracker drainRate,
@@ -55,6 +56,7 @@ public class QueueService implements QueueFacade {
             Clock clock,
             BotFacade bots) {
         this.redis = redis;
+        this.stateScript = queueStateScript;
         this.catalog = catalog;
         this.tokens = tokens;
         this.drainRate = drainRate;
@@ -70,6 +72,10 @@ public class QueueService implements QueueFacade {
      * refreshing buyer to the back (ADR-008). {@code NX} also makes a random draw safe (ADR-024): a
      * rejoin's fresh draw is discarded. A score derived from the session id would be grindable, because
      * ids are free to mint.
+     *
+     * <p>Allowed while the sale is paused. Joining moves no stock, and a line that keeps forming during
+     * a pause is still in arrival order when the sale resumes; refusing would turn the resume into a
+     * race between whoever retries fastest (ADR-066).
      */
     public QueueStatusResponse join(
             String sessionId, long eventId, String recaptchaToken, String clientAddress) {
@@ -78,7 +84,7 @@ public class QueueService implements QueueFacade {
         bots.verifyHuman(sessionId, recaptchaToken, clientAddress);
 
         EventSummary event = catalog.getEventSummary(eventId);
-        if (event.windowStatus() != EventWindowStatus.OPEN) {
+        if (event.windowStatus() != EventWindowStatus.OPEN && event.windowStatus() != EventWindowStatus.PAUSED) {
             throw CatalogErrors.saleNotOpen(eventId, event.windowStatus());
         }
 
@@ -90,6 +96,20 @@ public class QueueService implements QueueFacade {
         expireWithSale(QueueKeys.waiting(eventId), event.saleEndTime());
 
         return status(sessionId, eventId, event.windowStatus());
+    }
+
+    /**
+     * Takes a session out of the line and drops a pass it has not spent. The pass goes too because a
+     * buyer who left should not be let in a moment later by a promotion already on its way, and an
+     * unspent pass holds back the admission allowance until it expires (ADR-049). An admission is left
+     * alone: a buyer choosing seats ends that by buying or by letting it run out.
+     *
+     * <p>Joining again is {@code ZADD NX} with a fresh score, so it is at the back of the line.
+     */
+    public void leave(String sessionId, long eventId) {
+        redis.opsForZSet().remove(QueueKeys.waiting(eventId), sessionId);
+        redis.delete(QueueKeys.pass(eventId, sessionId));
+        redis.opsForZSet().remove(QueueKeys.passes(eventId), sessionId);
     }
 
     /**
@@ -129,6 +149,7 @@ public class QueueService implements QueueFacade {
                 state.estWaitSeconds(),
                 state.passToken(),
                 state.admissionExpiresAt(),
+                window == EventWindowStatus.PAUSED,
                 clock.instant());
     }
 
@@ -144,7 +165,7 @@ public class QueueService implements QueueFacade {
     /**
      * Seconds left on this session's promotion pass, or {@code null} when it holds none.
      *
-     * <p>Deliberately not folded into the pipelined read behind {@link #getQueueState}. That read
+     * <p>Deliberately not folded into the scripted read behind {@link #getQueueState}. That read
      * serves {@code GET /queue/status}, which is the single largest consumer of the cluster's CPU at
      * roughly 90,000 calls per replica per run; this answer is wanted only when a buyer reconnects
      * already promoted, so it costs one round trip on a rare path rather than a command on the
@@ -161,6 +182,8 @@ public class QueueService implements QueueFacade {
      *
      * <ol>
      *   <li>{@code CLOSED} first: the window outranks everything, or a closed sale's queue waits forever.
+     *       A <em>paused</em> sale is read like an open one — the buyer's place is the answer, and the
+     *       pause is reported beside it (ADR-066).
      *   <li>{@code ADMITTED}, then {@code PROMOTED}: most advanced first.
      *   <li>{@code EXHAUSTED} before {@code WAITING}: a buyer with no pass or admission in a sale with no
      *       stock is told so, and keeps their place in case stock returns (ADR-035).
@@ -179,7 +202,8 @@ public class QueueService implements QueueFacade {
         if (window == EventWindowStatus.CLOSED) {
             return new QueueState(QueuePhase.CLOSED, null, null, null, null);
         }
-        return decide(read(sessionId, eventId, exhausted), eventId);
+        QueueState state = decide(read(sessionId, eventId, exhausted), eventId);
+        return window == EventWindowStatus.PAUSED ? state.withoutEstimate() : state;
     }
 
     /**
@@ -187,36 +211,30 @@ public class QueueService implements QueueFacade {
      * most-called path in the system. Reading eagerly does not change the answer: only {@link #decide}
      * is ordered.
      *
-     * @param exhausted pre-resolved by a caller sweeping many sessions of one event, since it is per
-     *     event, not per session
+     * <p>A script, never a pipeline. A pipeline takes a connection of its own, and with no pool Spring
+     * opened one for every call, after asking Sentinel where the primary is, and closed it again: two
+     * TCP handshakes per poll, on the path 10,000 buyers poll (ADR-079). The script runs on the shared
+     * connection, and reads all four keys at one instant.
+     *
+     * @param exhausted pre-resolved by a caller sweeping many sessions of one event, so the whole
+     *     sweep agrees on it; {@code null} takes the script's own reading
      */
     private Snapshot read(String sessionId, long eventId, Boolean exhausted) {
-        String admissionKey = QueueKeys.admission(eventId, sessionId);
-        String passKey = QueueKeys.pass(eventId, sessionId);
-        String waitingKey = QueueKeys.waiting(eventId);
-        String exhaustedKey = QueueKeys.exhausted(eventId);
+        List<Object> replies = redis.execute(
+                stateScript,
+                List.of(
+                        QueueKeys.admission(eventId, sessionId),
+                        QueueKeys.pass(eventId, sessionId),
+                        QueueKeys.waiting(eventId),
+                        QueueKeys.exhausted(eventId)),
+                sessionId);
 
-        // The byte-level API rather than a StringRedisConnection cast: inside a pipeline the
-        // connection is a proxy, and the cast throws ClassCastException at runtime while compiling
-        // perfectly. Replies come back through the template's own String serializer.
-        List<Object> replies = redis.executePipelined((RedisCallback<Object>) connection -> {
-            connection.stringCommands().get(utf8(admissionKey));
-            connection.keyCommands().ttl(utf8(admissionKey));
-            connection.stringCommands().get(utf8(passKey));
-            connection.zSetCommands().zRank(utf8(waitingKey), utf8(sessionId));
-            if (exhausted == null) {
-                connection.keyCommands().exists(utf8(exhaustedKey));
-            }
-            return null;
-        });
-
-        int expected = exhausted == null ? 5 : 4;
-        if (replies.size() != expected) {
-            // Positional reads are only safe while the positions are known. Adding a command above
-            // without shifting the indices below would otherwise read a neighbour's value and answer
+        if (replies == null || replies.size() != 5) {
+            // Positional reads are only safe while the positions are known. A script edited without
+            // shifting the indices below would otherwise read a neighbour's value and answer
             // confidently with the wrong phase.
             throw new IllegalStateException(
-                    "Expected " + expected + " pipelined replies, got " + replies.size());
+                    "Expected 5 replies from queue_state.lua, got " + (replies == null ? "none" : replies.size()));
         }
 
         return new Snapshot(
@@ -250,10 +268,6 @@ public class QueueService implements QueueFacade {
         }
 
         return QueueState.notJoined();
-    }
-
-    private static byte[] utf8(String value) {
-        return value.getBytes(StandardCharsets.UTF_8);
     }
 
     /**

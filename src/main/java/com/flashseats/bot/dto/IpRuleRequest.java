@@ -3,6 +3,7 @@ package com.flashseats.bot.dto;
 import com.flashseats.bot.model.IpRuleAction;
 import jakarta.validation.constraints.NotBlank;
 import jakarta.validation.constraints.NotNull;
+import jakarta.validation.constraints.Size;
 import java.time.Instant;
 
 /**
@@ -13,7 +14,7 @@ import java.time.Instant;
  * no expiry is one somebody has to remember to remove.
  */
 public record IpRuleRequest(
-        @NotBlank String ipAddress,
+        @NotBlank @Size(max = 45) String ipAddress,
         @NotNull IpRuleAction action,
-        String reason,
+        @Size(max = 255) String reason,
         Instant expiresAt) {}

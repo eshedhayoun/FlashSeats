@@ -113,4 +113,40 @@ class QueueReplayIT extends IntegrationTest {
                                 + "for frames that were never written and is told it is current")
                 .isEqualTo(afterBroadcast);
     }
+
+    @Test
+    @DisplayName("One availability change seen by three replicas is retained once, and a change back is announced")
+    void anAvailabilityChangeIsAnnouncedOnce() {
+        var available = QueueChannelMessage.toAll("tier-availability", Map.of("tiers", "AVAILABLE"));
+        var low = QueueChannelMessage.toAll("tier-availability", Map.of("tiers", "LOW"));
+        String key = QueueKeys.availability(eventId);
+
+        // Every replica watching the sale sweeps it and sees the same state (ADR-076).
+        for (int replica = 0; replica < 3; replica++) {
+            replay.publishIfChanged(eventId, key, available);
+        }
+        assertThat(replay.after(eventId, "0")).hasSize(1);
+
+        for (int replica = 0; replica < 3; replica++) {
+            replay.publishIfChanged(eventId, key, low);
+        }
+        // Back to a state this replica announced before: still a change for every stream.
+        replay.publishIfChanged(eventId, key, available);
+
+        assertThat(replay.after(eventId, "0"))
+                .extracting(frame -> frame.data().get("tiers"))
+                .containsExactly("AVAILABLE", "LOW", "AVAILABLE");
+    }
+
+    @Test
+    @DisplayName("A sale's close is retained once, however many replicas sweep it")
+    void aCloseIsAnnouncedOnce() {
+        var closed = QueueChannelMessage.toAll("sale-closed", Map.of("closedAt", "now"));
+
+        assertThat(replay.publishOnce(eventId, QueueKeys.closed(eventId), closed)).isTrue();
+        assertThat(replay.publishOnce(eventId, QueueKeys.closed(eventId), closed)).isFalse();
+        assertThat(replay.publishOnce(eventId, QueueKeys.closed(eventId), closed)).isFalse();
+
+        assertThat(replay.after(eventId, "0")).hasSize(1);
+    }
 }

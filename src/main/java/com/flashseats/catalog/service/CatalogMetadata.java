@@ -11,6 +11,8 @@ import io.micrometer.core.instrument.MeterRegistry;
 import java.time.Clock;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionException;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.function.Supplier;
 import lombok.extern.slf4j.Slf4j;
@@ -21,13 +23,17 @@ import org.springframework.transaction.event.TransactionalEventListener;
 /**
  * Event and tier metadata read from memory instead of a pooled connection (ADR-051). These rows
  * barely change, yet every window check and tier lookup was its own transaction, and at 3–10
- * concurrent sales that traffic exhausted the pool first (ADR-049). Four rules:
+ * concurrent sales that traffic exhausted the pool first (ADR-049). Five rules:
  *
  * <ul>
  *   <li><strong>Every entry expires</strong>: the TTL is the cross-replica invalidation, or a paused
  *       sale answers {@code OPEN} on the other replicas forever.
  *   <li><strong>Loads happen outside the map</strong>, never in {@code computeIfAbsent}: blocking
  *       JDBC inside its per-bin lock pins carrier threads (ADR-022).
+ *   <li><strong>One load per miss</strong>: concurrent readers of an expired key wait for the load
+ *       already running instead of each taking a connection. Every entry expires on a timer, so
+ *       without this a waiting room polling one event spiked the pool on every TTL boundary (ADR-056's
+ *       single-flight rule, ADR-065).
  *   <li><strong>A miss is never cached</strong>: seed SQL inserts rows behind the app's back.
  *   <li><strong>Recovery paths do not read this</strong>: {@link #tiersUncached} serves pre-warm and
  *       rebuild, where a stale tier list would leave a tier with no counter (ADR-004, ADR-046).
@@ -48,6 +54,11 @@ public class CatalogMetadata implements DerivedStateCache {
     private final Map<Long, Entry<EventRow>> eventCache = new ConcurrentHashMap<>();
     private final Map<Long, Entry<List<TierRow>>> tierCache = new ConcurrentHashMap<>();
     private final Map<Long, Entry<List<EventRow>>> listCache = new ConcurrentHashMap<>();
+
+    /** The load in flight for each key, which concurrent misses wait on instead of repeating. */
+    private final Map<Long, CompletableFuture<EventRow>> eventLoads = new ConcurrentHashMap<>();
+    private final Map<Long, CompletableFuture<List<TierRow>>> tierLoads = new ConcurrentHashMap<>();
+    private final Map<Long, CompletableFuture<List<EventRow>>> listLoads = new ConcurrentHashMap<>();
 
     private final Counter hits;
     private final Counter misses;
@@ -80,12 +91,12 @@ public class CatalogMetadata implements DerivedStateCache {
      *     class note on misses.
      */
     public EventRow event(long eventId) {
-        return read(eventCache, eventId, properties.getMetadataEventTtlMs(), () -> loadEvent(eventId));
+        return read(eventCache, eventLoads, eventId, properties.getMetadataEventTtlMs(), () -> loadEvent(eventId));
     }
 
     /** An event's tiers, most expensive first — the order the landing page renders. */
     public List<TierRow> tiers(long eventId) {
-        return read(tierCache, eventId, properties.getMetadataTierTtlMs(), () -> loadTiers(eventId));
+        return read(tierCache, tierLoads, eventId, properties.getMetadataTierTtlMs(), () -> loadTiers(eventId));
     }
 
     /**
@@ -95,7 +106,7 @@ public class CatalogMetadata implements DerivedStateCache {
      * It is not clock-dependent, so caching it is safe.
      */
     public List<EventRow> selectableEvents() {
-        return read(listCache, ALL, properties.getMetadataEventTtlMs(), this::loadSelectable);
+        return read(listCache, listLoads, ALL, properties.getMetadataEventTtlMs(), this::loadSelectable);
     }
 
     /**
@@ -116,9 +127,14 @@ public class CatalogMetadata implements DerivedStateCache {
      * Drops one event's snapshots, and the list they appear in.
      *
      * <p>Unconditional, so a no-op pause is still safe. The list goes too because pausing is exactly
-     * what moves an event out of {@code findOpenEventIds}.
+     * what moves an event out of {@code findOpenEventIds}. Loads already in flight are dropped as well:
+     * they read the row before this change, so a reader arriving now must start its own, and the old
+     * load must not store what it read.
      */
     public void invalidate(long eventId) {
+        eventLoads.remove(eventId);
+        tierLoads.remove(eventId);
+        listLoads.clear();
         eventCache.remove(eventId);
         tierCache.remove(eventId);
         listCache.clear();
@@ -135,6 +151,9 @@ public class CatalogMetadata implements DerivedStateCache {
      */
     @Override
     public void invalidateAll() {
+        eventLoads.clear();
+        tierLoads.clear();
+        listLoads.clear();
         eventCache.clear();
         tierCache.clear();
         listCache.clear();
@@ -154,7 +173,12 @@ public class CatalogMetadata implements DerivedStateCache {
 
     // ----------------------------------------------------------------- internals
 
-    private <T> T read(Map<Long, Entry<T>> cache, long eventId, long ttlMs, Supplier<T> loader) {
+    private <T> T read(
+            Map<Long, Entry<T>> cache,
+            Map<Long, CompletableFuture<T>> loads,
+            long eventId,
+            long ttlMs,
+            Supplier<T> loader) {
         if (!properties.isMetadataCacheEnabled()) {
             return loader.get();
         }
@@ -166,9 +190,35 @@ public class CatalogMetadata implements DerivedStateCache {
             return cached.value();
         }
 
+        // Single-flight. Waiting is a park, not a monitor, so a virtual thread waiting here does not
+        // pin its carrier.
+        CompletableFuture<T> load = new CompletableFuture<>();
+        CompletableFuture<T> inFlight = loads.putIfAbsent(eventId, load);
+        if (inFlight != null) {
+            hits.increment();
+            return await(inFlight);
+        }
+
         misses.increment();
-        // Outside the map, and therefore outside any monitor: see the class note on pinning.
-        T loaded = loader.get();
+        try {
+            // Outside the map, and therefore outside any monitor: see the class note on pinning.
+            T loaded = loader.get();
+            // Stored only if no invalidation landed while it loaded: invalidate() drops the in-flight
+            // load, and a row read before a committed change must not outlive the change.
+            if (loads.remove(eventId, load)) {
+                store(cache, eventId, loaded, ttlMs, now);
+            }
+            load.complete(loaded);
+            return loaded;
+        } catch (RuntimeException | Error failed) {
+            // Every waiter gets the failure, and the next reader tries again: a miss is never cached.
+            loads.remove(eventId, load);
+            load.completeExceptionally(failed);
+            throw failed;
+        }
+    }
+
+    private <T> void store(Map<Long, Entry<T>> cache, long eventId, T loaded, long ttlMs, long now) {
         if (cache.size() < properties.getMetadataCacheMaxEvents() || cache.containsKey(eventId)) {
             cache.put(eventId, entry(loaded, ttlMs));
         } else {
@@ -176,7 +226,21 @@ public class CatalogMetadata implements DerivedStateCache {
             // for this one would be worse than serving this one uncached.
             purgeExpired(cache, now);
         }
-        return loaded;
+    }
+
+    /** The in-flight load's own exception, not the {@code CompletionException} wrapping it. */
+    private static <T> T await(CompletableFuture<T> load) {
+        try {
+            return load.join();
+        } catch (CompletionException failed) {
+            if (failed.getCause() instanceof RuntimeException cause) {
+                throw cause;
+            }
+            if (failed.getCause() instanceof Error cause) {
+                throw cause;
+            }
+            throw failed;
+        }
     }
 
     private <T> void purgeExpired(Map<Long, Entry<T>> cache, long now) {

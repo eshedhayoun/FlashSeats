@@ -27,6 +27,7 @@ import org.springframework.context.ApplicationEventPublisher;
 import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.data.domain.Limit;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.CannotCreateTransactionException;
 import org.springframework.transaction.annotation.Propagation;
 import org.springframework.transaction.annotation.Transactional;
 
@@ -77,9 +78,10 @@ public class HoldService implements HoldFacade {
 
     /**
      * Reserves seats. The Redis decrement is <strong>outside any transaction</strong>, because Redis
-     * cannot roll back (ADR-023, ADR-046). It is ordered first and compensated only on a constraint
-     * rejection, the one certain failure. An ambiguous commit failure is left to drift and a rebuild,
-     * since returning seats that may still be held would oversell (invariant 12).
+     * cannot roll back (ADR-023, ADR-046). It is ordered first and compensated only on a
+     * <em>certain</em> failure: a constraint rejection, or a transaction that never began. An
+     * ambiguous commit failure is left to drift and a rebuild, since returning seats that may still be
+     * held would oversell (invariant 12).
      *
      * <p>"Not enough seats" ({@code 409}) and "no counter" ({@code 503}) stay distinct; the second is
      * never sold out (ADR-004).
@@ -118,6 +120,13 @@ public class HoldService implements HoldFacade {
             // Flushed here, not at commit, so the constraint speaks while we can still translate it
             // — and while its verdict is still unambiguous enough to compensate on.
             holds.saveAndFlush(hold);
+        } catch (CannotCreateTransactionException neverBegan) {
+            // No connection came free, so the transaction never began and no row can exist. As
+            // certain as a constraint rejection — and the common one under pressure. Leaving it to
+            // drift hid these seats from every buyer until an operator rebuilt the counter: a sale
+            // that looked sold out early, at exactly the load it was built for (ADR-067).
+            catalog.restore(eventId, tierId, quantity);
+            throw neverBegan;
         } catch (DataIntegrityViolationException violation) {
             catalog.restore(eventId, tierId, quantity);
             if (!isOneActiveHoldPerSession(violation)) {
@@ -235,8 +244,8 @@ public class HoldService implements HoldFacade {
      * Reclaims one hold whose {@code hold:{token}} timer fired. <strong>The timer is a hint, never an
      * authority</strong> (ADR-048). The row is re-read and only a genuinely expired hold is reclaimed,
      * because {@code grantGrace} moves expiry in PostgreSQL, and AOF, eviction or a flush can all
-     * disagree with the row. A hold that is still alive gets its timer re-armed. Exactly one replica
-     * wins via the settle-once claim.
+     * disagree with the row. A hold that is still alive gets its timer re-armed once this read has
+     * committed. Exactly one replica wins via the settle-once claim.
      *
      * @return true if this replica won the claim and the seats are coming back
      */
@@ -248,8 +257,10 @@ public class HoldService implements HoldFacade {
             return false;
         }
         if (hold.getExpiresAt().isAfter(clock.instant())) {
-            timers.arm(holdToken, hold.getExpiresAt());
-            log.debug("Timer for hold {} fired early; re-armed to {}", holdToken, hold.getExpiresAt());
+            // Re-armed after this read commits, not inside it: a Redis write never sits inside a SQL
+            // transaction (invariant 9).
+            events.publishEvent(new HoldTimerFiredEarlyEvent(holdToken, hold.getExpiresAt()));
+            log.debug("Timer for hold {} fired early; re-arming it for {}", holdToken, hold.getExpiresAt());
             return false;
         }
         return settleAndRestore(hold, HoldStatus.EXPIRED, SettleReason.TTL);

@@ -27,6 +27,9 @@ public interface OutboxEventRepository extends JpaRepository<OutboxEvent, UUID> 
     @Query("SELECT MIN(e.createdAt) FROM OutboxEvent e WHERE e.status = :status")
     Optional<Instant> oldestCreatedAtWithStatus(@Param("status") OutboxStatus status);
 
+    /** Whether a message of this kind was ever queued for an order. */
+    boolean existsByAggregateIdAndEventType(String aggregateId, String eventType);
+
     /**
      * The most recent message published for an order, whatever became of it.
      *

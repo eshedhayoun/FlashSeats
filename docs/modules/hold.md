@@ -51,6 +51,10 @@ owns the truth. This is the `holdmeta` key ADR-019 deleted, and it is not coming
 
 A hold that is not yours answers `404`, not `403`, so tokens cannot be enumerated.
 
+A hold is created only while the sale window is `OPEN`. A **paused** sale answers `409 SALE_PAUSED`
+with `retryable: true` and moves no stock; holds that already exist are untouched by the pause, keep
+their own clock, and can still be paid for (ADR-066).
+
 **Facade:** `getActiveHold`, `findActiveHold`, `consumeHold`, `grantGrace`, `discardTimer`,
 `sumActiveQuantityForTier`.
 
@@ -71,13 +75,17 @@ roll back**. So they are ordered and compensated.
 reserve in Redis          ← outside any transaction
 write the hold row        ← its own transaction, flushed so the constraint speaks
     on constraint failure → restore, then 409/410
+    on "never began"      → restore, then 503 SERVICE_BUSY        ← ADR-067
 publish TicketHeldEvent
     AFTER_COMMIT          → arm the hold:{token} timer
 ```
 
-**Compensation runs only on a constraint rejection**, because that is the one failure whose outcome
-is certain. A flush that violates the one-live-hold index leaves no row, so the seats are
-unambiguously ours to return. **A failure at commit is ambiguous** — the row may exist, and returning
+**Compensation runs only on a certain failure.** A flush that violates the one-live-hold index leaves
+no row, so the seats are unambiguously ours to return. So does a transaction that **never began**:
+when no pooled connection comes free, nothing reached the database. That second case used to fall
+through to drift, so under exactly the pressure the system is built for, every pool timeout on a
+reserve hid its seats from every buyer until an operator rebuilt the counter (ADR-067). **A failure
+at commit is ambiguous** — the row may exist, and returning
 seats that are still held is an oversell. Those fall through to `flashseats.stock.drift` and a
 rebuild, which is the safe direction.
 
@@ -114,7 +122,8 @@ whose connection drops for a moment, loses the event permanently and nothing red
 **The listener re-reads the row and settles only what the sweeper would have.** Three reasons this is
 not pedantry: `grantGrace` moves a hold's expiry in PostgreSQL, so the original timer fires
 mid-payment; AOF `everysec` can resurrect or lose a key relative to its row; an operator can flush
-the key. A hold found alive is **re-armed**, which keeps a grace-extended hold on the fast path.
+the key. A hold found alive is **re-armed** once that read has committed (invariant 9), which keeps a
+grace-extended hold on the fast path.
 
 **Exactly-once across replicas needs no coordination.** Keyspace expiry is broadcast, so all three
 replicas run the listener, all three reach the claim, and exactly one `UPDATE` returns 1. Restoring

@@ -10,6 +10,7 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.jdbc.core.JdbcTemplate;
 
 /**
  * The delivery claim: strong enough to stop a double send, weak enough to allow a replay.
@@ -31,6 +32,9 @@ class NotificationClaimIT extends IntegrationTest {
 
     @Autowired
     private SaleFixture fixture;
+
+    @Autowired
+    private JdbcTemplate jdbc;
 
     @BeforeEach
     void reset() {
@@ -75,5 +79,34 @@ class NotificationClaimIT extends IntegrationTest {
         assertThat(logs.claim(ORDER, NotificationKind.TICKET_DELIVERY, EMAIL)).isTrue();
         // The same order still owes a refund notice; UNIQUE(order_number, kind) is what allows both.
         assertThat(logs.claim(ORDER, NotificationKind.REFUND_NOTICE, EMAIL)).isTrue();
+    }
+
+    /**
+     * A process killed between the claim and recording an outcome left the row PENDING for ever. The
+     * broker's redelivery found it neither claimable nor dead-lettered and acknowledged it, so the
+     * ticket was never sent and nothing listed it for an operator (ADR-069).
+     */
+    @Test
+    @DisplayName("A claim stranded by a dead process is dead-lettered, listed, and replayable")
+    void aStrandedClaimBecomesReplayable() {
+        assertThat(logs.claim(ORDER, KIND, EMAIL)).isTrue();
+        // The process dies here. The redelivery is turned away, as it must be while the claim is fresh.
+        assertThat(logs.claim(ORDER, KIND, EMAIL)).isFalse();
+
+        jdbc.update("UPDATE notification_logs SET updated_at = now() - interval '11 minutes' WHERE order_number = ?", ORDER);
+        assertThat(logs.deadLetterStranded()).isEqualTo(1);
+
+        assertThat(logs.deadLetters(0, 10)).singleElement()
+                .satisfies(letter -> assertThat(letter.failureReason()).startsWith("stranded"));
+        assertThat(logs.claim(ORDER, KIND, EMAIL)).isTrue();
+    }
+
+    @Test
+    @DisplayName("A claim still inside its window is left alone: the send may be in progress")
+    void aFreshClaimIsNotStranded() {
+        assertThat(logs.claim(ORDER, KIND, EMAIL)).isTrue();
+
+        assertThat(logs.deadLetterStranded()).isZero();
+        assertThat(logs.claim(ORDER, KIND, EMAIL)).isFalse();
     }
 }

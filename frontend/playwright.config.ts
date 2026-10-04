@@ -1,57 +1,37 @@
-import { defineConfig, devices } from '@playwright/test';
+import { defineConfig, devices } from "@playwright/test";
 
 /**
- * Read environment variables from file.
- * https://github.com/motdotla/dotenv
- */
-// require('dotenv').config();
-
-/**
- * See https://playwright.dev/docs/test-configuration.
+ * The FE_SPEC §8 suite. It drives the real backend — start it first:
+ *
+ *   docker/scripts/dev-up.sh && ./mvnw spring-boot:run      (from the repo root)
+ *
+ * One worker: every spec shares one backend, one Redis and one admission allowance.
  */
 export default defineConfig({
-  testDir: './e2e',
-  /* Run tests in files in parallel */
+  testDir: "./e2e/specs",
   fullyParallel: false,
-  /* Fail the build on CI if you accidentally left test.only in the source code. */
+  workers: 1,
   forbidOnly: !!process.env.CI,
-  /* Retry on CI only */
-  retries: process.env.CI ? 2 : 0,
-  /* Opt out of parallel tests on CI. */
-  workers: process.env.CI ? 1 : 1,
-  /* Reporter to use. See https://playwright.dev/docs/test-reporters */
-  reporter: 'html',
-  /* Shared settings for all the projects below. See https://playwright.dev/docs/api/class-testoptions. */
+  retries: process.env.CI ? 1 : 0,
+  reporter: [["list"], ["html", { open: "never" }]],
+  timeout: 90_000,
+  expect: { timeout: 10_000 },
   use: {
-    /* Base URL to use in actions like `await page.goto('/')`. */
-    baseURL: 'http://localhost:5173',
-    httpCredentials: undefined,
-    /* Collect trace when retrying the failed test. See https://playwright.dev/docs/trace-viewer */
-    trace: 'on-first-retry',
+    baseURL: process.env.E2E_BASE_URL ?? "http://localhost:5173",
+    trace: "retain-on-failure",
+    screenshot: "only-on-failure"
   },
-
-  /* Configure projects for major browsers */
   projects: [
-    {
-      name: 'chromium',
-      use: { ...devices['Desktop Chrome'] },
-    },
+    { name: "desktop", use: { ...devices["Desktop Chrome"] }, testIgnore: /mobile\.spec/ },
+    { name: "mobile", use: { ...devices["Pixel 7"] }, testMatch: /mobile\.spec/ }
   ],
-
-  /* Run your local dev server before starting the tests */
-  webServer: {
-    command: 'npm run dev',
-    url: 'http://localhost:5173',
-    reuseExistingServer: !process.env.CI,
-    timeout: 120 * 1000,
-  },
-  
-  /* Output directory for test results */
-  outputDir: 'test-results',
-  
-  /* Timeout settings */
-  timeout: 30 * 1000,
-  expect: {
-    timeout: 5 * 1000,
-  },
+  webServer: process.env.E2E_BASE_URL
+    ? undefined
+    : {
+        command: "npm run dev",
+        url: "http://localhost:5173",
+        reuseExistingServer: true,
+        timeout: 120_000
+      },
+  outputDir: "test-results"
 });

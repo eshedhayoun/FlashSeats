@@ -14,6 +14,7 @@ import com.flashseats.payment.event.PaymentSettledEvent;
 import com.flashseats.payment.facade.PaymentResult;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.context.event.EventListener;
+import org.springframework.dao.OptimisticLockingFailureException;
 import org.springframework.stereotype.Service;
 
 /**
@@ -24,6 +25,10 @@ import org.springframework.stereotype.Service;
  * (ADR-009) and a failure here must become the webhook's non-2xx. It re-claims the hold exactly as
  * checkout does, and if the seats are gone it refunds rather than confirm inventory another buyer
  * holds (ADR-012). It prices nothing: the confirmation prices from the tier (ADR-013).
+ *
+ * <p>It races the checkout that made the charge: Stripe sends this webhook the moment the payment
+ * succeeds, which for 3-D Secure is the moment the buyer's browser re-POSTs. Whichever path writes the
+ * order row first decides how the charge ends, and the other one finds out from that row (ADR-064).
  */
 @Slf4j
 @Service
@@ -68,13 +73,19 @@ public class PaymentSettlementService {
             return;
         }
 
-        if (order.getStatus() == OrderStatus.CONFIRMED || order.getStatus() == OrderStatus.REFUNDED) {
-            // The synchronous path already resolved this, or a previous delivery did. Nothing to do,
-            // and doing it again would consume a hold that is already consumed.
+        if (order.getStatus() == OrderStatus.CONFIRMED
+                || order.getStatus() == OrderStatus.REFUNDED
+                || order.getStatus() == OrderStatus.REFUND_FAILED) {
+            // The synchronous path already resolved this, or a previous delivery did, and settling
+            // again would consume a hold that is already consumed. Usually this is that same charge
+            // arriving late. If it is a different one, it is a second charge for these seats, and the
+            // webhook is the one witness of every settled charge, so it gives it back (ADR-075).
             log.debug(
-                    "Order {} is already {} — webhook settlement has nothing to do",
+                    "Order {} is already {} — webhook settlement has nothing to settle",
                     order.getOrderNumber(),
                     order.getStatus());
+            refunds.returnIfStray(
+                    order.getOrderNumber(), order.getGatewayReference(), chargeOf(event), order.getTotalAmountCents());
             return;
         }
 
@@ -82,10 +93,16 @@ public class PaymentSettlementService {
     }
 
     /**
-     * <strong>Only a definite failure is compensated</strong> (ADR-056). The three exceptions caught
-     * here are the hold module stating the seats are gone, and a refund is the right answer to a fact.
-     * Anything else, such as a pool timeout or a failed commit, is ambiguous and propagates, which
-     * releases the webhook claim and earns a redelivery. ADR-046's rule, applied to money.
+     * <strong>Only a definite failure is compensated</strong> (ADR-056). The exceptions caught here
+     * say this order did not take its seats just now. Anything else, such as a pool timeout or a
+     * failed commit, is ambiguous and propagates, which releases the webhook claim and earns a
+     * redelivery. ADR-046's rule, applied to money.
+     *
+     * <p>"Did not take its seats" is still not "the seats are gone". A hold this order consumed reads
+     * as expired too, because the checkout confirmed the purchase between the read in
+     * {@link #onPaymentSettled} and the claim here. The refund claim tells the two apart: it moves an
+     * order only from {@code PENDING} or {@code FAILED}, so a confirmed purchase is left alone
+     * (ADR-064).
      */
     private void settle(Order order, PaymentSettledEvent event) {
         String orderNumber = order.getOrderNumber();
@@ -96,18 +113,23 @@ public class PaymentSettlementService {
             commit.confirm(orderNumber, hold, tier, resultOf(event));
             log.info("Order {} confirmed from a webhook settlement", orderNumber);
 
-        } catch (HoldNotFoundException | HoldExpiredException | HoldAlreadySettledException seatsGone) {
-            log.warn(
-                    "Webhook settlement for order {} found hold {} gone — refunding",
+        } catch (HoldNotFoundException
+                | HoldExpiredException
+                | HoldAlreadySettledException
+                | OptimisticLockingFailureException claimLost) {
+            OrderRefundService.Outcome outcome = refunds.refund(
                     orderNumber,
-                    event.holdToken(),
-                    seatsGone);
-            refunds.refund(
-                    orderNumber,
-                    event.transactionReference(),
+                    chargeOf(event),
                     order.getTotalAmountCents(),
                     "webhook settled against a reservation that no longer exists");
+            if (outcome == OrderRefundService.Outcome.RESOLVED_ELSEWHERE) {
+                log.info("Order {} was resolved by the checkout before its webhook; nothing to do", orderNumber);
+            }
         }
+    }
+
+    private static SettledCharge chargeOf(PaymentSettledEvent event) {
+        return new SettledCharge(event.transactionReference(), event.gatewayReference());
     }
 
     /**

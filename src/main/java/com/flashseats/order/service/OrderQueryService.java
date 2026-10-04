@@ -117,6 +117,12 @@ public class OrderQueryService implements OrderFacade {
                         order.getCreatedAt()));
     }
 
+    /** The status of the order for a hold, whatever it is. */
+    @Transactional(readOnly = true)
+    public Optional<OrderStatus> statusFor(String holdToken) {
+        return orders.findByHoldToken(holdToken).map(Order::getStatus);
+    }
+
     /**
      * The completed purchase for a hold, if there is one.
      *

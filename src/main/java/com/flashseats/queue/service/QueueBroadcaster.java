@@ -37,6 +37,9 @@ public class QueueBroadcaster {
      */
     private static final long STREAM_TIMEOUT_MS = Duration.ofHours(1).toMillis();
 
+    static final String SALE_PAUSED = "sale-paused";
+    static final String SALE_RESUMED = "sale-resumed";
+
     private final SseEmitterRegistry emitters;
     private final QueueService queue;
     private final QueueDrainRateTracker drainRate;
@@ -44,7 +47,9 @@ public class QueueBroadcaster {
     private final StringRedisTemplate redis;
     private final Clock clock;
     private final QueueReplayService replay;
-    private final Map<Long, List<TierAvailability>> lastAvailability = new ConcurrentHashMap<>();
+
+    /** Events this replica last swept while paused, so the first sweep after a resume can say so. */
+    private final Set<Long> pausedEvents = ConcurrentHashMap.newKeySet();
 
     public QueueBroadcaster(
             SseEmitterRegistry emitters,
@@ -74,29 +79,35 @@ public class QueueBroadcaster {
      * back a spent or expired pass (ADR-058).
      */
     public SseEmitter connect(String sessionId, long eventId, String lastEventId) {
-        SseEmitter emitter = emitters.register(sessionId, eventId, STREAM_TIMEOUT_MS);
+        // Everything below goes to THIS tab's stream only: a replay or a first position belongs to the
+        // connection that asked, not to the buyer's other tabs (ADR-070).
+        SseEmitterRegistry.Connection stream = emitters.open(sessionId, eventId, STREAM_TIMEOUT_MS);
 
         if (lastEventId != null) {
             for (var frame : replay.after(eventId, lastEventId)) {
-                emitters.send(sessionId, frame.type(), frame.data(), frame.id());
+                emitters.send(stream, frame.type(), frame.data(), frame.id());
             }
         }
 
         // Flush at once even if this buyer has no position to send; an empty stream for two seconds
         // looks like a failure to connect.
-        emitters.comment(sessionId, "connected");
+        emitters.comment(stream, "connected");
 
-        QueueState state = queue.getQueueState(sessionId, eventId);
+        EventWindowStatus window = catalog.getWindowStatus(eventId);
+        QueueState state = queue.getQueueState(sessionId, eventId, window);
         if (state.phase() == QueuePhase.PROMOTED && state.passToken() != null) {
             Long expiresInSeconds = queue.passTimeToLiveSeconds(sessionId, eventId);
             if (expiresInSeconds != null) {
                 var promotion = QueueChannelMessage.promotion(sessionId, state.passToken(), expiresInSeconds);
-                emitters.send(sessionId, promotion.type(), promotion.data());
+                emitters.send(stream, promotion.type(), promotion.data(), null);
             }
         } else if (state.position() != null) {
-            emitters.sendPosition(sessionId, state.position(), state.estWaitSeconds());
+            emitters.sendPosition(stream, state.position(), state.estWaitSeconds());
         }
-        return emitter;
+        if (window == EventWindowStatus.PAUSED) {
+            emitters.send(stream, SALE_PAUSED, Map.of(), null);
+        }
+        return stream.emitter();
     }
 
     /**
@@ -109,7 +120,7 @@ public class QueueBroadcaster {
             initialDelayString = "${flashseats.queue.sse-position-interval-ms}")
     public void pushPositions() {
         Set<Long> watchedEventIds = emitters.watchedEventIds();
-        lastAvailability.keySet().removeIf(eventId -> !watchedEventIds.contains(eventId));
+        pausedEvents.removeIf(eventId -> !watchedEventIds.contains(eventId));
         for (long eventId : watchedEventIds) {
             try {
                 sweep(eventId);
@@ -124,11 +135,29 @@ public class QueueBroadcaster {
         EventWindowStatus window = catalog.getWindowStatus(eventId);
 
         if (window == EventWindowStatus.CLOSED) {
-            lastAvailability.remove(eventId);
-            replay.publishAndFanOut(
-                    eventId, QueueChannelMessage.toAll(
-                            "sale-closed", Map.of("closedAt", clock.instant().toString())));
+            pausedEvents.remove(eventId);
+            var closed = QueueChannelMessage.toAll("sale-closed", Map.of("closedAt", clock.instant().toString()));
+            // Announced and retained once, by whichever replica claims it. Every other replica still
+            // closes its own streams, so one that connected after the announcement is not left open
+            // on a finished sale (ADR-076).
+            if (!replay.publishOnce(eventId, QueueKeys.closed(eventId), closed)) {
+                emitters.closeAll(eventId, closed.type(), closed.data());
+            }
             return;
+        }
+
+        if (window == EventWindowStatus.PAUSED) {
+            // Not terminal, and neither retained nor fanned out: every replica sweeps its own streams,
+            // and a reconnect after the resume must not be replayed a pause that has ended. Sent every
+            // sweep, so a buyer who connects mid-pause hears it within one interval. Positions are not
+            // sent: nobody is promoted, so they cannot change (ADR-066).
+            pausedEvents.add(eventId);
+            emitters.broadcast(eventId, SALE_PAUSED, Map.of());
+            return;
+        }
+
+        if (pausedEvents.remove(eventId)) {
+            emitters.broadcast(eventId, SALE_RESUMED, Map.of());
         }
 
         sampleDepth(eventId);
@@ -141,21 +170,19 @@ public class QueueBroadcaster {
                 // Derived from live stock, so it is not terminal for the connection: if seats come
                 // back the marker clears and this buyer's position is still theirs (ADR-035).
                 emitters.send(
-                        sessionId, "sale-exhausted", Map.of("soldOutAt", clock.instant().toString()));
+                        sessionId, eventId, "sale-exhausted", Map.of("soldOutAt", clock.instant().toString()));
             } else if (state.position() != null) {
-                emitters.sendPosition(sessionId, state.position(), state.estWaitSeconds());
+                emitters.sendPosition(sessionId, eventId, state.position(), state.estWaitSeconds());
             }
         }
     }
 
     private void publishAvailabilityIfChanged(long eventId) {
         List<TierAvailability> current = catalog.getTierAvailability(eventId);
-        List<TierAvailability> previous = lastAvailability.put(eventId, current);
-        if (!current.equals(previous)) {
-            replay.publishAndFanOut(
-                    eventId, QueueChannelMessage.toAll(
-                            "tier-availability", Map.of("tiers", current)));
-        }
+        replay.publishIfChanged(
+                eventId,
+                QueueKeys.availability(eventId),
+                QueueChannelMessage.toAll("tier-availability", Map.of("tiers", current)));
     }
 
     /** Feeds the drain-rate estimate; see {@link QueueDrainRateTracker}. */

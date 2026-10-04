@@ -1,5 +1,5 @@
 export type Availability = "PLENTY" | "LIMITED" | "SOLD_OUT" | "UNKNOWN";
-export type WindowStatus = "UPCOMING" | "OPEN" | "CLOSED";
+export type WindowStatus = "UPCOMING" | "OPEN" | "PAUSED" | "CLOSED";
 export type QueueState =
   | "NOT_JOINED"
   | "WAITING"
@@ -7,7 +7,7 @@ export type QueueState =
   | "ADMITTED"
   | "EXHAUSTED"
   | "CLOSED";
-export type OrderStatus = "PENDING" | "CONFIRMED" | "FAILED" | "REFUNDED";
+export type OrderStatus = "PENDING" | "CONFIRMED" | "FAILED" | "REFUNDED" | "REFUND_FAILED";
 
 export type Problem = {
   type: string;
@@ -97,6 +97,7 @@ export type QueueStatusResponse = {
   estWaitSeconds: number | null;
   passToken: string | null;
   admissionExpiresAt: string | null;
+  paused: boolean;
   serverTime: string;
 };
 
@@ -155,7 +156,8 @@ export type OrderReceipt = {
 export type PositionUpdateEvent = {
   position: number;
   aheadOfYou: number;
-  estWaitSeconds: number;
+  /** `null` while the server has no drain rate to estimate from — never a `-1` sentinel. */
+  estWaitSeconds: number | null;
 };
 
 export type QueuePromotedEvent = {
@@ -175,5 +177,5 @@ export type SaleExhaustedEvent = {
 };
 
 export type SaleClosedEvent = {
-  saleEndTime: string;
+  closedAt: string;
 };

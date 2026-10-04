@@ -15,7 +15,7 @@
 | **1** | Correct single-user transaction | catalog, hold, mock payment, order, outbox rows | Two parallel requests for the last ticket → exactly one succeeds — **done, and tested** |
 | **2** | Move the hot path to RAM | Redis stock + Lua, ZSET queue, SSE, pass tokens | Same guarantee at 1,000 concurrent requests — **done** (ADR-046), bar the `hold:{token}` timer, deferred to Phase 4 |
 | **3** | Defence and real money | bot, Stripe, webhooks, Resilience4j | Payments survive tab closure; floods are throttled — **done** in Pass 9 (ADR-052-055): Stripe, the webhook receiver, 3-D Secure, two circuit breakers, reCAPTCHA failing open |
-| **4** | Async fulfilment and scale | RabbitMQ, PDFBox, email, Nginx, k6 | 10,000 users / 500 tickets / zero overbooking / 500 emails — **done bar two**: the cluster, the load runs and Sentinel (ADR-058) are built; the 10,000-VU run and the p99 number need a host where k6 is not competing for cores |
+| **4** | Async fulfilment and scale | RabbitMQ, PDFBox, email, Nginx, k6 | 10,000 users / 500 tickets / zero overbooking / 500 emails — **done bar one**: the cluster, the load runs and Sentinel (ADR-058) are built, and 10,000 buyers sell out five concurrent sales on the dev laptop (ADR-079); the p99 number at that size needs a host where k6 is not competing for cores |
 | **5** | Operate it, and let buyers return | The operator surface (ADR-043); buyer accounts as an overlay (ADR-044) | A dead-lettered ticket can be replayed by a human; a lost counter can be rebuilt without SQL; a buyer finds their order more than 24 h later |
 
 ---
@@ -70,11 +70,13 @@ Double-spend of a hold is prevented by `UNIQUE(hold_token)` and the settle-once 
 transaction boundary — consume the hold *inside* the commit — is right from the first line of code.
 
 ### Exit criteria
-- [ ] Full purchase completes end to end via API.
-- [ ] Two parallel requests for the final ticket: exactly one `201`, one clean `409`.
-- [ ] An abandoned hold returns to stock within ~10 s, exactly once.
-- [ ] A double-submitted checkout produces one order and one charge.
-- [ ] `ApplicationModules.verify()` passes.
+- [x] Full purchase completes end to end via API. (`UserJourneyIT`)
+- [x] Two parallel requests for the final ticket: exactly one `201`, one clean `409`.
+      (`StockReserveConcurrencyIT`)
+- [x] An abandoned hold returns to stock within ~10 s, exactly once. (`HoldLifecycleIT`; under 1 s
+      across three replicas once the `hold:{token}` timer was built, `hold-expiry-check.sh`)
+- [x] A double-submitted checkout produces one order and one charge. (`UserJourneyIT`)
+- [x] `ApplicationModules.verify()` passes. (`ModularityTests`)
 
 ---
 
@@ -124,7 +126,8 @@ position clamping.
 - [x] 1,000 concurrent requests for 100 tickets → exactly 100 sold. (`StockReserveConcurrencyIT`)
 - [x] `FLUSHDB` mid-sale → holds return `503`, rebuild restores the exact correct count.
       (`StockRebuildIT`, and by hand against real orders on the dev stack)
-- [ ] With 2 replicas, every promoted user receives a pass (pub/sub verified). — **Phase 4**
+- [x] With 2 replicas, every promoted user receives a pass (pub/sub verified). — done in Phase 4
+      with three: `fanout-check.sh`, 30 of 30 across all three replicas.
 - [x] Keyspace listener disabled → sweeper still restores every expired hold, exactly once. Holds
       trivially, because the listener is not built: the sweeper is the only path (ADR-046).
 - [x] A refresh mid-queue preserves position (`ZADD NX`).
@@ -195,10 +198,12 @@ below.
 - [x] **500 tickets, exactly 500 sold, zero overbooking.** Verified at 300 and 2,000 VUs, and again
       with a replica killed mid-sale. `confirmed + active_holds + remaining == total_capacity` held
       exactly on every check.
-- [ ] **10,000 users.** Not run here, and not for want of trying: three JVMs hold ~6 GB of the
-      7.65 GB Docker gets, and k6 needs ~0.33 MB per VU (660 MB at 2,000), so 10,000 VUs wants
-      roughly 3.3 GB that does not exist. **2,000 VUs is this machine's ceiling, not the system's**
-      — at that load Redis ran at 10.5k ops/s and 29 % CPU. The run needs a host with ~32 GB.
+- [x] **10,000 users.** Run in Pass 15 (ADR-079): 10,000 buyers across five concurrent sales of
+      500, 2,500 of 2,500 sold, no oversell, no drift. Getting there took two fixes in the system —
+      the status read had opened two TCP connections per poll — and one in the harness: ten
+      thousand one-buyer k6 VUs took 2.6 GiB and were OOM-killed, so a VU now drives ten buyers.
+      Recorded as it was before: "Not run here, and not for want of trying ... The run needs a host
+      with ~32 GB." Memory was not the limit; the connection churn was.
 - [x] PDF emails land in Mailpit; **zero duplicates**; DLQ empty. 677 `notification_logs` rows, all
       `SENT`, zero `(order_number, kind)` duplicates.
 - [x] **Killing one replica mid-sale loses no orders and no stock.** `docker kill` on app-2 at

@@ -1,6 +1,7 @@
 package com.flashseats.queue.dto;
 
 import jakarta.validation.constraints.NotNull;
+import jakarta.validation.constraints.Size;
 
 /**
  * A request to enter the waiting room.
@@ -10,4 +11,4 @@ import jakarta.validation.constraints.NotNull;
  * that times out — is to <strong>fail open</strong> and rely on rate limits (ADR-011). Making it
  * required would turn a third party's outage into a closed sale.
  */
-public record JoinQueueRequest(@NotNull Long eventId, String recaptchaToken) {}
+public record JoinQueueRequest(@NotNull Long eventId, @Size(max = 4096) String recaptchaToken) {}

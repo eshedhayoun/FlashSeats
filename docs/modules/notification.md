@@ -65,8 +65,15 @@ seats to describe, which is why a refund happened — so its composer must not d
 composer that assumed the confirmation shape would throw deterministically and dead-letter the one
 message telling a buyer their money is coming back.
 
-A crash between sending and acknowledging can resend once on redelivery. At-least-once delivery of an
-email beats a design that can silently never send it.
+**A claim stranded by a dead process is dead-lettered, not lost** (ADR-069). A process killed between
+claiming and recording an outcome used to leave the row `PENDING` for ever: the broker's redelivery
+found it neither claimable nor dead-lettered and acknowledged it, the DLQ listing never showed it, and
+an operator's resend could not re-claim it — a paid buyer's ticket that silently never went out. A
+scheduled sweep, safe on every replica, now moves any claim `PENDING` for longer than
+`stranded-after-seconds` (600 s) to `DLQ` with a reason saying the mail may or may not have been sent.
+It is **not** re-sent automatically: whether the SMTP call happened before the process died is unknown,
+and an automatic send would turn every such crash into a second ticket email (ADR-042). The operator
+decides, and the buyer can download the ticket meanwhile (ADR-050).
 
 **Failures are not retried here** (ADR-029). A malformed payload or a render failure fails
 identically every time, so retrying burns minutes, delays every other message, produces three

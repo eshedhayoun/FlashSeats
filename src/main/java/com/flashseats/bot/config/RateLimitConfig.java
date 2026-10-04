@@ -1,8 +1,10 @@
 package com.flashseats.bot.config;
 
+import io.github.bucket4j.distributed.ExpirationAfterWriteStrategy;
 import io.github.bucket4j.distributed.proxy.ProxyManager;
 import io.github.bucket4j.redis.lettuce.Bucket4jLettuce;
 import io.lettuce.core.RedisClient;
+import java.time.Duration;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.data.redis.connection.RedisConnectionFactory;
@@ -18,6 +20,9 @@ import org.springframework.data.redis.connection.lettuce.LettuceConnectionFactor
 @Configuration
 public class RateLimitConfig {
 
+    /** How long past a full refill a bucket's key outlives it. Long enough that an idle bucket is not churned. */
+    private static final Duration BUCKET_GRACE = Duration.ofSeconds(10);
+
     @Bean
     public ProxyManager<byte[]> rateLimitProxyManager(RedisConnectionFactory connectionFactory) {
         if (!(connectionFactory instanceof LettuceConnectionFactory lettuce)) {
@@ -26,6 +31,13 @@ public class RateLimitConfig {
                             + connectionFactory.getClass().getName());
         }
         RedisClient client = (RedisClient) lettuce.getNativeClient();
-        return Bucket4jLettuce.casBasedBuilder(client).build();
+        return Bucket4jLettuce.casBasedBuilder(client)
+                // A bucket refilled to capacity is the same as no bucket, so it may expire then. Without
+                // this every session and every address that ever made a request kept its bucket for
+                // ever: one load drill left 1.1 million keys with no TTL, and under `noeviction` that
+                // growth ends with Redis refusing writes — the stock counters included (ADR-079).
+                .expirationAfterWrite(
+                        ExpirationAfterWriteStrategy.basedOnTimeForRefillingBucketUpToMax(BUCKET_GRACE))
+                .build();
     }
 }

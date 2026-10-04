@@ -50,11 +50,11 @@
 ### Facade graph (acyclic — see ADR-005, ADR-025)
 
 ```
-                    shared          ← open module: ProblemDetail, ErrorCode, SessionId
+                    shared          ← open module: problems, ErrorCode, SessionId, signed tokens
                  (everyone may depend on it)
 
-filter   ──► bot
-queue    ──► catalog
+bot      ──► shared only            ← its servlet filters run before every handler
+queue    ──► catalog, bot           ← `bot` only on join, for the challenge (ADR-055)
 hold     ──► queue, catalog
 order    ──► hold, catalog, payment, queue
 saleflow ──► queue, hold, order, catalog        ← read-only leaf; nothing depends on it
@@ -69,7 +69,7 @@ key prefixes.
 Two additions from the 2nd-pass audit:
 
 * **`shared`** — a Modulith *open module* holding the RFC 7807 machinery, the canonical error-code
-  enum, and value types (`SessionId`, `Money`). Required, not optional: without it, seven modules
+  enum, the session identity (`SessionId`), signed tokens, the ticket PDF renderer and the clock. Required, not optional: without it, seven modules
   would either duplicate error codes or take dependencies on each other that `verify()` rejects
   (ADR-021).
 * **`saleflow`** — a read-only composition module owning one endpoint,
@@ -107,8 +107,8 @@ card: what the buyer does, what authorises it, and what clock is running.
 | :-- | :--- | :--- | :--- | :--- |
 | 0 | *(operator)* seeds counters | `POST /admin/events/{id}/prewarm` | HTTP Basic, `ROLE_ADMIN` | window must be `UPCOMING` |
 | 1 | Opens the landing page | `GET /events/{id}` | — (public) | — |
-| 2 | Joins the line | `POST /queue/join` | `fsid` cookie | window must be `OPEN` |
-| 3 | Watches their position | `GET /queue/stream` (SSE)<br>`GET /queue/status` (fallback) | `fsid` cookie | stream 1 h; position pushed every 2 s |
+| 2 | Joins the line | `POST /queue/join` | `fsid` cookie | window must be `OPEN` or `PAUSED` (ADR-066) |
+| 3 | Watches their position | `GET /queue/stream` (SSE)<br>`GET /queue/status` (fallback) | `fsid` cookie | stream 1 h; position pushed every 2 s. `POST /queue/leave` steps out; rejoining is at the back |
 | 4 | *(is promoted)* | — server-initiated | — | **pass TTL 120 s** |
 | 5 | Enters the sale | `POST /queue/admit` + `X-Queue-Pass-Token` | the pass, **spent here** | **admission TTL 600 s** |
 | 6 | Reserves seats | `POST /holds` + `X-Admission-Token` | the admission session | **hold TTL 300 s**, ceiling 420 s |
@@ -219,7 +219,8 @@ Without this, every client's skew smears the start of the sale and the fairness 
 ordering becomes a lie (ADR-016).
 
 `windowStatus` drives the UI directly: `UPCOMING` → countdown, "Join" disabled; `OPEN` → "Join Flash
-Sale" enabled; `CLOSED` → sale-ended panel.
+Sale" enabled; `PAUSED` → "Join" still enabled, with a paused banner — **never** the sale-ended panel
+(ADR-066); `CLOSED` → sale-ended panel.
 
 `availability` is a **bucket** — `PLENTY` | `LIMITED` | `SOLD_OUT` — never an exact count. Exact live
 inventory drives panic-buying and hands scalpers a free feed (ADR-027). `maxPerOrder` is
@@ -238,8 +239,9 @@ identity before the sale opens.
    validates the reCAPTCHA score (≥ 0.5). The verdict is cached in `bot:captcha:{sid}` for 30
    minutes so the hottest endpoint in the system makes at most one outbound call to Google per
    visitor.
-2. **`catalog`** confirms `windowStatus == OPEN`. A join before the sale opens is `409`, not a
-   silent success.
+2. **`catalog`** confirms `windowStatus` is `OPEN` or `PAUSED`. A join before the sale opens is
+   `409`, not a silent success. A join while paused is accepted: nobody is promoted until the sale
+   resumes, and the line keeps its arrival order (ADR-066).
 3. **`queue`** places the user:
 
    ```
@@ -258,7 +260,9 @@ identity before the sale opens.
    | `queue-promoted` | `{passToken, expiresInSeconds: 120}` | your turn — redirect |
    | `sale-exhausted` | `{soldOutAt}` | stock gone; queue drains |
    | `tier-availability` | `{tiers:[{tierId, level}]}` | a tier crossed a bucket boundary (ADR-027) |
-   | `sale-closed` | `{saleEndTime}` | window closed |
+   | `sale-closed` | `{closedAt}` | window closed — terminal |
+   | `sale-paused` | `{}` | an operator paused the sale — **not** terminal; never retained or replayed (ADR-066) |
+   | `sale-resumed` | `{}` | the pause ended; positions move again |
    | *(comment frame)* | `:hb` | 15 s heartbeat, keeps proxies open |
 
 Reconnects send `Last-Event-ID`. If the stream cannot be established at all, the client falls back
@@ -285,8 +289,8 @@ Two things are load-bearing here:
 
 * **`admittable` is bounded by real capacity.** The original design promoted users into a sold-out
   sale, so buyers waited twenty minutes to be handed a `409 INSUFFICIENT_STOCK`. When
-  `remainingStock` hits zero with no holds outstanding, the queue broadcasts `sale-exhausted` and
-  drains instead (ADR-008).
+  `remainingStock` hits zero the queue broadcasts `sale-exhausted` and promotes nobody (ADR-008),
+  until stock returns (ADR-035, ADR-079).
 * **`PUBLISH` is how the pass reaches the browser.** The promoter runs on one replica; the
   `SseEmitter` lives in another replica's heap. Every replica subscribes to `queue:events:{eventId}`
   and delivers to its own local emitters. Without this, behind three round-robin replicas roughly
@@ -426,24 +430,28 @@ takes card details.
 
 ```
  0. already CONFIRMED for this hold?              → return the receipt, 200
- 1. HoldFacade.getActiveHold(holdToken, sid)      → 404/410 if missing/expired/not yours
+ 1. HoldFacade.getActiveHold(holdToken, sid)      → 404/410 if missing/expired/not yours,
+                                                    unless the webhook confirmed it since step 0
  2. CatalogFacade.getTierSummary(eventId,tierId)  → price snapshot, SERVER-SIDE (ADR-013)
- 3. window gate                                   → OPEN, or CLOSED within 15 min (ADR-016)
+ 3. window gate                                   → OPEN or PAUSED, or CLOSED within 15 min (ADR-016, ADR-066)
  4. find-or-create orders row, hold_token UNIQUE, status = PENDING (ADR-002)
  ┌─ from here every exit leaves the order RESUMABLE (ADR-034) ─────────────────┐
  │ 5. HoldFacade.grantGrace(holdToken)             → once, ceiling 420s (ADR-030)
  │       └─ FAILS ⇒ ABORT with 410 HOLD_EXPIRED. Do NOT charge.       ← see below
- │ 6. PaymentFacade.authorize(...)                 ← OUTSIDE any transaction (ADR-023)
+ │ 6. PaymentFacade.authorize(...)                 ← OUTSIDE any transaction (ADR-023);
+ │                                                    a charge that already settled is reused
  │       └─ declined  ⇒ order FAILED, hold KEPT, 402 + attemptsRemaining
  │       └─ gateway   ⇒ order FAILED, hold KEPT, 503, no attempt consumed
  │ 7. @Transactional {          ← SQL ONLY. No Redis, no HTTP, no broker.
  │        UPDATE ticket_holds SET status='CONSUMED'
- │          WHERE hold_token=? AND status='ACTIVE'   → rowcount 0 ⇒ roll back + refund
- │        orders.status = CONFIRMED
+ │          WHERE hold_token=? AND status='ACTIVE'   → rowcount 0 ⇒ roll back, then ↓
+ │        orders.status = CONFIRMED   ← only from PENDING/FAILED; versioned (ADR-064)
  │        INSERT order_items
  │        INSERT outbox_events (ORDER_CONFIRMED, PENDING)
  │    }
- └─ any throw above ⇒ markAbandoned() ⇒ FAILED, which findOrCreate resumes ────┘
+ │    lost the hold or the order ⇒ claim REFUNDED on the order row (ADR-064):
+ │       claimed ⇒ refund, 409 ORDER_REFUNDED · refused (webhook CONFIRMED it) ⇒ receipt
+ └─ any other throw ⇒ markAbandoned() ⇒ FAILED, which findOrCreate resumes ─────┘
  8. AFTER_COMMIT (best-effort, safe to lose):
         HoldFacade.discardTimer(holdToken)         ← Redis cleanup only
         QueueFacade.revokeAdmission(sid, eventId)
@@ -459,6 +467,13 @@ it `PENDING` forever — and `PENDING` answered every retry with `409 DUPLICATE_
 held live seats they could no longer buy (ADR-034). `markAbandoned` only touches a row still
 `PENDING`, so a decline (already `FAILED`) and a compensated commit failure (already `REFUNDED`) pass
 through it untouched.
+
+**Only a lost hold refunds, and the order row decides even that** (ADR-064). The webhook settles the
+same charge as this request, so a hold found gone at step 7 may have been consumed by the webhook's
+own confirmation. The refund is *claimed* first, as a compare-and-set that a `CONFIRMED` order
+refuses — then the buyer gets the receipt instead. A failure that proves nothing (a pool timeout, a
+dropped connection) refunds nobody: the order is abandoned, and the retry confirms it with the charge
+that already settled.
 
 **Charge first, consume second.** Consuming before charging would require a
 `CONSUMED → RELEASED` transition the state machine forbids, and would briefly release inventory the
@@ -733,14 +748,17 @@ was what left a closed sale's waiting room reporting `WAITING` forever with noth
 say otherwise.
 
 **Exhaustion is derived and reversible.** The promotion worker sets `queue:exhausted:{eventId}` when
-stock is zero with no live pass or admission, publishes `sale-exhausted` once, and **deletes the
-marker on the next tick with stock**. Nothing deletes the waiting set.
+the sale's stock is zero, publishes `sale-exhausted` once, and **deletes the marker on the next tick
+with stock**. Nothing deletes the waiting set. It is derived from stock alone: it used to wait for
+every live pass and admission to lapse too, which kept the line on `WAITING`, going nowhere, for up
+to ten minutes after the last seat went (ADR-079).
 
 | Condition | Reported phase | Waiting set | Reverses? |
 | :--- | :--- | :--- | :--- |
 | Window closed | `CLOSED` | expires with the sale | no |
-| Stock zero, no claims held | `EXHAUSTED` | untouched, positions intact | **yes** — a released hold or a rebuilt counter clears it |
+| Stock zero | `EXHAUSTED` (a buyer holding a pass or an admission sees their own phase first) | untouched, positions intact | **yes** — a released hold or a rebuilt counter clears it |
 | Counter unreadable | promotion **pauses**; phase unchanged | untouched | yes, on pre-warm or rebuild |
+| Sale paused by an operator | phase unchanged, `paused: true`, no wait estimate | untouched, still accepting joins | **yes** — on resume. Exhaustion keeps un-deriving while paused, since expiring holds still return seats (ADR-066) |
 
 The third row is the one that mattered most. `SUM(remaining)` over an event with no counter rows
 returns `0`, indistinguishable from sold out — so an un-warmed sale announced itself exhausted and
@@ -761,40 +779,49 @@ Rules every facade obeys — synchronous, never `@Transactional` itself, records
 module-owned exceptions only — are in
 [`05-global-standards.md`](05-global-standards.md#5-facade-contract-rules) §5.
 
+Generated from the six `*Facade` interfaces and their call sites, so every row is a call that exists:
+
 | Caller | Facade | Method | Purpose |
 | :--- | :--- | :--- | :--- |
-| filter | `BotFacade` | `authorize(ip, sid, path)` | buckets + block flags |
-| filter | `BotFacade` | `verifyCaptcha(token, action, sid)` | cached reCAPTCHA score |
-| `hold` | `QueueFacade` | `verifyAdmission(token, sid, eventId)` | live admission session (ADR-020) |
-| `hold` | `CatalogFacade` | `getTierSummary(eventId, tierId)` | validity, price, window |
+| `queue` | `BotFacade` | `verifyHuman(sid, recaptchaToken, ip)` | the join's challenge; fails open (ADR-055) |
+| `queue` | `CatalogFacade` | `getEventSummary`, `getWindowStatus` | the window gates join, admit and every stream frame |
+| `queue` | `CatalogFacade` | `findOpenEventIds`, `findManagedEventIds` | which sales the promotion tick serves |
+| `queue` | `CatalogFacade` | `getRemainingForEvent` | the admission bound; "no counter" is never zero (ADR-035) |
+| `queue` | `CatalogFacade` | `getTierAvailability` | the `tier-availability` frame (ADR-027) |
+| `hold` | `QueueFacade` | `verifyAdmission(token, sid, eventId)` | a live admission session (ADR-020) |
+| `hold` | `CatalogFacade` | `getTierSummary(eventId, tierId)` | price, limits, window |
+| `hold` | `CatalogFacade` | `tryReserve`, `restore` | the only way stock moves (ADR-046) |
 | `order` | `HoldFacade` | `getActiveHold(token, sid)` | read-only, ownership-checked |
-| `order` | `HoldFacade` | `extendHold(token, seconds)` | bounded grace; **fails ⇒ abort** |
+| `order` | `HoldFacade` | `grantGrace(token)` | the one grace extension; **fails ⇒ abort** (ADR-030) |
 | `order` | `HoldFacade` | `consumeHold(token)` | claim — **joins the caller's transaction** |
-| `order` | `HoldFacade` | `releaseHold(token, reason)` | claim |
-| `order` | `CatalogFacade` | `getTierSummary(eventId, tierId)` | price snapshot |
-| `order` | `PaymentFacade` | `authorize(orderNumber, amount, currency, pm, key)` | charge |
-| `order` | `PaymentFacade` | `refund(txnRef, amount, reason)` | compensation |
+| `order` | `HoldFacade` | `discardTimer(token)` | after a purchase, post-commit |
+| `order` | `HoldFacade` | `sumActiveQuantityForTier(tierId)` | the stock invariant and the rebuild |
+| `order` | `CatalogFacade` | `getTierSummary`, `getEventSummary` | price snapshot, ticket details |
+| `order` | `CatalogFacade` | `findManagedEventIds`, `getTierCapacities`, `getLiveCounters`, `applyRebuild` | the drift gauge and the rebuild (ADR-046) |
+| `order` | `PaymentFacade` | `authorize(command)` | one charge attempt, outside every transaction |
+| `order` | `PaymentFacade` | `hasChargeFor(holdToken)` | whether to skip the time gate for a charge that exists (ADR-074) |
+| `order` | `PaymentFacade` | `refund(txnRef, amount, reason)` | compensation, after the claim (ADR-064) |
 | `order` | `QueueFacade` | `revokeAdmission(sid, eventId)` | after `CONFIRMED`, post-commit |
 | `saleflow` | `QueueFacade` | `getQueueState(sid, eventId)` | rehydration (ADR-025) |
 | `saleflow` | `HoldFacade` | `findActiveHold(sid, eventId)` | rehydration |
-| `saleflow` | `OrderFacade` | `findPendingOrder(sid, eventId)` | rehydration |
-| `saleflow` | `CatalogFacade` | `getEventDetail(eventId)` | rehydration |
-| admin | `NotificationFacade` | `resend(orderNumber, kind)` | DLQ replay |
+| `saleflow` | `OrderFacade` | `findLatestOrder(sid, eventId)` | rehydration — the latest order whatever its status (ADR-037) |
+| `saleflow` | `CatalogFacade` | `getEventSummary(eventId)` | rehydration |
 
-`verifyPassToken` / `revokePassToken` moved off `hold` and onto the `POST /api/v1/queue/admit`
-handler inside `queue` itself — the pass is now exchanged for an admission session rather than
-consumed at hold creation (ADR-020).
+`notification` exposes no facade: its operator surface (`/api/v1/admin/notifications/dlq`) is its own
+controller, and a resend is a new outbox row written by `order`.
 
 Events — the only asynchronous couplings:
 
 | Event | Publisher | Consumer | Transport |
 | :--- | :--- | :--- | :--- |
-| `PaymentSettledEvent` | `payment` (webhook only) | `order` | Spring in-process |
+| `PaymentSettledEvent` | `payment` (webhook only) | `order` | Spring in-process — the only cross-module event |
 | `ORDER_CONFIRMED` | `order` | `notification` | outbox → RabbitMQ |
 | `ORDER_REFUNDED` | `order` | `notification` | outbox → RabbitMQ |
-| `EventPrewarmedEvent` | `catalog` | monitoring | Spring in-process |
-| `TicketHoldExpiredEvent` | `hold` | monitoring | Spring in-process |
-| `BotAttackDetectedEvent` | `bot` | monitoring | Spring in-process |
+
+Every other application event is internal to its module and consumed `AFTER_COMMIT`, which is how a
+side effect waits for the transaction that justifies it (invariant 9): `hold`'s `TicketHeldEvent`,
+`TicketHoldSettledEvent` and `HoldTimerFiredEarlyEvent`; `order`'s `OrderConfirmedEvent`; `catalog`'s
+`EventMetadataChanged`.
 
 ---
 
@@ -839,7 +866,8 @@ Every value below is a named property in `application.properties`.
 | Trusted proxies | **empty by default — trust nobody** | **039** |
 | HikariCP pool | 30 max, 10 idle, 3 s timeout | std §7 |
 | Availability buckets | `SOLD_OUT` 0 · `LIMITED` < 10 % · `PLENTY` · **`UNKNOWN` = no counter** | **027 / 040** |
-
+| Rate-limit bucket expiry | once the bucket would be full again, **+ 10 s** — a full bucket and no bucket are the same bucket | **079** |
+| `EXHAUSTED` | derived from stock alone: set when the sale's remaining stock is 0, cleared the tick it is not | **035 / 079** |
 | reCAPTCHA on join | `flashseats.bot.recaptcha.*` — **blank secret means OFF**, and off allows | **011 / 055** |
 | Challenge score threshold | 0.5; provider timeouts 1 s connect / 2 s read, both **correctness** | **055** |
 | Verification remembered per session | 900 s, `bot:verified:{sid}` | **055** |
@@ -864,11 +892,14 @@ threshold refuses one (ADR-011, ADR-055).
 | `flashseats.queue.admission.budget.denied` | counter, per replica | **sustained** non-zero with `pending` at zero means the allowance is throttling a pool that could serve more (ADR-049) |
 | `flashseats.catalog.metadata.cache{result}` | counter, per replica | a miss rate near 1 means the cache is off or the TTL is below the poll interval (ADR-051) |
 | `flashseats.payment.refund.failed` | counter, per replica | **any non-zero value.** Each one is money owed to a named buyer that automation could not return (ADR-053) |
+| `flashseats.payment.charge.stray{outcome}` | counter, per replica | **any non-zero value.** A second settled charge for one reservation — two checkouts for one hold both reached the provider. `returned` is the system recovering it; `refund_failed` and `unaccounted` are money a person has to look at (ADR-075) |
 | `flashseats.outbox.lag.seconds` | gauge, per replica | sustained above a few seconds — a stalled relay otherwise shows up only as buyers not receiving tickets (ADR-058) |
 | `flashseats.dlq.depth` | gauge, per replica | any non-zero. The DLQ was listable by an operator and alarmed on by nothing; each entry is a paid buyer's ticket (ADR-029, ADR-058) |
 | `flashseats.payment.attempts{outcome}` | counter, per replica | `rate(attempts{outcome="declined"}[5m]) / rate(attempts[5m])` is the decline ratio over any window — a spike is either a provider incident or a fraud rule mis-firing, and both used to look like silence. **Deliberately not a ratio gauge:** one cumulative since process start is the single shape that cannot show a spike, because every healthy sample dilutes the next. `outcome` is a four-value enum, so the same series also answers "are we reaching the provider at all" (ADR-052) |
 | `flashseats.payment.webhook.received{type}` | counter, per replica | **zero while orders are being placed.** A stale webhook secret rejects every delivery, and the symptom is indistinguishable from a quiet day |
 | `flashseats.bot.refusals{outcome}` | counter, per replica | answers "are we shedding load right now?" without querying `bot_audit_logs` |
+| `flashseats.redis.primary.reconnects` | counter, per replica | any increase — this replica found itself on a Redis node that is not the primary and reconnected through Sentinel (ADR-073). Repeated increases mean the Sentinels themselves disagree with the nodes |
+| `flashseats.bot.limiter.unavailable` | counter, per replica | **any non-zero rate** — the rate-limit buckets could not be read and requests are being let through unmetered (ADR-067) |
 | `flashseats.notification.delivered` · `.failed` | counters, per replica | `failed` rising while `delivered` is flat is a mail path that is down rather than idle |
 | `resilience4j_circuitbreaker_state` | gauge, per replica | `open` — every checkout is answering `503` without reaching the provider (ADR-052) |
 | `resilience4j_circuitbreaker_calls{kind}` | counter, per replica | a rising `failed` count is transport trouble; declines are **not** counted here by design |
@@ -897,8 +928,9 @@ genuine gap rather than a deleted idea:
 dead-lettered?", not which queue — and that the three above are the whole of what remains, all of
 them per-event or per-connection shapes the current counters cannot express.
 
-Controls: `POST /api/v1/admin/events/{id}/pause` and `/resume` (stop promotions and new holds, honour
-existing ones), `POST /api/v1/admin/events/{id}/rebuild-stock`,
+Controls: `POST /api/v1/admin/events/{id}/pause` and `/resume` (stop promotions and new holds; the
+line keeps forming, and existing passes, admissions and holds are honoured — a buyer holding seats can
+still pay. Buyers see `PAUSED`, never "sale ended", ADR-066), `POST /api/v1/admin/events/{id}/rebuild-stock`,
 `GET /api/v1/admin/notifications/dlq`, `POST /api/v1/admin/notifications/resend/{orderNumber}`,
 `GET /api/v1/admin/orders/{orderNumber}`, and the bot surface —
 `GET`/`POST` `/api/v1/admin/bot/ip-rules`, `DELETE /api/v1/admin/bot/ip-rules/{ip}` and

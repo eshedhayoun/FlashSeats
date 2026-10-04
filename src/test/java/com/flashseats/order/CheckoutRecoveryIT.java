@@ -7,6 +7,7 @@ import com.flashseats.app.support.BuyerSession;
 import com.flashseats.app.support.IntegrationTest;
 import com.flashseats.app.support.SaleFixture;
 import java.time.Duration;
+import java.time.Instant;
 import java.util.Map;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
@@ -253,6 +254,57 @@ class CheckoutRecoveryIT extends IntegrationTest {
         assertThat(fixture.countPaymentTransactions()).isEqualTo(3);
         assertThat(fixture.holdStatus(holdToken)).isEqualTo("ACTIVE");
         assertThat(fixture.stockInvariantHolds(tierId)).isTrue();
+    }
+
+    @Test
+    @DisplayName("Three declines extend the hold once: 120 s of grace, and never past 420 s from creation")
+    void declinesGrantTheGraceOnce() {
+        BuyerSession buyer = admittedBuyer();
+        String holdToken = reserve(buyer, 1);
+        // Created with the 300 s TTL, so creation is 300 s before the first expiry the buyer sees.
+        Instant firstExpiry = Instant.parse(buyer.get("/holds/" + holdToken).text("expiresAt"));
+        Instant ceiling = firstExpiry.minusSeconds(300).plusSeconds(420);
+
+        for (int attempt = 1; attempt <= 3; attempt++) {
+            buyer.post(
+                    "/orders/checkout",
+                    checkout(holdToken, "pm_card_declined", "grace-" + attempt + "-" + holdToken));
+
+            // One grace per hold, not per attempt: a grace per decline would make three declines a
+            // way to hold seats for eleven minutes (ADR-030).
+            assertThat(Instant.parse(buyer.get("/holds/" + holdToken).text("expiresAt")))
+                    .describedAs("expiry after decline %d", attempt)
+                    .isEqualTo(firstExpiry.plusSeconds(120))
+                    .isEqualTo(ceiling);
+        }
+        assertThat(fixture.holdStatus(holdToken)).isEqualTo("ACTIVE");
+    }
+
+    @Test
+    @DisplayName("A reload reads the hold back for its owner only, and a released hold is gone")
+    void aHoldReadsBackForItsOwnerOnly() {
+        BuyerSession buyer = admittedBuyer();
+        String holdToken = reserve(buyer, 2);
+
+        var mine = buyer.get("/holds/" + holdToken);
+        assertThat(mine.status()).isEqualTo(200);
+        assertThat(mine.text("holdToken")).isEqualTo(holdToken);
+        assertThat(mine.number("quantity")).isEqualTo(2);
+        assertThat(mine.json().get("ttlRemainingSeconds").asLong()).isBetween(1L, 300L);
+        // Both clocks travel with the hold, so the client counts down against the server's (FE_SPEC §4).
+        assertThat(Instant.parse(mine.text("expiresAt"))).isAfter(Instant.parse(mine.text("serverTime")));
+
+        // Another session's token answers exactly like one that never existed: tokens cannot be probed.
+        BuyerSession stranger = new BuyerSession(port);
+        stranger.get("/events/" + eventId);
+        var theirs = stranger.get("/holds/" + holdToken);
+        assertThat(theirs.status()).isEqualTo(404);
+        assertThat(theirs.errorCode()).isEqualTo("HOLD_NOT_FOUND");
+
+        assertThat(buyer.delete("/holds/" + holdToken).status()).isEqualTo(204);
+        var released = buyer.get("/holds/" + holdToken);
+        assertThat(released.status()).isEqualTo(410);
+        assertThat(released.errorCode()).isEqualTo("HOLD_EXPIRED");
     }
 
     private BuyerSession admittedBuyer() {

@@ -102,6 +102,30 @@ class QueueLifecycleIT extends IntegrationTest {
     }
 
     @Test
+    @DisplayName("Leaving takes the buyer out of the line, and joining again starts at the back")
+    void leavingAndRejoiningGoesToTheBack() {
+        // No counter, so nobody is promoted and the line holds still while it is measured.
+        long eventId = fixture.openEvent("Leave And Rejoin");
+        fixture.tierWithoutCounter(eventId, "General Admission", 2_500, 100);
+
+        BuyerSession first = new BuyerSession(port);
+        first.get("/events/" + eventId);
+        first.post("/queue/join", Map.of("eventId", eventId));
+        BuyerSession second = new BuyerSession(port);
+        second.get("/events/" + eventId);
+        second.post("/queue/join", Map.of("eventId", eventId));
+
+        assertThat(first.post("/queue/leave", Map.of("eventId", eventId)).status()).isEqualTo(204);
+        assertThat(first.get("/queue/status?eventId=" + eventId).text("phase")).isEqualTo("NOT_JOINED");
+        assertThat(second.get("/queue/status?eventId=" + eventId).number("position")).isEqualTo(1);
+        // Leaving twice is not an error.
+        assertThat(first.post("/queue/leave", Map.of("eventId", eventId)).status()).isEqualTo(204);
+
+        first.post("/queue/join", Map.of("eventId", eventId));
+        assertThat(first.get("/queue/status?eventId=" + eventId).number("position")).isEqualTo(2);
+    }
+
+    @Test
     @DisplayName("A sale that closes on the clock ends the wait instead of freezing it")
     void closedSaleTerminatesTheWait() {
         long eventId = fixture.openEvent("Closing Soon");
@@ -189,6 +213,38 @@ class QueueLifecycleIT extends IntegrationTest {
             var state = second.get("/sale/" + eventId + "/state");
             assertThat(state.json().get("queue").get("state").asString()).isIn("WAITING", "PROMOTED", "ADMITTED");
         });
+    }
+
+    @Test
+    @DisplayName("Selling out tells the line at once, while the buyers it let in are still choosing")
+    void exhaustionDoesNotWaitForAdmissionsToLapse() {
+        long eventId = fixture.openEvent("Last Seat");
+        long tierId = fixture.tier(eventId, "Only", 9_900, 1);
+
+        BuyerSession first = new BuyerSession(port);
+        first.get("/events/" + eventId);
+        first.post("/queue/join", Map.of("eventId", eventId));
+        String pass = await().atMost(PATIENCE)
+                .until(() -> first.get("/queue/status?eventId=" + eventId).text("passToken"),
+                        token -> token != null);
+        String admission = first
+                .post("/queue/admit", Map.of("eventId", eventId), Map.of("X-Queue-Pass-Token", pass))
+                .text("admissionToken");
+        first.post(
+                "/holds",
+                Map.of("eventId", eventId, "tierId", tierId, "quantity", 1),
+                Map.of("X-Admission-Token", admission));
+
+        // The first buyer's admission lives on until they pay or it runs out, ten minutes by default.
+        // The line used to wait for it: no promotion was possible, and nobody was told why (ADR-079).
+        BuyerSession second = new BuyerSession(port);
+        second.get("/events/" + eventId);
+        second.post("/queue/join", Map.of("eventId", eventId));
+
+        await().atMost(PATIENCE).untilAsserted(() -> assertThat(
+                        second.get("/queue/status?eventId=" + eventId).text("phase"))
+                .isEqualTo("EXHAUSTED"));
+        assertThat(first.get("/queue/status?eventId=" + eventId).text("phase")).isEqualTo("ADMITTED");
     }
 
     @Test

@@ -3,6 +3,7 @@ package com.flashseats.queue.controller;
 import com.flashseats.queue.dto.AdmitRequest;
 import com.flashseats.queue.dto.AdmitResponse;
 import com.flashseats.queue.dto.JoinQueueRequest;
+import com.flashseats.queue.dto.LeaveQueueRequest;
 import com.flashseats.queue.dto.QueueStatusResponse;
 import com.flashseats.queue.service.QueueBroadcaster;
 import com.flashseats.queue.service.QueueService;
@@ -44,6 +45,16 @@ public class QueueController {
                 session.value(), request.eventId(), request.recaptchaToken(), ClientAddress.of(http));
     }
 
+    /**
+     * Steps out of the line. Idempotent, and joining again starts at the back, which is what leaving
+     * means (FE_SPEC V2).
+     */
+    @PostMapping("/leave")
+    @ResponseStatus(HttpStatus.NO_CONTENT)
+    public void leave(@Valid @RequestBody LeaveQueueRequest request, SessionId session) {
+        queue.leave(session.value(), request.eventId());
+    }
+
     @GetMapping("/status")
     public QueueStatusResponse status(@RequestParam long eventId, SessionId session) {
         return queue.status(session.value(), eventId);
@@ -60,7 +71,8 @@ public class QueueController {
 
     /**
      * Live position updates: {@code position-update}, {@code queue-promoted},
-     * {@code sale-exhausted}, {@code sale-closed}, plus comment heartbeats. A client that cannot hold
+     * {@code tier-availability}, {@code sale-exhausted}, {@code sale-closed}, {@code sale-paused},
+     * {@code sale-resumed}, plus comment heartbeats. A client that cannot hold
      * a stream polls {@code /queue/status}, which returns the same information.
      *
      * <p>{@code Last-Event-ID} is what a browser's EventSource sends by itself; the query parameter

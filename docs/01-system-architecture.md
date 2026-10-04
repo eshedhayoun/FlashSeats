@@ -13,9 +13,10 @@ that any module could later be extracted into its own service.
 
 The boundaries are not honour-system. `spring-modulith-starter-core` plus a single
 `ApplicationModules.verify()` test fails the build if any module reaches past another module's
-`facade` package. A module reads only its own tables and its own Redis key prefixes — the one
-deliberate, documented exception (the shared inventory counter, single-writer contract) is described in
-[`03-end-to-end-flow.md`](03-end-to-end-flow.md#the-one-shared-key-and-its-contract).
+`facade` package. A module reads only its own tables and its own Redis key prefixes, **with no
+exception**: the live stock counter is owned and moved by `catalog` alone, and `hold` reaches it
+through `CatalogFacade` (ADR-046). Earlier drafts let `hold` run the scripts against catalog's key and
+called it the one shared key in the system.
 
 The application is **stateless**. All state lives in Redis and PostgreSQL, so any replica can serve
 any request — with one caveat that shapes the design: an `SseEmitter` is unavoidably held in one
@@ -35,7 +36,6 @@ replica's heap, which is why queue promotions fan out over Redis Pub/Sub (ADR-00
 | **PostgreSQL** | 16 | ACID ledger: orders, order items, outbox, hold audit, payments, notification logs, bot rules. |
 | **Redis** | 7 | **The live stock counters**, queue ZSET, rate-limit buckets, idempotency, promotion pub/sub. `noeviction` is a correctness setting: see `CLAUDE.md` for the complete key map. |
 | **RabbitMQ** | 3.13 | Async fulfilment between `order` and `notification`. |
-| **springdoc-openapi** | 3.1.0 | Live API documentation. |
 | **Actuator + Micrometer** | managed | `/actuator/health` is the container healthcheck; Prometheus scrape for the metric set in `05-global-standards.md` §9. |
 | **Flyway** | managed | Schema migrations. `ddl-auto=validate` means the schema has to come from somewhere. |
 | **Testcontainers** | 1.21.3 | Lua scripts, keyspace notifications and row-lock semantics cannot be tested against embedded fakes. |
@@ -55,7 +55,6 @@ replica's heap, which is why queue promotions fan out over Redis Pub/Sub (ADR-00
 | **Stripe** | `com.stripe:stripe-java:29.2.0` | 3 | Payment gateway (test mode). |
 | **Resilience4j** | `io.github.resilience4j:resilience4j-circuitbreaker` + `-retry:2.3.0` | 3 | Circuit breaking and retry around Stripe. Core modules, wired programmatically. |
 | **PDFBox** | `org.apache.pdfbox:pdfbox:3.0.7` | 4 | In-memory PDF ticket rendering. |
-| **Thymeleaf** | `spring-boot-starter-thymeleaf` | 4 | HTML email templates. |
 | **Nginx / k6 / Mailpit** | Docker Compose | 4 | Load balancing, load generation, local SMTP capture. |
 
 Frontend: React + TypeScript (Vite), MUI, and the browser-native `EventSource` API for the queue
@@ -74,23 +73,23 @@ stream.
 
 | # | Module | Responsibility | PostgreSQL | Redis |
 | :--- | :--- | :--- | :--- | :--- |
-| 1 | **`bot`** | Signed `fsid` cookie, Redis-backed rate limits, reCAPTCHA v3, IP reputation | `ip_rules`, `bot_audit_logs` | `bot:rate:session:*`, `bot:rate:ip:*`, `bot:block:*`, `bot:captcha:*` |
+| 1 | **`bot`** | Redis-backed rate limits (session first, IP backstop), reCAPTCHA v3 on join (fails open), the operator's IP rules and the refusal audit | `ip_rules`, `bot_audit_logs` | `bot:rate:session:*`, `bot:rate:ip:*`, `bot:verified:{sid}` |
 | 2 | **`catalog`** | Event metadata, tiers, sale windows, **inventory ownership** | `events`, `ticket_tiers` | `catalog:stock:{e}:{t}` **(the live count)**, `catalog:vouch:{e}` |
-| 3 | **`queue`** | Virtual waiting room, SSE streaming, HMAC passes, **admission sessions**, admission control | *none* | `queue:waiting:*` (ZSET), `queue:pass:*`, `queue:passes:*`, `queue:admit:*`, `queue:admissions:*`, `queue:events:*` (pub/sub) |
+| 3 | **`queue`** | Virtual waiting room, SSE streaming, HMAC passes, **admission sessions**, admission control | *none* | `queue:waiting:*` (ZSET), `queue:pass:*`, `queue:passes:*`, `queue:admit:*`, `queue:admissions:*`, `queue:events:*` (pub/sub), `queue:replay:*`, `queue:replay-seq:*`, `queue:availability:*`, `queue:closed:*`, `queue:promote:*`, `queue:exhausted:*`, `queue:budget` |
 | 4 | **`hold`** | Time-bound reservations, atomic stock movement, settle-once restoration | `ticket_holds` **(authority)** | `hold:{token}` expiry timers |
-| 5 | **`payment`** | Stripe integration, idempotency, webhook reconciliation, refunds | `payment_transactions` | `payment:inflight:{holdToken}` |
+| 5 | **`payment`** | Stripe integration, idempotency, webhook reconciliation, refunds | `payment_transactions`, `webhook_events` | `payment:inflight:{holdToken}` |
 | 6 | **`order`** | ACID ledger, checkout orchestration, transactional outbox, **stock rebuild + drift gauge** (ADR-046) | `orders`, `order_items`, `outbox_events` | *none* |
 | 7 | **`notification`** | PDF rendering, email delivery, DLQ replay | `notification_logs` | *none* (RabbitMQ + SMTP) |
 | 8 | **`saleflow`** | Read-only rehydration endpoint (ADR-025) | *none* | *none* |
-| — | **`shared`** | Open module: `ProblemDetail`, `ErrorCode`, `SessionId`, `Money` (ADR-021) | *none* | *none* |
+| — | **`shared`** | Open module (ADR-021): RFC 7807 errors and the `ErrorCode` registry, the signed `fsid` session identity, signed tokens, the clock, the PDF ticket renderer, Lua-script loading | *none* | *none* |
 
 ### Dependency graph
 
 ```
                     shared        ← open module; everyone may depend on it
 
-filter   ──► bot
-queue    ──► catalog
+bot      ──► shared only          ← servlet filters; `filter` is a PACKAGE in `bot`, not a module
+queue    ──► catalog, bot         ← `bot` only on join (reCAPTCHA)
 hold     ──► queue, catalog
 order    ──► hold, catalog, payment, queue
 saleflow ──► queue, hold, order, catalog     ← read-only leaf; nothing depends on it

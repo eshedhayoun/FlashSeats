@@ -38,7 +38,10 @@ public class QueuePubSubListener implements MessageListener {
                     emitters.broadcast(eventIdOf(channel), frame.type(), frame.data(), frame.id());
                 }
             } else {
-                emitters.send(frame.sessionId(), frame.type(), frame.data(), frame.id());
+                // Addressed to the session's streams for THIS event only. A session queued in two
+                // sales holds a stream for each, and a pass for one must never reach the other's tab,
+                // which would spend it on the wrong sale (ADR-036, ADR-070).
+                emitters.send(frame.sessionId(), eventIdOf(channel), frame.type(), frame.data(), frame.id());
             }
         } catch (Exception malformed) {
             log.warn("Ignoring unreadable queue frame on {}", channel, malformed);
