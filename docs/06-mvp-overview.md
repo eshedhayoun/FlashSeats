@@ -6,9 +6,10 @@
 > A **Review passes** log at the bottom records every pass over this MVP. Append to it; do not
 > rewrite history.
 
-**Status:** built and running, two review passes, one cleanup pass and **Stage 1** deep. 112 tests
-green, including the concurrency, journey, checkout-recovery, queue-lifecycle, availability,
-problem-response, pre-warm, rebuild and Redis-restart suites.
+**Status:** built and running — Stages 1–4 and fifteen review passes deep. **311 backend tests**
+green in any class order, **58** frontend unit tests and **27** browser specs. Payment is real
+behind a stub default (ADR-052), Sentinel is built (ADR-058), and 10,000 buyers sell out five
+concurrent sales on the dev laptop (ADR-079).
 
 **Inventory lives in Redis** (ADR-046). `catalog:stock:{eventId}:{tierId}` is the live count;
 PostgreSQL keeps no copy of it and `tier_inventory` is dropped.
@@ -28,11 +29,19 @@ version that never oversells but cannot be walked proves nothing to anyone.
 ## 2. Run it
 
 ```bash
+# The whole demo, as an evaluator runs it: secrets, the three-replica cluster, two seeded sales
+docker/scripts/professor-demo.sh          # then open http://localhost:8080 — the React client
+
+# Development
 cp .env.example .env
-docker compose up -d          # postgres, redis, rabbitmq, mailpit
-./mvnw spring-boot:run        # the dev profile seeds a sale that is already open
-open http://localhost:8080
+docker/scripts/dev-up.sh                  # postgres, redis, rabbitmq, mailpit, and one OPEN sale
+./mvnw spring-boot:run                    # the dev profile; the API on :8080
+cd frontend && npm install && npm run dev # the React client on :5173, proxying /api to :8080
 ```
+
+`dev-up.sh`, not a bare `docker compose up -d`: it refuses a port conflict, stops cluster replicas
+that share this Redis but sign passes with different secrets, and guarantees one sale is actually
+`OPEN` — which the dev seeder cannot do once the volume holds anything.
 
 `dev` is set by the `spring-boot-maven-plugin`, **not** by `application.properties`. A default
 profile in the properties file made `SecretsGuard` opt-in: a packaged jar started with no
@@ -41,7 +50,7 @@ Running the jar directly therefore requires a profile, which is the intended fai
 
 | Where | What |
 | :--- | :--- |
-| `http://localhost:8080` | The demo client — the whole journey in a browser |
+| `http://localhost:8080` | Under the cluster, the React client served by nginx (ADR-068). Under `spring-boot:run`, a minimal API demo page — the React client is then on `:5173` |
 | `http://localhost:8025` | Mailpit — the ticket emails land here |
 | [`FE_SPEC.md`](../FE_SPEC.md) §2 | The API contract. There is no generated `/docs` page — springdoc described the shapes and none of the meaning |
 | `http://localhost:15672` | RabbitMQ (`flashseats` / `flashseats`) |
@@ -73,7 +82,7 @@ Nine steps. Everything below is real HTTP; the demo client at `/` is one consume
 | 3 | `GET /api/v1/queue/stream` | SSE: `position-update` (2 s, clamped monotonic), `queue-promoted`, `tier-availability`, `sale-exhausted`, `sale-closed`, `sale-paused` / `sale-resumed`, plus heartbeats. `GET /queue/status` is the equivalent polling path. |
 | 4 | *(worker)* | `PromotionWorker` ticks once a second, admits `min(45, floor(remaining × 1.5) − pendingPasses − liveAdmissions)`, and publishes each pass to `queue:events:{id}` so it reaches whichever replica holds that browser's stream. |
 | 5 | `POST /api/v1/queue/admit` | Exchanges the 120 s pass for a 600 s admission session, **and revokes the pass here** — that is what makes it single-use. |
-| 6 | `POST /api/v1/holds` | Requires `X-Admission-Token`. Validates the tier and window, caps quantity, then decrements stock and inserts the hold **in one transaction**. |
+| 6 | `POST /api/v1/holds` | Requires `X-Admission-Token`. Validates the tier and window and caps the quantity, reserves the seats in Redis (`stock_reserve.lua`, one atomic step), **then** inserts the hold in its own transaction. A hold that never commits gives its seats back (ADR-046, ADR-067). |
 | 7 | `POST /api/v1/orders/checkout` | The nine-step orchestration below. |
 | 8 | `GET /api/v1/orders/{n}` | Requires a matching `fsid` **or** `?receiptToken=` — the order number alone authorises nothing. |
 | 9 | *(async)* | Outbox → RabbitMQ → PDFBox → SMTP. The email is in Mailpit within seconds. |
@@ -110,7 +119,7 @@ it, so if anything fails the hold returns to `ACTIVE` and expires normally.
 
 | Module | Ships now | Deferred |
 | :--- | :--- | :--- |
-| `shared` | `ErrorCode` (42 codes), `ProblemDetails`, one global advice, `SessionId`, `Money`, `Clock`, `SignedToken`, `TraceIdFilter` | — |
+| `shared` | `ErrorCode` (41 codes), `ProblemDetails`, one global advice, `SessionId` and the signed `fsid` cookie, `Clock`, `SignedToken`, `TraceIdFilter`, the PDF ticket renderer, `LuaScript` | — |
 | `bot` | Redis-backed Bucket4j session + IP buckets (SSE **counted once**, not exempt); reCAPTCHA v3 on join, failing open behind its own circuit breaker; cached `ip_rules`; async `bot_audit_logs`; operator surface; **`flashseats.bot.refusals{outcome}`** | CIDR ranges; audit retention. The `fsid` cookie moved to `shared` in Pass 7 |
 | `catalog` | Events, tiers, window derivation, metadata cache, `serverTime`, bucketed availability, **Redis counters + Lua, the `-2` fault path, pre-warm, pause/resume, the Redis-restart guard** | create-event endpoint, `TierAvailabilityChangedEvent` |
 | `queue` | `ZADD NX` join, `FIFO`/`RANDOM` ordering, SSE with heartbeats, HMAC passes, admission sessions, promotion worker, **pub/sub fan-out**, measured drain-rate estimates, `tier-availability` frame, **`Last-Event-ID` replay of broadcast frames** | per-event queue metrics |
@@ -122,11 +131,11 @@ it, so if anything fails the hold returns to `ACTIVE` and expires normally.
 
 ### What gets replaced later
 
-| Today | Later | Blast radius |
+| Then | Now | Blast radius, as it turned out |
 | :--- | :--- | :--- |
-| `HoldFacade.discardTimer` — a no-op | `DEL hold:{token}` | the method body |
-| `StubPaymentGateway` | `StripeGateway` | one `@Bean` |
-| `LoggingOutboxPublisher` | already switchable by property | none |
+| `HoldFacade.discardTimer` — a no-op | **done** — it disarms `hold:{token}` | the method body |
+| `StubPaymentGateway` | **done** — `StripePaymentGateway` behind the same `PaymentGateway`, chosen by `flashseats.payment.stripe.enabled`; the stub stays the default (ADR-052) | one `@Bean`, plus the webhook and 3-D Secure, which the seam did not foresee |
+| `LoggingOutboxPublisher` | the RabbitMQ publisher; the logging one remains, switchable by property | none |
 
 `CatalogFacade.tryReserve` has already made its move, and it cost more than the method body the
 first draft of this table predicted — the signature, the transaction boundary either side of it, and
@@ -212,7 +221,7 @@ Findings that cost real time and would cost it again.
 ## 8. Verification
 
 ```bash
-./mvnw test        # 306 tests: unit, modularity, concurrency, journey, recovery, queue lifecycle,
+./mvnw test        # 311 tests: unit, modularity, concurrency, journey, recovery, queue lifecycle,
                    #             pre-warm, stock rebuild, drift, Redis-restart guard, the metadata
                    #             cache's five rules, the cluster admission allowance, payment and
                    #             webhooks, bot defence, and fulfilment through a real broker.
@@ -242,8 +251,10 @@ Findings that cost real time and would cost it again.
 | `RemainingForEventTest` | "Nothing known" is never "nothing left", at the method every admission decision reads: no tiers, a missing counter, genuinely drained and live are four distinct answers (ADR-004, ADR-035, ADR-040). |
 | `CatalogMetadataCacheTest` | Every rule that makes a cache in front of `events` safe: an entry stops being served when its TTL passes, a miss is never remembered, a committed change evicts, the recovery path reads PostgreSQL (ADR-051), concurrent misses share one load, and a load overtaken by an eviction is not stored (ADR-065). |
 | `GlobalPromotionBudgetIT` | One allowance is shared by every caller whichever sale it is promoting, a single claim cannot exceed a window, the window refills, and **no open sale is starved by another** (ADR-049). |
+| `QueueRedisConnectionsIT` | **Nothing opens a Redis connection per call** (ADR-079): 201 status reads and a ten-buyer promotion open none, counted from the driver's own connection events. They opened 201 and 21 while the two were pipelines. |
+| `RequestObservationsIT` | A request records `http.server.requests` and neither Spring Security's per-filter nor Lettuce's per-command observations (ADR-079). |
 | `ModularityTests` | The boundary graph is acyclic and unbroken. |
-| `SignedTokenTest`, `AvailabilityBucketsTest`, `TicketPdfRendererTest` | The signing primitive — including domain separation — the availability rule including its fault value, and a ticket that renders whatever alphabet the title is in. |
+| `SignedTokenTest`, `AvailabilityLevelTest`, `TicketPdfRendererTest` | The signing primitive — including domain separation — the availability rule including its fault value, and a ticket that renders whatever alphabet the title is in. |
 
 **Verified by hand against the live stack:** the nine-step journey end to end, a declined card
 leaving the hold `ACTIVE`, a replay returning `200` with the same order number, a 1,058-byte PDF
@@ -331,9 +342,10 @@ Honest list. None of these is hidden behind a passing test.
   `OutboxPublisher` is batch-shaped, so an unhealthy broker costs one timeout per batch rather than
   one per message. Unconfirmed rows stay `PROCESSING` and the stale-claim sweep retries them.
 - ~~**`QueueBroadcaster` does 4 sequential Redis round trips per connection per 2 s tick.**~~
-  **Fixed — it is one.** `getQueueState` now issues the admission `GET`, its `TTL`, the pass `GET`, the
-  waiting `ZRANK` and (when not hoisted) the exhausted `EXISTS` in a single pipelined round trip, and
-  the state machine decides over the values rather than between the calls. The reads were always
+  **Fixed — it is one.** `getQueueState` reads the admission `GET`, its `TTL`, the pass `GET`, the
+  waiting `ZRANK` and the exhausted `EXISTS` in one round trip — a pipeline at first, the
+  `queue_state.lua` script since ADR-079, because the pipeline opened a connection per call — and the
+  state machine decides over the values rather than between the calls. The reads were always
   independent; only the decision was ordered.
   **What made it worth doing was the volume, not the sweep.** `GET /queue/status` shares this code and
   is called **~90,000 times per replica** in a 300-VU five-sale run, against ~1,100 checkouts — 80×
@@ -342,11 +354,13 @@ Honest list. None of these is hidden behind a passing test.
   **No p99 claim is attached to it.** Two runs of the identical build measured checkout p99 at 1,880 ms
   and 1,242 ms, so this host's variance is ±50 % and swamps the change. Four round trips becoming one
   is a structural fact; the latency it buys is not measurable here.
-- **The emitter registry is a flat map keyed by session id.** "Sessions watching event X" streams the
-  whole map and allocates a `Set`, so a sweep costs `O(connections × events)` traversals before it
-  makes a single Redis call. A per-event index removes it.
-- ~~**`notification.order-refunded.queue` has no consumer.**~~ **Fixed:** `OrderRefundedConsumer`
-  consumes the durable queue and sends `REFUND_NOTICE` mail.
+- ~~**The emitter registry is a flat map keyed by session id.**~~ **Fixed by ADR-070:** streams are
+  keyed by event, then session. Recorded as it was: "Sessions watching event X" streamed the
+  whole map and allocated a `Set`, so a sweep cost `O(connections × events)` traversals before it
+  made a single Redis call; the per-event index removed it.
+- ~~**`notification.order-refunded.queue` has no consumer.**~~ **Fixed:** `NotificationConsumer`
+  listens on the durable queue and sends `REFUND_NOTICE` mail, through the same claim-then-send flow
+  as tickets.
 - **Checkout does not survive a Redis outage.** It opens with `SETNX payment:inflight:{holdToken}`,
   and `POST /holds` verifies admission against Redis. Both fail closed, which for a payment is the
   right direction — but §12's "does checkout keep working?" now has a written answer: no.
@@ -534,7 +548,7 @@ ever committed, so that work lived only in an uncommitted tree and none of it wa
 
 ### Stage 2 — Real money and real defence (Phase 3) — DONE (Pass 9)
 
-- ~~`StripeGateway` implementing the existing `PaymentGateway`~~ — **built** (ADR-052). Server-confirmed
+- ~~`StripeGateway` implementing the existing `PaymentGateway`~~ — **built** as `StripePaymentGateway` (ADR-052). Server-confirmed
   PaymentIntents, so `FE_SPEC` §2's checkout body and ADR-001's ordering are unchanged.
 - ~~the webhook receiver with signature verification and `webhook_events` replay protection;
   `PaymentSettledEvent` → `order`~~ — **built** (ADR-053). The claim is released when settlement
@@ -668,8 +682,8 @@ dependency order. Everything in the first two groups is cheap; the third is the 
 
 - ~~`OrderFacade.getOrderSummary` (zero callers) and `HoldFacade.releaseHold` +
   `HoldReleaseReason` + the service method behind them (test-only).~~ Built.
-- ~~The `ORDER_REFUNDED` decision: build the Stage 4b consumer, or stop writing the rows.~~ Built as
-  `OrderRefundedConsumer`.
+- ~~The `ORDER_REFUNDED` decision: build the Stage 4b consumer, or stop writing the rows.~~ Built: a
+  second listener in `NotificationConsumer`.
 
 **Fix the bugs:**
 
@@ -1120,33 +1134,32 @@ a correctness defect; each is legibility or tidiness.
 
 ## 12. What to examine in the next review pass
 
-Ordered by expected value. The first three are where this build is most likely to be wrong.
+Ordered by expected value. Multi-replica behaviour, the promotion lock and back-pressure — the first
+three items of earlier versions of this list — have been measured since (§11, ADR-049, ADR-079).
 
-1. **Multi-replica behaviour.** Run two instances and check: does every promoted buyer receive their
-   pass? Do two sweepers restore a hold once? Do two relays publish an event once? All three are
-   correct by construction and none has been observed.
-2. **The promotion lock under contention.** ADR-032 accepts that a tick overrunning its 900 ms TTL
-   lets two replicas promote in the same second. Measure how long a tick actually takes with a deep
-   queue, and confirm the oversubscribe factor absorbs the overlap.
-3. **Failure injection.** Kill Redis mid-sale — does the queue fail closed and does checkout keep
-   working? Kill PostgreSQL — is the error a clean `503`? Kill the broker — do orders still commit
-   and does the outbox drain on recovery?
-4. **Transaction-boundary audit.** Grep every `@Transactional` and confirm nothing inside it makes a
-   network call, renders, or sleeps. This is the rule most likely to erode as features are added, and
-   the damage is invisible until load arrives.
-5. **The `AFTER_COMMIT` block.** Everything there must be safe to lose. Confirm that skipping it
-   entirely leaves the system correct.
-6. **Clock discipline.** Every timer flows from the injected `Clock`. Check that no new code reaches
-   for `Instant.now()`, and that every countdown the client renders derives from `serverTime`.
-7. **Error-code coverage.** Every failure path should return a registry code, and every registry code
-   should be reachable. Both directions are worth checking — an unreachable code is dead contract,
-   and a failure without one is a client that cannot branch.
-8. **Backpressure.** Where does the system queue when it is overloaded — Hikari, the SSE registry, the
-   broker? Under virtual threads nothing errors, so this has to be measured rather than observed.
-9. **The React client against `FE_SPEC.md`.** `frontend/e2e` covers the four rules and the reload
-   points that a browser can reach on one replica. What it cannot: a network handover mid-queue, and a
-   promotion delivered across replicas to a stream another replica holds — walk the first by hand, and
-   prove the second with `docker/scripts/fanout-check.sh`.
+1. **10,000 buyers with the load generator on another machine.** On the dev laptop k6 takes 2–3.5 of
+   the ten cores the cluster needs, so checkout p99 5.8 s and status p99 15 s at 10,000 are a bound on
+   the laptop, not a measurement of the system (ADR-079). Only a second host can say which.
+2. **Rendering tickets during the sale.** The replicas render a PDF per order while serving the sale
+   that produced it. `flashseats.notification.enabled=false` on the web replicas, with a separate
+   notification replica, is the experiment.
+3. **The tail of a sale.** An admission that will not buy holds back the last seats until it lapses
+   (600 s; `queue.md` §4). Decide whether a hold refused for want of stock should end the admission.
+4. **The broadcaster's per-connection read.** One `queue_state.lua` call per stream per tick is linear
+   in connections; measure it with real SSE clients at scale (`sse-cadence.sh`), and batch per event
+   if it overruns.
+5. **The real provider.** `stripe-check.sh` with a test key, and a second card after a decline
+   (ADR-074), have not been run against Stripe in this pass.
+6. **Transaction-boundary audit.** Grep every `@Transactional` and confirm nothing inside it makes a
+   network call, renders, or sleeps — the rule most likely to erode, and invisible until load arrives.
+   The `AFTER_COMMIT` block must stay safe to lose.
+7. **Clock discipline.** Every timer flows from the injected `Clock`; the one exception is the rate
+   limiter's log throttle. Every countdown the client renders must derive from `serverTime`.
+8. **Error-code coverage, both directions.** Every failure path returns a registry code; every registry
+   code is reachable. An unreachable code is dead contract, a failure without one a client that
+   cannot branch.
+9. **The React client against `FE_SPEC.md`.** `frontend/e2e` covers what a browser can reach on one
+   replica. A network handover mid-queue still has to be walked by hand.
 
 ---
 
@@ -2131,6 +2144,6 @@ rather than an archaeology.
 | **Money owed and mail stranded are states, not silences** (ADR-069) | A refused refund is `REFUND_FAILED` and answers `409 REFUND_FAILED` — never "refunded in full". A notification claim stranded by a process that died mid-send is dead-lettered by a sweep after 10 minutes, so it shows in the operator's DLQ and a resend works; it used to be acknowledged and never sent |
 | **A pause is a pause** (ADR-066) | A paused sale used to read `CLOSED`: buyers were told it had ended, their streams were closed, the close was **replayed after the resume**, and the event left `/events`. `PAUSED` is now a window status inside the sale window: the line keeps forming in arrival order, nobody is promoted, holds answer `409 SALE_PAUSED` (retryable), a buyer already holding seats can still pay, and `sale-paused` / `sale-resumed` are sent to each replica's own streams and never retained. The admin refusal to pause a draft is `EVENT_NOT_PAUSABLE`. A review then found two things that keep moving while paused: sold-out now un-derives during the pause when expiring holds return seats, and no wait estimate is shown while the line is not moving |
 
-**Verified so far:** 306/306 (228 + 78 new) backend, 58 vitest and 27 Playwright specs, including `SettlementArbiterIT`, which races confirm
+**Verified so far:** 311/311 (228 + 83 new) backend, 58 vitest and 27 Playwright specs, including `SettlementArbiterIT`, which races confirm
 against refund fifteen times with the refund claim staggered across the confirm transaction: both
 endings occur, and every round ends exactly one way. Its resume race — a retry resuming the order while it is being confirmed — failed on its second round until `confirm` held the row (ADR-075). `OutboxRecoveryIT` was also made immune to the context's own relay, which could claim a row in the moment a test left it `PENDING`.

@@ -1,8 +1,94 @@
 # Architecture Decision Record
 
-> Every decision below resolves a contradiction, correctness bug, or gap found in the first-pass
-> design review. Each entry states the decision, the reason, and what it replaces. When a module
-> spec and this document disagree, **this document wins** and the module spec is stale.
+> Every decision below resolves a contradiction, correctness bug, or gap — found in the design
+> review, in the review passes over the built code, or in a drill. Each entry states the decision, the
+> reason, and what it replaces. When a module spec and this document disagree, **this document wins**
+> and the module spec is stale. A decision that a later one changed carries a marker saying so; the
+> original text stays, for the record.
+
+## Index
+
+| ADR | Decision |
+| :--- | :--- |
+| [001](#adr-001--order-orchestrates-checkout-charge-first-consume-the-hold-second) | `order` orchestrates checkout; charge first, consume the hold second |
+| [002](#adr-002--uniquehold_token-on-orders-is-the-single-use-guard) | `UNIQUE(hold_token)` on `orders` is the single-use guard |
+| [003](#adr-003--settle-once-claim-is-the-universal-stock-restoration-primitive) | "Settle-once claim" is the universal stock-restoration primitive |
+| [004](#adr-004--redis-stock-is-never-rebuilt-from-total_capacity-during-a-live-sale) | Redis stock is never rebuilt from `total_capacity` during a live sale |
+| [005](#adr-005--the-facade-graph-is-acyclic-the-only-cross-module-event-is-the-stripe-webhook) | The facade graph is acyclic; the only cross-module event is the Stripe webhook |
+| [006](#adr-006--three-nested-timers-each-with-a-hard-ceiling) | Three nested timers, each with a hard ceiling |
+| [007](#adr-007--queue-promotion-fans-out-over-redis-pubsub) | Queue promotion fans out over Redis Pub/Sub |
+| [008](#adr-008--admission-control-is-bounded-by-real-remaining-capacity) | Admission control is bounded by real remaining capacity |
+| [009](#adr-009--hand-rolled-outbox_events-not-the-modulith-event-publication-registry) | Hand-rolled `outbox_events`, not the Modulith Event Publication Registry |
+| [010](#adr-010--identity-comes-from-a-signed-cookie-never-from-the-request-body) | Identity comes from a signed cookie, never from the request body |
+| [011](#adr-011--session-first-rate-limiting-the-ip-bucket-is-a-coarse-backstop) | Session-first rate limiting; the IP bucket is a coarse backstop |
+| [012](#adr-012--the-webhook-may-not-finalise-an-order-whose-seats-are-gone) | The webhook may not finalise an order whose seats are gone |
+| [013](#adr-013--prices-are-computed-server-side-always) | Prices are computed server-side, always |
+| [014](#adr-014--payment-idempotency-is-anchored-to-the-hold-not-to-a-client-chosen-string) | Payment idempotency is anchored to the hold, not to a client-chosen string |
+| [015](#adr-015--the-outbox-payload-is-a-complete-self-contained-snapshot) | The outbox payload is a complete, self-contained snapshot |
+| [016](#adr-016--sale-windows-are-enforced-and-the-server-owns-the-clock) | Sale windows are enforced, and the server owns the clock |
+| [017](#adr-017--explicit-inventory-limits-per-session) | Explicit inventory limits per session |
+| [018](#adr-018--redis-topology-single-primary--sentinel-not-cluster) | Redis topology: single primary + Sentinel, not Cluster |
+| [019](#adr-019--one-claim-in-postgresql--supersedes-adr-003) | One claim, in PostgreSQL — *supersedes ADR-003* |
+| [020](#adr-020--three-tier-timer-model-add-the-admission-session--amends-adr-006) | Three-tier timer model: add the admission session — *amends ADR-006* |
+| [021](#adr-021--rfc-7807-problemdetail-per-module-advice-and-a-shared-kernel) | RFC 7807 `ProblemDetail`, per-module advice, and a shared kernel |
+| [022](#adr-022--drop-redisson-use-postgresql-advisory-locks) | Drop Redisson; use PostgreSQL advisory locks |
+| [023](#adr-023--a-sql-transaction-may-contain-only-sql) | A SQL transaction may contain only SQL |
+| [024](#adr-024--queue-ordering-is-configurable-fifo-by-default-randomized-available) | Queue ordering is configurable; FIFO by default, randomized available |
+| [025](#adr-025--saleflow-a-read-only-composition-module) | `saleflow`: a read-only composition module |
+| [026](#adr-026--the-queue-drains-by-promotion-never-by-eviction) | The queue drains by promotion, never by eviction |
+| [027](#adr-027--per-tier-availability-is-pushed-into-the-waiting-room) | Per-tier availability is pushed into the waiting room |
+| [028](#adr-028--promotion-batch-size-is-derived-from-the-connection-pool) | Promotion batch size is derived from the connection pool |
+| [029](#adr-029--notification-failures-are-classified-before-they-are-retried) | Notification failures are classified before they are retried |
+| [030](#adr-030--the-grace-budget-is-per-hold-not-per-payment-attempt) | The grace budget is per hold, not per payment attempt |
+| [031](#adr-031--queue--catalog-is-a-real-facade-edge) | `queue → catalog` is a real facade edge |
+| [032](#adr-032--the-promotion-tick-is-a-singleton-by-redis-lock-not-a-postgresql-advisory-lock) | The promotion tick is a singleton by Redis lock, not a PostgreSQL advisory lock |
+| [033](#adr-033--one-restcontrolleradvice-via-a-shared-exception-base-type) | One `@RestControllerAdvice`, via a shared exception base type |
+| [034](#adr-034--a-pending-order-is-in-flight-never-terminal) | A `PENDING` order is in-flight, never terminal |
+| [035](#adr-035--no-counter-is-never-zero-and-exhausted-is-derived-not-destructive) | "No counter" is never "zero", and `EXHAUSTED` is derived, not destructive |
+| [036](#adr-036--the-window-is-checked-before-the-queue-and-every-queue-key-expires) | The window is checked before the queue, and every queue key expires |
+| [037](#adr-037--rehydration-reports-the-latest-order-whatever-its-status) | Rehydration reports the latest order, whatever its status |
+| [038](#adr-038--a-claim-is-released-when-the-work-did-not-happen) | A claim is released when the work did not happen |
+| [039](#adr-039--tokens-are-domain-separated-and-secret-separated-defaults-refuse-to-boot) | Tokens are domain-separated and secret-separated; defaults refuse to boot |
+| [040](#adr-040--an-unreadable-counter-is-unknown-never-a-bucket) | An unreadable counter is `UNKNOWN`, never a bucket |
+| [041](#adr-041--a-restcontrolleradvice-that-catches-exception-must-list-what-spring-throws-first) | A `@RestControllerAdvice` that catches `Exception` must list what Spring throws first |
+| [042](#adr-042--dlq-means-the-work-did-not-happen) | `DLQ` means the work did not happen |
+| [043](#adr-043--the-operator-surface-is-a-correctness-dependency-not-polish) | The operator surface is a correctness dependency, not polish |
+| [044](#adr-044--buyer-accounts-are-an-overlay-on-session-identity-never-a-replacement) | Buyer accounts are an overlay on session identity, never a replacement |
+| [045](#adr-045--actuatorhealth-is-already-the-right-shape-the-gap-is-what-it-reports) | `/actuator/health` is already the right shape; the gap is what it reports |
+| [046](#adr-046--redis-is-the-counter-postgresql-is-the-ledger-and-every-redis-write-fails-toward-under-counting) | Redis is the counter, PostgreSQL is the ledger, and every Redis write fails toward under-counting |
+| [047](#adr-047--proving-the-cluster-what-a-load-harness-must-simulate-and-what-stage-3-deliberately-did-not-build) | Proving the cluster: what a load harness must simulate, and what Stage 3 deliberately did not build |
+| [048](#adr-048--the-operator-surface-and-the-two-guarantees-stage-3-left-behind) | The operator surface, and the two guarantees Stage 3 left behind |
+| [049](#adr-049--admission-is-budgeted-globally-not-per-sale--amends-adr-028) | Admission is budgeted globally, not per sale — *amends ADR-028* |
+| [050](#adr-050--a-ticket-is-retrievable-not-only-deliverable) | A ticket is retrievable, not only deliverable |
+| [051](#adr-051--event-and-tier-metadata-are-cached-the-sale-window-is-still-derived) | Event and tier metadata are cached; the sale window is still derived |
+| [052](#adr-052--stripe-goes-behind-the-seam-that-was-already-there-the-breaker-is-a-decorator) | Stripe goes behind the seam that was already there; the breaker is a decorator |
+| [053](#adr-053--a-webhook-delivery-is-a-claim-and-a-claim-is-released-when-its-work-did-not-happen) | A webhook delivery is a claim, and a claim is released when its work did not happen |
+| [054](#adr-054--3-d-secure-resumes-the-existing-intent-there-is-no-resume-endpoint) | 3-D Secure resumes the existing intent; there is no resume endpoint |
+| [055](#adr-055--bot-defence-fails-open-and-its-rules-are-never-read-from-the-database-on-the-request-path) | Bot defence fails open, and its rules are never read from the database on the request path |
+| [056](#adr-056--compensation-requires-a-definite-failure-a-cache-in-front-of-a-failing-dependency-must-back-off) | Compensation requires a definite failure; a cache in front of a failing dependency must back off |
+| [057](#adr-057--the-contract-is-a-type-not-a-layer-facades-are-implemented-by-their-services-and-most-exceptions-are-factories) | The contract is a type, not a layer: facades are implemented by their services, and most exceptions are factories |
+| [058](#adr-058--what-arrived-with-the-frontend-merge-sentinel-a-broadcast-only-replay-log-and-the-metric-set) | What arrived with the frontend merge: Sentinel, a broadcast-only replay log, and the metric set |
+| [059](#adr-059--a-connection-pool-timeout-is-back-pressure-503-service_busy-not-500) | A connection-pool timeout is back-pressure: `503 SERVICE_BUSY`, not `500` |
+| [060](#adr-060--post-sessionreset-accepts-only-applicationjson) | `POST /session/reset` accepts only `application/json` |
+| [061](#adr-061--cached-test-contexts-are-never-paused) | Cached test contexts are never paused |
+| [062](#adr-062--each-replica-has-a-memory-limit-and-the-image-alone-owns-the-jvm-flags) | Each replica has a memory limit, and the image alone owns the JVM flags |
+| [063](#adr-063--adr-057s-exception-rule-applied-without-exceptions) | ADR-057's exception rule, applied without exceptions |
+| [064](#adr-064--a-settled-charge-ends-exactly-one-way-and-the-order-row-decides-which) | A settled charge ends exactly one way, and the order row decides which |
+| [065](#adr-065--promotion-writes-in-one-pipeline-a-metadata-miss-loads-once) | Promotion writes in one pipeline; a metadata miss loads once |
+| [066](#adr-066--a-pause-is-a-pause-its-own-window-status-and-nothing-ends) | A pause is a pause: its own window status, and nothing ends |
+| [067](#adr-067--a-failure-that-proves-nothing-happened-is-compensated-a-callers-mistake-is-never-a-500) | A failure that proves nothing happened is compensated; a caller's mistake is never a 500 |
+| [068](#adr-068--the-cluster-serves-the-react-client-and-one-command-starts-the-whole-demo) | The cluster serves the React client, and one command starts the whole demo |
+| [069](#adr-069--money-owed-and-mail-stranded-are-states-not-silences) | Money owed and mail stranded are states, not silences |
+| [070](#adr-070--a-live-stream-belongs-to-a-tab-and-a-frame-to-the-sale-it-is-about) | A live stream belongs to a tab, and a frame to the sale it is about |
+| [071](#adr-071--the-clients-address-is-the-right-most-one-nobody-we-trust-appended) | The client's address is the right-most one nobody we trust appended |
+| [072](#adr-072--a-charge-is-tried-once-inside-the-holds-clock-only-a-refund-is-retried-in-process) | A charge is tried once inside the hold's clock; only a refund is retried in-process |
+| [073](#adr-073--sentinel-and-the-data-nodes-agree-on-the-primary-after-every-start) | Sentinel and the data nodes agree on the primary after every start |
+| [074](#adr-074--a-provider-key-per-attempt-a-challenge-finished-whatever-the-clock-says-and-a-ledger-that-hears-the-webhook) | A provider key per attempt, a challenge finished whatever the clock says, and a ledger that hears the webhook |
+| [075](#adr-075--confirming-holds-the-order-row-and-a-charge-the-order-does-not-name-goes-back) | Confirming holds the order row, and a charge the order does not name goes back |
+| [076](#adr-076--small-gaps-a-timer-after-its-read-one-announcement-per-change-logs-without-capabilities-secrets-the-guard-can-trust) | Small gaps: a timer after its read, one announcement per change, logs without capabilities, secrets the guard can trust |
+| [077](#adr-077--what-the-rebuilt-client-needed-from-the-server-a-way-out-of-the-line-and-quiet-disconnects) | What the rebuilt client needed from the server: a way out of the line, and quiet disconnects |
+| [078](#adr-078--the-browser-suite-uses-the-api-a-buyer-and-an-operator-use-and-nothing-else) | The browser suite uses the API a buyer and an operator use, and nothing else |
+| [079](#adr-079--ten-thousand-buyers-what-the-hot-path-was-paying-for-that-nobody-asked-for) | Ten thousand buyers: what the hot path was paying for that nobody asked for |
 
 ---
 
@@ -1383,6 +1469,8 @@ observed on one instance. They move to Stage 3 with the rest of the multi-replic
 
 ---
 
+# Stages 2–4 and Passes 6–14 — decisions the cluster, the operator surface, real money and the review passes forced (ADR-047 – ADR-063)
+
 ## ADR-047 — Proving the cluster: what a load harness must simulate, and what Stage 3 deliberately did not build
 
 **Status:** Accepted (Stage 3)
@@ -1466,6 +1554,8 @@ nothing, and pointed the whole load test at a 700-seat sale while asserting agai
 a drained counter sells nothing and proves nothing.
 
 ### Decision 5 — Sentinel is deferred, and the reason is not cost
+
+> **Superseded by ADR-058, Decision 1:** Sentinel is built in the `cluster` profile.
 
 Sentinel is named in Phase 4 and is **not** built here. No Phase 4 exit criterion needs failover;
 they need fan-out, no-oversell, p99, drift and fulfilment. More importantly it works *against* the
@@ -2389,6 +2479,9 @@ quotes back is always a sequence this log minted.
 > either. An id space with two authorities is not an id space.
 
 ### Decision 3 — The metric set is built; three gauges remain specified
+
+> **Later:** `payment.decline.ratio` became the counter `flashseats.payment.attempts{outcome}`. A ratio
+> accumulated since process start cannot show a spike; a rate over the counter can (`03` §7).
 
 `flashseats.outbox.lag.seconds`, `flashseats.dlq.depth`, `flashseats.payment.decline.ratio`,
 `flashseats.payment.webhook.received{type}`, `flashseats.bot.refusals{outcome}` and
