@@ -13,7 +13,11 @@ set -euo pipefail
 
 cd "$(dirname "$0")/../.."
 
-HTTP_PORT="${HTTP_PORT:-$(grep -E '^HTTP_PORT=' .env 2>/dev/null | head -1 | cut -d= -f2-)}"
+# A fresh clone has no .env yet. Reading it unguarded made grep fail, and under
+# `set -euo pipefail` that ended this script on its first line: exit 2, no output.
+if [[ -z "${HTTP_PORT:-}" && -f .env ]]; then
+    HTTP_PORT="$(grep -E '^HTTP_PORT=' .env | head -1 | cut -d= -f2-)" || HTTP_PORT=""
+fi
 HTTP_PORT="${HTTP_PORT:-8080}"
 export HTTP_PORT
 
@@ -75,9 +79,11 @@ else
     fi
 fi
 
+# gen-env.sh prints the password after "  #    ". This took substr($0, 9), one column
+# too far: it dropped the first character, and every operator call then answered 401.
 if [[ -z "${FLASHSEATS_ADMIN_PLAINTEXT:-}" ]]; then
     FLASHSEATS_ADMIN_PLAINTEXT="$(
-        awk '/^  #    / { print substr($0, 9); exit }' "$password_file"
+        awk '/^  #    / { sub(/^  #    /, ""); print; exit }' "$password_file"
     )"
     export FLASHSEATS_ADMIN_PLAINTEXT
 fi
@@ -96,7 +102,7 @@ if [[ -z "${FLASHSEATS_ADMIN_PLAINTEXT:-}" ]]; then
     ' "$tmp_env" > .env
     bash docker/secrets/gen-env.sh | tee "$password_file"
     FLASHSEATS_ADMIN_PLAINTEXT="$(
-        awk '/^  #    / { print substr($0, 9); exit }' "$password_file"
+        awk '/^  #    / { sub(/^  #    /, ""); print; exit }' "$password_file"
     )"
     export FLASHSEATS_ADMIN_PLAINTEXT
     rm -f "$tmp_env"

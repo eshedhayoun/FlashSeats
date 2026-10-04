@@ -2133,18 +2133,19 @@ unevenly. Pass 9's ADR-057 was right, and branches that forked before it re-adde
 removed. Writing the rules as a checklist (§11) is what makes the next reviewer's job a comparison
 rather than an archaeology.
 
-### Pass 15 — submission readiness *(in progress)*
+### Pass 15 — submission readiness
 
 - **Scope:** a five-way audit before submission — docs and cleanup, backend correctness, the buyer's
   experience in both clients, the test inventory, and a teammate's branch
-  (`shoham-preview-fixup`), which is read for its fixes and re-applied here rather than merged.
-  This entry grows as each step lands.
+  (`shoham-preview-fixup`), which is read for its fixes and re-applied here rather than merged —
+  then the 10,000-buyer drill (ADR-079), every doc re-checked against the code, and a test campaign
+  over the final build (§11, "Pass 15, measured").
 
 - **Also recorded here: PR #21** (merged just before this pass). It added the Playwright scaffold in
   `frontend/e2e`, `FE_SPEC.md` §10, cleanup scripts, `Countdown` tone styling, and a test-profile
   Stripe pin — and a blank first line in `docker/seed/seed.sh` that stopped its shebang working.
 
-**Changed so far:**
+**Changed:**
 
 | Change | Effect |
 | :--- | :--- |
@@ -2159,6 +2160,7 @@ rather than an archaeology.
 | **Leaving the line, and quiet disconnects** (ADR-077) | `POST /queue/leave` takes a buyer out of the line and drops an unspent pass — FE_SPEC's "Leave queue" had nothing to call. A client that goes away mid-stream is now a debug line: the `Exception` backstop had logged every closed waiting-room tab as an `ERROR` with two stack traces, then failed again writing to the dead socket. Two server messages rewritten to FE_SPEC §7's tone |
 | **The browser suite** (ADR-078) | 27 Playwright specs replace the scaffold, driving only the API buyers and operators use: the journey to a downloaded ticket, every stub-reachable checkout failure, the reload points, pause and resume on the stream, the polling fallback, leaving the line, two tabs, two sales, a skewed clock, back-off, dead links and a phone layout. A first draft seeded with SQL and `redis-cli`; what no API can create is proven by the backend's integration tests and the client's unit tests instead. `dev-up.sh` also now names any open sale whose counters an earlier Redis vouched for, with the rebuild that repairs it, instead of calling it walkable |
 | **Ten thousand buyers** (ADR-079) | The concurrent-sales drill at 10,000 buyers sold 22–28 % and the load generator was OOM-killed. Nothing errored; the hot path was paying for things nobody asked for. Every status poll opened two TCP connections — a Lettuce pipeline cannot share the multiplexed connection and no pool is configured — so the status read and the promotion writes are now Lua scripts on the shared connection (201 reads opened 201 connections; now none). Every script call re-read its file's timestamp out of the jar under a lock; scripts are read once. Spring Security's per-filter and Lettuce's per-command observations, read by nobody, are off. Rate-limit buckets expire (one drill left 1.1 million keys under `noeviction`). "Sold out" is told when stock is gone, not up to ten minutes later when the last admission lapses. The harness drives ten buyers per k6 VU, stays in line when told sold out, takes one seat when two are not there, and polls at the client's 5 s. Result: 10,000 buyers, 2,500 / 2,500 sold; 2,000 buyers, checkout p99 195 ms (was 6.1 s) |
+| **The evaluator's one command, on a clean machine** | Run from a fresh clone for the first time, `professor-demo.sh` failed twice before doing anything useful. It read `HTTP_PORT` from a `.env` that does not exist yet, and under `set -euo pipefail` the failed `grep` ended it on its first line, with exit 2 and no output. Past that, it took the generated operator password one column too far and dropped its first character, so seeding the demo sales answered `401`. Both fixed; from a fresh clone it now builds, seeds both sales, and sells a ticket whose PDF lands in Mailpit |
 | **Confirming holds the order row; a second charge goes back** (ADR-075) | A retry that resumed a stranded order moved its version, and `confirm` treated that as losing: a valid purchase went to the refund claim — which succeeded, the order being still unresolved — and the retry then charged again. `confirm` now locks the row it checks. And two checkouts for one hold, possible once the in-flight guards expire, left the second charge with no ending; every resolved order now names its charge, and any other settled charge for the hold is refunded and counted in `flashseats.payment.charge.stray` |
 | **Small gaps** (ADR-076) | An early hold timer was re-armed inside its read transaction; it waits for the commit now. Each availability change reached every stream once per replica and was retained as many times; one replica announces it, via `queue:availability:{e}`, and `sale-closed` is retained once via `queue:closed:{e}`. nginx no longer logs query strings, which carried 90-day receipt tokens. `SecretsGuard` refuses short or shared signing keys and any admin password that is not an adaptive hash — the compose default `admin` used to start cleanly and fail every login |
 | **The provider path, fixed where the stub cannot see** (ADR-074) | The client's one idempotency key went to Stripe unchanged on every new charge, so a second card after a decline got the first decline replayed or an idempotency error counted as an outage; it is now scoped to the attempt. Finishing 3-D Secure close to expiry is no longer refused as a new charge. A charge settled by webhook is recorded as `SUCCEEDED` on the ledger instead of staying `PROCESSING`. Still wants a run of `stripe-check.sh` with a real test key |
@@ -2169,6 +2171,6 @@ rather than an archaeology.
 | **Money owed and mail stranded are states, not silences** (ADR-069) | A refused refund is `REFUND_FAILED` and answers `409 REFUND_FAILED` — never "refunded in full". A notification claim stranded by a process that died mid-send is dead-lettered by a sweep after 10 minutes, so it shows in the operator's DLQ and a resend works; it used to be acknowledged and never sent |
 | **A pause is a pause** (ADR-066) | A paused sale used to read `CLOSED`: buyers were told it had ended, their streams were closed, the close was **replayed after the resume**, and the event left `/events`. `PAUSED` is now a window status inside the sale window: the line keeps forming in arrival order, nobody is promoted, holds answer `409 SALE_PAUSED` (retryable), a buyer already holding seats can still pay, and `sale-paused` / `sale-resumed` are sent to each replica's own streams and never retained. The admin refusal to pause a draft is `EVENT_NOT_PAUSABLE`. A review then found two things that keep moving while paused: sold-out now un-derives during the pause when expiring holds return seats, and no wait estimate is shown while the line is not moving |
 
-**Verified so far:** 311/311 (228 + 83 new) backend, 58 vitest and 27 Playwright specs, including `SettlementArbiterIT`, which races confirm
+**Verified:** 311/311 (228 + 83 new) backend in both run orders, 58 vitest and 27 Playwright specs, including `SettlementArbiterIT`, which races confirm
 against refund fifteen times with the refund claim staggered across the confirm transaction: both
 endings occur, and every round ends exactly one way. Its resume race — a retry resuming the order while it is being confirmed — failed on its second round until `confirm` held the row (ADR-075). `OutboxRecoveryIT` was also made immune to the context's own relay, which could claim a row in the moment a test left it `PENDING`.
