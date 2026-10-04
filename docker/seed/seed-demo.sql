@@ -22,9 +22,9 @@ INSERT INTO events (
 ) VALUES
 (
     :aurora_id,
-    'Aurora Fest 2026',
-    'Three stages, one night, under the northern lights.',
-    'Riverside Arena',
+    'Coldplay: Music of the Spheres',
+    'Chris Martin and the band bring Yellow, Fix You and Viva la Vida to the stadium, with LED wristbands for every seat.',
+    'Wembley Stadium, London',
     now() + interval '30 days',
     now() + interval '2 minutes',
     now() + interval '8 hours',
@@ -32,9 +32,9 @@ INSERT INTO events (
 ),
 (
     :midnight_id,
-    'Midnight Sessions',
-    'An intimate late set, on sale now.',
-    'The Vault',
+    'Arctic Monkeys: Live',
+    'The Sheffield four play AM, Favourite Worst Nightmare and The Car in full voice.',
+    'Madison Square Garden, New York',
     now() + interval '30 days',
     now() + interval '2 minutes',
     now() + interval '8 hours',
@@ -44,10 +44,10 @@ INSERT INTO events (
 INSERT INTO ticket_tiers (
     id, event_id, tier_name, price_cents, currency, total_capacity, max_per_order
 ) VALUES
-(:aurora_vip_tier_id, :aurora_id, 'VIP', 7500, 'USD', 50, 6),
-(:aurora_floor_tier_id, :aurora_id, 'Floor', 4500, 'USD', 150, 6),
-(:aurora_general_tier_id, :aurora_id, 'General Admission', 2500, 'USD', 500, 6),
-(:midnight_tier_id, :midnight_id, 'General Admission', 3000, 'USD', 200, 4);
+(:aurora_vip_tier_id, :aurora_id, 'VIP', 25000, 'USD', 50, 6),
+(:aurora_floor_tier_id, :aurora_id, 'Floor', 14500, 'USD', 150, 6),
+(:aurora_general_tier_id, :aurora_id, 'General Admission', 8900, 'USD', 500, 6),
+(:midnight_tier_id, :midnight_id, 'General Admission', 9500, 'USD', 200, 4);
 
 SELECT setval('events_id_seq', GREATEST((SELECT MAX(id) FROM events), :midnight_id), true);
 SELECT setval(

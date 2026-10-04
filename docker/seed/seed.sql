@@ -48,9 +48,9 @@ INSERT INTO events (
     event_start_time, sale_start_time, sale_end_time, status
 ) VALUES (
     :event_id,
-    'FlashSeats Load Test',
-    'The 10,000-buyer flash sale. 500 seats, one tier, no second chances.',
-    'Compose Arena',
+    'Metallica: M72 World Tour',
+    'Enter Sandman, Master of Puppets and One, in the round. 500 seats, one tier, no second chances.',
+    'SoFi Stadium, Los Angeles',
     now() + interval '30 days',
     now() + interval '2 minutes',   -- UPCOMING, so pre-warm is legal (ADR-004)
     now() + interval '2 hours',     -- outlasts the run and the replica/Redis drills

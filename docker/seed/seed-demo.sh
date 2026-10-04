@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# Seed the evaluator-facing Aurora Fest and Midnight Sessions catalog.
+# Seed the evaluator-facing Coldplay and Arctic Monkeys catalog.
 # Unlike the concurrent-sale seed, this is for the human browser journey.
 
 set -euo pipefail
@@ -60,7 +60,7 @@ for _ in $(seq 1 90); do
     midnight="$(curl -fsS "${BASE_URL}/api/v1/events/9102" | tr ',' '\n' |
         grep '"windowStatus"' | cut -d'"' -f4 || true)"
     if [[ "$aurora" == "OPEN" && "$midnight" == "OPEN" ]]; then
-        echo "Aurora Fest 2026 and Midnight Sessions are OPEN."
+        echo "Coldplay and Arctic Monkeys are OPEN."
         exit 0
     fi
     sleep 2
