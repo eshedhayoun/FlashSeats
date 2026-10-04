@@ -77,37 +77,39 @@ public class CatalogDevSeeder implements ApplicationRunner {
         Instant saleEnd = octoberThirtieth.plusDays(1).atStartOfDay(ZoneOffset.UTC).toInstant();
 
         Event live = saveEvent(
-                "Aurora Fest 2026",
-                "Three stages, one night, under the northern lights.",
-                "Riverside Arena",
+                "Coldplay: Music of the Spheres",
+                "Chris Martin and the band bring Yellow, Fix You and Viva la Vida to the stadium,"
+                        + " with LED wristbands for every seat.",
+                "Wembley Stadium, London",
                 eventDate,
                 now.minusSeconds(1), // already open, so the demo starts immediately
                 saleEnd);
         List<StockSeed> counters = new ArrayList<>();
-        counters.add(seedTier(live, "VIP", 7_500, 50, 6));
-        counters.add(seedTier(live, "Floor", 4_500, 150, 6));
-        counters.add(seedTier(live, "General Admission", 2_500, 500, 6));
+        counters.add(seedTier(live, "VIP", 25_000, 50, 6));
+        counters.add(seedTier(live, "Floor", 14_500, 150, 6));
+        counters.add(seedTier(live, "General Admission", 8_900, 500, 6));
 
         Event secondLive = saveEvent(
-                "Midnight Sessions",
-                "An intimate late set, on sale now.",
-                "The Vault",
+                "Arctic Monkeys: Live",
+                "The Sheffield four play AM, Favourite Worst Nightmare and The Car in full voice.",
+                "Madison Square Garden, New York",
                 eventDate,
                 now.minusSeconds(1),
                 saleEnd);
-        counters.add(seedTier(secondLive, "General Admission", 3_000, 200, 4));
+        counters.add(seedTier(secondLive, "General Admission", 9_500, 200, 4));
 
         Event upcoming = saveEvent(
-                "מופע חצות 🎵",
-                "A sale that has not opened yet, for the countdown and for pre-warm.",
-                "היכל התרבות",
+                "Billie Eilish: Hit Me Hard and Soft",
+                "Billie and Finneas bring Birds of a Feather, Lunch and Bad Guy to the arena.",
+                "Crypto.com Arena, Los Angeles",
                 eventDate,
                 now.plus(Duration.ofHours(2)),
                 saleEnd);
         // Deliberately NO counter. POST /api/v1/admin/events/{id}/prewarm creates it, and that
         // endpoint refuses any window but UPCOMING — so this event is the only place on the dev
         // profile where ADR-004's seeding path can be exercised at all.
-        tier(upcoming, "General Admission", 3_000, 200, 4);
+        // Opens two hours after startup, for the countdown and for pre-warm.
+        tier(upcoming, "General Admission", 12_000, 200, 4);
 
         log.info(
                 "Seeded dev catalog: event {} OPEN with 700 seats, event {} OPEN with 200 seats,"

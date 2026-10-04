@@ -125,7 +125,7 @@ if ! curl -fsS "http://localhost:${HTTP_PORT}/actuator/health" >/dev/null 2>&1; 
     exit 1
 fi
 
-echo "Seeding the Aurora Fest and Midnight Sessions demonstration sales..."
+echo "Seeding the Coldplay and Arctic Monkeys demonstration sales..."
 bash docker/seed/seed-demo.sh
 
 cat <<EOF

@@ -11,7 +11,6 @@ import { alpha } from "@mui/material/styles";
 import ConfirmationNumberRounded from "@mui/icons-material/ConfirmationNumberRounded";
 import DarkModeRounded from "@mui/icons-material/DarkModeRounded";
 import LightModeRounded from "@mui/icons-material/LightModeRounded";
-import SettingsBrightnessRounded from "@mui/icons-material/SettingsBrightnessRounded";
 import WifiOffRounded from "@mui/icons-material/WifiOffRounded";
 import type { ReactNode } from "react";
 import { Link as RouterLink } from "react-router-dom";
@@ -20,13 +19,10 @@ import { BrandMark } from "../ui/BrandMark";
 import { useColorMode } from "./colorMode";
 import { useOnline } from "./useOnline";
 
-const THEME_LABEL = { system: "system setting", light: "light", dark: "dark" } as const;
-
 export function AppShell({ children }: { children: ReactNode }) {
-  const { preference, cyclePreference } = useColorMode();
+  const { mode, toggleMode } = useColorMode();
   const online = useOnline();
-  const ThemeIcon =
-    preference === "system" ? SettingsBrightnessRounded : preference === "light" ? LightModeRounded : DarkModeRounded;
+  const next = mode === "light" ? "dark" : "light";
 
   return (
     <Box sx={{ minHeight: "100vh", display: "flex", flexDirection: "column", bgcolor: "background.default" }}>
@@ -70,13 +66,9 @@ export function AppShell({ children }: { children: ReactNode }) {
             <Button component={RouterLink} to="/#tickets" color="inherit" startIcon={<ConfirmationNumberRounded />}>
               My tickets
             </Button>
-            <Tooltip title={`Theme: ${THEME_LABEL[preference]}`}>
-              <IconButton
-                onClick={cyclePreference}
-                aria-label={`Colour theme: ${THEME_LABEL[preference]}. Change it`}
-                color="inherit"
-              >
-                <ThemeIcon />
+            <Tooltip title={`Switch to ${next} mode`}>
+              <IconButton onClick={toggleMode} aria-label={`Switch to ${next} mode`} color="inherit">
+                {mode === "light" ? <DarkModeRounded /> : <LightModeRounded />}
               </IconButton>
             </Tooltip>
           </Toolbar>
