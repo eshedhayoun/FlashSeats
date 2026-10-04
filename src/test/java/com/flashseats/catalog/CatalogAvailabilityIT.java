@@ -5,6 +5,8 @@ import static org.assertj.core.api.Assertions.assertThat;
 import com.flashseats.app.support.BuyerSession;
 import com.flashseats.app.support.IntegrationTest;
 import com.flashseats.app.support.SaleFixture;
+import java.util.ArrayList;
+import java.util.List;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
@@ -83,5 +85,27 @@ class CatalogAvailabilityIT extends IntegrationTest {
                         .get("availability")
                         .asString())
                 .isEqualTo("PLENTY");
+    }
+
+    @Test
+    @DisplayName("The event index lists every published sale with its window, by sale start, and nothing else")
+    void theIndexListsPublishedSalesWithTheirWindow() {
+        long closed = fixture.closedEvent("Last Night");
+        long open = fixture.openEvent("Tonight");
+        long upcoming = fixture.upcomingEvent("Tomorrow");
+        long cancelled = fixture.upcomingEvent("Called Off");
+        fixture.setEventStatus(cancelled, "CANCELLED");
+
+        var listed = new BuyerSession(port).get("/events").json();
+
+        List<Long> ids = new ArrayList<>();
+        List<String> windows = new ArrayList<>();
+        listed.forEach(event -> {
+            ids.add(event.get("eventId").asLong());
+            windows.add(event.get("windowStatus").asString());
+        });
+        // A finished sale is still published, so it stays listed as CLOSED; a cancelled one is not.
+        assertThat(ids).containsExactly(closed, open, upcoming);
+        assertThat(windows).containsExactly("CLOSED", "OPEN", "UPCOMING");
     }
 }
