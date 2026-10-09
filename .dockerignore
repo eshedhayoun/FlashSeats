@@ -22,6 +22,7 @@ Dockerfile
 .env
 .env.*
 
+
 # Dependencies and build output are recreated inside the frontend build stage.
 frontend/node_modules/
 frontend/dist/
