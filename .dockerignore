@@ -21,7 +21,7 @@ Dockerfile
 .dockerignore
 .env
 .env.*
-!frontend/.env.local
+
 
 # Dependencies and build output are recreated inside the frontend build stage.
 frontend/node_modules/
