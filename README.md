@@ -321,6 +321,12 @@ npm run dev                         # http://localhost:5173, /api proxied to :80
 npm test                            # vitest unit tests
 npm run test:e2e                    # the FE_SPEC §8 Playwright suite against the real backend;
                                     # needs `./mvnw spring-boot:run` (the dev profile) on :8080
+#might need before npm run test:e2e
+npm ci
+cp .env.example .env.local
+npx playwright install chromium
+#if you ran npm test before 
+docker/scripts/dev-up.sh --reset
 ```
 
 The Docker build deliberately excludes `frontend/.env.local`, so a developer's optional Stripe
