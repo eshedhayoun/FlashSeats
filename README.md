@@ -385,7 +385,7 @@ resend test instructon:
 in .env file
 comment out the default mail confirugation and uncomment the resend one
 having used the free one simply to prove the app is ready for real mail intagration.
-meaning we havent bought a domain for it it can only send to the mail of the user of the resend acount which for the key re_221vY5QW_2446HiSAH3cDUafktJCf4erB is sherers@post.bgu.ac.il
+meaning we havent bought a domain for it it can only send to the mail of the user of the resend acount which for the key re_Y3iAYpcW_4wDYq9g_GAP_c8cyZ2Y6w1wcXG2xf (remove the _GAP_ to run key) is sherers@post.bgu.ac.il
 and can only send 300 mails a day so make sure to use the mail pit settings to run concurrency tests
 ```
 
