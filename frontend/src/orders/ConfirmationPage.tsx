@@ -98,9 +98,13 @@ export function ConfirmationPage() {
       .catch(() => undefined); // the order stands on its own without the event's details
   }, [eventId]);
 
+  
   useEffect(() => {
-    if (receipt?.status === "CONFIRMED") rememberOrder(receipt, event?.title ?? "FlashSeats event");
+    if (receipt?.status !== "CONFIRMED" || !event?.title) return;
+
+    rememberOrder(receipt, event.title);
   }, [receipt, event?.title]);
+
 
   const download = async () => {
     setTicket({ kind: "working" });
