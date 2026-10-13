@@ -375,6 +375,20 @@ and get OOM-killed under load (ADR-062). What the drills measured is in
 restoration (ADR-003) both behave perfectly on a single instance and break on three if implemented
 naively. A single-instance test cannot see either bug.
 
+```
+stripe test instructions:
+after having copied both env.example into .env and copied in frontend .env.example into 
+env.local uncomment the lines containing the keys and comment out the one without
+to use the stripe set up. and of course swtich STRIPE_ENABLED=true
+
+resend test instructon:
+in .env file
+comment out the default mail confirugation and uncomment the resend one
+having used the free one simply to prove the app is ready for real mail intagration.
+meaning we havent bought a domain for it it can only send to the mail of the user of the resend acount which for the key re_221vY5QW_2446HiSAH3cDUafktJCf4erB is sherers@post.bgu.ac.il
+and can only send 300 mails a day so make sure to use the mail pit settings to run concurrency tests
+```
+
 ### Docker layout
 
 ```
@@ -462,3 +476,28 @@ Fifteen review passes over the built code followed — correctness, the Redis fa
 three-replica cluster, the operator surface, real payments, concurrent sales, the React client and
 the 10,000-buyer drill — each logged in [`docs/06-mvp-overview.md`](docs/06-mvp-overview.md) §13.
 79 ADRs record every decision and the failure it prevents.
+
+
+### tests metrics passed
+
+backend with ./mvnw test
+
+
+
+frontend with npm test 
+![alt text](forntend_test.png)
+
+
+frontend with npm run test:e2e 
+![alt text](test_e2e.png.png)
+
+
+
+concurrency test
+
+
+
+real email ticket sale
+![email test](emailtest.png)
+
+
