@@ -481,7 +481,7 @@ the 10,000-buyer drill — each logged in [`docs/06-mvp-overview.md`](docs/06-mv
 ### tests metrics passed
 
 backend with ./mvnw test
-
+![alt text](backend_test.png)
 
 
 frontend with npm test 
