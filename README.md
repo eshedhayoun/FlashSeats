@@ -489,7 +489,7 @@ frontend with npm test
 
 
 frontend with npm run test:e2e 
-![alt text](test_e2e.png.png)
+![alt text](test_e2e.png)
 
 
 
