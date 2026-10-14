@@ -505,14 +505,14 @@ real email ticket sale
 we set out to create the foundation of a ticket sales app in order to learn the foundation
 of desigining such app:
 
-> database mangement: achieved through PostgreSQL and rdis to manage the amount of requests
+# database mangement: achieved through PostgreSQL and rdis to manage the amount of requests
   received (also aplies to the concurrency part). where we learned how to manage large amount of data efficiently and how to set up test scenarios on such scale.
-> concurrency: acheived through the 3 replicas rdis and the genral app module we learned how
+# concurrency: acheived through the 3 replicas rdis and the genral app module we learned how
   to proccess a large number of requests efficiently.
-> user side journy: thorught the use of react and typescript we learned how to develop
+# user side journy: thorught the use of react and typescript we learned how to develop
   a frontend intuitive to the user and how to replicate the e2e journy inorder to discover
   any issues that may arise for the user while using the app
-> testing: we learned how to create a thourgh tests to all aspects of the app the backend the 
+# testing: we learned how to create a thourgh tests to all aspects of the app the backend the 
   frontend and the concurrency allowing us to understand how much work is required to make sure 
   an app "works" from automated tests to make sure the smaller parts (the individual classes and methods) function as intended,
   to the scripts and scenarios required to construct more thorugh tests of part of the system
