@@ -508,7 +508,8 @@ of desigining such app:
 #### database mangement: 
   achieved through PostgreSQL and rdis to manage the amount of requests
   received (also aplies to the concurrency part). where we learned how to manage large amount of data efficiently and how to set up test scenarios on such scale.
- concurrency: acheived through the 3 replicas rdis and the genral app module we learned how
+#### concurrency: 
+  acheived through the 3 replicas rdis and the genral app module we learned how
   to proccess a large number of requests efficiently.
 #### user side journy: 
   thorught the use of react and typescript we learned how to develop
