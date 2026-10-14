@@ -501,3 +501,31 @@ real email ticket sale
 ![email test](emailtest.png)
 
 
+### conclusion
+we set out to create the foundation of a ticket sales app in order to learn the foundation
+of desigining such app:
+
+> database mangement: achieved through PostgreSQL and rdis to manage the amount of requests
+  received (also aplies to the concurrency part). where we learned how to manage large amount of data efficiently and how to set up test scenarios on such scale.
+> concurrency: acheived through the 3 replicas rdis and the genral app module we learned how
+  to proccess a large number of requests efficiently.
+> user side journy: thorught the use of react and typescript we learned how to develop
+  a frontend intuitive to the user and how to replicate the e2e journy inorder to discover
+  any issues that may arise for the user while using the app
+> testing: we learned how to create a thourgh tests to all aspects of the app the backend the 
+  frontend and the concurrency allowing us to understand how much work is required to make sure 
+  an app "works" from automated tests to make sure the smaller parts (the individual classes and methods) function as intended,
+  to the scripts and scenarios required to construct more thorugh tests of part of the system
+  for example in the proffesor demo scrypt in order to quiclly create and tests the neccery
+  docker sturcts to test the app demo and devup scrupt to test the front end and so on
+  we learned to appreciate just how much app testing and bug fixing is development step of its own in a new capcity compare to smaller projects
+
+overall we have found this project to be an incrediable educational expreince providing us
+with great insight into the world of app developing. and tought us lessons in project managment 
+that will cerantly be of great use to us in our futre careers.
+
+### collaborators:
+
+eshed hayoun
+adar gerbi
+shoham sherer
