@@ -2158,6 +2158,26 @@ rather than an archaeology.
   five screenshots of the React client on the cluster plus the delivered ticket email; the three
   test-run screenshots were removed, since the results are recorded here.
   No behaviour changed.
+- **A fresh clone runs, on the stub and on real Stripe (15 Oct 2026).** Cloned `main` anonymously
+  from GitHub, isolated Compose project, nothing pre-existing:
+  - `professor-demo.sh` exits 0 and opens both sales. A full purchase through nginx works:
+    declined card `402` with the hold intact, confirmed order, PDF download, and the ticket email in
+    Mailpit with the PDF attached.
+  - With the reviewer's Stripe test keys applied as the credentials sheet instructs, the gateway
+    logs `Stripe`, the publishable key is in the served bundle, and `stripe-check.sh` **passes**:
+    charge, 3-D Secure `402` with a client secret, webhook delivered, redelivery deduplicated. This
+    is the run ADR-074 was waiting for.
+  - Playwright drove the real PaymentElement: `4000…0002` declined with the seats still held,
+    `4242…` then confirmed, and `4000…3184` completed the challenge and confirmed.
+  - Applying the keys *after* a stub run and rerunning the demo switches both sides, because the
+    rerun rebuilds the nginx image (`frontend/.env.local` is part of its build context) and recreates
+    the app.
+- **`stripe-check.sh` reported a running Stripe gateway as the stub**, intermittently.
+  `grep -q` exits at its first match, `docker compose logs` dies of SIGPIPE, and `pipefail` marks
+  the pipeline failed. Both checks now use a plain `grep`.
+- `.gitattributes` keeps `.env.example`, `frontend/.env.example` and everything under `docker/`
+  LF. With Git for Windows' default `core.autocrlf=true`, a CRLF `.env` defeated `gen-env.sh`'s
+  exact matches, so no secret was generated and `SecretsGuard` refused the cluster.
 
 ### Pass 15 — submission readiness
 
