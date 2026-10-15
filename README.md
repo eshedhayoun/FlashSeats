@@ -7,7 +7,8 @@ they all arrive in the same second.** Exactly 500 must sell, nobody may be charg
 did not get, and the 9,500 who miss out must find out quickly. The system is built as a modular
 monolith on Java 21 and Spring Boot 4, runs as three replicas behind nginx, and has a React client.
 
-**Quick start.** You need only Docker and a POSIX shell (Git Bash on Windows):
+**Quick start.** You need only Docker and a POSIX shell (Git Bash on Windows). The first run builds
+the images and takes several minutes; give Docker at least 8 GB of memory.
 
 ```bash
 docker/scripts/professor-demo.sh     # secrets, a three-replica cluster, two open sales; prints the admin password

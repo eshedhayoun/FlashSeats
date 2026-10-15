@@ -157,9 +157,11 @@ npm run test:e2e                    # the FE_SPEC §8 Playwright suite against t
 On a fresh machine, run `npm ci` and `npx playwright install chromium` once before the E2E suite.
 Run `docker/scripts/dev-up.sh --reset` when the test database needs a fresh open sale.
 
-The Docker build deliberately excludes `frontend/.env.local`, so a developer's optional Stripe
-publishable key cannot change the evaluator's image. The cluster's payment mode is set in the root
-`.env`: `STRIPE_ENABLED=false` for the deterministic stub, `true` for real Stripe.
+The cluster's nginx image builds the client from `frontend/`, so it **includes**
+`frontend/.env.local`: a publishable key there is baked into the client served at `:8080`. The
+backend's payment mode is set in the root `.env`: `STRIPE_ENABLED=false` for the deterministic stub,
+`true` for real Stripe. Set both sides together. To return to the stub, blank the key, set
+`STRIPE_ENABLED=false`, and rerun `professor-demo.sh`, which rebuilds the image.
 
 With no `VITE_STRIPE_PUBLISHABLE_KEY`, the checkout offers the stub's outcomes directly: succeed,
 decline, gateway outage, 3-D Secure. This is the easiest way to walk the failure branches in a
