@@ -1,5 +1,7 @@
 # FlashSeats
 
+**Team members:** Eshed Hayoun · Adar Gerbi · Shoham Sherer
+
 A high-concurrency ticket flash-sale engine, built as a **modular monolith** on Java 21 and Spring
 Boot 4.
 
@@ -559,9 +561,3 @@ outcomes were:
 Overall, the project provided practical experience in system design, concurrency, testing, failure
 recovery, and team coordination. Most importantly, it demonstrated how to turn architectural claims
 such as “no overselling” into measurable results that can be reproduced and audited.
-
-## Collaborators
-
-- Eshed Hayoun
-- Adar Gerbi
-- Shoham Sherer
