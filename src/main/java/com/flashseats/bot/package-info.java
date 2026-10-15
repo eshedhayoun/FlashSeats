@@ -1,20 +1,14 @@
 /**
- * Gatekeeping — the first thing every request touches.
+ * Rate limiting and bot defence, the first thing every API request touches. Identity itself
+ * ({@code fsid}) is {@code shared}'s.
  *
- * <p>Issues the signed {@code fsid} cookie the rest of the system treats as identity, and enforces
- * rate limits before any business logic runs.
+ * <p>Aggressive against sessions, conservative against IPs: thousands of legitimate buyers share
+ * carrier NAT during a spike (ADR-011). {@code queue} calls in on join through
+ * {@link com.flashseats.bot.facade.BotFacade}; this module depends on nothing but {@code shared}.
  *
- * <p><strong>Design stance:</strong> aggressive against sessions, conservative against IPs. During a
- * flash sale thousands of legitimate humans arrive at once, many behind the same carrier-grade NAT;
- * a tight per-IP limit would block them all during exactly the spike this system exists to serve
- * (ADR-011).
- *
- * <p>The filters here are servlet infrastructure, not facade callers — no other module references a
- * type in this package. Identity reaches them as a request attribute
- * ({@link com.flashseats.shared.identity.SessionId#REQUEST_ATTRIBUTE}).
- *
- * <p>MVP scope: cookie identity and rate limits. reCAPTCHA, {@code ip_rules} and audit logging are
- * deferred — this module writes no tables.
+ * <p><strong>Verification fails open</strong> (ADR-011, ADR-055). The per-request path never touches
+ * the database: buckets live in Redis and address rules in a TTL snapshot, because a filter that
+ * queries to shed load sits inside the pool it protects (ADR-051).
  */
 @org.springframework.modulith.ApplicationModule(displayName = "Bot Defence")
 package com.flashseats.bot;

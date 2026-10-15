@@ -1,9 +1,13 @@
 package com.flashseats.order.config;
 
+import lombok.Getter;
+import lombok.Setter;
 import org.springframework.boot.context.properties.ConfigurationProperties;
 
 /** Checkout and outbox tunables. */
 @ConfigurationProperties(prefix = "flashseats.order")
+@Getter
+@Setter
 public class OrderProperties {
 
     /**
@@ -22,69 +26,24 @@ public class OrderProperties {
     private int minRemainingSecondsForRetry = 45;
 
     /**
-     * How long a {@code PENDING} order is presumed to have a charge in flight (ADR-034).
-     *
-     * <p>Past this, the row is treated as stranded and a retry resumes it on the same order number.
-     * It mirrors {@code flashseats.payment.inflight-ttl-seconds} — the duplicate-click guard whose
-     * expiry means no charge can still be running — but is declared here rather than read across
-     * the module boundary.
-     *
-     * <p><strong>Never zero.</strong> A value below the gateway timeout would let a second request
-     * start a charge while the first is still live.
+     * How long a {@code PENDING} order is presumed to have a charge in flight (ADR-034); past it, a
+     * retry resumes the order. It mirrors {@code flashseats.payment.inflight-ttl-seconds}. Never below
+     * the gateway timeout, or a second charge could start while the first is live.
      */
     private int stalePendingSeconds = 90;
+
+    /**
+     * How long a rebuild waits between its two ledger snapshots, so a reserve whose hold row has not
+     * yet committed is caught by the second read. Must comfortably exceed one local INSERT.
+     */
+    private int rebuildSettleMillis = 1_000;
+
+    /** How often the stock-drift gauge is recomputed (ADR-045, invariant 1). */
+    private int driftIntervalMs = 60_000;
 
     /** Signs receipt tokens. Rotating it invalidates every outstanding receipt link. */
     private String receiptSecret = "dev-only-change-me";
 
     /** How long a receipt link stays usable (ADR-039). Long enough to survive a forwarded email. */
     private int receiptTokenTtlDays = 90;
-
-    public int getCheckoutGraceMinutes() {
-        return checkoutGraceMinutes;
-    }
-
-    public void setCheckoutGraceMinutes(int checkoutGraceMinutes) {
-        this.checkoutGraceMinutes = checkoutGraceMinutes;
-    }
-
-    public int getMaxPaymentAttempts() {
-        return maxPaymentAttempts;
-    }
-
-    public void setMaxPaymentAttempts(int maxPaymentAttempts) {
-        this.maxPaymentAttempts = maxPaymentAttempts;
-    }
-
-    public int getMinRemainingSecondsForRetry() {
-        return minRemainingSecondsForRetry;
-    }
-
-    public void setMinRemainingSecondsForRetry(int minRemainingSecondsForRetry) {
-        this.minRemainingSecondsForRetry = minRemainingSecondsForRetry;
-    }
-
-    public int getStalePendingSeconds() {
-        return stalePendingSeconds;
-    }
-
-    public void setStalePendingSeconds(int stalePendingSeconds) {
-        this.stalePendingSeconds = stalePendingSeconds;
-    }
-
-    public String getReceiptSecret() {
-        return receiptSecret;
-    }
-
-    public void setReceiptSecret(String receiptSecret) {
-        this.receiptSecret = receiptSecret;
-    }
-
-    public int getReceiptTokenTtlDays() {
-        return receiptTokenTtlDays;
-    }
-
-    public void setReceiptTokenTtlDays(int receiptTokenTtlDays) {
-        this.receiptTokenTtlDays = receiptTokenTtlDays;
-    }
 }

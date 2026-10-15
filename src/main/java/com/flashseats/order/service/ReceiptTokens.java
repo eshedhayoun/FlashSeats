@@ -10,29 +10,13 @@ import java.util.UUID;
 import org.springframework.stereotype.Component;
 
 /**
- * Signs and verifies the receipt token — a capability that grants read access to exactly one order.
+ * Signs and verifies the receipt token: a capability to read exactly one order, so the email link
+ * works on another device with no session (ADR-010).
  *
- * <p>It exists so the link in a confirmation email works: the buyer may open it on a different
- * device, in a different browser, weeks later, with no session cookie. Without it, the alternative
- * is a public lookup by order number, which is how an earlier design leaked buyers' email addresses
- * against a guessable reference (ADR-010).
- *
- * <p>Payload is {@code orderNumber:expiryEpochSecond:nonce}, mirroring
- * {@link com.flashseats.queue.service.QueueTokens} — and every field is there for a reason
- * (ADR-039):
- *
- * <ul>
- *   <li><strong>expiry</strong> — a receipt link travels through forwarded mail, browser history and
- *       {@code Referer} headers. An unlimited-lifetime capability in a URL is one that leaks and
- *       then keeps working. The buyer's cookie is the path that never expires; this is the one that
- *       has to.
- *   <li><strong>nonce</strong> — without it the token is a pure function of the order number and the
- *       secret. Combined with sequential order numbers, anyone who learned the secret could derive
- *       every buyer's link by counting, rather than having to observe one.
- * </ul>
- *
- * <p>The token is also domain-separated by kind, so it can never verify as the session cookie or a
- * queue pass even where a deployment reuses one secret.
+ * <p>Payload is {@code orderNumber:expiryEpochSecond:nonce}, like {@code QueueTokens} (ADR-039). The
+ * expiry exists because a link in mail and history leaks and must stop working. The nonce exists
+ * because without it the token is derivable from sequential order numbers. Domain-separated by
+ * kind, so it never verifies as another token type.
  */
 @Component
 public class ReceiptTokens {

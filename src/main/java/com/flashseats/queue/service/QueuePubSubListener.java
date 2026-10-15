@@ -8,14 +8,9 @@ import org.springframework.stereotype.Component;
 import tools.jackson.databind.ObjectMapper;
 
 /**
- * Delivers queue frames published by <em>any</em> replica to the connections held by <em>this</em>
- * one.
- *
- * <p>This class is the fix for the defect that most often breaks a waiting room in production. The
- * promotion worker runs on a single replica; a buyer's {@code SseEmitter} lives wherever the load
- * balancer happened to put them. Without this fan-out the system works perfectly on one instance and
- * silently drops roughly two-thirds of promotions on three — and no single-instance test can see it
- * (ADR-007).
+ * Delivers frames published by <em>any</em> replica to the connections held by <em>this</em> one.
+ * Without it the waiting room works on one instance and drops about two-thirds of promotions on
+ * three (ADR-007).
  */
 @Slf4j
 @Component
@@ -37,9 +32,16 @@ public class QueuePubSubListener implements MessageListener {
                     json.readValue(message.getBody(), QueueChannelMessage.class);
 
             if (frame.isBroadcast()) {
-                emitters.broadcast(eventIdOf(channel), frame.type(), frame.data());
+                if ("sale-closed".equals(frame.type())) {
+                    emitters.closeAll(eventIdOf(channel), frame.type(), frame.data(), frame.id());
+                } else {
+                    emitters.broadcast(eventIdOf(channel), frame.type(), frame.data(), frame.id());
+                }
             } else {
-                emitters.send(frame.sessionId(), frame.type(), frame.data());
+                // Addressed to the session's streams for THIS event only. A session queued in two
+                // sales holds a stream for each, and a pass for one must never reach the other's tab,
+                // which would spend it on the wrong sale (ADR-036, ADR-070).
+                emitters.send(frame.sessionId(), eventIdOf(channel), frame.type(), frame.data(), frame.id());
             }
         } catch (Exception malformed) {
             log.warn("Ignoring unreadable queue frame on {}", channel, malformed);

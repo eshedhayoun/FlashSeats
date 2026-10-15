@@ -3,12 +3,14 @@ package com.flashseats.queue.controller;
 import com.flashseats.queue.dto.AdmitRequest;
 import com.flashseats.queue.dto.AdmitResponse;
 import com.flashseats.queue.dto.JoinQueueRequest;
+import com.flashseats.queue.dto.LeaveQueueRequest;
 import com.flashseats.queue.dto.QueueStatusResponse;
+import com.flashseats.queue.service.QueueBroadcaster;
 import com.flashseats.queue.service.QueueService;
-import com.flashseats.queue.service.SseEmitterRegistry;
 import com.flashseats.shared.identity.SessionId;
+import com.flashseats.shared.web.ClientAddress;
+import jakarta.servlet.http.HttpServletRequest;
 import jakarta.validation.Valid;
-import java.time.Duration;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
 import org.springframework.web.bind.annotation.GetMapping;
@@ -26,46 +28,39 @@ import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
 @RequestMapping("/api/v1/queue")
 public class QueueController {
 
-    /**
-     * A wait can legitimately last an hour, so the stream must outlive any default. Nginx is
-     * configured with a matching {@code proxy_read_timeout}; a shorter value at either end severs
-     * every stream on a timer and looks to the buyer like a broken connection.
-     */
-    private static final long STREAM_TIMEOUT_MS = Duration.ofHours(1).toMillis();
-
     private final QueueService queue;
-    private final SseEmitterRegistry emitters;
+    private final QueueBroadcaster broadcaster;
 
-    public QueueController(QueueService queue, SseEmitterRegistry emitters) {
+    public QueueController(QueueService queue, QueueBroadcaster broadcaster) {
         this.queue = queue;
-        this.emitters = emitters;
+        this.broadcaster = broadcaster;
     }
 
-    /** Joins the line. Idempotent — rejoining preserves the original position. */
+    /** Joins the line. Idempotent: rejoining keeps the original position (ADR-008). */
     @PostMapping("/join")
     @ResponseStatus(HttpStatus.ACCEPTED)
-    public QueueStatusResponse join(@Valid @RequestBody JoinQueueRequest request, SessionId session) {
-        return queue.join(session.value(), request.eventId());
+    public QueueStatusResponse join(
+            @Valid @RequestBody JoinQueueRequest request, SessionId session, HttpServletRequest http) {
+        return queue.join(
+                session.value(), request.eventId(), request.recaptchaToken(), ClientAddress.of(http));
     }
 
     /**
-     * The polling fallback, and the reconnect path.
-     *
-     * <p>Returns the pass if one was minted while the client was away, which is what stops a
-     * promotion from being lost to a dead socket (ADR-007).
+     * Steps out of the line. Idempotent, and joining again starts at the back, which is what leaving
+     * means (FE_SPEC V2).
      */
+    @PostMapping("/leave")
+    @ResponseStatus(HttpStatus.NO_CONTENT)
+    public void leave(@Valid @RequestBody LeaveQueueRequest request, SessionId session) {
+        queue.leave(session.value(), request.eventId());
+    }
+
     @GetMapping("/status")
     public QueueStatusResponse status(@RequestParam long eventId, SessionId session) {
         return queue.status(session.value(), eventId);
     }
 
-    /**
-     * Exchanges the single-use pass for a browse session.
-     *
-     * <p>{@code eventId} arrives in the body, like every other {@code POST} here and as
-     * {@code FE_SPEC.md} §2 specifies. It was a query parameter, which worked only because the demo
-     * client was written against the code rather than against the contract.
-     */
+    /** Exchanges the single-use pass for an admission. {@code eventId} is in the body (FE_SPEC §2). */
     @PostMapping("/admit")
     public AdmitResponse admit(
             @Valid @RequestBody AdmitRequest request,
@@ -75,25 +70,21 @@ public class QueueController {
     }
 
     /**
-     * Live position updates.
+     * Live position updates: {@code position-update}, {@code queue-promoted},
+     * {@code tier-availability}, {@code sale-exhausted}, {@code sale-closed}, {@code sale-paused},
+     * {@code sale-resumed}, plus comment heartbeats. A client that cannot hold
+     * a stream polls {@code /queue/status}, which returns the same information.
      *
-     * <p>Frames: {@code position-update} (clamped monotonic), {@code queue-promoted},
-     * {@code sale-exhausted}, {@code sale-closed}, plus comment heartbeats. Every frame carries an
-     * id so a reconnect can send {@code Last-Event-ID}.
-     *
-     * <p>If the stream cannot be established at all the client polls {@code /queue/status}, which
-     * returns the same information — the buyer should never have to care which transport is live.
+     * <p>{@code Last-Event-ID} is what a browser's EventSource sends by itself; the query parameter
+     * is for clients that cannot set a header.
      */
     @GetMapping(value = "/stream", produces = MediaType.TEXT_EVENT_STREAM_VALUE)
-    public SseEmitter stream(@RequestParam long eventId, SessionId session) {
-        SseEmitter emitter = emitters.register(session.value(), eventId, STREAM_TIMEOUT_MS);
-
-        // Send the current position immediately: an empty stream for the first two seconds looks
-        // like a failure to connect.
-        var state = queue.getQueueState(session.value(), eventId);
-        if (state.position() != null) {
-            emitters.sendPosition(session.value(), state.position(), state.estWaitSeconds());
-        }
-        return emitter;
+    public SseEmitter stream(
+            @RequestParam long eventId,
+            @RequestParam(value = "lastEventId", required = false) String lastEventId,
+            @RequestHeader(value = "Last-Event-ID", required = false) String lastEventIdHeader,
+            SessionId session) {
+        return broadcaster.connect(
+                session.value(), eventId, lastEventIdHeader != null ? lastEventIdHeader : lastEventId);
     }
 }

@@ -5,9 +5,12 @@ import com.flashseats.order.dto.OrderReceiptResponse;
 import com.flashseats.order.service.CheckoutOutcome;
 import com.flashseats.order.service.CheckoutService;
 import com.flashseats.order.service.OrderQueryService;
+import com.flashseats.order.service.TicketDownloadService;
 import com.flashseats.shared.identity.SessionId;
 import jakarta.validation.Valid;
+import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpStatus;
+import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
@@ -24,10 +27,13 @@ public class OrderController {
 
     private final CheckoutService checkout;
     private final OrderQueryService orders;
+    private final TicketDownloadService tickets;
 
-    public OrderController(CheckoutService checkout, OrderQueryService orders) {
+    public OrderController(
+            CheckoutService checkout, OrderQueryService orders, TicketDownloadService tickets) {
         this.checkout = checkout;
         this.orders = orders;
+        this.tickets = tickets;
     }
 
     /**
@@ -56,5 +62,31 @@ public class OrderController {
             @RequestParam(required = false) String receiptToken,
             SessionId session) {
         return orders.readAuthorised(orderNumber, session.value(), receiptToken);
+    }
+
+    /**
+     * The ticket itself (ADR-050), authorised exactly like the receipt: session cookie or
+     * {@code receiptToken}. It exists so a mistyped email address still leaves the buyer a way to their
+     * ticket. {@code inline} so a phone at the door shows it on screen.
+     *
+     * <p>No {@code produces} on the mapping: it would also constrain the error responses, turning every
+     * problem+json failure here into an uncoded {@code 406}. The content type is set on the success body.
+     */
+    @GetMapping("/{orderNumber}/ticket.pdf")
+    public ResponseEntity<byte[]> ticket(
+            @PathVariable String orderNumber,
+            @RequestParam(required = false) String receiptToken,
+            SessionId session) {
+
+        byte[] pdf = tickets.render(orderNumber, session.value(), receiptToken);
+        return ResponseEntity.ok()
+                .contentType(MediaType.APPLICATION_PDF)
+                .header(
+                        HttpHeaders.CONTENT_DISPOSITION,
+                        "inline; filename=\"" + orderNumber + ".pdf\"")
+                // A ticket is a bearer document and the URL can carry a 90-day token. Keep it out of
+                // shared caches entirely.
+                .header(HttpHeaders.CACHE_CONTROL, "private, no-store")
+                .body(pdf);
     }
 }

@@ -4,12 +4,11 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.awaitility.Awaitility.await;
 
-import com.flashseats.flashseats.support.BuyerSession;
-import com.flashseats.flashseats.support.IntegrationTest;
-import com.flashseats.flashseats.support.SaleFixture;
+import com.flashseats.app.support.BuyerSession;
+import com.flashseats.app.support.IntegrationTest;
+import com.flashseats.app.support.SaleFixture;
 import com.flashseats.hold.exception.HoldAlreadySettledException;
 import com.flashseats.hold.facade.HoldFacade;
-import com.flashseats.hold.facade.HoldReleaseReason;
 import java.time.Duration;
 import java.util.Map;
 import java.util.concurrent.CountDownLatch;
@@ -76,7 +75,12 @@ class HoldLifecycleIT extends IntegrationTest {
     @Test
     @DisplayName("Ten threads releasing the same hold restore its seats once, not ten times")
     void concurrentReleasesRestoreOnce() throws Exception {
-        String holdToken = newHold(3);
+        // Driven through DELETE /holds/{token} — the path a buyer actually takes. This used to call
+        // HoldFacade.releaseHold, which no production code ever called: the facade method, its enum
+        // and the service method behind it existed so this test could reach them. Nothing in the
+        // system releases a hold that way, because ADR-001 has a decline deliberately RETAIN it.
+        BuyerSession buyer = admittedBuyer();
+        String holdToken = reserve(buyer, admissionToken, 3).text("holdToken");
         assertThat(fixture.remaining(tierId)).isEqualTo(CAPACITY - 3);
 
         int racers = 10;
@@ -87,7 +91,7 @@ class HoldLifecycleIT extends IntegrationTest {
             for (int i = 0; i < racers; i++) {
                 pool.submit(() -> {
                     startLine.await();
-                    holds.releaseHold(holdToken, HoldReleaseReason.USER_CANCEL);
+                    buyer.delete("/holds/" + holdToken);
                     completed.incrementAndGet();
                     return null;
                 });
@@ -138,10 +142,14 @@ class HoldLifecycleIT extends IntegrationTest {
         assertThat(second.status()).isEqualTo(409);
         assertThat(second.errorCode()).isEqualTo("HOLD_LIMIT_EXCEEDED");
 
-        // The rejected attempt must not have cost the tier any inventory: the decrement and the
-        // insert share a transaction, so the constraint violation rolled both back.
+        // The rejected attempt must not have cost the tier any inventory — and this is no longer
+        // free. The decrement is a Redis write that happens BEFORE the insert and cannot roll back
+        // with it, so those two seats come back only because the constraint violation is caught and
+        // explicitly compensated. A buyer double-clicking is the ordinary way to reach this path;
+        // without the compensation every double-click would quietly burn seats.
         assertThat(fixture.remaining(tierId)).isEqualTo(CAPACITY - 2);
         assertThat(fixture.countHolds("ACTIVE")).isEqualTo(1);
+        assertThat(fixture.stockInvariantHolds(tierId)).isTrue();
     }
 
     @Test
@@ -165,7 +173,7 @@ class HoldLifecycleIT extends IntegrationTest {
         // oversells. That pause is the subject of QueueLifecycleIT; what this test is about is what
         // the buyer sees when they reach a tier whose counter is missing.
         BuyerSession buyer = admittedBuyer();
-        long unwarmedTier = fixture.tierWithoutInventory(eventId, "Balcony", 3_000, 50);
+        long unwarmedTier = fixture.tierWithoutCounter(eventId, "Balcony", 3_000, 50);
 
         var response = buyer.post(
                 "/holds",
@@ -191,7 +199,13 @@ class HoldLifecycleIT extends IntegrationTest {
     private BuyerSession admittedBuyer() {
         BuyerSession buyer = new BuyerSession(port);
         buyer.get("/events/" + eventId);
-        buyer.post("/queue/join", Map.of("eventId", eventId));
+
+        // Asserted, not discarded. A refused join makes every later step fail as a 15 s timeout
+        // waiting for a pass that was never going to come, which says nothing about why.
+        var join = buyer.post("/queue/join", Map.of("eventId", eventId));
+        assertThat(join.ok())
+                .describedAs("join refused: %s %s", join.status(), join.rawBody())
+                .isTrue();
 
         String passToken = await().atMost(Duration.ofSeconds(15))
                 .until(() -> buyer.get("/queue/status?eventId=" + eventId).text("passToken"),

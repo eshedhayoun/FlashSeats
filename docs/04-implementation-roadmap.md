@@ -13,9 +13,9 @@
 | Phase | Objective | Core work | Exit criterion |
 | :--- | :--- | :--- | :--- |
 | **1** | Correct single-user transaction | catalog, hold, mock payment, order, outbox rows | Two parallel requests for the last ticket → exactly one succeeds — **done, and tested** |
-| **2** | Move the hot path to RAM | Redis stock + Lua, ZSET queue, SSE, pass tokens | Same guarantee at 1,000 concurrent requests — **queue, SSE and passes done; Lua and the rebuild are not** |
-| **3** | Defence and real money | bot, Stripe, webhooks, Resilience4j | Payments survive tab closure; floods are throttled — **cookie identity and rate limits done; Stripe and reCAPTCHA are not** |
-| **4** | Async fulfilment and scale | RabbitMQ, PDFBox, email, Nginx, k6 | 10,000 users / 500 tickets / zero overbooking / 500 emails — **fulfilment done on one replica; the cluster and load runs are not** |
+| **2** | Move the hot path to RAM | Redis stock + Lua, ZSET queue, SSE, pass tokens | Same guarantee at 1,000 concurrent requests — **done** (ADR-046), bar the `hold:{token}` timer, deferred to Phase 4 |
+| **3** | Defence and real money | bot, Stripe, webhooks, Resilience4j | Payments survive tab closure; floods are throttled — **done** in Pass 9 (ADR-052-055): Stripe, the webhook receiver, 3-D Secure, two circuit breakers, reCAPTCHA failing open |
+| **4** | Async fulfilment and scale | RabbitMQ, PDFBox, email, Nginx, k6 | 10,000 users / 500 tickets / zero overbooking / 500 emails — **done bar one**: the cluster, the load runs and Sentinel (ADR-058) are built, and 10,000 buyers sell out five concurrent sales on the dev laptop (ADR-079); the p99 number at that size needs a host where k6 is not competing for cores |
 | **5** | Operate it, and let buyers return | The operator surface (ADR-043); buyer accounts as an overlay (ADR-044) | A dead-lettered ticket can be replayed by a human; a lost counter can be rebuilt without SQL; a buyer finds their order more than 24 h later |
 
 ---
@@ -70,11 +70,13 @@ Double-spend of a hold is prevented by `UNIQUE(hold_token)` and the settle-once 
 transaction boundary — consume the hold *inside* the commit — is right from the first line of code.
 
 ### Exit criteria
-- [ ] Full purchase completes end to end via API.
-- [ ] Two parallel requests for the final ticket: exactly one `201`, one clean `409`.
-- [ ] An abandoned hold returns to stock within ~10 s, exactly once.
-- [ ] A double-submitted checkout produces one order and one charge.
-- [ ] `ApplicationModules.verify()` passes.
+- [x] Full purchase completes end to end via API. (`UserJourneyIT`)
+- [x] Two parallel requests for the final ticket: exactly one `201`, one clean `409`.
+      (`StockReserveConcurrencyIT`)
+- [x] An abandoned hold returns to stock within ~10 s, exactly once. (`HoldLifecycleIT`; under 1 s
+      across three replicas once the `hold:{token}` timer was built, `hold-expiry-check.sh`)
+- [x] A double-submitted checkout produces one order and one charge. (`UserJourneyIT`)
+- [x] `ApplicationModules.verify()` passes. (`ModularityTests`)
 
 ---
 
@@ -85,16 +87,22 @@ Move inventory to RAM without weakening any Phase 1 guarantee, and add admission
 
 ### Build
 
-**`catalog`** — Redis counters, `SETNX` pre-warm **restricted to `UPCOMING`**, and the locked
-rebuild procedure (`00-architecture-decisions.md` ADR-004). Redis configured with
+**`catalog`** — Redis counters, `SETNX` pre-warm **restricted to `UPCOMING`**, and the rebuild
+procedure (`00-architecture-decisions.md` ADR-004 — served by `order`, which is the only module that
+may read the whole ledger; ADR-046). Redis configured with
 `maxmemory-policy noeviction`, AOF `everysec`, and `notify-keyspace-events **Ex**` — all three
 already shipped in [`docker/redis/redis.conf`](../docker/redis/redis.conf).
 
-**`hold`** — `hold_reserve.lua` and `hold_restore.lua`. **The claim stays exactly where it was in
-Phase 1**: a conditional `UPDATE` on `ticket_holds` (ADR-019). Redis gains the TTL timer and the
-keyspace listener as a latency optimisation; the sweeper (now 30 s) remains the correctness
-guarantee. `extendHold()` — once, +120 s, ceiling 420 s, pushing `ticket_holds.expires_at`, and
-**failing the checkout rather than charging** if it cannot win the claim.
+**`catalog`** — `stock_reserve.lua` and `stock_restore.lua`. **As built, both scripts and the key
+live in `catalog`, not in `hold`** (ADR-046): `hold` moves stock through `CatalogFacade` like every
+other caller, and the boundary has no exception. Each script touches one key.
+
+**`hold`** — **The claim stays exactly where it was in Phase 1**: a conditional `UPDATE` on
+`ticket_holds` (ADR-019). Redis gains the `hold:{token}` TTL timer and the keyspace listener as a
+latency optimisation; the sweeper (**10 s**, not 30) remains the correctness guarantee, and the
+listener re-reads the row rather than trusting the event (ADR-048). `grantGrace()` — once **per
+hold**, +120 s, ceiling 420 s, pushing `ticket_holds.expires_at`, and **failing the checkout rather
+than charging** if it cannot win the claim.
 
 **`queue`** — ZSET with `ZADD NX` (`FIFO` or `RANDOM` score — ADR-024); `GET /api/v1/queue/stream`
 with a 15 s heartbeat and `Last-Event-ID`; `GET /api/v1/queue/status` returning the pass as a
@@ -115,12 +123,19 @@ position clamping.
    two-thirds of passes on three. Test with ≥ 2 replicas or the bug stays hidden until Phase 4.
 
 ### Exit criteria
-- [ ] 1,000 concurrent requests for 100 tickets → exactly 100 sold.
-- [ ] `FLUSHDB` mid-sale → holds return `503`, rebuild restores the exact correct count.
-- [ ] With 2 replicas, every promoted user receives a pass (pub/sub verified).
-- [ ] Keyspace listener disabled → sweeper still restores every expired hold, exactly once.
-- [ ] A refresh mid-queue preserves position (`ZADD NX`).
-- [ ] `stock.drift` reads zero throughout.
+- [x] 1,000 concurrent requests for 100 tickets → exactly 100 sold. (`StockReserveConcurrencyIT`)
+- [x] `FLUSHDB` mid-sale → holds return `503`, rebuild restores the exact correct count.
+      (`StockRebuildIT`, and by hand against real orders on the dev stack)
+- [x] With 2 replicas, every promoted user receives a pass (pub/sub verified). — done in Phase 4
+      with three: `fanout-check.sh`, 30 of 30 across all three replicas.
+- [x] Keyspace listener disabled → sweeper still restores every expired hold, exactly once. Holds
+      trivially, because the listener is not built: the sweeper is the only path (ADR-046).
+- [x] A refresh mid-queue preserves position (`ZADD NX`).
+- [x] `stock.drift` reads zero throughout — and is now exported rather than only asserted.
+
+**Added by Stage 1, beyond the original criteria:** a Redis restart must stop the sale rather than
+oversell it (`StockEpochIT`), because AOF `everysec` brings counters back high and no ordering of
+operations can prevent that.
 
 ---
 
@@ -175,13 +190,51 @@ insert-then-send; `REFUND_NOTICE` template; admin resend.
 **Load harness** — k6 firing 10,000 virtual users at Nginx.
 
 ### Exit criteria
-- [ ] **10,000 users, 500 tickets, exactly 500 sold, zero overbooking.**
-- [ ] 500 PDF emails land in Mailpit; zero duplicates; DLQ empty.
-- [ ] Killing one replica mid-sale loses no orders and no stock.
-- [ ] Restarting Redis mid-sale → reconciliation restores the exact count.
-- [ ] Checkout p99 under 200 ms at peak.
-- [ ] `stock.drift` zero for the entire run.
-- [ ] Every SSE client receives its promotion across all 3 replicas.
+
+Measured in Stage 3 on a 10-core laptop, Docker Desktop capped at 7.65 GB. Every *correctness*
+criterion passes. The one that does not is the latency number, and the reason is the host — see
+below.
+
+- [x] **500 tickets, exactly 500 sold, zero overbooking.** Verified at 300 and 2,000 VUs, and again
+      with a replica killed mid-sale. `confirmed + active_holds + remaining == total_capacity` held
+      exactly on every check.
+- [x] **10,000 users.** Run in Pass 15 (ADR-079): 10,000 buyers across five concurrent sales of
+      500, 2,500 of 2,500 sold, no oversell, no drift. Getting there took two fixes in the system —
+      the status read had opened two TCP connections per poll — and one in the harness: ten
+      thousand one-buyer k6 VUs took 2.6 GiB and were OOM-killed, so a VU now drives ten buyers.
+      Recorded as it was before: "Not run here, and not for want of trying ... The run needs a host
+      with ~32 GB." Memory was not the limit; the connection churn was.
+- [x] PDF emails land in Mailpit; **zero duplicates**; DLQ empty. 677 `notification_logs` rows, all
+      `SENT`, zero `(order_number, kind)` duplicates.
+- [x] **Killing one replica mid-sale loses no orders and no stock.** `docker kill` on app-2 at
+      196 remaining: 485 sold + 11 active holds + 4 remaining = 500. Five orders were left `PENDING`
+      — the in-flight case ADR-034 exists for, and recoverable, not stranded.
+- [x] **Restarting Redis mid-sale → reconciliation restores the exact count.** All three replicas
+      independently refused to sell (`catalog:vouch:{e}` no longer matched Redis's `run_id`), and a
+      rebuild issued on **one** replica released the event on **all three**. This is ADR-046's
+      per-event, recomputed-each-tick design doing exactly what it was built for.
+- [ ] **Checkout p99 under 200 ms at peak.** Measured 682 ms at 300 VUs and 4,689 ms at 2,000. Not a
+      verdict on the design: the three JVMs were at 130–190 % CPU each and k6 at 163 % on ten shared
+      cores, with the whole stack plus the load generator on one laptop. Re-measure on a host where
+      the generator is not competing with the system under test. **Update (Pass 12, run H): 129 ms
+      at 300 VUs across five concurrent sales**, on the same laptop with nothing else running. That
+      is one run, so it is recorded as a data point and not ticked. **Pass 13 sweep:** the criterion
+      holds up to about 600 VUs across five sales (145 ms), sits at the line for 300 VUs across ten
+      and for 1,000 across five, and fails at 2,000 (6.1 s). The limiting resource was host CPU
+      throughout; the pool never queued (`06` §11). Left unticked: "at peak" means 10,000, and
+      no run here reaches that.
+- [x] **`stock.drift` zero for the entire run.** `flashseats_stock_drift` read `0.0` on all three
+      replicas after every run.
+- [x] **Every SSE client receives its promotion across all 3 replicas.** 30/30, spread 10/10/10 over
+      the three upstreams, repeatable via `docker/scripts/fanout-check.sh`. **This was the point of
+      the stage** — ADR-007's Pub/Sub fan-out is now verified rather than asserted.
+
+**Since built:** Redis Sentinel — deferred with reasons in ADR-047, delivered in PR #16 and recorded in ADR-058. A failover distrusts every event's counters until rebuilt, which is ADR-046 working rather than a regression, and is the half `sentinel-failover-check.sh` deliberately does not test.
+
+**Originally listed as not built:** Sentinel. Four blockers found and fixed
+before any of the above could run are recorded there too; one of them — nginx dropping `Host` and
+`X-Forwarded-For` in every location that set a header of its own — meant *every* proxied API request
+answered a bare HTTP 400.
 
 ---
 

@@ -4,29 +4,24 @@ import java.util.LinkedHashMap;
 import java.util.Map;
 
 /**
- * Base type for every exception any module raises to the HTTP layer.
+ * Base type for every exception raised to the HTTP layer. Carrying the {@link ErrorCode} lets one
+ * {@link GlobalExceptionHandler} serve every module without importing their types (ADR-033).
+ * {@code extensions} carries the RFC 7807 members that vary by failure (global standards §1).
  *
- * <p>Carrying the {@link ErrorCode} on the exception is what lets a <em>single</em>
- * {@link GlobalExceptionHandler} serve all nine modules without importing one module-specific type
- * (ADR-033). Global standards §1 originally asked for one {@code @RestControllerAdvice} per module
- * to stop a global handler pulling every module's exceptions into one class — a shared base type
- * satisfies that constraint with one class instead of seven.
- *
- * <p>{@code extensions} carries the RFC 7807 members that vary by failure — {@code retryable},
- * {@code attemptsRemaining}, {@code expiresAt}, {@code retryAfterSeconds}. Names and types are fixed
- * by global standards §1; the SPA switches on them.
+ * <p>Most failures come from a module's {@code <Module>Errors} factory. A subclass exists only
+ * where a {@code catch} names it (ADR-057, ADR-063).
  */
 public class FlashSeatsException extends RuntimeException {
 
     private final ErrorCode code;
     private final Map<String, Object> extensions = new LinkedHashMap<>();
 
-    protected FlashSeatsException(ErrorCode code, String detail) {
+    public FlashSeatsException(ErrorCode code, String detail) {
         super(detail);
         this.code = code;
     }
 
-    protected FlashSeatsException(ErrorCode code, String detail, Throwable cause) {
+    public FlashSeatsException(ErrorCode code, String detail, Throwable cause) {
         super(detail, cause);
         this.code = code;
     }

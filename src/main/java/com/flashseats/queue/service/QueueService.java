@@ -1,80 +1,134 @@
 package com.flashseats.queue.service;
 
-import com.flashseats.catalog.exception.SaleNotOpenException;
+import com.flashseats.bot.facade.BotFacade;
+import com.flashseats.catalog.exception.CatalogErrors;
 import com.flashseats.catalog.facade.CatalogFacade;
 import com.flashseats.catalog.facade.EventSummary;
 import com.flashseats.catalog.facade.EventWindowStatus;
+import com.flashseats.queue.config.QueueOrdering;
 import com.flashseats.queue.config.QueueProperties;
 import com.flashseats.queue.dto.AdmitResponse;
 import com.flashseats.queue.dto.QueueStatusResponse;
-import com.flashseats.queue.exception.QueuePassInvalidException;
+import com.flashseats.queue.exception.QueueErrors;
+import com.flashseats.queue.facade.QueueFacade;
 import com.flashseats.queue.facade.QueuePhase;
 import com.flashseats.queue.facade.QueueState;
 import java.time.Clock;
 import java.time.Duration;
 import java.time.Instant;
+import java.util.List;
 import java.util.OptionalDouble;
+import java.util.concurrent.ThreadLocalRandom;
+import java.util.concurrent.TimeUnit;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.data.redis.core.StringRedisTemplate;
+import org.springframework.data.redis.core.script.RedisScript;
 import org.springframework.stereotype.Service;
 
-/** Joining, position, and the pass-for-admission exchange. */
+/**
+ * Joining, position, and the pass-for-admission exchange.
+ *
+ * <p>This class <em>is</em> {@link QueueFacade}. Other modules see only that interface, because this
+ * package is internal to the module and they may not name it. There is no separate delegating
+ * implementation: one existed, held a single null check, and only added a hop between the contract
+ * and the code that honours it.
+ */
 @Slf4j
 @Service
-public class QueueService {
+public class QueueService implements QueueFacade {
 
     private final StringRedisTemplate redis;
+    private final RedisScript<List<Object>> stateScript;
     private final CatalogFacade catalog;
     private final QueueTokens tokens;
     private final QueueDrainRateTracker drainRate;
     private final QueueProperties properties;
     private final Clock clock;
+    private final BotFacade bots;
 
     public QueueService(
             StringRedisTemplate redis,
+            RedisScript<List<Object>> queueStateScript,
             CatalogFacade catalog,
             QueueTokens tokens,
             QueueDrainRateTracker drainRate,
             QueueProperties properties,
-            Clock clock) {
+            Clock clock,
+            BotFacade bots) {
         this.redis = redis;
+        this.stateScript = queueStateScript;
         this.catalog = catalog;
         this.tokens = tokens;
         this.drainRate = drainRate;
         this.properties = properties;
         this.clock = clock;
+        this.bots = bots;
     }
 
     // -------------------------------------------------------------------- join
 
     /**
-     * Puts a session in line.
+     * Puts a session in line with {@code ZADD NX}, never a plain {@code ZADD}, which would move a
+     * refreshing buyer to the back (ADR-008). {@code NX} also makes a random draw safe (ADR-024): a
+     * rejoin's fresh draw is discarded. A score derived from the session id would be grindable, because
+     * ids are free to mint.
      *
-     * <p><strong>{@code ZADD NX}, never a plain {@code ZADD}.</strong> A plain add <em>updates</em>
-     * an existing member's score, so a page refresh or a double-click on "Join" would reset the
-     * arrival time and send the buyer to the <em>back</em> of the line — the exact opposite of the
-     * fairness the queue exists to provide (ADR-008). Rejoining is therefore idempotent, and that is
-     * a feature.
+     * <p>Allowed while the sale is paused. Joining moves no stock, and a line that keeps forming during
+     * a pause is still in arrival order when the sale resumes; refusing would turn the resume into a
+     * race between whoever retries fastest (ADR-066).
      */
-    public QueueStatusResponse join(String sessionId, long eventId) {
+    public QueueStatusResponse join(
+            String sessionId, long eventId, String recaptchaToken, String clientAddress) {
+        // The one place a challenge is worth its cost: join is the front of the line, cheap to
+        // repeat, and session ids are free to mint (ADR-011). It fails open (ADR-055).
+        bots.verifyHuman(sessionId, recaptchaToken, clientAddress);
+
         EventSummary event = catalog.getEventSummary(eventId);
-        if (event.windowStatus() != EventWindowStatus.OPEN) {
-            throw new SaleNotOpenException(eventId, event.windowStatus());
+        if (event.windowStatus() != EventWindowStatus.OPEN && event.windowStatus() != EventWindowStatus.PAUSED) {
+            throw CatalogErrors.saleNotOpen(eventId, event.windowStatus());
         }
 
         redis.opsForZSet()
                 .addIfAbsent(
                         QueueKeys.waiting(eventId),
                         sessionId,
-                        (double) clock.instant().toEpochMilli());
+                        queueScore());
         expireWithSale(QueueKeys.waiting(eventId), event.saleEndTime());
-        touchHeartbeat(sessionId);
 
         return status(sessionId, eventId, event.windowStatus());
     }
 
+    /**
+     * Takes a session out of the line and drops a pass it has not spent. The pass goes too because a
+     * buyer who left should not be let in a moment later by a promotion already on its way, and an
+     * unspent pass holds back the admission allowance until it expires (ADR-049). An admission is left
+     * alone: a buyer choosing seats ends that by buying or by letting it run out.
+     *
+     * <p>Joining again is {@code ZADD NX} with a fresh score, so it is at the back of the line.
+     */
+    public void leave(String sessionId, long eventId) {
+        redis.opsForZSet().remove(QueueKeys.waiting(eventId), sessionId);
+        redis.delete(QueueKeys.pass(eventId, sessionId));
+        redis.opsForZSet().remove(QueueKeys.passes(eventId), sessionId);
+    }
+
+    /**
+     * The ZSET score, which is the ordering (ADR-024).
+     *
+     * <p>{@code FIFO} is arrival epoch-millis: intuitive, explicable, and decided by whoever has the
+     * lowest network latency. {@code RANDOM} is a draw bounded at 2^53 so it stays exactly
+     * representable as the double a ZSET score is — anything larger would collide after rounding and
+     * hand two buyers the same position.
+     */
+    private double queueScore() {
+        if (properties.getOrdering() == QueueOrdering.RANDOM) {
+            return ThreadLocalRandom.current().nextLong(1L << 53);
+        }
+        return (double) clock.instant().toEpochMilli();
+    }
+
     private void expireWithSale(String key, Instant saleEndTime) {
-        QueueKeyLifetimes.expireWithSale(
+        QueueKeys.expireWithSale(
                 redis, key, clock.instant(), saleEndTime, properties.getKeyRetentionAfterSaleSeconds());
     }
 
@@ -85,7 +139,6 @@ public class QueueService {
     }
 
     private QueueStatusResponse status(String sessionId, long eventId, EventWindowStatus window) {
-        touchHeartbeat(sessionId);
         QueueState state = getQueueState(sessionId, eventId, window);
         Integer position = state.position();
 
@@ -96,60 +149,119 @@ public class QueueService {
                 state.estWaitSeconds(),
                 state.passToken(),
                 state.admissionExpiresAt(),
+                window == EventWindowStatus.PAUSED,
                 clock.instant());
     }
 
+    @Override
     public QueueState getQueueState(String sessionId, long eventId) {
         return getQueueState(sessionId, eventId, catalog.getWindowStatus(eventId));
     }
 
+    boolean isExhausted(long eventId) {
+        return Boolean.TRUE.equals(redis.hasKey(QueueKeys.exhausted(eventId)));
+    }
+
     /**
-     * Assembles a session's whole position in the sale.
+     * Seconds left on this session's promotion pass, or {@code null} when it holds none.
      *
-     * <p><strong>The order of these checks is the state machine</strong> (ADR-036):
+     * <p>Deliberately not folded into the scripted read behind {@link #getQueueState}. That read
+     * serves {@code GET /queue/status}, which is the single largest consumer of the cluster's CPU at
+     * roughly 90,000 calls per replica per run; this answer is wanted only when a buyer reconnects
+     * already promoted, so it costs one round trip on a rare path rather than a command on the
+     * hottest one.
+     */
+    public Long passTimeToLiveSeconds(String sessionId, long eventId) {
+        Long remaining = redis.getExpire(QueueKeys.pass(eventId, sessionId), TimeUnit.SECONDS);
+        return remaining == null || remaining < 0 ? null : remaining;
+    }
+
+    /**
+     * Assembles a session's position in the sale. <strong>The order of the checks is the state
+     * machine</strong> (ADR-036):
      *
      * <ol>
-     *   <li><strong>{@code CLOSED} first.</strong> The window outranks everything. Checking it last
-     *       meant a buyer still ranked in the ZSET when the sale ended kept reporting
-     *       {@code WAITING} forever — and because the promotion worker and the broadcaster both
-     *       iterate only <em>open</em> events, nothing was left to tell them otherwise. The waiting
-     *       room simply froze.
-     *   <li><strong>{@code ADMITTED}, then {@code PROMOTED}.</strong> Most-advanced-first: an
-     *       admitted buyer is admitted even if a stale pass is lying around, and a promoted buyer is
-     *       promoted even though they have left the ZSET.
-     *   <li><strong>{@code EXHAUSTED} before {@code WAITING}.</strong> A buyer holding a pass or an
-     *       admission still has a claim worth spending — someone may release seats — but a buyer
-     *       with neither, in a sale with no stock, should be told so. They stay in the ZSET, so if
-     *       stock returns the marker is cleared and their place is exactly where they left it.
+     *   <li>{@code CLOSED} first: the window outranks everything, or a closed sale's queue waits forever.
+     *       A <em>paused</em> sale is read like an open one — the buyer's place is the answer, and the
+     *       pause is reported beside it (ADR-066).
+     *   <li>{@code ADMITTED}, then {@code PROMOTED}: most advanced first.
+     *   <li>{@code EXHAUSTED} before {@code WAITING}: a buyer with no pass or admission in a sale with no
+     *       stock is told so, and keeps their place in case stock returns (ADR-035).
      * </ol>
      *
-     * <p>The window arrives as a parameter so a caller iterating many sessions of one event resolves
-     * it once rather than once per session.
+     * <p>The window is a parameter so a caller sweeping many sessions resolves it once.
      */
     QueueState getQueueState(String sessionId, long eventId, EventWindowStatus window) {
+        return getQueueState(sessionId, eventId, window, null);
+    }
+
+    QueueState getQueueState(String sessionId, long eventId, EventWindowStatus window, Boolean exhausted) {
+        // Before the read, not after: the window outranks every other state, so a closed sale costs
+        // no Redis at all. Reading first and discarding it would spend a round trip per poll for the
+        // hour a finished sale's clients keep polling.
         if (window == EventWindowStatus.CLOSED) {
             return new QueueState(QueuePhase.CLOSED, null, null, null, null);
         }
+        QueueState state = decide(read(sessionId, eventId, exhausted), eventId);
+        return window == EventWindowStatus.PAUSED ? state.withoutEstimate() : state;
+    }
 
-        String admissionToken = redis.opsForValue().get(QueueKeys.admission(eventId, sessionId));
-        if (admissionToken != null) {
-            Long ttl = redis.getExpire(QueueKeys.admission(eventId, sessionId));
+    /**
+     * Everything this session's state depends on, in <strong>one</strong> Redis round trip; this is the
+     * most-called path in the system. Reading eagerly does not change the answer: only {@link #decide}
+     * is ordered.
+     *
+     * <p>A script, never a pipeline. A pipeline takes a connection of its own, and with no pool Spring
+     * opened one for every call, after asking Sentinel where the primary is, and closed it again: two
+     * TCP handshakes per poll, on the path 10,000 buyers poll (ADR-079). The script runs on the shared
+     * connection, and reads all four keys at one instant.
+     *
+     * @param exhausted pre-resolved by a caller sweeping many sessions of one event, so the whole
+     *     sweep agrees on it; {@code null} takes the script's own reading
+     */
+    private Snapshot read(String sessionId, long eventId, Boolean exhausted) {
+        List<Object> replies = redis.execute(
+                stateScript,
+                List.of(
+                        QueueKeys.admission(eventId, sessionId),
+                        QueueKeys.pass(eventId, sessionId),
+                        QueueKeys.waiting(eventId),
+                        QueueKeys.exhausted(eventId)),
+                sessionId);
+
+        if (replies == null || replies.size() != 5) {
+            // Positional reads are only safe while the positions are known. A script edited without
+            // shifting the indices below would otherwise read a neighbour's value and answer
+            // confidently with the wrong phase.
+            throw new IllegalStateException(
+                    "Expected 5 replies from queue_state.lua, got " + (replies == null ? "none" : replies.size()));
+        }
+
+        return new Snapshot(
+                (String) replies.get(0),
+                (Long) replies.get(1),
+                (String) replies.get(2),
+                (Long) replies.get(3),
+                exhausted != null ? exhausted : truthy(replies.get(4)));
+    }
+
+    private QueueState decide(Snapshot snapshot, long eventId) {
+        if (snapshot.admissionToken() != null) {
+            Long ttl = snapshot.admissionTtlSeconds();
             Instant expiresAt = ttl != null && ttl > 0 ? clock.instant().plusSeconds(ttl) : null;
             return new QueueState(QueuePhase.ADMITTED, null, null, expiresAt, null);
         }
 
-        String passToken = redis.opsForValue().get(QueueKeys.pass(eventId, sessionId));
-        if (passToken != null) {
-            return new QueueState(QueuePhase.PROMOTED, null, null, null, passToken);
+        if (snapshot.passToken() != null) {
+            return new QueueState(QueuePhase.PROMOTED, null, null, null, snapshot.passToken());
         }
 
-        if (Boolean.TRUE.equals(redis.hasKey(QueueKeys.exhausted(eventId)))) {
+        if (snapshot.exhausted()) {
             return new QueueState(QueuePhase.EXHAUSTED, null, null, null, null);
         }
 
-        Long rank = redis.opsForZSet().rank(QueueKeys.waiting(eventId), sessionId);
-        if (rank != null) {
-            int position = rank.intValue() + 1;
+        if (snapshot.rank() != null) {
+            int position = snapshot.rank().intValue() + 1;
             OptionalDouble estimate = drainRate.estimateSeconds(eventId, position);
             Integer estWaitSeconds = estimate.isPresent() ? (int) Math.ceil(estimate.getAsDouble()) : null;
             return new QueueState(QueuePhase.WAITING, position, estWaitSeconds, null, null);
@@ -158,21 +270,40 @@ public class QueueService {
         return QueueState.notJoined();
     }
 
+    /**
+     * {@code EXISTS} is a Redis integer; a driver may hand it back as {@code Boolean} or as a number.
+     *
+     * <p>{@code Boolean.TRUE.equals(1L)} is {@code false}, so taking the narrow view would make an
+     * exhausted sale report {@code WAITING} for ever — silently, and on the one path this design is
+     * most careful about (ADR-035, ADR-040). Accept either shape rather than depend on which.
+     */
+    private static boolean truthy(Object reply) {
+        if (reply instanceof Boolean value) {
+            return value;
+        }
+        return reply instanceof Number value && value.longValue() > 0;
+    }
+
+    /** One session's raw queue state, as Redis answered it. */
+    private record Snapshot(
+            String admissionToken,
+            Long admissionTtlSeconds,
+            String passToken,
+            Long rank,
+            boolean exhausted) {}
+
     // ------------------------------------------------------------------- admit
 
     /**
-     * Exchanges a pass for an admission session, and <strong>revokes the pass here</strong>.
-     *
-     * <p>Spending the pass at this moment — rather than at hold creation — is what makes it truly
-     * single-use. In an earlier design nothing ever revoked it, so one promoted session could mint
-     * unlimited holds and drain a tier by itself (ADR-006, ADR-020).
+     * Exchanges a pass for an admission session, and <strong>revokes the pass here</strong>, which is
+     * what makes it single-use: one promotion cannot mint unlimited holds (ADR-006, ADR-020).
      */
     public AdmitResponse admit(String sessionId, long eventId, String passToken) {
         String stored = redis.opsForValue().get(QueueKeys.pass(eventId, sessionId));
         if (stored == null
                 || !stored.equals(passToken)
                 || !tokens.isValidPass(passToken, eventId, sessionId)) {
-            throw new QueuePassInvalidException();
+            throw QueueErrors.queuePassInvalid();
         }
 
         String admissionToken = tokens.mintAdmission(eventId, sessionId);
@@ -196,11 +327,12 @@ public class QueueService {
     // -------------------------------------------------------------- admission
 
     /**
-     * Two checks, both required: the signature proves the token was minted by us for this session and
-     * this event; the Redis key proves it has not since expired or been revoked.
+     * Signature plus Redis key: the signature proves we minted it for this session and event, the key
+     * proves it is unexpired and unrevoked. A missing token is refused here, the rule's only home.
      */
-    public boolean hasLiveAdmission(String admissionToken, String sessionId, long eventId) {
-        if (!tokens.isValidAdmission(admissionToken, eventId, sessionId)) {
+    @Override
+    public boolean verifyAdmission(String admissionToken, String sessionId, long eventId) {
+        if (admissionToken == null || !tokens.isValidAdmission(admissionToken, eventId, sessionId)) {
             return false;
         }
         String stored = redis.opsForValue().get(QueueKeys.admission(eventId, sessionId));
@@ -208,22 +340,9 @@ public class QueueService {
     }
 
     /** Called once an order is confirmed: the buyer has what they came for. */
+    @Override
     public void revokeAdmission(String sessionId, long eventId) {
         redis.delete(QueueKeys.admission(eventId, sessionId));
         redis.opsForZSet().remove(QueueKeys.admissions(eventId), sessionId);
-    }
-
-    // ---------------------------------------------------------------- internal
-
-    /**
-     * Refreshes the liveness marker. Advisory only — it feeds an abandonment metric and is never
-     * consulted before promoting or removing anyone (ADR-026).
-     */
-    void touchHeartbeat(String sessionId) {
-        redis.opsForValue()
-                .set(
-                        QueueKeys.heartbeat(sessionId),
-                        "1",
-                        Duration.ofSeconds(properties.getHeartbeatTtlSeconds()));
     }
 }

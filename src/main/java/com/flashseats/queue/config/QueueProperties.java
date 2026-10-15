@@ -1,9 +1,13 @@
 package com.flashseats.queue.config;
 
+import lombok.Getter;
+import lombok.Setter;
 import org.springframework.boot.context.properties.ConfigurationProperties;
 
-/** Waiting-room tunables (ADR-007, ADR-020, ADR-026, ADR-028). */
+/** Waiting-room tunables (ADR-007, ADR-020, ADR-026, ADR-028, ADR-049). */
 @ConfigurationProperties(prefix = "flashseats.queue")
+@Getter
+@Setter
 public class QueueProperties {
 
     /** Signs pass and admission tokens. Rotating it invalidates every live pass. */
@@ -28,22 +32,26 @@ public class QueueProperties {
     private int promotionBatchSize = 45;
 
     /**
+     * Buyers the whole cluster may admit per promotion interval, shared by every open sale (ADR-049);
+     * {@link #promotionBatchSize} stays the per-sale cap. 45 is ADR-028's {@code hikariMax × 1.5} at
+     * cluster scope. Raise it only against the instruments: the ceiling is where
+     * {@code hikaricp_connections_pending} stops returning to zero.
+     */
+    private int globalAdmissionBudgetPerTick = 45;
+
+    /**
      * Hold-to-order conversion is well under 100%, so admitting exactly {@code remainingStock}
      * buyers leaves the sale under-filled. Every real waiting room tunes this (ADR-020).
      */
     private double oversubscribeFactor = 1.5;
 
+    /** FIFO is the explainable default; RANDOM is the fair drop mode from ADR-024. */
+    private QueueOrdering ordering = QueueOrdering.FIFO;
+
     private long ssePositionIntervalMs = 2_000;
 
     /** Comment frames that keep proxies from closing an idle stream. */
     private long sseHeartbeatMs = 15_000;
-
-    /**
-     * Advisory only — an abandonment metric, <strong>never</strong> a reason to evict (ADR-026). A
-     * Wi-Fi to cellular handover routinely outlasts any heartbeat, and evicting on one deletes live
-     * buyers from the line through no fault of their own.
-     */
-    private int heartbeatTtlSeconds = 90;
 
     /**
      * How long this module's per-sale keys outlive the sale itself (ADR-036).
@@ -54,84 +62,4 @@ public class QueueProperties {
      * {@code noeviction}, so a key with no TTL is a leak nothing else will clean up.
      */
     private long keyRetentionAfterSaleSeconds = 3_600;
-
-    public String getPassSecret() {
-        return passSecret;
-    }
-
-    public void setPassSecret(String passSecret) {
-        this.passSecret = passSecret;
-    }
-
-    public int getPassTtlSeconds() {
-        return passTtlSeconds;
-    }
-
-    public void setPassTtlSeconds(int passTtlSeconds) {
-        this.passTtlSeconds = passTtlSeconds;
-    }
-
-    public int getAdmissionTtlSeconds() {
-        return admissionTtlSeconds;
-    }
-
-    public void setAdmissionTtlSeconds(int admissionTtlSeconds) {
-        this.admissionTtlSeconds = admissionTtlSeconds;
-    }
-
-    public long getPromotionIntervalMs() {
-        return promotionIntervalMs;
-    }
-
-    public void setPromotionIntervalMs(long promotionIntervalMs) {
-        this.promotionIntervalMs = promotionIntervalMs;
-    }
-
-    public int getPromotionBatchSize() {
-        return promotionBatchSize;
-    }
-
-    public void setPromotionBatchSize(int promotionBatchSize) {
-        this.promotionBatchSize = promotionBatchSize;
-    }
-
-    public double getOversubscribeFactor() {
-        return oversubscribeFactor;
-    }
-
-    public void setOversubscribeFactor(double oversubscribeFactor) {
-        this.oversubscribeFactor = oversubscribeFactor;
-    }
-
-    public long getSsePositionIntervalMs() {
-        return ssePositionIntervalMs;
-    }
-
-    public void setSsePositionIntervalMs(long ssePositionIntervalMs) {
-        this.ssePositionIntervalMs = ssePositionIntervalMs;
-    }
-
-    public long getSseHeartbeatMs() {
-        return sseHeartbeatMs;
-    }
-
-    public void setSseHeartbeatMs(long sseHeartbeatMs) {
-        this.sseHeartbeatMs = sseHeartbeatMs;
-    }
-
-    public int getHeartbeatTtlSeconds() {
-        return heartbeatTtlSeconds;
-    }
-
-    public void setHeartbeatTtlSeconds(int heartbeatTtlSeconds) {
-        this.heartbeatTtlSeconds = heartbeatTtlSeconds;
-    }
-
-    public long getKeyRetentionAfterSaleSeconds() {
-        return keyRetentionAfterSaleSeconds;
-    }
-
-    public void setKeyRetentionAfterSaleSeconds(long keyRetentionAfterSaleSeconds) {
-        this.keyRetentionAfterSaleSeconds = keyRetentionAfterSaleSeconds;
-    }
 }

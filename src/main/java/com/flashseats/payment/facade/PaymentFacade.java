@@ -19,10 +19,17 @@ public interface PaymentFacade {
      *
      * @throws com.flashseats.payment.exception.DuplicatePaymentException if a charge for this hold is
      *     already in flight
-     * @throws com.flashseats.payment.exception.PaymentGatewayUnavailableException if the provider
-     *     could not be reached. The buyer's seats are retained.
+     * @throws com.flashseats.shared.error.FlashSeatsException {@code PAYMENT_GATEWAY_UNAVAILABLE} if
+     *     the provider could not be reached. The buyer's seats are retained.
      */
     PaymentResult authorize(AuthorizeCommand command);
+
+    /**
+     * Whether this hold already has a charge that a checkout would <em>complete</em> rather than start:
+     * one authenticating 3-D Secure, or one that settled. Checkout asks only when a hold is too close to
+     * expiry to start a charge, so finishing one that exists is not refused as if it were new (ADR-074).
+     */
+    boolean hasChargeFor(String holdToken);
 
     /**
      * Refunds a settled charge. Used when the money moved but the seats cannot be delivered — the

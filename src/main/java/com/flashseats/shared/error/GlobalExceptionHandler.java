@@ -1,15 +1,20 @@
 package com.flashseats.shared.error;
 
+import java.sql.SQLTransientConnectionException;
 import java.util.List;
 import java.util.Map;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.core.Ordered;
 import org.springframework.core.annotation.Order;
+import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpStatusCode;
 import org.springframework.http.ProblemDetail;
 import org.springframework.http.ResponseEntity;
 import org.springframework.http.converter.HttpMessageNotReadableException;
+import org.springframework.jdbc.CannotGetJdbcConnectionException;
+import org.springframework.transaction.CannotCreateTransactionException;
 import org.springframework.web.ErrorResponse;
+import org.springframework.web.HttpMediaTypeNotAcceptableException;
 import org.springframework.web.HttpMediaTypeNotSupportedException;
 import org.springframework.web.HttpRequestMethodNotSupportedException;
 import org.springframework.web.bind.MethodArgumentNotValidException;
@@ -18,24 +23,27 @@ import org.springframework.web.bind.MissingRequestHeaderException;
 import org.springframework.web.bind.MissingServletRequestParameterException;
 import org.springframework.web.bind.annotation.ExceptionHandler;
 import org.springframework.web.bind.annotation.RestControllerAdvice;
+import org.springframework.web.context.request.async.AsyncRequestNotUsableException;
+import org.springframework.web.context.request.async.AsyncRequestTimeoutException;
 import org.springframework.web.method.annotation.MethodArgumentTypeMismatchException;
+import org.springframework.web.servlet.NoHandlerFoundException;
+import org.springframework.web.servlet.resource.NoResourceFoundException;
 
 /**
- * The one exception handler for the whole application (ADR-033).
- *
- * <p>Global standards §1 asked for a {@code @RestControllerAdvice} per module, reasoning that a
- * single global advice would have to import every module's exception types and so break the
- * boundary Modulith enforces. Because every module exception extends {@link FlashSeatsException} and
- * carries its own {@link ErrorCode}, this handler catches the base type and imports nothing
- * module-specific — the constraint is satisfied with one class instead of seven.
- *
- * <p>Runs at {@link Ordered#LOWEST_PRECEDENCE} so a module may still add its own advice later
- * without being shadowed.
+ * The one exception handler for the whole application (ADR-033). Every module exception extends
+ * {@link FlashSeatsException} and carries its {@link ErrorCode}, so this imports nothing
+ * module-specific. Lowest precedence, so a module could still add its own advice.
  */
 @Slf4j
 @RestControllerAdvice
 @Order(Ordered.LOWEST_PRECEDENCE)
 public class GlobalExceptionHandler {
+
+    /**
+     * One second: long enough for a pool of 30 turning over millisecond transactions to have freed
+     * many connections, short enough that a buyer mid-checkout barely notices.
+     */
+    private static final int BUSY_RETRY_AFTER_SECONDS = 1;
 
     /** Every deliberate business failure in every module arrives here. */
     @ExceptionHandler(FlashSeatsException.class)
@@ -46,6 +54,16 @@ public class GlobalExceptionHandler {
             log.debug("{}: {}", ex.code(), ex.getMessage());
         }
         return ProblemDetails.from(ex);
+    }
+
+    /**
+     * A path nothing serves. With static resources on, Spring reports it as
+     * {@link NoResourceFoundException}, which the {@code Exception} backstop used to own: every typo'd
+     * URL was a {@code 500} with an {@code ERROR} line (ADR-041's trap, ADR-067).
+     */
+    @ExceptionHandler({NoResourceFoundException.class, NoHandlerFoundException.class})
+    public ProblemDetail onNoSuchPath(Exception ex) {
+        return ProblemDetails.of(ErrorCode.NOT_FOUND, "Nothing is served at this path.");
     }
 
     @ExceptionHandler(MethodArgumentNotValidException.class)
@@ -73,18 +91,9 @@ public class GlobalExceptionHandler {
     }
 
     /**
-     * Malformed requests that Spring MVC rejects before a handler ever runs.
-     *
-     * <p><strong>These must be listed explicitly, and that is not a formality.</strong>
-     * {@code ExceptionHandlerExceptionResolver} runs <em>before</em>
-     * {@code DefaultHandlerExceptionResolver}, so the {@code Exception.class} backstop below matches
-     * first and would answer every one of them with {@code 500 INTERNAL_ERROR} — a client error
-     * reported as a server fault, with no registry {@code code} to branch on and an
-     * {@code ERROR}-level log line for every mistyped query string. A missing {@code eventId} on
-     * {@code POST /queue/admit} did exactly that.
-     *
-     * <p>Global standards §1: {@code 400} is malformed input, {@code 500} is never a client error,
-     * and every problem carries a {@code code}.
+     * Malformed requests Spring MVC rejects before a handler runs. Listed explicitly because this
+     * advice runs before Spring's default resolver, so the backstop would answer them {@code 500} with
+     * no {@code code} (ADR-041). A client error is {@code 400}, never {@code 500}.
      */
     @ExceptionHandler({
         MissingServletRequestParameterException.class,
@@ -96,12 +105,14 @@ public class GlobalExceptionHandler {
     }
 
     /**
-     * Wrong method or wrong content type. Kept apart from the {@code 400}s because the status is
-     * part of the answer — {@code 405} and {@code 415} tell a client something {@code 400} does not.
+     * Wrong method, wrong content type, or an {@code Accept} we cannot satisfy: {@code 405},
+     * {@code 415} and {@code 406}, each keeping its status. Every exception Spring throws must be named
+     * before the {@code Exception} backstop, or the backstop owns it (ADR-041).
      */
     @ExceptionHandler({
         HttpRequestMethodNotSupportedException.class,
-        HttpMediaTypeNotSupportedException.class
+        HttpMediaTypeNotSupportedException.class,
+        HttpMediaTypeNotAcceptableException.class
     })
     public ResponseEntity<ProblemDetail> onUnsupportedRequest(ErrorResponse ex) {
         HttpStatusCode status = ex.getStatusCode();
@@ -109,6 +120,39 @@ public class GlobalExceptionHandler {
                 ProblemDetails.of(ErrorCode.VALIDATION_FAILED, ex.getBody().getDetail());
         problem.setStatus(status.value());
         return ResponseEntity.status(status).body(problem);
+    }
+
+    /**
+     * A request that could not get a database connection in time: back-pressure, not a fault (ADR-059).
+     * {@code 503 SERVICE_BUSY} with {@code Retry-After}; checkout is find-or-create, so a retry is safe.
+     * Classified by cause: only HikariCP's {@link SQLTransientConnectionException} is busy, while a
+     * database that is down still reaches the backstop.
+     */
+    @ExceptionHandler({CannotCreateTransactionException.class, CannotGetJdbcConnectionException.class})
+    public ResponseEntity<ProblemDetail> onNoConnection(Exception ex) {
+        if (!causedBy(ex, SQLTransientConnectionException.class)) {
+            return ResponseEntity.internalServerError().body(onUnhandled(ex));
+        }
+        log.warn("Connection pool exhausted; answering {}: {}", ErrorCode.SERVICE_BUSY, ex.getMessage());
+        ProblemDetail problem = ProblemDetails.of(
+                ErrorCode.SERVICE_BUSY,
+                "The service is busy. Please retry shortly.",
+                Map.of("retryable", true, "retryAfterSeconds", BUSY_RETRY_AFTER_SECONDS));
+        return ResponseEntity.status(ErrorCode.SERVICE_BUSY.status())
+                .header(HttpHeaders.RETRY_AFTER, Integer.toString(BUSY_RETRY_AFTER_SECONDS))
+                .body(problem);
+    }
+
+    /**
+     * A client that went away mid-response: a waiting-room tab closed, a phone changed networks, a
+     * stream ended by its own timeout. Routine, and there is no one left to answer. The backstop below
+     * used to own it, so every closed tab wrote an {@code ERROR} with two stack traces, and then a
+     * second failure trying to write a problem document to a dead socket — thousands a minute in a
+     * busy waiting room, burying the errors that matter (ADR-077).
+     */
+    @ExceptionHandler({AsyncRequestNotUsableException.class, AsyncRequestTimeoutException.class})
+    public void onClientGone(Exception ex) {
+        log.debug("Client went away mid-response: {}", ex.getMessage());
     }
 
     /**
@@ -120,6 +164,15 @@ public class GlobalExceptionHandler {
         log.error("Unhandled exception", ex);
         return ProblemDetails.of(
                 ErrorCode.INTERNAL_ERROR, "Something went wrong. Quote the traceId to support.");
+    }
+
+    private static boolean causedBy(Throwable ex, Class<? extends Throwable> type) {
+        for (Throwable cause = ex; cause != null; cause = cause.getCause()) {
+            if (type.isInstance(cause)) {
+                return true;
+            }
+        }
+        return false;
     }
 
     /** Names the offending parameter without echoing whatever the client sent. */

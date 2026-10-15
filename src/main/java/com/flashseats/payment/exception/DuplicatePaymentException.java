@@ -12,7 +12,7 @@ import com.flashseats.shared.error.FlashSeatsException;
  */
 public class DuplicatePaymentException extends FlashSeatsException {
 
-    public DuplicatePaymentException(String holdToken) {
+    public DuplicatePaymentException() {
         super(ErrorCode.DUPLICATE_PAYMENT, "A payment for this reservation is already being processed.");
         with("retryable", false);
     }

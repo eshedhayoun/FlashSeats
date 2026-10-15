@@ -3,16 +3,33 @@ package com.flashseats.queue;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.awaitility.Awaitility.await;
 
-import com.flashseats.flashseats.support.BuyerSession;
-import com.flashseats.flashseats.support.IntegrationTest;
-import com.flashseats.flashseats.support.SaleFixture;
+import com.flashseats.app.support.BuyerSession;
+import com.flashseats.app.support.IntegrationTest;
+import com.flashseats.app.support.SaleFixture;
+import com.flashseats.queue.config.QueueOrdering;
+import com.flashseats.queue.config.QueueProperties;
+import com.flashseats.queue.service.QueueBroadcaster;
+import com.flashseats.queue.service.QueueKeys;
+import com.flashseats.queue.service.QueueService;
+import java.io.BufferedReader;
+import java.io.InputStreamReader;
+import java.net.CookieManager;
+import java.net.CookiePolicy;
+import java.net.URI;
+import java.net.http.HttpClient;
+import java.net.http.HttpRequest;
+import java.net.http.HttpResponse;
 import java.time.Duration;
 import java.util.Map;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.TimeUnit;
+import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.web.server.LocalServerPort;
+import org.springframework.data.redis.core.StringRedisTemplate;
 
 /**
  * The waiting room's terminal states, which is where the first pass was weakest.
@@ -33,9 +50,29 @@ class QueueLifecycleIT extends IntegrationTest {
     @Autowired
     private SaleFixture fixture;
 
+    @Autowired
+    private QueueService queue;
+
+    @Autowired
+    private QueueBroadcaster broadcaster;
+
+    @Autowired
+    private QueueProperties properties;
+
+    @Autowired
+    private StringRedisTemplate redis;
+
+    private QueueOrdering originalOrdering;
+
     @BeforeEach
     void reset() {
         fixture.reset();
+        originalOrdering = properties.getOrdering();
+    }
+
+    @AfterEach
+    void restoreProperties() {
+        properties.setOrdering(originalOrdering);
     }
 
     @Test
@@ -45,7 +82,7 @@ class QueueLifecycleIT extends IntegrationTest {
         // and reading that 0 as "sold out" told the whole waiting room the sale had ended and then
         // deleted the line (ADR-035).
         long eventId = fixture.openEvent("Un-warmed");
-        fixture.tierWithoutInventory(eventId, "General Admission", 2_500, 100);
+        fixture.tierWithoutCounter(eventId, "General Admission", 2_500, 100);
 
         BuyerSession buyer = new BuyerSession(port);
         buyer.get("/events/" + eventId);
@@ -54,7 +91,7 @@ class QueueLifecycleIT extends IntegrationTest {
         // Give the promotion worker several ticks to get it wrong.
         await().pollDelay(Duration.ofSeconds(2)).atMost(Duration.ofSeconds(5)).untilAsserted(() -> {
             var state = buyer.get("/sale/" + eventId + "/state");
-            assertThat(state.json().get("queue").get("state").asText())
+            assertThat(state.json().get("queue").get("state").asString())
                     .describedAs("a missing counter is a fault, never a sold-out sale")
                     .isEqualTo("WAITING");
         });
@@ -62,6 +99,30 @@ class QueueLifecycleIT extends IntegrationTest {
         // And their place is intact: the line was never deleted.
         assertThat(buyer.get("/queue/status?eventId=" + eventId).json().get("position").asInt())
                 .isEqualTo(1);
+    }
+
+    @Test
+    @DisplayName("Leaving takes the buyer out of the line, and joining again starts at the back")
+    void leavingAndRejoiningGoesToTheBack() {
+        // No counter, so nobody is promoted and the line holds still while it is measured.
+        long eventId = fixture.openEvent("Leave And Rejoin");
+        fixture.tierWithoutCounter(eventId, "General Admission", 2_500, 100);
+
+        BuyerSession first = new BuyerSession(port);
+        first.get("/events/" + eventId);
+        first.post("/queue/join", Map.of("eventId", eventId));
+        BuyerSession second = new BuyerSession(port);
+        second.get("/events/" + eventId);
+        second.post("/queue/join", Map.of("eventId", eventId));
+
+        assertThat(first.post("/queue/leave", Map.of("eventId", eventId)).status()).isEqualTo(204);
+        assertThat(first.get("/queue/status?eventId=" + eventId).text("phase")).isEqualTo("NOT_JOINED");
+        assertThat(second.get("/queue/status?eventId=" + eventId).number("position")).isEqualTo(1);
+        // Leaving twice is not an error.
+        assertThat(first.post("/queue/leave", Map.of("eventId", eventId)).status()).isEqualTo(204);
+
+        first.post("/queue/join", Map.of("eventId", eventId));
+        assertThat(first.get("/queue/status?eventId=" + eventId).number("position")).isEqualTo(2);
     }
 
     @Test
@@ -79,8 +140,8 @@ class QueueLifecycleIT extends IntegrationTest {
         // The promotion worker and the broadcaster both skip closed events, so nothing was left to
         // tell a session still ranked in the ZSET. It reported WAITING indefinitely (ADR-036).
         var state = buyer.get("/sale/" + eventId + "/state");
-        assertThat(state.json().get("queue").get("state").asText()).isEqualTo("CLOSED");
-        assertThat(state.json().get("windowStatus").asText()).isEqualTo("CLOSED");
+        assertThat(state.json().get("queue").get("state").asString()).isEqualTo("CLOSED");
+        assertThat(state.json().get("windowStatus").asString()).isEqualTo("CLOSED");
     }
 
     @Test
@@ -150,7 +211,127 @@ class QueueLifecycleIT extends IntegrationTest {
         // (ADR-035).
         await().atMost(PATIENCE).untilAsserted(() -> {
             var state = second.get("/sale/" + eventId + "/state");
-            assertThat(state.json().get("queue").get("state").asText()).isIn("WAITING", "PROMOTED", "ADMITTED");
+            assertThat(state.json().get("queue").get("state").asString()).isIn("WAITING", "PROMOTED", "ADMITTED");
         });
+    }
+
+    @Test
+    @DisplayName("Selling out tells the line at once, while the buyers it let in are still choosing")
+    void exhaustionDoesNotWaitForAdmissionsToLapse() {
+        long eventId = fixture.openEvent("Last Seat");
+        long tierId = fixture.tier(eventId, "Only", 9_900, 1);
+
+        BuyerSession first = new BuyerSession(port);
+        first.get("/events/" + eventId);
+        first.post("/queue/join", Map.of("eventId", eventId));
+        String pass = await().atMost(PATIENCE)
+                .until(() -> first.get("/queue/status?eventId=" + eventId).text("passToken"),
+                        token -> token != null);
+        String admission = first
+                .post("/queue/admit", Map.of("eventId", eventId), Map.of("X-Queue-Pass-Token", pass))
+                .text("admissionToken");
+        first.post(
+                "/holds",
+                Map.of("eventId", eventId, "tierId", tierId, "quantity", 1),
+                Map.of("X-Admission-Token", admission));
+
+        // The first buyer's admission lives on until they pay or it runs out, ten minutes by default.
+        // The line used to wait for it: no promotion was possible, and nobody was told why (ADR-079).
+        BuyerSession second = new BuyerSession(port);
+        second.get("/events/" + eventId);
+        second.post("/queue/join", Map.of("eventId", eventId));
+
+        await().atMost(PATIENCE).untilAsserted(() -> assertThat(
+                        second.get("/queue/status?eventId=" + eventId).text("phase"))
+                .isEqualTo("EXHAUSTED"));
+        assertThat(first.get("/queue/status?eventId=" + eventId).text("phase")).isEqualTo("ADMITTED");
+    }
+
+    @Test
+    @DisplayName("RANDOM ordering is stable for one buyer and orders the queue by the draw")
+    void randomOrderingUsesStablePerEventDraw() {
+        properties.setOrdering(QueueOrdering.RANDOM);
+        long eventId = fixture.openEvent("Draw Sale");
+        fixture.tierWithoutCounter(eventId, "GA", 2_500, 100);
+
+        String first = "session-first";
+        String second = "session-second";
+
+        queue.join(first, eventId, null, "127.0.0.1");
+        Double firstDraw = redis.opsForZSet().score(QueueKeys.waiting(eventId), first);
+        queue.join(second, eventId, null, "127.0.0.1");
+        Double secondDraw = redis.opsForZSet().score(QueueKeys.waiting(eventId), second);
+        queue.join(first, eventId, null, "127.0.0.1");
+
+        assertThat(redis.opsForZSet().score(QueueKeys.waiting(eventId), first)).isEqualTo(firstDraw);
+        assertThat(firstDraw).isNotEqualTo(secondDraw);
+
+        var firstState = queue.status(first, eventId);
+        var secondState = queue.status(second, eventId);
+        if (firstDraw < secondDraw) {
+            assertThat(firstState.position()).isLessThan(secondState.position());
+        } else {
+            assertThat(secondState.position()).isLessThan(firstState.position());
+        }
+    }
+
+    @Test
+    @DisplayName("The waiting room streams tier availability changes")
+    void streamPublishesTierAvailabilityChanges() throws Exception {
+        long eventId = fixture.openEvent("Live Availability");
+        long tierId = fixture.tier(eventId, "GA", 2_500, 100);
+
+        HttpClient http = HttpClient.newBuilder()
+                .cookieHandler(new CookieManager(null, CookiePolicy.ACCEPT_ALL))
+                .connectTimeout(Duration.ofSeconds(5))
+                .build();
+        http.send(
+                request("/events/" + eventId).GET().build(),
+                HttpResponse.BodyHandlers.ofString());
+        http.send(
+                request("/queue/join")
+                        .POST(HttpRequest.BodyPublishers.ofString("{\"eventId\":" + eventId + "}"))
+                        .build(),
+                HttpResponse.BodyHandlers.ofString());
+
+        HttpResponse<java.io.InputStream> stream = http.send(
+                request("/queue/stream?eventId=" + eventId).GET().build(),
+                HttpResponse.BodyHandlers.ofInputStream());
+        assertThat(stream.statusCode()).isEqualTo(200);
+
+        CompletableFuture<String> frame = CompletableFuture.supplyAsync(() -> {
+            try (BufferedReader reader = new BufferedReader(new InputStreamReader(stream.body()))) {
+                String event = null;
+                String line;
+                while ((line = reader.readLine()) != null) {
+                    if (line.startsWith("event:")) {
+                        event = line.substring("event:".length()).trim();
+                    }
+                    if ("tier-availability".equals(event)
+                            && line.startsWith("data:")
+                            && line.contains("\"SOLD_OUT\"")) {
+                        return line;
+                    }
+                }
+                return "";
+            } catch (Exception failure) {
+                throw new IllegalStateException(failure);
+            }
+        });
+
+        broadcaster.pushPositions();
+        fixture.drainTier(tierId);
+        broadcaster.pushPositions();
+
+        assertThat(frame.get(5, TimeUnit.SECONDS))
+                .contains("\"tierId\":" + tierId)
+                .contains("\"level\":\"SOLD_OUT\"");
+    }
+
+    private HttpRequest.Builder request(String path) {
+        return HttpRequest.newBuilder(URI.create("http://localhost:" + port + "/api/v1" + path))
+                .header("Accept", "application/json, text/event-stream")
+                .header("Content-Type", "application/json")
+                .timeout(Duration.ofSeconds(20));
     }
 }

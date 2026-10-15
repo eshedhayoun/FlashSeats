@@ -1,10 +1,15 @@
 package com.flashseats.notification.service;
 
+import com.flashseats.notification.config.NotificationProperties;
+import com.flashseats.notification.dto.DeadLetterResponse;
 import com.flashseats.notification.model.NotificationKind;
 import com.flashseats.notification.model.NotificationStatus;
 import com.flashseats.notification.repository.NotificationLogRepository;
 import java.time.Clock;
+import java.util.List;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.data.domain.PageRequest;
+import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Propagation;
 import org.springframework.transaction.annotation.Transactional;
@@ -21,49 +26,94 @@ import org.springframework.transaction.annotation.Transactional;
 @Service
 public class NotificationLogService {
 
+    /**
+     * What a stranded claim's {@code failure_reason} says. The process died after claiming, so whether
+     * the mail went out is unknown — the operator replaying it decides, and the buyer can always
+     * download the ticket from the receipt page meanwhile (ADR-050).
+     */
+    static final String STRANDED =
+            "stranded: claimed, then the process died before recording an outcome; the mail may or may not"
+                    + " have been sent";
+
     private final NotificationLogRepository logs;
+    private final NotificationProperties properties;
     private final Clock clock;
 
-    public NotificationLogService(NotificationLogRepository logs, Clock clock) {
+    public NotificationLogService(
+            NotificationLogRepository logs, NotificationProperties properties, Clock clock) {
         this.logs = logs;
+        this.properties = properties;
         this.clock = clock;
     }
 
     /**
-     * Claims the right to send this message, by inserting the row that makes a second attempt
-     * impossible.
-     *
-     * <p><strong>Insert first, send second.</strong> The unique constraint — not a preceding
-     * {@code SELECT} — is the guard, because the constraint is atomic and a read is not. Two workers
-     * handling the same redelivered message would both pass a {@code SELECT} and both send, and the
-     * buyer would get two tickets (ADR-015).
-     *
-     * <p>{@code REQUIRES_NEW} so the claim commits on its own, independently of anything the caller
-     * does afterwards.
-     *
-     * <p><strong>A dead-lettered row is re-claimable</strong> (ADR-038). The claim guards a send in
-     * progress, so it has to be released when the send did not happen — otherwise an SMTP outage
-     * dead-letters the message and permanently consumes its own guard, and replaying it from the
-     * DLQ silently acknowledges without sending. The re-claim is itself a conditional {@code UPDATE}
-     * on {@code status = 'DLQ'}, so a {@code PENDING} or {@code SENT} row is never disturbed and
-     * this can never authorise a second delivery of a message that worked.
+     * Claims the right to send, by inserting the row that makes a second send impossible. The unique
+     * constraint is the guard, never a preceding {@code SELECT} (ADR-015). {@code REQUIRES_NEW}, so the
+     * claim commits on its own. A {@code DLQ} row is re-claimable, so a replay sends (ADR-038).
      *
      * @return true if this caller may send; false if someone already has, or is doing so now
      */
     @Transactional(propagation = Propagation.REQUIRES_NEW)
     public boolean claim(String orderNumber, NotificationKind kind, String recipientEmail) {
-        // Two conditional statements, each answering with a rowcount. Neither can throw, so neither
-        // can leave this transaction rollback-only — which is what the earlier insert-and-catch did,
-        // making "already handled, acknowledge quietly" impossible to actually return.
+        // Two conditional statements answering with rowcounts. Neither throws, so neither can leave
+        // this transaction rollback-only (ADR-038).
         if (logs.claimIfAbsent(orderNumber, kind.name(), recipientEmail) == 1) {
             return true;
         }
-        if (logs.reclaimDeadLettered(orderNumber, kind) == 1) {
+        if (logs.reclaimDeadLettered(orderNumber, kind, clock.instant()) == 1) {
             log.info("Re-claimed dead-lettered {} for {}", kind, orderNumber);
             return true;
         }
         log.debug("{} for {} was already handled", kind, orderNumber);
         return false;
+    }
+
+    /**
+     * Moves claims stranded in {@code PENDING} to {@code DLQ}, where an operator sees them and a replay
+     * sends (ADR-069). A process killed between {@link #claim} and recording an outcome left its row
+     * {@code PENDING} for ever: the broker's redelivery found it neither claimable nor dead-lettered and
+     * acknowledged it, the DLQ listing never showed it, and a resend could not re-claim it — a paid
+     * buyer's ticket silently never sent. Idempotent, so every replica may run it.
+     *
+     * <p>Not re-sent automatically: whether the mail went out before the process died is unknown, and an
+     * automatic send would turn every crash after the SMTP call into a second ticket email (ADR-042).
+     */
+    @Scheduled(fixedDelay = 60_000, initialDelay = 60_000)
+    @Transactional
+    public int deadLetterStranded() {
+        int stranded = logs.deadLetterStranded(
+                clock.instant().minusSeconds(properties.getStrandedAfterSeconds()), STRANDED, clock.instant());
+        if (stranded > 0) {
+            log.warn("{} notification claim(s) were stranded mid-send; dead-lettered for an operator", stranded);
+        }
+        return stranded;
+    }
+
+    /**
+     * The dead letters an operator can act on, newest first.
+     *
+     * <p>{@code DLQ} is the one status that means <strong>the work did not happen</strong>, which is
+     * what makes every row here safely replayable — and why nothing writes {@code DLQ} once the mail
+     * server has accepted a message (ADR-038).
+     */
+    @Transactional(readOnly = true)
+    public List<DeadLetterResponse> deadLetters(int page, int size) {
+        return logs
+                .findByStatusOrderByUpdatedAtDesc(
+                        NotificationStatus.DLQ, PageRequest.of(page, size))
+                .map(entry -> new DeadLetterResponse(
+                        entry.getOrderNumber(),
+                        entry.getKind(),
+                        entry.getRecipientEmail(),
+                        entry.getRetryCount(),
+                        entry.getFailureReason(),
+                        entry.getUpdatedAt()))
+                .getContent();
+    }
+
+    @Transactional(readOnly = true)
+    public long deadLetterCount() {
+        return logs.countByStatus(NotificationStatus.DLQ);
     }
 
     @Transactional(propagation = Propagation.REQUIRES_NEW)

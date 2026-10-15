@@ -1,263 +1,171 @@
 # Module: `catalog`
 
-> **Status:** aligned to [`../00-architecture-decisions.md`](../00-architecture-decisions.md) and
-> [`../05-global-standards.md`](../05-global-standards.md). Structural rewrite to the §10 template
-> is pending.
+> **Describes what is built.** No class names — see [`../../CLAUDE.md`](../../CLAUDE.md), "Updating
+> the docs is part of the change".
 
-**Package:** `com.flashseats.catalog` · **Phase:** 1 · **Storage:** PostgreSQL + Redis
+**Package:** `com.flashseats.catalog` · **Storage:** PostgreSQL + Redis · **Depends on:** `shared`
 
 ---
 
 ## 1. Scope
 
-Owns event metadata, ticket tiers, sale windows, and **all inventory**. Serves high-volume browse
-reads, publishes the server clock for the pre-sale countdown, seeds Redis counters before a sale,
-and owns the recovery procedure when those counters are lost.
-
-**Forbidden:** creating holds, processing payments, managing queue positions, writing orders.
-
-**Inventory ownership, precisely.** `catalog` owns `catalog:stock:{eventId}:{tierId}` — it seeds,
-reads, rebuilds and reconciles. `hold` is the only other module permitted to touch it, exclusively
-through `hold_reserve.lua` / `hold_restore.lua`, because a decrement and the reservation that
-justifies it must be one atomic operation. That exception is deliberate, narrow, and the only shared
-key in the system.
+Event metadata, sale windows, and **every movement of the inventory counter**. This module has no
+outbound dependency on any other domain module, and it must not acquire one — `catalog` sits at the
+bottom of the graph and everything above it reads through `CatalogFacade`.
 
 ---
 
-## 2. Package layout
+## 2. What it owns
 
-```
-com.flashseats.catalog
-├── controller   # public browse endpoints, admin prewarm/rebuild
-├── service      # metadata reads, window derivation, prewarm, stock rebuild
-├── facade       # CatalogFacade (+ Impl) — the only cross-module surface
-├── repository   # JPA repositories, Redis stock template
-├── model        # Event, TicketTier, TierInventory, EventWindowStatus
-├── dto          # EventDetailDTO, TierSummaryDTO, TierAvailabilityDTO
-└── event        # EventPrewarmedEvent, StockRebuiltEvent
-```
-
----
-
-## 3. Schema
-
-### `events`
-
-| Column | Type | Notes |
-| :--- | :--- | :--- |
-| `id` | `BIGSERIAL` PK | |
-| `title` | `VARCHAR(255)` NOT NULL | |
-| `description` | `TEXT` | |
-| `venue_name` | `VARCHAR(255)` NOT NULL | in the ticket PDF |
-| `event_start_time` | `TIMESTAMPTZ` NOT NULL | **added** — the PDF and email need it |
-| `sale_start_time` | `TIMESTAMPTZ` NOT NULL | |
-| `sale_end_time` | `TIMESTAMPTZ` NOT NULL | |
-| `status` | `VARCHAR(32)` NOT NULL | `DRAFT`, `PUBLISHED`, `CANCELLED` |
-| `created_at` / `updated_at` | `TIMESTAMPTZ` NOT NULL | |
-
-### `ticket_tiers`
-
-| Column | Type | Notes |
-| :--- | :--- | :--- |
-| `id` | `BIGSERIAL` PK | |
-| `event_id` | `BIGINT` FK → `events(id)` NOT NULL | |
-| `tier_name` | `VARCHAR(100)` NOT NULL | |
-| `price_cents` | `BIGINT` NOT NULL `CHECK (>= 0)` | |
-| `currency` | `CHAR(3)` NOT NULL DEFAULT `'USD'` | **added** (ADR-013) |
-| `total_capacity` | `INT` NOT NULL `CHECK (> 0)` | immutable once the sale opens |
-| `max_per_order` | `INT` NOT NULL DEFAULT `6` | **added** (ADR-017) |
-| `created_at` / `updated_at` | `TIMESTAMPTZ` NOT NULL | |
-
-### `tier_inventory` — **new**
-
-```sql
-CREATE TABLE tier_inventory (
-    tier_id    BIGINT PRIMARY KEY REFERENCES ticket_tiers(id),
-    event_id   BIGINT NOT NULL,
-    remaining  INT    NOT NULL CHECK (remaining >= 0),
-    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
-);
-CREATE INDEX idx_tier_inventory_event ON tier_inventory(event_id);
-```
-
-Phase 1: the live counter, mutated by a conditional `UPDATE`.
-Phase 2+: Redis is the live counter; this column becomes last-known-good, refreshed on
-reconciliation. `CHECK (remaining >= 0)` is the database-level guarantee that overbooking cannot be
-persisted.
-
-### Window status — derived, never stored
-
-| `windowStatus` | Condition |
+| PostgreSQL | Contents |
 | :--- | :--- |
-| `UPCOMING` | `status = PUBLISHED` and `now < sale_start_time` |
-| `OPEN` | `status = PUBLISHED` and `sale_start_time ≤ now < sale_end_time` |
-| `CLOSED` | `status ≠ PUBLISHED`, or `now ≥ sale_end_time` |
+| `events` | title, venue, event start, **sale window**, status (`DRAFT`/`PUBLISHED`/`PAUSED`/`CANCELLED`) |
+| `ticket_tiers` | name, `price_cents`, currency, `total_capacity`, `max_per_order` |
 
-Gates: `queue/join` requires `OPEN`; `POST /holds` requires `OPEN`; `orders/checkout` allows `OPEN`
-or `CLOSED` within 15 min of `sale_end_time` (ADR-016).
-
----
-
-## 4. Redis
-
-| Key | Type | TTL | Notes |
+| Redis key | Type | TTL | Purpose |
 | :--- | :--- | :--- | :--- |
-| `catalog:stock:{eventId}:{tierId}` | String (integer) | none | live remaining; `noeviction` required |
-| `catalog:meta:{eventId}` | String (JSON) | 60 s | browse-read cache |
+| `catalog:stock:{e}:{t}` | String | **none** | **the live inventory count** |
+| `catalog:vouch:{e}` | String | none | which Redis incarnation last derived this event's counters (ADR-046) |
 
-**`maxmemory-policy noeviction` is mandatory.** A `TTL = −1` key is not protected from an LRU
-eviction policy; losing a stock counter mid-sale is the worst failure the system has.
+**It also holds an in-process cache of both tables** (ADR-051) — event rows for 1 s, tier lists for
+60 s. That is derived state, not owned state: dropping all of it costs a re-read and nothing else. Two
+rules make it safe to have at all. The **TTL is the cross-replica invalidation**, because eviction
+reaches only the replica that served the operator's call — so the event TTL is the bound on how long a
+paused sale can still answer `OPEN` elsewhere, and it is a correctness setting rather than a
+performance one. And the **window status is never cached**: it is derived from the row and the clock on
+every call, since it flips with no write to evict on. **A miss loads once**: readers that miss the same
+key together wait for the load already running instead of each taking a connection — every entry
+expires on a timer, so a polled event would otherwise spike the pool on every TTL boundary. A load
+that an eviction overtakes is not stored (ADR-065).
 
-### Pre-warm
+**There is no copy of the count in PostgreSQL.** `tier_inventory` was dropped in `V7` — it had
+become a write-only copy of a number that had moved to Redis, with a stale column named `remaining`
+that read exactly like the truth (ADR-046). The database holds the **ledger** the count can be
+derived from: `ticket_tiers.total_capacity` minus what `order_items` sold minus what `ticket_holds`
+is holding. That derivation is the rebuild, and it lives in `order` — the only module that can
+legally read all three tables.
 
-```
-if windowStatus != UPCOMING: reject 409 PREWARM_WINDOW_CLOSED
-for each tier:  SETNX catalog:stock:{eventId}:{tierId} <total_capacity>
-publish EventPrewarmedEvent
-```
-
-`SETNX` makes a repeated trigger a no-op. The `UPCOMING` gate is the important part: once the sale
-is `OPEN`, seeding from `total_capacity` would resurrect every ticket already sold (ADR-004).
-
-### Missing counter = fault, not cache miss
-
-**The previous version of this document specified falling back to `total_capacity` and
-repopulating on a cache miss. That was the single most dangerous line in the design.** A Redis
-eviction, cold restart, or `FLUSHDB` mid-sale would have silently restored the entire inventory.
-
-Correct behaviour while `OPEN`:
-
-1. `hold_reserve.lua` returns `-2`; the API returns `503 INVENTORY_UNAVAILABLE`; the alarm fires.
-2. Browse reads degrade to `tier_inventory.remaining` clearly marked as approximate.
-3. Recovery is an explicit locked rebuild.
-
-### Rebuild (`pg_try_advisory_xact_lock(hash('stock-rebuild', eventId))`)
-
-```sql
-remaining = tt.total_capacity
-  - COALESCE((SELECT SUM(oi.quantity) FROM order_items oi
-                JOIN orders o ON o.id = oi.order_id
-               WHERE oi.tier_id = tt.id AND o.status = 'CONFIRMED'), 0)
-  - COALESCE((SELECT SUM(th.quantity) FROM ticket_holds th
-               WHERE th.tier_id = tt.id AND th.status = 'ACTIVE'
-                 AND th.expires_at > now()), 0)
-```
-
-No double counting: a `PENDING` order still has an `ACTIVE` hold; a `CONFIRMED` order's hold is
-`CONSUMED`. Writes both Redis and `tier_inventory`, then publishes `StockRebuiltEvent`.
-
-The lock is a PostgreSQL **transaction-scoped advisory lock**: released automatically on commit or
-rollback, impossible to leak, and needing no extra dependency. Redisson was dropped in ADR-022 once
-this was its only remaining use.
-
-**Mandatory after any Redis restart** — AOF `everysec` can lose a second of `DECRBY`s, which reads
-as inventory that does not exist.
+`noeviction` is a **correctness setting**, not tuning. A `TTL = -1` key is not protected from an LRU
+policy, and evicting a live counter is the worst failure this system has.
 
 ---
 
-## 5. Interfaces
+## 3. What it exposes
 
-| Method | Path | Access |
+### Endpoints
+
+| Method | Path | Auth |
 | :--- | :--- | :--- |
-| `GET` | `/api/v1/events` | public |
-| `GET` | `/api/v1/events/{eventId}` | public — `windowStatus`, `serverTime`, **bucketed** availability |
-| `POST` | `/api/v1/admin/events/{eventId}/prewarm` | admin — `UPCOMING` only |
-| `POST` | `/api/v1/admin/events/{eventId}/rebuild-stock` | admin |
-| `POST` | `/api/v1/admin/events/{eventId}/pause` | admin — halt promotions and new holds |
+| `GET` | `/api/v1/events` | public — published and paused events, each with its window status |
+| `GET` | `/api/v1/events/{eventId}` | public — the landing page |
+| `POST` | `/api/v1/admin/events/{eventId}/prewarm` | `ROLE_ADMIN` |
+| `POST` | `/api/v1/admin/events/{eventId}/pause` | `ROLE_ADMIN` |
+| `POST` | `/api/v1/admin/events/{eventId}/resume` | `ROLE_ADMIN` |
 
-```java
-public interface CatalogFacade {
-    TierSummaryDTO   getTierSummary(long eventId, long tierId);   // throws TierNotFoundException
-    EventWindowStatus getWindowStatus(long eventId);
-    int              getRemaining(long eventId, long tierId);      // -1 ⇒ counter unavailable
+**Availability is a bucket, never a count** (ADR-027): `SOLD_OUT` · `LIMITED` (< 10 %) · `PLENTY` ·
+**`UNKNOWN`**. Publishing exact live inventory drives panic-buying and hands scalpers a free feed.
 
-    // Phase 1 only; superseded by hold_reserve.lua in Phase 2+
-    boolean tryReserve(long eventId, long tierId, int quantity);
-    void    restore(long eventId, long tierId, int quantity);
-}
+`UNKNOWN` is the one that matters. An unreadable counter was previously clamped to zero with
+`Math.max`, which published "we cannot read our own inventory" to every visitor as "this tier is
+gone" — ADR-004's failure mode reaching the landing page (ADR-040).
 
-public record TierSummaryDTO(
-    long eventId, long tierId, String tierName,
-    long priceCents, String currency, int maxPerOrder,
-    String eventTitle, String venueName, Instant eventStartTime,
-    EventWindowStatus windowStatus) {}
-```
+### Facade
 
-`TierSummaryDTO` carries the venue and event time so `order` can snapshot a complete outbox payload
-and `notification` never needs to call `catalog` (ADR-015).
+Reads: `getEventSummary`, `getWindowStatus`, `getTierSummary`, `findOpenEventIds`,
+`findManagedEventIds`, `getRemainingForEvent`, `getLiveCounters`, `getTierCapacities`.
+Movement: `tryReserve`, `restore`, `applyRebuild`.
 
-**Events:**
-* `EventPrewarmedEvent(eventId, tierIds, totalStock, at)`
-* `StockRebuiltEvent(eventId, perTierBefore, perTierAfter, at)`
-* `TierAvailabilityChangedEvent(eventId, tierId, level, at)` — **new (ADR-027)**. Fired when a tier
-  crosses a bucket boundary (`PLENTY` → `LIMITED` → `SOLD_OUT`). `queue` consumes it and fans it out
-  to the waiting room as a `tier-availability` SSE frame, so a buyer waiting specifically for VIP
-  learns it is gone **while waiting** rather than after admission.
+**The window status has four values** — `UPCOMING`, `OPEN`, `PAUSED`, `CLOSED` — derived from the row
+and the clock on every call. `PAUSED` exists only inside the window: an event paused before its sale
+starts still reads `UPCOMING`, and one past its end reads `CLOSED`. A paused sale stays in the public
+event list, marked as such, so the buyers in its line can find it again (ADR-066). Every gate tests
+for the statuses it admits, never for the ones it refuses, so a gate that has not heard of a status
+refuses it — which is what made adding one safe (ADR-048's objection, answered in ADR-066).
 
-  Buckets, never exact counts: exact live inventory drives panic-buying and hands scalpers a feed.
-  Thresholds are `SOLD_OUT` at 0, `LIMITED` below 10 % of `total_capacity`, else `PLENTY`, with
-  hysteresis so a restored hold does not flap the banner.
-
-### `AvailabilityLevel` has four values, and the fourth is not a bucket (ADR-040)
-
-| Value | Meaning |
-| :--- | :--- |
-| `PLENTY` | above the threshold |
-| `LIMITED` | at or below `limited-threshold-percent` of capacity |
-| `SOLD_OUT` | the counter says zero |
-| **`UNKNOWN`** | **there is no counter** — a fault to repair, never a sold-out tier |
-
-`AvailabilityBuckets.of` takes the **raw** value, fault code included. The call site used to clamp
-with `Math.max(remaining, 0)`, which turned `COUNTER_UNAVAILABLE` (`-1`) into `0` and published a
-missing counter to every visitor as `SOLD_OUT` — ADR-004's prohibition, on the browse path, on the
-first surface anyone loads. ADR-035 fixed the same substitution for the promoter and the reserve
-path; this was the third caller.
-
-Clients render `UNKNOWN` neutrally and keep the tier **selectable**. `POST /holds` is what actually
-knows, and it already separates `409 INSUFFICIENT_STOCK` from `503 INVENTORY_UNAVAILABLE`.
+**`findOpenEventIds` and `findManagedEventIds` are not interchangeable.** *Managed* means open **or
+paused** — what an operator is still answerable for. Pausing is what an operator does *while*
+investigating a counter, so the drift gauge and the Redis-restart guard both need paused events
+included; reusing "is it on sale?" to mean "should we still watch it?" meant a paused event's
+rolled-back counters were flagged only once someone resumed and started selling from them (ADR-048).
 
 ---
 
-## 6. Edge cases
+## 4. Inventory movement — the four rules
 
-| Case | Handling |
-| :--- | :--- |
-| Prewarm triggered twice | `SETNX` no-op |
-| Prewarm attempted after sale opens | `409 PREWARM_WINDOW_CLOSED` |
-| Stock counter missing mid-sale | `-2` → `503` → alarm → rebuild. **Never** reseed from capacity |
-| Redis down | Browse degrades to PostgreSQL (approximate); holds `503` |
-| Redis restarted | Rebuild is mandatory before resuming |
-| PostgreSQL slow mid-sale | Browse and reserve continue from Redis |
-| Capacity increased mid-sale | Not supported. Requires pause → capacity change → rebuild |
-| Price changed mid-sale | Not supported. Orders snapshot price at checkout |
+**1. `tryReserve` answers three ways, atomically.** One Lua script, so readable-ness and
+sufficiency are decided in the same step:
 
-**Exceptions:** `EventNotFoundException` → 404 · `TierNotFoundException` → 404 ·
-`PrewarmWindowClosedException` → 409 · `InventoryUnavailableException` → 503 ·
-`StockRebuildInProgressException` → 503.
+| Result | Meaning | Becomes |
+| :--- | :--- | :--- |
+| `RESERVED` | seats taken | carry on |
+| `INSUFFICIENT` | genuinely sold out | `409` — try another tier |
+| `COUNTER_MISSING` | **no counter at all** | `503`, alarm, locked rebuild |
+
+Recovering that distinction afterwards by re-reading the counter *raced*: a concurrent restore
+between the two calls turned a fault into an ordinary "sold out". The Lua return codes stay inside
+the repository — `-1` means "sold out" at one layer and "no counter" one layer up, which is the
+precise pair of meanings this design spends its effort keeping apart.
+
+**2. Never reseed from `total_capacity` during a live sale.** `prewarm` refuses unless the window is
+`UPCOMING`. Seeding an open sale would silently resurrect every ticket already sold (ADR-004).
+Recovery during a live sale is a rebuild from the ledger, never a reseed.
+
+**3. `restore` will not create a counter.** `INCRBY` treats a missing key as zero and creates it, so
+a bare `INCRBY` would rebuild a lost counter out of whichever hold happened to expire next. The
+`EXISTS` guard makes those seats invisible instead — reported by `flashseats.stock.drift` and
+returned by an explicit rebuild. Invisible seats are lost revenue a rebuild recovers; phantom seats
+are an oversell nothing recovers.
+
+**4. Neither call may run inside a SQL transaction.** Redis does not roll back (ADR-023).
 
 ---
 
-## 7. Changes from v1
+## 5. The restart guard — and the failover guard, which is the same guard
 
-1. Cache-miss repopulation from `total_capacity` **removed** — replaced by fault + locked rebuild
-   (ADR-004).
-2. `tier_inventory` table added — the Phase 1 counter and the Phase 2+ reconciliation target.
-3. `windowStatus` + `serverTime` added and enforced (ADR-016).
-4. `event_start_time`, `currency`, `max_per_order` columns added.
-5. `TierSummaryDTO` widened so `notification` needs no facade call.
-6. `maxmemory-policy noeviction` and post-restart reconciliation made explicit.
-7. Prewarm restricted to `UPCOMING`.
-8. Admin `rebuild-stock` and `pause` endpoints added.
+Redis AOF is `appendfsync everysec`, so a restart replays to about a second ago: the `DECRBY`s in
+that second are gone while the `ticket_holds` rows they paid for remain. **The counters come back
+high**, which is the one direction that oversells.
 
-### Added in the 2nd pass
+**A Sentinel failover is the same event, and it is now reachable.** The `cluster` profile runs a
+primary with two replicas and three sentinels (ADR-058). A promoted replica is a *different process*
+with a different `run_id` and is a second or so behind, so a failover distrusts **every managed
+event at once** and refuses holds until each is rebuilt. Failover keeps the cluster up and stops the
+sale; that is the trade ADR-046 chose deliberately, because the alternative is selling from counters
+that read high. The recovery is `POST /admin/events/{id}/rebuild-stock`, per event.
 
-9. Rebuild lock is now `pg_try_advisory_xact_lock`, not a Redisson lock (ADR-022).
-10. Public availability is exposed **bucketed** (`PLENTY` / `LIMITED` / `SOLD_OUT`) rather than as an
-    exact integer. Exact counts drive panic-buying and hand scalpers a live inventory feed; industry
-    practice is a coarse indicator. Exact values remain internal, for `hold` and for metrics.
-11. Error codes aligned to the canonical registry in `05-global-standards.md` §2.
+`catalog:vouch:{e}` records which Redis `run_id` last derived this event's counters from scratch. A
+mismatch means selling is refused for that event until a rebuild runs.
 
-### Added in the 3rd pass
+**The verdict is derived, never consumed.** The first version stamped a shared key when it fired, so
+whichever replica noticed used the signal up and the others sold on. Each replica reaches the same
+conclusion independently, and a rebuild performed on one releases the event on all three (ADR-046).
 
-12. `TierAvailabilityChangedEvent` published on bucket transitions, so the waiting room can show
-    per-tier sold-out state before admission (ADR-027).
+---
+
+## 6. Known gaps
+
+| Gap | Detail |
+| :--- | :--- |
+| **No cross-replica cache invalidation** | Pause takes effect on the replica that served it immediately and on the others when their cached row expires — 1 s (ADR-051). A Redis invalidation channel would buy a fraction of a second on a control measured in seconds, and adds a failure mode a TTL does not have. It becomes worth building when an operator can *edit* an event, which is the gap below |
+| **No create-event endpoint** | Events are seeded by a `dev`-profile seeder or by `docker/seed/seed.sql`. An operator cannot create a sale through the API |
+
+---
+
+## 7. What it must never do
+
+- Depend on another domain module. It has no outbound edges and must keep none.
+- Reseed a counter from `total_capacity` outside the `UPCOMING` window.
+- Create a counter in `restore`.
+- Let a Lua return code escape the repository.
+- Publish a count, or clamp `COUNTER_UNAVAILABLE` into a number.
+- **Sum an empty tier list and call it zero.** An event with no tiers is *unknowable* inventory, and
+  answering `0` makes the promotion worker mark it exhausted — permanently, since that marker clears
+  only when `remaining > 0`. Every event exists before its tiers do, so this is on the normal path.
+- Move stock inside a SQL transaction.
+- **Cache a window status, or anything else derived from the clock.** Cache the row; derive on read.
+- **Cache a miss.** Rows are inserted out of band by the seed scripts, so a remembered "no such event"
+  outlives the insert that created it.
+- **Serve pre-warm or a rebuild from the cache.** Both write counters derived from the tier list: a
+  probably-right list produces a definitely-wrong counter (ADR-004, ADR-046).
+- **Load a cache entry inside `computeIfAbsent`.** Blocking JDBC inside `ConcurrentHashMap`'s per-bin
+  monitor pins carrier threads (ADR-022, ADR-051).

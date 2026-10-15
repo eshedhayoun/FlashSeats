@@ -17,8 +17,8 @@
                               |  HTTP        |  SSE        |  HTTP
                               v              v             v
                        +---------------------------------------------+
-                       |            `bot`  SERVLET FILTER            |
-                       |  fsid cookie · Bucket4j (Redis) · reCAPTCHA |
+                       |            `bot`  SERVLET FILTERS           |
+                       |  fsid cookie · Bucket4j (Redis, session+IP) |
                        +---------------------------------------------+
                                             |
         +---------------------+-------------+-------------+---------------------+
@@ -29,10 +29,10 @@
 | inventory      |   |                |          |                |    |                |
 +----------------+   +----------------+          +----------------+    +----------------+
 | PG: events,    |   | PG: none       |          | PG: ticket_    |    | PG: orders,    |
-|  ticket_tiers, |   | Redis: ZSET,   |          |  holds (AUTH-  |    | order_items,   |
-|  tier_inventory|   |  pass, admit,  |          |  ORITY)        |    | outbox_events  |
-| Redis: stock   |   |  pubsub        |          | Redis: hold:   |    |                |
-|                |   |                |          |  (timer only)  |    |                |
+|  ticket_tiers  |   | Redis: ZSET,   |          |  holds (AUTH-  |    | order_items,   |
+| Redis: stock   |   |  pass, admit,  |          |  ORITY)        |    | outbox_events  |
+|  (THE count),  |   |  pubsub        |          | Redis: hold:   |    |                |
+|  vouch         |   |                |          |  {token} timer |    |                |
 +----------------+   +----------------+          +----------------+    +----------------+
                                                                               |
                                                              +----------------+---------+
@@ -50,11 +50,11 @@
 ### Facade graph (acyclic — see ADR-005, ADR-025)
 
 ```
-                    shared          ← open module: ProblemDetail, ErrorCode, SessionId
+                    shared          ← open module: problems, ErrorCode, SessionId, signed tokens
                  (everyone may depend on it)
 
-filter   ──► bot
-queue    ──► catalog
+bot      ──► shared only            ← its servlet filters run before every handler
+queue    ──► catalog, bot           ← `bot` only on join, for the challenge (ADR-055)
 hold     ──► queue, catalog
 order    ──► hold, catalog, payment, queue
 saleflow ──► queue, hold, order, catalog        ← read-only leaf; nothing depends on it
@@ -69,7 +69,7 @@ key prefixes.
 Two additions from the 2nd-pass audit:
 
 * **`shared`** — a Modulith *open module* holding the RFC 7807 machinery, the canonical error-code
-  enum, and value types (`SessionId`, `Money`). Required, not optional: without it, seven modules
+  enum, the session identity (`SessionId`), signed tokens, the ticket PDF renderer and the clock. Required, not optional: without it, seven modules
   would either duplicate error codes or take dependencies on each other that `verify()` rejects
   (ADR-021).
 * **`saleflow`** — a read-only composition module owning one endpoint,
@@ -77,21 +77,98 @@ Two additions from the 2nd-pass audit:
   `queue`, because `queue` would then need `HoldFacade` while `hold → queue` already exists — a
   cycle. A leaf that depends on many and is depended on by none is the standard answer (ADR-025).
 
-### The one shared key, and its contract
+### There is no shared key — *corrected by ADR-046*
 
-`catalog:stock:{eventId}:{tierId}` is the sole piece of state touched by two modules.
+Earlier drafts of this document described `catalog:stock:{eventId}:{tierId}` as "the one shared key
+in the system", mutated by `hold` through scripts that lived in `hold`. **That is not the design and
+never shipped.**
 
-* **`catalog` owns it.** It seeds the key (only while the window is `UPCOMING`), reads it for
-  display, rebuilds it during recovery, and reconciles it after the sale.
-* **`hold` mutates it**, exclusively through `hold_reserve.lua` and `hold_restore.lua`. Those two
-  scripts are the entire mutation surface, and they live in `hold` because a decrement and the
-  creation of the reservation that justifies it must be one atomic operation.
+* **`catalog` owns the key outright.** It seeds it (only while the window is `UPCOMING`), reads it
+  for display, moves it through `stock_reserve.lua` / `stock_restore.lua`, and rebuilds it from the
+  ledger during recovery. Those scripts live in
+  [`src/main/resources/redis/`](../src/main/resources/redis/) and are invoked only by
+  [`StockCounterRepository`](../src/main/java/com/flashseats/catalog/repository/StockCounterRepository.java).
+* **`hold` moves stock through `CatalogFacade`**, like every other caller. It touches no
+  `catalog:` key.
 
-No other module reads or writes it. This exception is deliberate, narrow, and written down.
+The boundary rule has no exception. A module reads only its own tables and its own Redis prefixes,
+and `ApplicationModules.verify()` fails the build otherwise.
 
 ---
 
 ## 2. The User Journey
+
+### The whole journey on one page
+
+Everything below this table is the same journey with its reasoning attached. This is the reference
+card: what the buyer does, what authorises it, and what clock is running.
+
+| # | Buyer does | Endpoint | Authorised by | Bounded by |
+| :-- | :--- | :--- | :--- | :--- |
+| 0 | *(operator)* seeds counters | `POST /admin/events/{id}/prewarm` | HTTP Basic, `ROLE_ADMIN` | window must be `UPCOMING` |
+| 1 | Opens the landing page | `GET /events/{id}` | — (public) | — |
+| 2 | Joins the line | `POST /queue/join` | `fsid` cookie | window must be `OPEN` or `PAUSED` (ADR-066) |
+| 3 | Watches their position | `GET /queue/stream` (SSE)<br>`GET /queue/status` (fallback) | `fsid` cookie | stream 1 h; position pushed every 2 s. `POST /queue/leave` steps out; rejoining is at the back |
+| 4 | *(is promoted)* | — server-initiated | — | **pass TTL 120 s** |
+| 5 | Enters the sale | `POST /queue/admit` + `X-Queue-Pass-Token` | the pass, **spent here** | **admission TTL 600 s** |
+| 6 | Reserves seats | `POST /holds` + `X-Admission-Token` | the admission session | **hold TTL 300 s**, ceiling 420 s |
+| 7 | Re-syncs the countdown | `GET /holds/{token}` | `fsid` cookie + ownership | — |
+| 8 | Pays | `POST /orders/checkout` | `fsid` cookie + live hold | 3 attempts; one +120 s grace per hold |
+| 9 | Reads the receipt | `GET /orders/{orderNumber}` | `fsid` cookie **or** `receiptToken` | receipt token 90 d |
+| 10 | *(receives the ticket)* | email, via outbox → RabbitMQ | — | at-least-once, deduped on `(order_number, kind)` |
+| — | Reloads at any point | `GET /sale/{id}/state` | `fsid` cookie | rehydrates steps 2–10 |
+
+Three nested timers, each strictly inside the one before it: **pass (120 s) → admission (600 s) →
+hold (300 s, ceiling 420 s)** (ADR-020). Releasing a hold returns the buyer to step 6, not step 2 —
+the admission session deliberately survives, which is the entire reason the middle tier exists.
+
+### The operating envelope
+
+The capacity arithmetic in this system used to assume one sale at a time. It does not any more, and
+every limit below is stated at the scale it actually has to hold at.
+
+```
+  E   concurrent open sales             3 .. 10
+  N   waiting buyers per sale           up to 10,000
+  R   application replicas              3
+      DB connections                    30 per replica  ->  90 cluster-wide
+      admission budget                  GLOBAL across E, then capped per sale   (ADR-049, built)
+                                        45 per tick, cluster-wide
+```
+
+**`E` is the number that was missing.** ADR-028 derives the promotion batch size from the connection
+pool — `batchSize <= hikariMax x 1.5` — and that derivation is sound for exactly one sale. The
+promotion worker loops every open event and applies the cap *per event*, and the tick lock
+`queue:promote:{e}` is per event too, so replicas promote different sales in the same second. At
+`E = 5` the cluster admitted up to `3 x 5 x 45 = 675` buyers per second into 90 connections. Nothing
+errors — under virtual threads the requests simply queue on HikariCP while p99 collapses, which is
+the exact failure ADR-028 exists to prevent.
+
+**That is now bounded by `queue:budget`**, one cluster-wide allowance claimed per event per tick
+before anyone is promoted, with the per-event batch left as a secondary cap. The open-event order is
+shuffled each tick, because every replica otherwise reads the same ascending list and the lowest
+event id takes the whole allowance.
+
+**A checkout is not one connection, either.** It is **nine** sequential transactions —
+`findConfirmedReceiptFor`, `getActiveHold`, `getTierSummary`, `findOrCreate`, `grantGrace`, **two**
+in the payment store (`recordInitiated` and `recordOutcome`, the `REQUIRES_NEW` pair that brackets
+the gateway call), `confirm`, `receiptFor` — and a buyer's full session costs roughly fifteen
+including `POST /holds` and `GET /sale/state`. Every earlier listing said eight, collapsing the
+payment pair into one. ADR-049 budgets against that order of magnitude rather than against one.
+
+**The promoter itself needed a connection, which made the failure self-sustaining.**
+`findOpenEventIds()` ran once per tick against PostgreSQL, so at peak the promotion worker queued behind
+the buyers it existed to admit — a logged wait of **16 s inside a 1 s tick**. Nobody promoted means the
+waiting room does not drain, which means everyone keeps polling, which is what saturated the pool. The
+open-event set is now served from the metadata cache and the tick touches only Redis (ADR-051).
+
+**And polling, not admission, was the larger half.** Every window check, event summary and tier
+summary was its own transaction, on paths that scale with *waiting* buyers rather than admitted ones.
+Those are now served from an in-process cache with a 1 s TTL (ADR-051), which is also the bound on
+how long a paused sale can still answer `OPEN` on a replica that did not handle the pause.
+
+Alarm on `hikaricp_connections_pending`, per replica — it is scraped per instance, and through a
+load balancer you get one replica at random.
 
 ### Step 0 — Pre-sale setup and inventory warming *(admin)*
 
@@ -110,8 +187,9 @@ rebuild procedure in §4.1 instead (ADR-004).
 
 `catalog` then fires `EventPrewarmedEvent` for monitoring.
 
-> **Phase 1 (MVP):** no Redis. Pre-warm writes `tier_inventory.remaining = total_capacity` in
-> PostgreSQL. Still correct — it is just a slower counter.
+> **Historical — Phase 1 (MVP):** no Redis. Pre-warm wrote `tier_inventory.remaining =
+> total_capacity` in PostgreSQL. Correct, just slower. Superseded in Stage 1: pre-warm now
+> `SETNX`s the Redis counter and `tier_inventory` is dropped (ADR-046).
 
 ---
 
@@ -141,7 +219,8 @@ Without this, every client's skew smears the start of the sale and the fairness 
 ordering becomes a lie (ADR-016).
 
 `windowStatus` drives the UI directly: `UPCOMING` → countdown, "Join" disabled; `OPEN` → "Join Flash
-Sale" enabled; `CLOSED` → sale-ended panel.
+Sale" enabled; `PAUSED` → "Join" still enabled, with a paused banner — **never** the sale-ended panel
+(ADR-066); `CLOSED` → sale-ended panel.
 
 `availability` is a **bucket** — `PLENTY` | `LIMITED` | `SOLD_OUT` — never an exact count. Exact live
 inventory drives panic-buying and hands scalpers a free feed (ADR-027). `maxPerOrder` is
@@ -160,8 +239,9 @@ identity before the sale opens.
    validates the reCAPTCHA score (≥ 0.5). The verdict is cached in `bot:captcha:{sid}` for 30
    minutes so the hottest endpoint in the system makes at most one outbound call to Google per
    visitor.
-2. **`catalog`** confirms `windowStatus == OPEN`. A join before the sale opens is `409`, not a
-   silent success.
+2. **`catalog`** confirms `windowStatus` is `OPEN` or `PAUSED`. A join before the sale opens is
+   `409`, not a silent success. A join while paused is accepted: nobody is promoted until the sale
+   resumes, and the line keeps its arrival order (ADR-066).
 3. **`queue`** places the user:
 
    ```
@@ -180,7 +260,9 @@ identity before the sale opens.
    | `queue-promoted` | `{passToken, expiresInSeconds: 120}` | your turn — redirect |
    | `sale-exhausted` | `{soldOutAt}` | stock gone; queue drains |
    | `tier-availability` | `{tiers:[{tierId, level}]}` | a tier crossed a bucket boundary (ADR-027) |
-   | `sale-closed` | `{saleEndTime}` | window closed |
+   | `sale-closed` | `{closedAt}` | window closed — terminal |
+   | `sale-paused` | `{}` | an operator paused the sale — **not** terminal; never retained or replayed (ADR-066) |
+   | `sale-resumed` | `{}` | the pause ended; positions move again |
    | *(comment frame)* | `:hb` | 15 s heartbeat, keeps proxies open |
 
 Reconnects send `Last-Event-ID`. If the stream cannot be established at all, the client falls back
@@ -207,8 +289,8 @@ Two things are load-bearing here:
 
 * **`admittable` is bounded by real capacity.** The original design promoted users into a sold-out
   sale, so buyers waited twenty minutes to be handed a `409 INSUFFICIENT_STOCK`. When
-  `remainingStock` hits zero with no holds outstanding, the queue broadcasts `sale-exhausted` and
-  drains instead (ADR-008).
+  `remainingStock` hits zero the queue broadcasts `sale-exhausted` and promotes nobody (ADR-008),
+  until stock returns (ADR-035, ADR-079).
 * **`PUBLISH` is how the pass reaches the browser.** The promoter runs on one replica; the
   `SseEmitter` lives in another replica's heap. Every replica subscribes to `queue:events:{eventId}`
   and delivers to its own local emitters. Without this, behind three round-robin replicas roughly
@@ -272,47 +354,55 @@ identity would let anyone act as anyone (ADR-010).
 2. `CatalogFacade.getTierSummary(eventId, tierId)` — tier exists, belongs to the event, window is
    `OPEN`.
 3. Limits: `quantity ≤ 6`; at most one `ACTIVE` hold per session per event (ADR-017).
-4. `hold_reserve.lua` — one atomic script:
+4. `CatalogFacade.tryReserve(eventId, tierId, quantity)` — **outside any transaction**, because
+   Redis does not roll back (ADR-023). Behind it, `catalog`'s `stock_reserve.lua`, which touches
+   **one key** and does one job:
 
 ```lua
-local stockKey, holdKey = KEYS[1], KEYS[2]
-local qty, ttl = tonumber(ARGV[1]), tonumber(ARGV[2])
-
-local stock = redis.call('GET', stockKey)
-if stock == false then return -2 end          -- key absent: FAULT, never "sold out" (ADR-004)
-if tonumber(stock) < qty then return -1 end   -- genuinely insufficient
-
-redis.call('DECRBY', stockKey, qty)
-redis.call('HSET', holdKey,
-    'userSessionId', ARGV[3], 'eventId', ARGV[4], 'tierId', ARGV[5],
-    'quantity', tostring(qty), 'status', 'ACTIVE', 'expiresAt', ARGV[6])
-redis.call('EXPIRE', holdKey, ttl)
+-- KEYS[1] catalog:stock:{eventId}:{tierId}   ARGV[1] quantity
+local stock = redis.call('GET', KEYS[1])
+if not stock then return -2 end                    -- no counter: FAULT, never "sold out" (ADR-004)
+if tonumber(stock) < tonumber(ARGV[1]) then return -1 end   -- genuinely insufficient
+redis.call('DECRBY', KEYS[1], ARGV[1])
 return 1
 ```
 
-> There is no `holdmeta` key any more. ADR-019 moved the settle-once claim into PostgreSQL, and
-> `holdmeta` only ever existed because a Redis expiry event carries no payload — a problem that
-> disappears once the expiry handler reads `ticket_holds` by token.
+> **The script lives in `catalog` and so does the key.** Earlier drafts had `hold` run a
+> `hold_reserve.lua` against catalog's key and also write a `holdmeta` hash. Neither exists.
+> ADR-019 moved the settle-once claim into PostgreSQL — `holdmeta` had only ever existed because a
+> Redis expiry event carries no payload, which stops being a problem once the expiry handler reads
+> `ticket_holds` by token. ADR-046 then confirmed the key is `catalog`'s alone.
+>
+> The return codes do **not** escape `catalog`'s repository: `-1` means "sold out" there and
+> "no counter" one layer up, which is the precise pair of meanings this design keeps apart. Callers
+> see `RESERVED` / `INSUFFICIENT` / `COUNTER_MISSING`.
 
-5. Insert the `ticket_holds` row with `status = ACTIVE`. **This row is the authority**, not the
-   Redis key.
+5. Insert the `ticket_holds` row with `status = ACTIVE`, flushed so the one-live-hold constraint
+   speaks. **This row is the authority**, not any Redis key. On a constraint rejection — and only
+   then — the seats are restored, because that is the one failure whose outcome is certain.
+6. After commit: arm the `hold:{token}` expiry timer (ADR-048). Best-effort; the sweeper is the
+   guarantee.
 
 The admission session is **not** revoked here — that is the whole point of Step 2b.
 
-| Script result | Response |
+| Reserve result | Response |
 | :--- | :--- |
-| `1` | `201` + `HoldResponseDTO` |
-| `-1` | `409 INSUFFICIENT_STOCK` |
-| `-2` | `503 INVENTORY_UNAVAILABLE` + alarm — **never** treated as sold out |
+| `RESERVED` | `201` + the hold |
+| `INSUFFICIENT` | `409 INSUFFICIENT_STOCK` — try another tier |
+| `COUNTER_MISSING` | `503 INVENTORY_UNAVAILABLE` + alarm — **never** treated as sold out |
 
 The `-2` case is the fix for the most dangerous line in the original docs, which had a cache miss
 repopulate the counter from `total_capacity` (ADR-004).
 
-> **Phase 1 (MVP):** the atomic primitive is
+> **Historical — Phase 1 (MVP):** the atomic primitive was
 > `UPDATE tier_inventory SET remaining = remaining - :q WHERE tier_id = :t AND remaining >= :q`.
 > One statement, row-locked by PostgreSQL, `rowcount = 1` means the seats are yours. Combined with
-> `CHECK (remaining >= 0)` this makes overbooking impossible in the MVP too — the concurrency story
-> is complete from day one; Phase 2 only makes it faster.
+> `CHECK (remaining >= 0)` this made overbooking impossible in the MVP too — the concurrency story
+> was complete from day one, and Stage 1 only made it faster.
+>
+> The guarantee moved with the counter: `stock_reserve.lua` refuses to decrement below the requested
+> quantity in one atomic step, and `flashseats.stock.drift` watches what the `CHECK` used to
+> (ADR-046).
 
 ---
 
@@ -340,24 +430,28 @@ takes card details.
 
 ```
  0. already CONFIRMED for this hold?              → return the receipt, 200
- 1. HoldFacade.getActiveHold(holdToken, sid)      → 404/410 if missing/expired/not yours
+ 1. HoldFacade.getActiveHold(holdToken, sid)      → 404/410 if missing/expired/not yours,
+                                                    unless the webhook confirmed it since step 0
  2. CatalogFacade.getTierSummary(eventId,tierId)  → price snapshot, SERVER-SIDE (ADR-013)
- 3. window gate                                   → OPEN, or CLOSED within 15 min (ADR-016)
+ 3. window gate                                   → OPEN or PAUSED, or CLOSED within 15 min (ADR-016, ADR-066)
  4. find-or-create orders row, hold_token UNIQUE, status = PENDING (ADR-002)
  ┌─ from here every exit leaves the order RESUMABLE (ADR-034) ─────────────────┐
  │ 5. HoldFacade.grantGrace(holdToken)             → once, ceiling 420s (ADR-030)
  │       └─ FAILS ⇒ ABORT with 410 HOLD_EXPIRED. Do NOT charge.       ← see below
- │ 6. PaymentFacade.authorize(...)                 ← OUTSIDE any transaction (ADR-023)
+ │ 6. PaymentFacade.authorize(...)                 ← OUTSIDE any transaction (ADR-023);
+ │                                                    a charge that already settled is reused
  │       └─ declined  ⇒ order FAILED, hold KEPT, 402 + attemptsRemaining
  │       └─ gateway   ⇒ order FAILED, hold KEPT, 503, no attempt consumed
  │ 7. @Transactional {          ← SQL ONLY. No Redis, no HTTP, no broker.
  │        UPDATE ticket_holds SET status='CONSUMED'
- │          WHERE hold_token=? AND status='ACTIVE'   → rowcount 0 ⇒ roll back + refund
- │        orders.status = CONFIRMED
+ │          WHERE hold_token=? AND status='ACTIVE'   → rowcount 0 ⇒ roll back, then ↓
+ │        orders.status = CONFIRMED   ← only from PENDING/FAILED; versioned (ADR-064)
  │        INSERT order_items
  │        INSERT outbox_events (ORDER_CONFIRMED, PENDING)
  │    }
- └─ any throw above ⇒ markAbandoned() ⇒ FAILED, which findOrCreate resumes ────┘
+ │    lost the hold or the order ⇒ claim REFUNDED on the order row (ADR-064):
+ │       claimed ⇒ refund, 409 ORDER_REFUNDED · refused (webhook CONFIRMED it) ⇒ receipt
+ └─ any other throw ⇒ markAbandoned() ⇒ FAILED, which findOrCreate resumes ─────┘
  8. AFTER_COMMIT (best-effort, safe to lose):
         HoldFacade.discardTimer(holdToken)         ← Redis cleanup only
         QueueFacade.revokeAdmission(sid, eventId)
@@ -373,6 +467,13 @@ it `PENDING` forever — and `PENDING` answered every retry with `409 DUPLICATE_
 held live seats they could no longer buy (ADR-034). `markAbandoned` only touches a row still
 `PENDING`, so a decline (already `FAILED`) and a compensated commit failure (already `REFUNDED`) pass
 through it untouched.
+
+**Only a lost hold refunds, and the order row decides even that** (ADR-064). The webhook settles the
+same charge as this request, so a hold found gone at step 7 may have been consumed by the webhook's
+own confirmation. The refund is *claimed* first, as a compare-and-set that a `CONFIRMED` order
+refuses — then the buyer gets the receipt instead. A failure that proves nothing (a pool timeout, a
+dropped connection) refunds nobody: the order is abandoned, and the retry confirms it with the charge
+that already settled.
 
 **Charge first, consume second.** Consuming before charging would require a
 `CONSUMED → RELEASED` transition the state machine forbids, and would briefly release inventory the
@@ -400,10 +501,10 @@ hold. This abort was missing from the first pass and is the phantom-hold race cl
 | **Crash between commit and charge** | The order is stranded `PENDING` with no handler having run. Within `stale-pending-seconds` a retry gets `409` — a charge really may be in flight. Past it, the row is resumed on the same `order_number` (ADR-034). |
 | **Too little time left to finish** | `409 INSUFFICIENT_TIME_REMAINING`, **nothing charged**, order → `FAILED`. The grace extension is already spent, so this hold cannot be stretched further; the buyer releases and re-reserves. |
 | **Double-click / double submit** | Layer 1: `SETNX payment:inflight:{holdToken}` (90 s). Layer 2: `UNIQUE(hold_token)` — the second request sees a *fresh* `PENDING` and gets `409`. Layer 3: the client `idempotencyKey` reaches Stripe as its `Idempotency-Key` (ADR-014). |
-| **3-D Secure required** | `402 PAYMENT_ACTION_REQUIRED` + `resumeUrl`. Client runs `stripe.handleNextAction()`, then calls `POST /api/v1/orders/checkout/resume` with the same `holdToken`. The order stays `PENDING` throughout; the grace extension from step 4 covers the challenge. |
+| **3-D Secure required** | `402 PAYMENT_ACTION_REQUIRED` + `clientSecret`. Client runs `stripe.handleNextAction()`, then **re-POSTs the same `/orders/checkout` body** — there is no resume endpoint, and building one would be a second retry mechanism (ADR-054). The order is left `FAILED`, which find-or-create resumes on the same `order_number`, and **no attempt is consumed**. The server retrieves the existing intent rather than charging again. The grace extension from step 5 covers the challenge. |
 | **Extension fails at step 4** | `410 HOLD_EXPIRED`, **nothing charged**. |
 | **Timer expires before submit** | `410 HOLD_EXPIRED`. UI offers re-entry — and the admission session may still be live, so the buyer often does not have to re-queue at all. |
-| **Network drops after charge** | Stripe still settles. `payment_intent.succeeded` → webhook (signature-verified) → `PaymentSettledEvent` → `order` finalises the still-`PENDING` order by `hold_token`. |
+| **Network drops after charge** | Stripe still settles. `payment_intent.succeeded` → webhook (signature-verified over the raw bytes, claimed once on `stripe_event_id`) → `PaymentSettledEvent` → `order` finalises the order by `hold_token`, which travelled to the provider as metadata. A settlement that throws **releases the claim** so the redelivery retries (ADR-053). |
 | **Webhook arrives, hold already gone** | `order` refunds automatically, sets `REFUNDED`, writes a `REFUND_NOTICE` outbox event. The original design would have confirmed an order for seats another buyer already owned (ADR-012). |
 | **Charge succeeds, commit fails** | Compensating refund, order → `REFUNDED`, `REFUND_NOTICE` queued. |
 | **User cancels** | `DELETE /api/v1/holds/{holdToken}` → claim → stock restored. **Admission session survives**, so they can pick another tier (ADR-020). |
@@ -415,11 +516,13 @@ Note what is *absent*: `payment` never calls `HoldFacade`. Grace extension is re
 a decline deliberately retains the hold; abandonment is handled by the TTL. Removing that edge is
 what makes the facade graph acyclic (ADR-005).
 
-> **Phase 1 (MVP):** `PaymentFacade` is a stub returning `SUCCEEDED`, but behind the *real*
-> interface, in the *real* position in the sequence. No webhook, no refunds. The orchestration —
-> including `UNIQUE(hold_token)`, find-or-create, and consume-inside-the-transaction — is built
-> correctly from day one, because retrofitting transaction boundaries later is exactly how
-> overbooking bugs are born.
+> **The stub is still here, and still the default.** Stage 2 put Stripe behind the same interface,
+> in the same position, selected by `flashseats.payment.stripe.enabled` (ADR-052). With it false —
+> `dev`, `test`, the load harness and every drill — the in-process stub drives *every* branch above,
+> including the 3-D Secure one, with no keys and no network. Building the orchestration first and
+> the provider second is what let `UNIQUE(hold_token)`, find-or-create and
+> consume-inside-the-transaction be right from day one; retrofitting transaction boundaries later is
+> exactly how overbooking bugs are born.
 
 ---
 
@@ -468,14 +571,15 @@ tx2 (short):  UPDATE outbox_events SET status='PROCESSED', processed_at=now()
 order.events.exchange  (topic)  ── order.confirmed ──►  notification.order-confirmed.queue
                                 └─ order.refunded  ──►  notification.order-refunded.queue
       ↓
-OrderConfirmedConsumer                                    -- no @Transactional around 2-4
-   1. INSERT notification_logs (order_number, kind='TICKET_DELIVERY', status='PENDING')
-        └─ unique violation ⇒ already handled ⇒ ack and stop
-   2. PDFBox renders the ticket in memory
-   3. Thymeleaf renders the HTML body
-   4. JavaMailSender → SMTP (Mailpit locally)
-   5. status='SENT', sent_at=now, basicAck
-   ✗ on failure: 3 retries (5s, 30s, 2m) → DLQ, status='DLQ'
+NotificationConsumer (one flow, two listeners)          -- no @Transactional around 2-3
+   1. claim: INSERT notification_logs (order_number, kind, status='PENDING') ON CONFLICT DO NOTHING,
+      or re-claim a row in 'DLQ'                          ⇒ rowcount 0: already handled, ack, stop
+   2. TICKET_DELIVERY: PDFBox renders the ticket; REFUND_NOTICE: no attachment
+   3. EmailComposer builds the HTML; JavaMailSender → SMTP (Mailpit locally)
+   4. status='SENT', sent_at=now, basicAck
+   ✗ on failure: NO retries (ADR-029) → basicNack(requeue=false) → DLQ
+      · not yet sent  ⇒ status='DLQ'  (re-claimable, so an operator replay sends)
+      · already sent  ⇒ status='SENT' (ADR-042 — a DLQ row would authorise a second ticket)
 ```
 
 **`FOR UPDATE SKIP LOCKED`** stops three replicas from publishing the same event three times.
@@ -644,14 +748,17 @@ was what left a closed sale's waiting room reporting `WAITING` forever with noth
 say otherwise.
 
 **Exhaustion is derived and reversible.** The promotion worker sets `queue:exhausted:{eventId}` when
-stock is zero with no live pass or admission, publishes `sale-exhausted` once, and **deletes the
-marker on the next tick with stock**. Nothing deletes the waiting set.
+the sale's stock is zero, publishes `sale-exhausted` once, and **deletes the marker on the next tick
+with stock**. Nothing deletes the waiting set. It is derived from stock alone: it used to wait for
+every live pass and admission to lapse too, which kept the line on `WAITING`, going nowhere, for up
+to ten minutes after the last seat went (ADR-079).
 
 | Condition | Reported phase | Waiting set | Reverses? |
 | :--- | :--- | :--- | :--- |
 | Window closed | `CLOSED` | expires with the sale | no |
-| Stock zero, no claims held | `EXHAUSTED` | untouched, positions intact | **yes** — a released hold or a rebuilt counter clears it |
+| Stock zero | `EXHAUSTED` (a buyer holding a pass or an admission sees their own phase first) | untouched, positions intact | **yes** — a released hold or a rebuilt counter clears it |
 | Counter unreadable | promotion **pauses**; phase unchanged | untouched | yes, on pre-warm or rebuild |
+| Sale paused by an operator | phase unchanged, `paused: true`, no wait estimate | untouched, still accepting joins | **yes** — on resume. Exhaustion keeps un-deriving while paused, since expiring holds still return seats (ADR-066) |
 
 The third row is the one that mattered most. `SUM(remaining)` over an event with no counter rows
 returns `0`, indistinguishable from sold out — so an un-warmed sale announced itself exhausted and
@@ -672,40 +779,49 @@ Rules every facade obeys — synchronous, never `@Transactional` itself, records
 module-owned exceptions only — are in
 [`05-global-standards.md`](05-global-standards.md#5-facade-contract-rules) §5.
 
+Generated from the six `*Facade` interfaces and their call sites, so every row is a call that exists:
+
 | Caller | Facade | Method | Purpose |
 | :--- | :--- | :--- | :--- |
-| filter | `BotFacade` | `authorize(ip, sid, path)` | buckets + block flags |
-| filter | `BotFacade` | `verifyCaptcha(token, action, sid)` | cached reCAPTCHA score |
-| `hold` | `QueueFacade` | `verifyAdmission(token, sid, eventId)` | live admission session (ADR-020) |
-| `hold` | `CatalogFacade` | `getTierSummary(eventId, tierId)` | validity, price, window |
+| `queue` | `BotFacade` | `verifyHuman(sid, recaptchaToken, ip)` | the join's challenge; fails open (ADR-055) |
+| `queue` | `CatalogFacade` | `getEventSummary`, `getWindowStatus` | the window gates join, admit and every stream frame |
+| `queue` | `CatalogFacade` | `findOpenEventIds`, `findManagedEventIds` | which sales the promotion tick serves |
+| `queue` | `CatalogFacade` | `getRemainingForEvent` | the admission bound; "no counter" is never zero (ADR-035) |
+| `queue` | `CatalogFacade` | `getTierAvailability` | the `tier-availability` frame (ADR-027) |
+| `hold` | `QueueFacade` | `verifyAdmission(token, sid, eventId)` | a live admission session (ADR-020) |
+| `hold` | `CatalogFacade` | `getTierSummary(eventId, tierId)` | price, limits, window |
+| `hold` | `CatalogFacade` | `tryReserve`, `restore` | the only way stock moves (ADR-046) |
 | `order` | `HoldFacade` | `getActiveHold(token, sid)` | read-only, ownership-checked |
-| `order` | `HoldFacade` | `extendHold(token, seconds)` | bounded grace; **fails ⇒ abort** |
+| `order` | `HoldFacade` | `grantGrace(token)` | the one grace extension; **fails ⇒ abort** (ADR-030) |
 | `order` | `HoldFacade` | `consumeHold(token)` | claim — **joins the caller's transaction** |
-| `order` | `HoldFacade` | `releaseHold(token, reason)` | claim |
-| `order` | `CatalogFacade` | `getTierSummary(eventId, tierId)` | price snapshot |
-| `order` | `PaymentFacade` | `authorize(orderNumber, amount, currency, pm, key)` | charge |
-| `order` | `PaymentFacade` | `refund(txnRef, amount, reason)` | compensation |
+| `order` | `HoldFacade` | `discardTimer(token)` | after a purchase, post-commit |
+| `order` | `HoldFacade` | `sumActiveQuantityForTier(tierId)` | the stock invariant and the rebuild |
+| `order` | `CatalogFacade` | `getTierSummary`, `getEventSummary` | price snapshot, ticket details |
+| `order` | `CatalogFacade` | `findManagedEventIds`, `getTierCapacities`, `getLiveCounters`, `applyRebuild` | the drift gauge and the rebuild (ADR-046) |
+| `order` | `PaymentFacade` | `authorize(command)` | one charge attempt, outside every transaction |
+| `order` | `PaymentFacade` | `hasChargeFor(holdToken)` | whether to skip the time gate for a charge that exists (ADR-074) |
+| `order` | `PaymentFacade` | `refund(txnRef, amount, reason)` | compensation, after the claim (ADR-064) |
 | `order` | `QueueFacade` | `revokeAdmission(sid, eventId)` | after `CONFIRMED`, post-commit |
 | `saleflow` | `QueueFacade` | `getQueueState(sid, eventId)` | rehydration (ADR-025) |
 | `saleflow` | `HoldFacade` | `findActiveHold(sid, eventId)` | rehydration |
-| `saleflow` | `OrderFacade` | `findPendingOrder(sid, eventId)` | rehydration |
-| `saleflow` | `CatalogFacade` | `getEventDetail(eventId)` | rehydration |
-| admin | `NotificationFacade` | `resend(orderNumber, kind)` | DLQ replay |
+| `saleflow` | `OrderFacade` | `findLatestOrder(sid, eventId)` | rehydration — the latest order whatever its status (ADR-037) |
+| `saleflow` | `CatalogFacade` | `getEventSummary(eventId)` | rehydration |
 
-`verifyPassToken` / `revokePassToken` moved off `hold` and onto the `POST /api/v1/queue/admit`
-handler inside `queue` itself — the pass is now exchanged for an admission session rather than
-consumed at hold creation (ADR-020).
+`notification` exposes no facade: its operator surface (`/api/v1/admin/notifications/dlq`) is its own
+controller, and a resend is a new outbox row written by `order`.
 
 Events — the only asynchronous couplings:
 
 | Event | Publisher | Consumer | Transport |
 | :--- | :--- | :--- | :--- |
-| `PaymentSettledEvent` | `payment` (webhook only) | `order` | Spring in-process |
+| `PaymentSettledEvent` | `payment` (webhook only) | `order` | Spring in-process — the only cross-module event |
 | `ORDER_CONFIRMED` | `order` | `notification` | outbox → RabbitMQ |
 | `ORDER_REFUNDED` | `order` | `notification` | outbox → RabbitMQ |
-| `EventPrewarmedEvent` | `catalog` | monitoring | Spring in-process |
-| `TicketHoldExpiredEvent` | `hold` | monitoring | Spring in-process |
-| `BotAttackDetectedEvent` | `bot` | monitoring | Spring in-process |
+
+Every other application event is internal to its module and consumed `AFTER_COMMIT`, which is how a
+side effect waits for the transaction that justifies it (invariant 9): `hold`'s `TicketHeldEvent`,
+`TicketHoldSettledEvent` and `HoldTimerFiredEarlyEvent`; `order`'s `OrderConfirmedEvent`; `catalog`'s
+`EventMetadataChanged`.
 
 ---
 
@@ -718,7 +834,7 @@ Every value below is a named property in `application.properties`.
 | Queue pass TTL | 120 s, single-use | 006 / 020 |
 | **Admission session TTL** | **600 s**, reusable | **020** |
 | **Admission oversubscribe factor** | **1.5** | **020** |
-| **Queue ordering** | **`FIFO` (default) or `RANDOM`** | **024** |
+| Queue ordering | `flashseats.queue.ordering` — **FIFO** (default) or **RANDOM**, a fresh draw at join | **024** |
 | Hold TTL | 300 s | 006 |
 | Payment grace | +120 s once, ceiling 420 s | 006 |
 | Checkout after `sale_end_time` | 15 min | 016 |
@@ -726,38 +842,103 @@ Every value below is a named property in `application.properties`.
 | Active holds per session per event | 1 | 017 |
 | Charge attempts per hold | 3 | 014 |
 | `payment:inflight` TTL | 90 s | 014 |
-| Promotion tick | 1 s | 008 |
-| Promotion batch size | **≤ `hikariMax × 1.5`** (45) | **028** |
-| Queue heartbeat | 90 s, advisory only | **026** |
+| **Payment provider** | `flashseats.payment.stripe.enabled` — **false by default**, which runs the in-process stub | **052** |
+| **Gateway breaker** | 20-call window, 10 minimum, 50 % threshold, 10 s open, 3 half-open probes. Counts **transport failures only** | **052** |
+| **Gateway timeouts** | 5 s connect / 20 s read, `maxNetworkRetries=0` | **052** |
+| Promotion tick | 1 s, singleton per event by Redis `SET NX PX` | 008 / **032** |
+| Promotion batch size | **≤ `hikariMax × 1.5`** (45) — **per sale**, the secondary cap | **028 / 049** |
+| **Cluster admission allowance** | **45 per tick**, `global-admission-budget-per-tick` — ADR-028's `hikariMax × 1.5` re-scoped from one sale to the cluster. Claimed from `queue:budget` before the per-sale cap applies | **049** |
+| Open-event order per tick | **shuffled** — a fixed order starves every sale but the lowest id | **049** |
+| Catalog metadata cache | event **1 s** · tier **60 s** · 1,000 events, `metadata-cache-enabled` | **051** |
 | SSE position push / heartbeat | 2 s / 15 s | 007 |
-| Sweeper interval | 30 s (Phase 2+); 10 s (Phase 1) | 019 |
-| Outbox poll / batch | 1 s / 100, `SKIP LOCKED` | 009 / 023 |
+| SSE stream timeout | 1 h, matched by nginx `proxy_read_timeout` | 007 |
+| Hold sweeper interval | 10 s | 019 |
+| Hold expiry timer | `hold:{token}`, fired by keyspace expiry — accelerator only | **048** |
+| Stale `PENDING` order | 90 s, then a retry resumes it | **034** |
+| Minimum time left to start a retry | 45 s | **030** |
+| Outbox poll / batch / confirm timeout | 1 s / 100 / 5 s, `SKIP LOCKED` | 009 / 023 / **048** |
+| Outbox stale claim recovery | 60 s | **048** |
+| Drift gauge interval | 60 s | **046** |
+| Redis epoch check | 5 s | **046** |
+| Rebuild settle window | 1 s between the two ledger reads | **046** |
 | Session bucket | 20 burst, 10/s | 011 |
 | IP bucket | 300 burst, 150/s | 011 |
-| HikariCP pool | 30 max, 10 idle | std §7 |
-| Availability buckets | `SOLD_OUT` 0 · `LIMITED` < 10 % · else `PLENTY` | **027** |
-| reCAPTCHA threshold / cache | 0.5 / 30 min | 011 |
+| Trusted proxies | **empty by default — trust nobody** | **039** |
+| HikariCP pool | 30 max, 10 idle, 3 s timeout | std §7 |
+| Availability buckets | `SOLD_OUT` 0 · `LIMITED` < 10 % · `PLENTY` · **`UNKNOWN` = no counter** | **027 / 040** |
+| Rate-limit bucket expiry | once the bucket would be full again, **+ 10 s** — a full bucket and no bucket are the same bucket | **079** |
+| `EXHAUSTED` | derived from stock alone: set when the sale's remaining stock is 0, cleared the tick it is not | **035 / 079** |
+| reCAPTCHA on join | `flashseats.bot.recaptcha.*` — **blank secret means OFF**, and off allows | **011 / 055** |
+| Challenge score threshold | 0.5; provider timeouts 1 s connect / 2 s read, both **correctness** | **055** |
+| Verification remembered per session | 900 s, `bot:verified:{sid}` | **055** |
+| `ip_rules` snapshot TTL | 10 s — **the TTL is the cross-replica invalidation** | **051 / 055** |
+
+Verification **fails open**: an unconfigured secret, a missing token, a timeout or a non-2xx all
+allow the join and are audited as degraded. Only a score the provider actively returns below the
+threshold refuses one (ADR-011, ADR-055).
 
 ---
 
 ## 7. Metrics and operational controls
 
-Nothing in the original design was observable. At minimum:
+**Built, and emitting today:**
 
-| Metric | Alarm |
+| Metric | Kind | Alarm |
+| :--- | :--- | :--- |
+| `flashseats.stock.drift` | gauge, **per replica** | **sustained** non-zero (ADR-046) |
+| `flashseats.stock.counters.missing` | gauge, **per replica** | any non-zero — each one answers holds with a `503` |
+| `hikaricp_connections_pending` | Boot built-in, per replica | sustained non-zero — the ADR-028 / ADR-049 alarm |
+| `flashseats.queue.admissions` | counter, per replica | zero while a waiting room has depth — a stuck promoter (ADR-049) |
+| `flashseats.queue.admission.budget.denied` | counter, per replica | **sustained** non-zero with `pending` at zero means the allowance is throttling a pool that could serve more (ADR-049) |
+| `flashseats.catalog.metadata.cache{result}` | counter, per replica | a miss rate near 1 means the cache is off or the TTL is below the poll interval (ADR-051) |
+| `flashseats.payment.refund.failed` | counter, per replica | **any non-zero value.** Each one is money owed to a named buyer that automation could not return (ADR-053) |
+| `flashseats.payment.charge.stray{outcome}` | counter, per replica | **any non-zero value.** A second settled charge for one reservation — two checkouts for one hold both reached the provider. `returned` is the system recovering it; `refund_failed` and `unaccounted` are money a person has to look at (ADR-075) |
+| `flashseats.outbox.lag.seconds` | gauge, per replica | sustained above a few seconds — a stalled relay otherwise shows up only as buyers not receiving tickets (ADR-058) |
+| `flashseats.dlq.depth` | gauge, per replica | any non-zero. The DLQ was listable by an operator and alarmed on by nothing; each entry is a paid buyer's ticket (ADR-029, ADR-058) |
+| `flashseats.payment.attempts{outcome}` | counter, per replica | `rate(attempts{outcome="declined"}[5m]) / rate(attempts[5m])` is the decline ratio over any window — a spike is either a provider incident or a fraud rule mis-firing, and both used to look like silence. **Deliberately not a ratio gauge:** one cumulative since process start is the single shape that cannot show a spike, because every healthy sample dilutes the next. `outcome` is a four-value enum, so the same series also answers "are we reaching the provider at all" (ADR-052) |
+| `flashseats.payment.webhook.received{type}` | counter, per replica | **zero while orders are being placed.** A stale webhook secret rejects every delivery, and the symptom is indistinguishable from a quiet day |
+| `flashseats.bot.refusals{outcome}` | counter, per replica | answers "are we shedding load right now?" without querying `bot_audit_logs` |
+| `flashseats.redis.primary.reconnects` | counter, per replica | any increase — this replica found itself on a Redis node that is not the primary and reconnected through Sentinel (ADR-073). Repeated increases mean the Sentinels themselves disagree with the nodes |
+| `flashseats.bot.limiter.unavailable` | counter, per replica | **any non-zero rate** — the rate-limit buckets could not be read and requests are being let through unmetered (ADR-067) |
+| `flashseats.notification.delivered` · `.failed` | counters, per replica | `failed` rising while `delivered` is flat is a mail path that is down rather than idle |
+| `resilience4j_circuitbreaker_state` | gauge, per replica | `open` — every checkout is answering `503` without reaching the provider (ADR-052) |
+| `resilience4j_circuitbreaker_calls{kind}` | counter, per replica | a rising `failed` count is transport trouble; declines are **not** counted here by design |
+
+`stock.drift` compares the live Redis counter against the §4.1 ledger formula every 60 s. It is the
+system's canary. **Alarm on sustained non-zero, not on one sample:** Redis and PostgreSQL are not
+read in one snapshot, so a hold created between the two reads shows as a momentary gap. The two SQL
+sums *are* one snapshot, which removes the only drift the measurement can manufacture by itself.
+
+Both gauges are scraped **per replica** — nginx routes only `/actuator/health`, and through a load
+balancer you would get one instance at random.
+
+**Specified, not built.** These were listed here as though they existed; they do not, and each is a
+genuine gap rather than a deleted idea:
+
+| Metric | Why it is wanted |
 | :--- | :--- |
-| `flashseats.queue.depth{event}` | — |
-| `flashseats.queue.promotion.rate{event}` | zero while queue depth > 0 |
-| `flashseats.hold.conversion.ratio{event}` | sustained < 0.3 |
-| `flashseats.stock.drift{event,tier}` | **any non-zero value** |
-| `flashseats.outbox.lag.seconds` | > 60 |
-| `flashseats.dlq.depth{queue}` | > 0 |
-| `flashseats.payment.decline.ratio` | > 0.2 |
-| `flashseats.sse.connections.active` | — |
+| `flashseats.queue.depth{event}` | the only direct read on whether a waiting room is draining |
+| ~~`flashseats.queue.promotion.rate{event}`~~ | **built** as `flashseats.queue.admissions`, above — untagged, so it answers "is the cluster promoting?" and not "is *this* sale promoting?" |
+| `flashseats.hold.conversion.ratio{event}` | the number the 1.5× oversubscribe factor is a guess at |
+| `flashseats.sse.connections.active` | the input to every capacity question about the broadcaster |
 
-`stock.drift` compares the live Redis counter against the §4.1 formula every 60 s. It is the
-system's canary: a non-zero value means inventory accounting has diverged, and it should page.
+**Built in Pass 11** (ADR-058), and listed above rather than here: `outbox.lag.seconds`,
+`dlq.depth`, `payment.decline.ratio`, `payment.webhook.received{type}`, `bot.refusals{outcome}` and
+`notification.delivered` / `.failed`. Note that `dlq.depth` is **untagged** — it answers "is anything
+dead-lettered?", not which queue — and that the three above are the whole of what remains, all of
+them per-event or per-connection shapes the current counters cannot express.
 
-Controls: `POST /api/v1/admin/events/{id}/pause` (stop promotions and new holds, honour existing
-ones) and `POST /api/v1/admin/events/{id}/rebuild-stock`. There was previously no way to stop a
-sale that was going wrong.
+Controls: `POST /api/v1/admin/events/{id}/pause` and `/resume` (stop promotions and new holds; the
+line keeps forming, and existing passes, admissions and holds are honoured — a buyer holding seats can
+still pay. Buyers see `PAUSED`, never "sale ended", ADR-066), `POST /api/v1/admin/events/{id}/rebuild-stock`,
+`GET /api/v1/admin/notifications/dlq`, `POST /api/v1/admin/notifications/resend/{orderNumber}`,
+`GET /api/v1/admin/orders/{orderNumber}`, and the bot surface —
+`GET`/`POST` `/api/v1/admin/bot/ip-rules`, `DELETE /api/v1/admin/bot/ip-rules/{ip}` and
+`GET /api/v1/admin/bot/audit`. An address flooding a sale used to be answerable only by changing a
+property and restarting three replicas, during the sale; a rule now reaches every replica within
+`ip-rule-cache-ttl-ms` (ADR-055). All are HTTP Basic, `ROLE_ADMIN`, and **curl-only — there
+is no operator UI.**
+
+**Pause takes effect cluster-wide within `metadata-event-ttl-ms`** (1 s), not instantly: the replica
+that handles the call evicts its cached event row immediately, and the others stop selling when their
+entry expires (ADR-051).

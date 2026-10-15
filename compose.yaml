@@ -18,22 +18,46 @@ x-app: &app
     dockerfile: Dockerfile
   profiles: ["cluster"]
   restart: unless-stopped
+  # A hard limit per replica, and it is correctness, not tuning. Without one the
+  # JVM sizes its heap as a percentage of the WHOLE Docker VM (7.65 GB here), so
+  # three replicas may claim ~17 GB between them. They did: at 2,000 VUs the VM's
+  # kernel OOM killer SIGKILLed replicas mid-sale (Pass 13, runs L and L2). Every
+  # hold reserved in Redis but not yet written was lost, which is the safe
+  # direction (ADR-046), and a rebuild recovered it. It is still an outage.
+  # 1.5 GiB covers the ~1.1-1.5 GiB each replica reached at 300-600 VUs.
+  mem_limit: ${APP_MEM_LIMIT:-1536m}
   environment:
     SPRING_PROFILES_ACTIVE: docker
     SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/${POSTGRES_DB:-flashseats}
     SPRING_DATASOURCE_USERNAME: ${POSTGRES_USER:-flashseats}
     SPRING_DATASOURCE_PASSWORD: ${POSTGRES_PASSWORD:-flashseats}
-    SPRING_DATA_REDIS_HOST: redis
-    SPRING_DATA_REDIS_PORT: 6379
+    # The docker profile discovers the primary through Sentinel. Keeping the
+    # standalone settings in application.properties preserves the local/dev
+    # stack, while this profile exercises the failover topology.
+    SPRING_DATA_REDIS_SENTINEL_MASTER: flashseats
+    SPRING_DATA_REDIS_SENTINEL_NODES: redis-sentinel-1:26379,redis-sentinel-2:26379,redis-sentinel-3:26379
     SPRING_RABBITMQ_HOST: rabbitmq
     SPRING_RABBITMQ_PORT: 5672
     SPRING_RABBITMQ_USERNAME: ${RABBITMQ_USER:-flashseats}
     SPRING_RABBITMQ_PASSWORD: ${RABBITMQ_PASSWORD:-flashseats}
-    SPRING_MAIL_HOST: mailpit
-    SPRING_MAIL_PORT: 1025
+    # Local .env.example values target Mailpit. Preview/production must set
+    # these to the real SMTP relay; Mailpit remains a local-only sink.
+    SPRING_MAIL_HOST: ${SMTP_HOST:-mailpit}
+    SPRING_MAIL_PORT: ${SMTP_PORT:-1025}
+    SPRING_MAIL_USERNAME: ${SMTP_USERNAME:-}
+    SPRING_MAIL_PASSWORD: ${SMTP_PASSWORD:-}
+    SPRING_MAIL_PROPERTIES_MAIL_SMTP_AUTH: ${SMTP_AUTH:-false}
+    SPRING_MAIL_PROPERTIES_MAIL_SMTP_STARTTLS_ENABLE: ${SMTP_STARTTLS:-false}
+    FLASHSEATS_MAIL_FROM: ${SMTP_FROM:-tickets@flashseats.dev}
     # Behind Nginx the client IP arrives in X-Forwarded-For. The bot module
-    # rate-limits on it, so Spring must be told to trust the proxy.
-    SERVER_FORWARD_HEADERS_STRATEGY: framework
+    # rate-limits on it, so Spring must be told to trust the proxy — and NATIVE,
+    # not `framework` (ADR-071). Spring's ForwardedHeaderFilter takes the LEFT-
+    # most X-Forwarded-For entry from anyone, and nginx APPENDS to whatever the
+    # client sent, so `framework` let every caller choose its own address and
+    # mint a fresh IP bucket per request. Tomcat's RemoteIpValve trusts only
+    # internal proxies and walks right to left, stopping at the first address
+    # that is not one: the real client, whatever it sent.
+    SERVER_FORWARD_HEADERS_STRATEGY: native
     # ...and so must the rate limiter, which reads the header itself and
     # therefore does its own trust check (ADR-039). Without an entry here the
     # header is ignored and every request shares nginx's single IP bucket.
@@ -46,13 +70,32 @@ x-app: &app
     FLASHSEATS_ADMIN_USERNAME: ${FLASHSEATS_ADMIN_USERNAME:-admin}
     FLASHSEATS_ADMIN_PASSWORD: ${FLASHSEATS_ADMIN_PASSWORD:-admin}
     FLASHSEATS_COOKIE_SECURE: ${FLASHSEATS_COOKIE_SECURE:-false}
+    # STRIPE_ENABLED is what chooses the real provider over the stub. Left false,
+    # the cluster runs StubPaymentGateway and the whole journey works with no
+    # account at all — which is what the load harness and every drill rely on.
+    STRIPE_ENABLED: ${STRIPE_ENABLED:-false}
     STRIPE_API_KEY: ${STRIPE_API_KEY:-}
-    STRIPE_WEBHOOK_SECRET: ${STRIPE_WEBHOOK_SECRET:-}
+    # Minted per `stripe listen` session, not per account. See the `stripe`
+    # service below; SecretsGuard refuses to start on the docker profile with
+    # STRIPE_ENABLED=true and this still at its default.
+    STRIPE_WEBHOOK_SECRET: ${STRIPE_WEBHOOK_SECRET:-whsec_dev_only_change_me}
     RECAPTCHA_SECRET: ${RECAPTCHA_SECRET:-}
-    JAVA_TOOL_OPTIONS: "-XX:MaxRAMPercentage=75"
+    # The two halves of the concurrent-sales fix, overridable per run, because the
+    # drill is a comparison and not a pass/fail (ADR-049, ADR-051). Defaults match
+    # application.properties; a baseline run is
+    #   FLASHSEATS_CATALOG_METADATA_CACHE_ENABLED=false \
+    #   FLASHSEATS_QUEUE_GLOBAL_ADMISSION_BUDGET_PER_TICK=999999 \
+    #   docker compose --profile cluster up -d
+    FLASHSEATS_CATALOG_METADATA_CACHE_ENABLED: ${FLASHSEATS_CATALOG_METADATA_CACHE_ENABLED:-true}
+    FLASHSEATS_QUEUE_GLOBAL_ADMISSION_BUDGET_PER_TICK: ${FLASHSEATS_QUEUE_GLOBAL_ADMISSION_BUDGET_PER_TICK:-45}
+    # JAVA_TOOL_OPTIONS is deliberately NOT set here: the Dockerfile owns it. A
+    # value here REPLACES the image's, and one did, silently dropping
+    # -XX:+ExitOnOutOfMemoryError for every run before Pass 13.
   depends_on:
     postgres: { condition: service_healthy }
-    redis:    { condition: service_healthy }
+    redis-sentinel-1: { condition: service_healthy }
+    redis-sentinel-2: { condition: service_healthy }
+    redis-sentinel-3: { condition: service_healthy }
     rabbitmq: { condition: service_healthy }
   healthcheck:
     test: ["CMD", "wget", "-qO-", "http://localhost:8080/actuator/health"]
@@ -107,13 +150,139 @@ services:
     volumes:
       - ./docker/redis/redis.conf:/usr/local/etc/redis/redis.conf:ro
       - redis-data:/data
+    networks:
+      flashseats:
+        ipv4_address: 172.28.0.11
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s
       timeout: 3s
       retries: 12
       start_period: 5s
-    networks: [flashseats]
+
+  redis-replica-1:
+    image: redis:7-alpine
+    profiles: ["cluster"]
+    restart: unless-stopped
+    command: ["redis-server", "/usr/local/etc/redis/redis.conf", "--replicaof", "redis", "6379"]
+    volumes:
+      - ./docker/redis/redis.conf:/usr/local/etc/redis/redis.conf:ro
+      - redis-replica-1-data:/data
+    depends_on:
+      redis: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 5s
+    networks:
+      flashseats:
+        ipv4_address: 172.28.0.12
+
+  redis-replica-2:
+    image: redis:7-alpine
+    profiles: ["cluster"]
+    restart: unless-stopped
+    command: ["redis-server", "/usr/local/etc/redis/redis.conf", "--replicaof", "redis", "6379"]
+    volumes:
+      - ./docker/redis/redis.conf:/usr/local/etc/redis/redis.conf:ro
+      - redis-replica-2-data:/data
+    depends_on:
+      redis: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 5s
+    networks:
+      flashseats:
+        ipv4_address: 172.28.0.13
+
+  redis-sentinel-1:
+    image: redis:7-alpine
+    profiles: ["cluster"]
+    restart: unless-stopped
+    # Invoked through `sh` rather than executed directly. The file is mounted from
+    # the host, so its mode is whatever the checkout produced -- and a checkout on a
+    # filesystem without POSIX permissions produces 0644, which fails as
+    # "exec /usr/local/bin/sentinel-entrypoint.sh: permission denied" and takes the
+    # whole cluster with it, because every app replica depends on the sentinels.
+    # The exec bit is also set in git; this makes it not matter.
+    entrypoint: ["sh", "/usr/local/bin/sentinel-entrypoint.sh"]
+    volumes:
+      - ./docker/redis/sentinel-entrypoint.sh:/usr/local/bin/sentinel-entrypoint.sh:ro
+      - redis-sentinel-1-data:/data
+    depends_on:
+      redis: { condition: service_healthy }
+      redis-replica-1: { condition: service_healthy }
+      redis-replica-2: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD", "redis-cli", "-p", "26379", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 5s
+    networks:
+      flashseats:
+        ipv4_address: 172.28.0.14
+
+  redis-sentinel-2:
+    image: redis:7-alpine
+    profiles: ["cluster"]
+    restart: unless-stopped
+    # Invoked through `sh` rather than executed directly. The file is mounted from
+    # the host, so its mode is whatever the checkout produced -- and a checkout on a
+    # filesystem without POSIX permissions produces 0644, which fails as
+    # "exec /usr/local/bin/sentinel-entrypoint.sh: permission denied" and takes the
+    # whole cluster with it, because every app replica depends on the sentinels.
+    # The exec bit is also set in git; this makes it not matter.
+    entrypoint: ["sh", "/usr/local/bin/sentinel-entrypoint.sh"]
+    volumes:
+      - ./docker/redis/sentinel-entrypoint.sh:/usr/local/bin/sentinel-entrypoint.sh:ro
+      - redis-sentinel-2-data:/data
+    depends_on:
+      redis: { condition: service_healthy }
+      redis-replica-1: { condition: service_healthy }
+      redis-replica-2: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD", "redis-cli", "-p", "26379", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 5s
+    networks:
+      flashseats:
+        ipv4_address: 172.28.0.15
+
+  redis-sentinel-3:
+    image: redis:7-alpine
+    profiles: ["cluster"]
+    restart: unless-stopped
+    # Invoked through `sh` rather than executed directly. The file is mounted from
+    # the host, so its mode is whatever the checkout produced -- and a checkout on a
+    # filesystem without POSIX permissions produces 0644, which fails as
+    # "exec /usr/local/bin/sentinel-entrypoint.sh: permission denied" and takes the
+    # whole cluster with it, because every app replica depends on the sentinels.
+    # The exec bit is also set in git; this makes it not matter.
+    entrypoint: ["sh", "/usr/local/bin/sentinel-entrypoint.sh"]
+    volumes:
+      - ./docker/redis/sentinel-entrypoint.sh:/usr/local/bin/sentinel-entrypoint.sh:ro
+      - redis-sentinel-3-data:/data
+    depends_on:
+      redis: { condition: service_healthy }
+      redis-replica-1: { condition: service_healthy }
+      redis-replica-2: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD", "redis-cli", "-p", "26379", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 5s
+    networks:
+      flashseats:
+        ipv4_address: 172.28.0.16
 
   # ===================================================================
   # Phase 4 — asynchronous fulfilment
@@ -163,22 +332,43 @@ services:
   app-3: { <<: *app, container_name: flashseats-app-3 }
 
   nginx:
-    image: nginx:1.27-alpine
+    build:
+      context: .
+      dockerfile: docker/nginx/Dockerfile
+    container_name: flashseats-nginx
     profiles: ["cluster"]
     restart: unless-stopped
     ports: ["${HTTP_PORT:-8080}:80"]
     volumes:
       - ./docker/nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./docker/nginx/proxy-headers.conf:/etc/nginx/proxy-headers.conf:ro
     depends_on:
       app-1: { condition: service_healthy }
       app-2: { condition: service_healthy }
       app-3: { condition: service_healthy }
     healthcheck:
-      test: ["CMD", "wget", "-qO-", "http://localhost/nginx-health"]
+      # 127.0.0.1, NOT localhost. In this image `localhost` resolves to `::1`
+      # only, and `listen 80` binds IPv4 only — so the check connected to an
+      # address nothing was listening on and nginx reported `unhealthy` for its
+      # entire life while proxying perfectly.
+      #
+      # A healthcheck that lies is worse than none: `depends_on: service_healthy`
+      # on this service would never be satisfied, and an operator reading
+      # `docker compose ps` during an incident is told the load balancer is the
+      # problem when it is the only thing working.
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1/nginx-health"]
       interval: 10s
       timeout: 3s
       retries: 6
-    networks: [flashseats]
+    # A STATIC address, and it is load-bearing (ADR-047). The rate limiter only
+    # honours X-Forwarded-For from a peer in FLASHSEATS_TRUSTED_PROXIES, and
+    # that check is exact-address membership rather than a CIDR match (ADR-039).
+    # A bridge-assigned address would therefore have to be looked up and pasted
+    # into .env after every `up`, and a stale one fails silently: the header is
+    # ignored and all ten thousand buyers share nginx's single IP bucket.
+    networks:
+      flashseats:
+        ipv4_address: 172.28.0.10
 
   # ===================================================================
   # Load harness (profile: loadtest)
@@ -192,16 +382,110 @@ services:
       TIER_ID: ${K6_TIER_ID:-1}
       VUS: ${K6_VUS:-10000}
       CAPACITY: ${K6_CAPACITY:-500}
+    # NOT read-only: handleSummary writes /scripts/summary.json at the end of
+    # every run, and a :ro mount made that throw after the run had finished —
+    # losing the whole result. `docker/k6/summary.json` is gitignored.
     volumes:
-      - ./docker/k6:/scripts:ro
+      - ./docker/k6:/scripts
     entrypoint: ["k6", "run", "/scripts/flash-sale.js"]
+    networks: [flashseats]
+
+  # The ADR-049 drill: E sales open at once, contending for one connection pool.
+  #
+  # A separate service rather than an env var on `k6` above, because the two runs
+  # are not variants of each other. `k6` asserts no-oversell on one sale — a
+  # CORRECTNESS property. This asserts the same per event, but exists to measure
+  # a LATENCY failure that produces no error at all, and it is only half an
+  # instrument: docker/scripts/pool-pressure.sh reads the gauge that actually
+  # shows it. Run them together or the drill proves nothing.
+  #
+  #   docker/seed/seed-concurrent.sh
+  #   docker/scripts/pool-pressure.sh 300 &
+  #   docker compose --profile loadtest run --rm -e VUS=2000 k6-concurrent
+  k6-concurrent:
+    image: grafana/k6:latest
+    profiles: ["loadtest"]
+    environment:
+      BASE_URL: ${K6_BASE_URL:-http://nginx:80}
+      FIRST_ID: ${K6_FIRST_ID:-9001}
+      EVENTS: ${K6_EVENTS:-5}
+      VUS: ${K6_VUS:-10000}
+      CAPACITY: ${K6_CAPACITY:-500}
+    volumes:
+      - ./docker/k6:/scripts
+    entrypoint: ["k6", "run", "/scripts/concurrent-sales.js"]
+    networks: [flashseats]
+
+  # The waiting room alone: a simultaneous arrival that browses, joins and polls,
+  # with no holds or checkouts (header of waiting-room.js). One event, seeded by
+  # docker/seed/seed.sh.
+  #
+  #   docker compose --profile loadtest run --rm -e VUS=2000 k6-waiting-room
+  k6-waiting-room:
+    image: grafana/k6:latest
+    profiles: ["loadtest"]
+    environment:
+      BASE_URL: ${K6_BASE_URL:-http://nginx:80}
+      EVENT_ID: ${K6_EVENT_ID:-9001}
+      VUS: ${K6_VUS:-10000}
+      WAIT_SECONDS: ${K6_WAIT_SECONDS:-180}
+      POLL_SECONDS: ${K6_POLL_SECONDS:-2}
+    volumes:
+      - ./docker/k6:/scripts
+    entrypoint: ["k6", "run", "/scripts/waiting-room.js"]
+    networks: [flashseats]
+
+  # ===================================================================
+  # Live provider webhooks (profile: stripe)
+  # ===================================================================
+  #
+  # The Stripe CLI's tunnel: it receives real test-mode deliveries for your
+  # account and forwards them to nginx. Its own profile, because it is the one
+  # service that cannot run without credentials — a plain `up -d` must not start
+  # needing an account.
+  #
+  #   export STRIPE_API_KEY=sk_test_... STRIPE_ENABLED=true
+  #   docker compose --profile cluster --profile stripe up -d
+  #   docker compose logs stripe        # prints the whsec_... to put in .env
+  #   docker/scripts/stripe-check.sh
+  #
+  # NOTE the ordering trap: `stripe listen` MINTS a webhook secret per session,
+  # and the app must already have that value. So the first run is two steps —
+  # start this, read the secret from its logs into STRIPE_WEBHOOK_SECRET, then
+  # recreate the app. A signature check against a stale secret rejects every
+  # delivery, and the symptom is silence that looks exactly like a quiet day.
+  stripe:
+    image: stripe/stripe-cli:latest
+    profiles: ["stripe"]
+    restart: unless-stopped
+    environment:
+      STRIPE_API_KEY: ${STRIPE_API_KEY:?set STRIPE_API_KEY to a sk_test_... key}
+    command:
+      - listen
+      - --forward-to
+      - http://nginx:80/api/v1/payments/webhook
+      # Only what this system acts on. Forwarding everything makes the log
+      # unreadable and every ignored delivery a round trip.
+      - --events
+      - payment_intent.succeeded
+    depends_on: [nginx]
     networks: [flashseats]
 
 volumes:
   postgres-data:
   redis-data:
+  redis-replica-1-data:
+  redis-replica-2-data:
+  redis-sentinel-1-data:
+  redis-sentinel-2-data:
+  redis-sentinel-3-data:
   rabbitmq-data:
 
 networks:
   flashseats:
     driver: bridge
+    # An explicit subnet so nginx can hold a fixed address; see its `networks:`
+    # block and ADR-047.
+    ipam:
+      config:
+        - subnet: 172.28.0.0/16

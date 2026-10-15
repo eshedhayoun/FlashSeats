@@ -88,13 +88,33 @@ means *that opportunity is gone*. The SPA renders different screens.
 One namespace across all modules. `code` values are **stable API contract** — renaming one is a
 breaking change.
 
+**Every code here is reachable, and that is checked in both directions.** An unreachable code is
+dead contract — a client writes a branch for a response the server can never send, and `FE_SPEC.md`
+§2 had begun warning readers off three of them. **A code is added when the path that raises it is,
+not before.**
+
+Ten were unreachable and were removed in Pass 9. **Six stayed removed**: `NOT_IN_QUEUE`,
+`QUEUE_PASS_EXPIRED`, `QUEUE_UNAVAILABLE`, `SALE_EXHAUSTED`, `ORDER_ALREADY_CONFIRMED` and
+`NOTIFICATION_LOG_NOT_FOUND`. **Four came straight back** — `PAYMENT_ACTION_REQUIRED`,
+`WEBHOOK_SIGNATURE_INVALID`, `BOT_VERIFICATION_FAILED` and `IP_BLOCKED` — when the real gateway, the
+webhook and the IP-rule surface landed in the same week. That is the rule working in both
+directions, and also the caveat on it: **delete a code when its feature is not being built, not
+merely when it is not built yet.**
+
+Three sold-out answers were among them, and their absence is informative: "sold out" reaches the
+waiting room as the `sale-exhausted` SSE frame and the `EXHAUSTED` queue phase, never as an error
+(ADR-035). `SALE_EXHAUSTED` existed because an earlier design refused a request; the current one
+tells the client a state.
+
 | Code | Status | Module | Meaning / client action |
 | :--- | :--- | :--- | :--- |
 | `VALIDATION_FAILED` | 400 | shared | Fix `violations` and resubmit |
 | `INTERNAL_ERROR` | 500 | shared | Show `traceId`, offer retry |
+| `SERVICE_BUSY` | 503 | shared | **Back-pressure, not a fault**: no database connection came free inside `connection-timeout`. Carries `Retry-After` and `retryAfterSeconds`; re-send the same request after it — checkout is find-or-create, so that is always safe. Seats, if any, are untouched (ADR-059) |
+| `NOT_FOUND` | 404 | shared | No endpoint or resource at this path — a caller's mistake, never a server fault. It used to be `500 INTERNAL_ERROR` (ADR-041's trap, ADR-067) |
 | `RATE_LIMITED` | 429 | bot | Back off `retryAfterSeconds` |
-| `BOT_VERIFICATION_FAILED` | 403 | bot | Re-run reCAPTCHA |
-| `IP_BLOCKED` | 403 | bot | Terminal; contact support |
+| `BOT_VERIFICATION_FAILED` | 403 | bot | The challenge scored below the threshold. Reload for a fresh token and retry — **never** returned for a provider timeout or outage, which fail open (ADR-011, ADR-055) |
+| `IP_BLOCKED` | 403 | bot | A standing operator decision on this address. Terminal for the client — `retryable` is false; contact support (ADR-055) |
 | `SESSION_INVALID` | 401 | bot | Reload to obtain a fresh `fsid` |
 | `EVENT_NOT_FOUND` | 404 | catalog | — |
 | `TIER_NOT_FOUND` | 404 | catalog | — |
@@ -102,31 +122,39 @@ breaking change.
 | `SALE_CLOSED` | 409 | catalog | Terminal |
 | `INVENTORY_UNAVAILABLE` | 503 | catalog | **Fault** — retry; alarm fires server-side |
 | `PREWARM_WINDOW_CLOSED` | 409 | catalog | Admin only |
-| `NOT_IN_QUEUE` | 404 | queue | Rejoin |
+| `STOCK_REBUILD_IN_PROGRESS` | 503 | catalog | Admin only. Another rebuild holds this event's lock; retry, never force — two rebuilds computing from a moving ledger is how a recovery makes things worse (ADR-046). Raised by `order`, which runs the rebuild |
 | `QUEUE_PASS_INVALID` | 401 | queue | Rejoin |
-| `QUEUE_PASS_EXPIRED` | 410 | queue | Rejoin |
 | `ADMISSION_EXPIRED` | 410 | queue | Rejoin the queue |
 | `ADMISSION_REQUIRED` | 401 | queue | Not admitted to the sale |
-| `QUEUE_UNAVAILABLE` | 503 | queue | Retry with backoff |
-| `SALE_EXHAUSTED` | 409 | queue | Sold out. **Not terminal** — exhaustion is derived from live stock and clears when seats return (ADR-035) |
 | `INSUFFICIENT_STOCK` | 409 | hold | Choose another tier |
 | `HOLD_NOT_FOUND` | 404 | hold | — |
 | `HOLD_EXPIRED` | 410 | hold | Reservation gone; nothing charged |
-| `HOLD_ALREADY_SETTLED` | 409 | hold | Already consumed or released |
+| `HOLD_ALREADY_SETTLED` | 409 | hold | Already consumed or released. **Not reachable over HTTP**: checkout routes it to the order row, which answers with a receipt or `ORDER_REFUNDED` (ADR-064) |
 | `HOLD_LIMIT_EXCEEDED` | 409 | hold | Release the existing hold first |
 | `QUANTITY_EXCEEDS_LIMIT` | 422 | hold | Max 6 per order |
 | `PAYMENT_DECLINED` | 402 | payment | Retry — see `attemptsRemaining` |
 | `PAYMENT_ATTEMPTS_EXHAUSTED` | 402 | payment | Terminal |
-| `PAYMENT_ACTION_REQUIRED` | 402 | payment | 3-D Secure — follow `resumeUrl` |
+| `PAYMENT_ACTION_REQUIRED` | 402 | payment | 3-D Secure. Run `handleNextAction` with the `clientSecret` on the problem document, then **re-POST the same checkout body** — there is no `resumeUrl` and no resume endpoint. Hold retained, **no attempt consumed** (ADR-054) |
 | `PAYMENT_GATEWAY_UNAVAILABLE` | 503 | payment | Circuit open; hold retained, **no payment attempt consumed**, and the retry genuinely works (ADR-034) |
 | `DUPLICATE_PAYMENT` | 409 | payment | A charge is already in flight. Do **not** re-enable the pay button; poll `/sale/{id}/state`. Bounded by `stale-pending-seconds` — it can no longer mean "forever" (ADR-034) |
-| `WEBHOOK_SIGNATURE_INVALID` | 400 | payment | Gateway only |
+| `WEBHOOK_SIGNATURE_INVALID` | 400 | payment | Provider callback only. Never retried — a caller who cannot sign will not do better on the fourth attempt (ADR-053) |
 | `ORDER_NOT_FOUND` | 404 | order | — |
-| `ORDER_ALREADY_CONFIRMED` | 409 | order | Return the existing receipt |
 | `CHECKOUT_WINDOW_CLOSED` | 409 | order | Past the 15-minute grace |
 | `INSUFFICIENT_TIME_REMAINING` | 409 | order | Too little of the hold left to start a charge that could finish (ADR-030). Nothing charged; the order is left resumable |
 | `ORDER_REFUNDED` | 409 | order | A settled charge was refunded because the seats could not be delivered (ADR-012). Distinct from `HOLD_EXPIRED`, whose promise that nothing was charged would be false |
-| `NOTIFICATION_LOG_NOT_FOUND` | 404 | notification | Admin only |
+| `REFUND_FAILED` | 409 | order | A settled charge could not become a purchase, **and the provider refused the refund**. Money owed to the buyer, now with a person: counted in `flashseats.payment.refund.failed` and never announced as refunded (ADR-069) |
+| `TICKET_NOT_AVAILABLE` | 409 | order | The order is the caller's and has no ticket (ADR-050). Only a `CONFIRMED` order does; rendering for any other status would mint a document indistinguishable from a real ticket. Returned **only** to a caller who has already proved ownership, so it can afford to say why — an unauthorised one still gets `ORDER_NOT_FOUND`. `retryable` is true for `PENDING` and false for everything else |
+| `SALE_PAUSED` | 409 | catalog | An operator has paused the sale: no hold is created until it resumes. **Retryable** (`retryable: true`), and not terminal — the buyer keeps their place in line and any hold they already have. An admission keeps its own clock, so a pause longer than it sends that buyer back to the line (ADR-066) |
+| `EVENT_NOT_PAUSABLE` | 409 | catalog | Admin only. Pause or resume asked for on an event that is `DRAFT` or `CANCELLED`, where neither means anything (ADR-048). It used `SALE_PAUSED` until that code began meaning something to buyers (ADR-066) |
+| `NOTIFICATION_PAYLOAD_UNAVAILABLE` | 410 | order | A resend was asked for past `flashseats.outbox.purge-after-days`, so the stored message is gone. `410`, not `404`: the order existed and so did its message — they aged out, and a `404` would send an operator hunting a typo |
+| `ADMIN_AUTH_REQUIRED` | 401 | shared | No operator credentials, or the wrong ones |
+| `ADMIN_FORBIDDEN` | 403 | shared | Authenticated, but not an operator |
+
+The last two are the only codes **not** raised by a `FlashSeatsException`. Spring Security throws
+inside the filter chain, which runs before `DispatcherServlet`, so `GlobalExceptionHandler` cannot
+see them and `AdminProblemResponses` writes the problem at the entry point instead. Until Stage 4
+they were not codes at all: the admin surface answered with Boot's stock error body, making it the
+one place in the API that broke §1 (ADR-048).
 
 ---
 
@@ -239,27 +267,36 @@ A facade is the *only* legal cross-module surface. Every one obeys:
    order transaction and must join it — ADR-019.)
 3. **Records in, records out.** Immutable Java records only. **Never a JPA entity** — a detached
    entity leaks a lazy-loading proxy and a mapping across a boundary that is supposed to be opaque.
-4. **Module-owned exceptions only.** `HoldFacade` throws hold exceptions; it never surfaces a
+4. **Module-owned failures only.** A facade raises its module's own refusals — a `<Module>Errors`
+   factory or one of its few dedicated exception types — and never surfaces a
    `DataIntegrityViolationException`.
-5. **No `Optional` for absence that is an error.** Throw the module's `*NotFoundException`; reserve
+5. **No `Optional` for absence that is an error.** Raise the module's "not found" refusal; reserve
    `Optional` for genuinely optional reads.
 6. **One store per call where possible.** A facade that touches PostgreSQL *and* Redis *and* calls
    another facade is doing orchestration and belongs in a service.
-7. **Declared in the module's `facade` package**; the implementation is package-private where the
-   language allows.
+7. **Declared in the module's `facade` package, and implemented by the service itself.** There is
+   no separate `*Impl`: five existed, every one pure delegation, and all they added was a hop
+   between the contract and the code honouring it. The service lives in an internal package no
+   other module may name, so the interface is still the only visible surface — Modulith checks
+   *source-code type references*, not runtime bean types, and `ApplicationModules.verify()` is the
+   proof (ADR-057).
 8. **The graph stays acyclic.** Adding an edge requires checking `ApplicationModules.verify()`.
 
-### The one shared write: the inventory counter
+### There is no shared write — the inventory counter is catalog's alone
 
-Named pattern: **shared counter, single-writer contract.**
+> **Superseded by ADR-046.** This section used to describe a "shared counter, single-writer
+> contract": `catalog` owning `catalog:stock:{eventId}:{tierId}` while `hold` wrote it directly
+> through the Lua scripts, as the one deliberate exception to key ownership.
+>
+> **That exception no longer exists.** The scripts live in `catalog` and are executed there;
+> `hold` moves stock by calling `CatalogFacade.tryReserve` / `restore` and never touches the key.
+> `tier_inventory` is dropped. Ordinary facade rules cover the whole path, so nothing here needs a
+> special case.
+>
+> The original reasoning is kept below, because the *constraint* it identified is still real and is
+> what the scripts exist to satisfy.
 
-- `catalog` **owns** `catalog:stock:{eventId}:{tierId}` and `tier_inventory` — schema, lifecycle,
-  seeding, rebuild, reconciliation.
-- `hold` is the **sole writer** during a sale, in *both* storages, via exactly two operations
-  (`hold_reserve.lua` / `hold_restore.lua` in Phase 2+; one CTE statement in Phase 1).
-- Nothing else reads or writes them.
-
-This is a deliberate, bounded exception, not an oversight: the stock decrement and the reservation
+This was a deliberate, bounded exception, not an oversight: the stock decrement and the reservation
 that justifies it must be atomic, and splitting them across two modules would open a crash window
 that leaks inventory. Documenting it once as a contract is better than pretending it isn't there.
 
@@ -370,20 +407,23 @@ business change, it does not belong there.
 
 ## 9. Observability
 
-Metric naming: `flashseats.<module>.<subject>.<unit>`. Every module exposes at minimum its own
-error rate by `code`, and the latency of any external call it makes.
+Metric naming: `flashseats.<module>.<subject>.<unit>`. Every module should expose its own error rate
+by `code` and the latency of any external call it makes — **specified, not built** as a per-module
+series: today `http.server.requests` carries status and URI, and the payment gateway's latency is in
+the Resilience4j series. [`03-end-to-end-flow.md`](03-end-to-end-flow.md) §7 is the full list of what
+is built and what is specified.
 
 Required alarms:
 
 | Metric | Alarm | Why |
 | :--- | :--- | :--- |
-| `flashseats.stock.drift` | **any non-zero** | inventory accounting has diverged — page |
+| `flashseats.stock.drift` | **sustained** non-zero — across consecutive 60 s computations, not one sample | inventory accounting has diverged — page. Redis and PostgreSQL are not read in one snapshot, so a single sample can catch a hold in flight (ADR-046) |
 | `hikaricp_connections_pending` | > 0 sustained | the real saturation signal under virtual threads |
 | `flashseats.outbox.lag.seconds` | > 60 | fulfilment is stalling |
 | `flashseats.dlq.depth` | > 0 | tickets are not reaching buyers |
-| `flashseats.queue.promotion.rate` | 0 while depth > 0 | the queue has stalled |
-| `flashseats.payment.decline.ratio` | > 0.2 | gateway or configuration problem |
-| `jvm.threads.pinned` | > 0 | virtual-thread pinning (§7) |
+| `flashseats.queue.admissions` | zero while a waiting room has depth | the queue has stalled. Specified as `queue.promotion.rate`; built as this untagged counter, so it answers "is the cluster promoting?", not "is this sale?" |
+| `flashseats.payment.attempts{outcome}` | declined share > 0.2 over 5 m | gateway or configuration problem. A counter, not a lifetime ratio, which cannot show a spike |
+| `jvm.threads.pinned` | > 0 | virtual-thread pinning (§7). **Specified, not built** |
 
 `stock.drift` compares the live counter against
 `total_capacity − confirmed_sold − active_holds` every 60 s. It is the system's canary.
@@ -426,3 +466,48 @@ Sections 5, 6, 7 and 9 are new in the 2nd pass — their absence is exactly what
 - [ ] Redis keys list owner and TTL
 - [ ] Metrics named per §9
 - [ ] No contradiction with any ADR
+
+---
+
+## 11. Code layout — the conventions every module follows
+
+Written down in Pass 14, because the drift it fixed (below) came from conventions nobody had stated.
+A reviewer checks new code against this list.
+
+**Packages, per module**, and nothing else:
+
+| Package | Holds | Visible to other modules? |
+| :--- | :--- | :--- |
+| `facade` | the interface and the records that cross the boundary | yes — `@NamedInterface` |
+| `exception` | `<Module>Errors` plus any exception a `catch` names | yes — `@NamedInterface` |
+| `event` | an event **another module** listens to (only `payment` has one) | yes — `@NamedInterface` |
+| `controller`, `dto` | endpoints and their request/response records | no |
+| `service` | the logic, the facade implementation, in-module events, key and token helpers | no |
+| `model`, `repository`, `config` | entities, Spring Data repositories, `@ConfigurationProperties` | no |
+
+App-wide wiring (security, startup guards) lives in `com.flashseats.app`, a leaf nothing depends
+on. The application class sits at the root package, so scanning needs no widening.
+
+**Rules**
+
+1. **A facade is implemented by its module's service.** There is no `*Impl` (ADR-057, §5 rule 7).
+2. **An exception class exists only if a `catch` names it.** Every other refusal is a static
+   method on `<Module>Errors`, which can branch its code, message and extensions as freely as a
+   constructor (ADR-063).
+3. **Controllers only map.** They read the request, call one service method, and return. Flow —
+   ordering, orchestration, a guard like the bot check — lives in the service.
+4. **A separate bean for a separate transaction.** A `@Transactional` method called on `this` runs
+   with no transaction, so the short transactions around a network call live on their own bean
+   (`*Store`, `OrderCommitService`) — ADR-023. That split is required, not duplication.
+5. **Behaviour next to its data.** A rule computed from one type is a method on that type
+   (`EventRow.windowStatus`, `AvailabilityLevel.of`), not a separate `*Helper`.
+6. **Mapping.** Entity → response is a static `of` on the response record, or built in the service
+   for a read model. Never in a controller body, and never an entity across a module boundary.
+7. **Metrics.** A counter is registered in the one class that increments it. A `*Metrics` bean
+   exists only for a gauge that polls state (`OutboxMetrics`, `NotificationMetrics`) or a counter
+   incremented from more than one class (`BotMetrics`).
+8. **`@ConfigurationProperties` are Lombok `@Getter @Setter` beans**, not records. Integration tests
+   adjust live beans to avoid forking Spring contexts (ADR-061).
+9. **Comments say why, briefly, and cite the ADR.** No history in code ("used to", "Pass N"). The
+   ADR log is the record of how a decision came to be.
+

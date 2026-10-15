@@ -9,7 +9,7 @@ import org.springframework.web.bind.annotation.RestController;
 
 /**
  * Operator endpoints. Guarded by {@code ROLE_ADMIN} in
- * {@link com.flashseats.flashseats.config.SecurityConfig} — "admin only" is an enforced role here,
+ * {@link com.flashseats.app.SecurityConfig} — "admin only" is an enforced role here,
  * not a comment.
  */
 @RestController
@@ -26,5 +26,21 @@ public class AdminCatalogController {
     @PostMapping("/{eventId}/prewarm")
     public Map<String, Object> prewarm(@PathVariable long eventId) {
         return Map.of("eventId", eventId, "tiersSeeded", catalog.prewarm(eventId));
+    }
+
+    /**
+     * Halts a live sale: nobody is promoted and no hold is created, while the line keeps forming and a
+     * buyer already holding seats can still pay (ADR-066). Nothing is destroyed: positions, passes,
+     * admissions and stock stay, so {@code /resume} puts everyone back where they were. Idempotent.
+     */
+    @PostMapping("/{eventId}/pause")
+    public Map<String, Object> pause(@PathVariable long eventId) {
+        return Map.of("eventId", eventId, "status", catalog.setPaused(eventId, true));
+    }
+
+    /** Puts a paused sale back on sale. Idempotent. */
+    @PostMapping("/{eventId}/resume")
+    public Map<String, Object> resume(@PathVariable long eventId) {
+        return Map.of("eventId", eventId, "status", catalog.setPaused(eventId, false));
     }
 }

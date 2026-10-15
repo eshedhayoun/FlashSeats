@@ -1,22 +1,20 @@
 package com.flashseats.catalog.facade;
 
 import java.util.List;
+import java.util.Map;
 
 /**
- * The only legal way into {@code catalog} from another module.
+ * The only way into {@code catalog} from another module. Callers: {@code hold} (tier, price,
+ * window, inventory movement), {@code queue} (window and remaining stock), {@code order} (pricing,
+ * rebuild) and {@code saleflow}. {@code catalog} depends on nothing, so every edge is acyclic.
  *
- * <p>Callers: {@code hold} (tier validity, price, window, and the inventory movement),
- * {@code queue} (window gate and remaining stock — ADR-031), {@code order} (server-side pricing),
- * {@code saleflow} (rehydration). {@code catalog} itself depends on nothing, so every one of those
- * edges is acyclic.
- *
- * <p>Per global standards §5 no method here opens a transaction of its own; the two mutating methods
- * <em>require</em> one, so the caller's boundary governs.
+ * <p>No method opens its own transaction (global standards §5). {@link #tryReserve} and
+ * {@link #restore} are Redis writes and must be called <strong>outside</strong> one (ADR-046).
  */
 public interface CatalogFacade {
 
     /**
-     * Returned by {@link #getRemaining} when the tier has no counter at all.
+     * Returned by {@link #getRemainingForEvent} when a tier has no counter at all.
      *
      * <p>Callers must treat this as a <strong>fault</strong>, never as zero: it means inventory state
      * is missing and needs rebuilding, not that the tier sold out (ADR-004).
@@ -24,8 +22,9 @@ public interface CatalogFacade {
     int COUNTER_UNAVAILABLE = -1;
 
     /**
-     * @throws com.flashseats.catalog.exception.EventNotFoundException if the event does not exist
-     * @throws com.flashseats.catalog.exception.TierNotFoundException if the tier is not this event's
+     * @throws com.flashseats.shared.error.FlashSeatsException {@code EVENT_NOT_FOUND} if the event
+     *     does not exist, {@code TIER_NOT_FOUND} if the tier is not this event's — see
+     *     {@link com.flashseats.catalog.exception.CatalogErrors}
      */
     TierSummary getTierSummary(long eventId, long tierId);
 
@@ -37,37 +36,79 @@ public interface CatalogFacade {
     List<Long> findOpenEventIds();
 
     /**
-     * Exact remaining seats for one tier, for internal use only — never rendered to a buyer, who
-     * sees a bucket instead (ADR-027).
+     * Ids of events inside their sale window that are open <strong>or paused</strong>.
      *
-     * @return remaining seats, or {@code -1} when no counter exists. {@code -1} is a
-     *     <strong>fault</strong> and callers must treat it as one: it means inventory state is
-     *     missing, not that the tier is sold out (ADR-004).
+     * <p>Not the same question as {@link #findOpenEventIds}, and the difference matters: a paused
+     * sale admits nobody, but it is still an operator's responsibility and must still be watched.
+     * This is what the {@code stock.drift} gauge iterates, because pausing a sale is exactly what
+     * someone does while investigating a counter.
      */
-    int getRemaining(long tierId);
+    List<Long> findManagedEventIds();
 
     /**
      * Total remaining across every tier of an event. Bounds how many buyers the queue admits.
      *
-     * @return remaining seats, or {@link #COUNTER_UNAVAILABLE} when <em>any</em> tier of the event
-     *     has no counter. As with {@link #getRemaining}, that is a <strong>fault</strong> and must
-     *     never be read as a sold-out sale: doing so drained an entire waiting room in the first
-     *     pass, because a {@code SUM} over missing rows is indistinguishable from zero (ADR-035).
+     * @return remaining seats, or {@link #COUNTER_UNAVAILABLE} when <em>any</em> tier has no counter:
+     *     a <strong>fault</strong>, never a sold-out sale (ADR-035)
      */
     int getRemainingForEvent(long eventId);
 
     /**
-     * Atomically takes seats from a tier. <strong>Must be called inside the caller's
-     * transaction</strong> so the reservation that justifies the decrement commits or rolls back
-     * with it.
+     * Public availability buckets for every tier in the event.
      *
-     * @return true when reserved, false when stock is insufficient
+     * <p>Used by the waiting-room stream to push {@code tier-availability} frames without copying
+     * bucket rules out of {@code catalog} (ADR-027).
      */
-    boolean tryReserve(long tierId, int quantity);
+    List<TierAvailability> getTierAvailability(long eventId);
 
     /**
-     * Returns seats to a tier. Call only after winning the settle-once claim on the hold — that
-     * claim is what makes restoration exactly-once (ADR-019).
+     * Atomically takes seats from a tier. <strong>Must not be called inside a SQL transaction</strong>:
+     * it is a Redis write that cannot roll back (ADR-023, ADR-046). The caller writes the hold that
+     * justifies it immediately afterwards, and {@link #restore}s only on a definite rejection.
      */
-    void restore(long tierId, int quantity);
+    ReserveResult tryReserve(long eventId, long tierId, int quantity);
+
+    /**
+     * Returns seats to a tier.
+     *
+     * <p>Call only after winning the settle-once claim on the hold — that claim, not this call, is
+     * what makes restoration exactly-once (ADR-019) — and only <strong>after the claim has
+     * committed</strong>. Incrementing before the commit would hand the seats back and then let the
+     * transaction put the hold back to {@code ACTIVE}, which is an oversell.
+     *
+     * <p>Does nothing if the tier has no counter: creating one here would conjure inventory out of a
+     * single expiring hold (ADR-004). Those seats are reported by the drift gauge and returned by a
+     * rebuild.
+     */
+    void restore(long eventId, long tierId, int quantity);
+
+    /**
+     * Every tier of an event and the capacity it was created with.
+     *
+     * <p>The starting point for a rebuild: {@code capacity − confirmed − held} is the only legal way
+     * to work out what a lost counter should hold (ADR-004).
+     */
+    Map<Long, Integer> getTierCapacities(long eventId);
+
+    /**
+     * The live counters as they stand, tier id to remaining.
+     *
+     * <p><strong>A tier with no counter is absent, never zero.</strong> The caller is either
+     * measuring drift or repairing a fault, and both need to tell "nothing left" from "nothing
+     * known" (ADR-035, ADR-040).
+     */
+    Map<Long, Integer> getLiveCounters(long eventId);
+
+    /**
+     * Overwrites the live counters with values derived from the ledger.
+     *
+     * <p><strong>The only legal reseed of an open sale.</strong> Every other path into a counter
+     * either creates it from capacity before the sale opens (pre-warm) or moves it by one
+     * reservation. Passing anything not computed as {@code capacity − confirmed − held} would
+     * resurrect sold tickets, which is the failure ADR-004 exists to prevent.
+     *
+     * <p>Callers must hold the rebuild lock. This method does not take it, because the lock has to
+     * span the ledger read that produced these numbers — and that read happens in the caller.
+     */
+    void applyRebuild(long eventId, Map<Long, Integer> remainingByTier);
 }

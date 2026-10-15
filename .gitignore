@@ -34,7 +34,48 @@ build/
 
 # Local environment overrides (see .env.example)
 .env
+# ...and every backup/variant of it. A `.env.bak` holds the same secrets the
+# original does, and only `.env` being listed here let one reach a commit.
+.env.*
+!.env.example
 .env.local
 
 # Load-test output
 docker/k6/summary.json
+docker/k6/summary-concurrent.json
+
+# Frontend local dependencies, build output and TypeScript build metadata.
+# All of it was committed once — 7,805 files and 57 MB of node_modules — because
+# these rules were added in the same merge that tracked the files, and an ignore
+# rule does not apply to a path git already tracks.
+frontend/node_modules/
+frontend/dist/
+frontend/tsconfig.*.tsbuildinfo
+frontend/vite.config.js
+frontend/vite.config.d.ts
+frontend/vitest.config.js
+frontend/vitest.config.d.ts
+frontend/.vite/
+frontend/.env.local
+frontend/.env.*.local
+
+# Playwright output. Both directories were committed once, and `npm run test:e2e`
+# deletes them before every run, so a tracked copy dirtied the tree on each run.
+frontend/playwright-report/
+frontend/test-results/
+frontend/blob-report/
+
+# Scratch probes and classpath dumps. The merge that added the frontend also
+# carried Probe.java, its .class file and a Windows `cp.txt` into the repo root.
+*.class
+cp.txt
+
+# Run logs. Load drills write app and k6 logs next to wherever they were started.
+*.log
+
+.DS_Store
+
+# Claude Code's per-checkout settings. Its permission allow-list records the exact
+# commands that were approved, and one of them exported the admin plaintext, so
+# `git add .` would have committed a live credential.
+.claude/

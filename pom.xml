@@ -12,7 +12,7 @@
 	<artifactId>flashseats</artifactId>
 	<version>0.0.1-SNAPSHOT</version>
 	<name>flashseats</name>
-	<description/>
+	<description>High-concurrency ticket flash-sale engine: a Spring Modulith monolith that sells exactly the seats it has</description>
 	<url/>
 	<licenses>
 		<license/>
@@ -28,13 +28,15 @@
 	</scm>
 	<properties>
 		<java.version>21</java.version>
+		<!-- Surefire run order; see the surefire block. Override with -Dtest.runOrder=reversealphabetical or random -->
+		<test.runOrder>alphabetical</test.runOrder>
 		<spring-modulith.version>2.1.1</spring-modulith.version>
 		<!-- Third-party libraries not managed by the Spring Boot BOM. See docs/01-system-architecture.md -->
 		<bucket4j.version>8.14.0</bucket4j.version>
 		<testcontainers.version>1.21.3</testcontainers.version>
 		<pdfbox.version>3.0.7</pdfbox.version>
-		<!-- Pinned versions for Stage 2, kept so re-adding the dependency is a one-line change:
-		     stripe-java 29.2.0 · resilience4j 2.3.0 -->
+		<stripe.version>29.2.0</stripe.version>
+		<resilience4j.version>2.3.0</resilience4j.version>
 	</properties>
 	<dependencies>
 		<dependency>
@@ -61,11 +63,13 @@
 			<groupId>org.springframework.boot</groupId>
 			<artifactId>spring-boot-starter-webmvc</artifactId>
 		</dependency>
-		<dependency>
-			<groupId>org.springdoc</groupId>
-			<artifactId>springdoc-openapi-starter-webmvc-ui</artifactId>
-			<version>3.1.0</version>
-		</dependency>
+		<!--
+			springdoc-openapi was removed. It served an OpenAPI document derived
+			entirely from request mappings: the codebase contains zero @Operation,
+			@Tag, @Schema or OpenAPI beans, so /docs described the shapes and none
+			of the meaning. FE_SPEC.md is the client contract and says what the
+			generated page could not. Re-add it with annotations, or not at all.
+		-->
 		<dependency>
 			<groupId>org.springframework.modulith</groupId>
 			<artifactId>spring-modulith-starter-core</artifactId>
@@ -113,15 +117,41 @@
 			<version>${bucket4j.version}</version>
 		</dependency>
 		<!--
-			Stripe, Resilience4j and Thymeleaf were declared here ahead of the stages that
-			use them, and none of them is on the classpath for a reason yet:
-
-			  - stripe-java      -> Stage 2, with StripeGateway and the webhook receiver
-			  - resilience4j-*   -> Stage 2, as plain beans (the Boot 3 starter does not apply)
-			  - thymeleaf        -> deferred indefinitely; EmailComposer builds the one small
-			                        HTML body in Java on purpose, and there is no templates/
-			                        directory. Its starter also autoconfigures a view resolver
-			                        into an API that returns nothing but JSON.
+			Stripe. Arrived in Stage 2 with StripePaymentGateway and the webhook receiver.
+			Note it is on the classpath unconditionally but only *used* when
+			flashseats.payment.stripe.enabled is true: dev and test keep the stub, and the
+			webhook receiver's signature verification (com.stripe.net.Webhook) is needed on
+			every profile, because that is how the tests sign their own payloads.
+		-->
+		<dependency>
+			<groupId>com.stripe</groupId>
+			<artifactId>stripe-java</artifactId>
+			<version>${stripe.version}</version>
+		</dependency>
+		<!--
+			Resilience4j as PLAIN artifacts, never the starter: resilience4j-spring-boot3
+			targets Boot 3 and autoconfigures against APIs this application does not have.
+			One CircuitBreaker bean, declared by hand in PaymentGatewayConfig.
+		-->
+		<dependency>
+			<groupId>io.github.resilience4j</groupId>
+			<artifactId>resilience4j-circuitbreaker</artifactId>
+			<version>${resilience4j.version}</version>
+		</dependency>
+		<dependency>
+			<groupId>io.github.resilience4j</groupId>
+			<artifactId>resilience4j-retry</artifactId>
+			<version>${resilience4j.version}</version>
+		</dependency>
+		<dependency>
+			<groupId>io.github.resilience4j</groupId>
+			<artifactId>resilience4j-micrometer</artifactId>
+			<version>${resilience4j.version}</version>
+		</dependency>
+		<!--
+			Thymeleaf stays deferred indefinitely; EmailComposer builds the one small HTML
+			body in Java on purpose, and there is no templates/ directory. Its starter also
+			autoconfigures a view resolver into an API that returns nothing but JSON.
 
 			An unused dependency is not free: it ships in the image and it carries CVEs that
 			someone has to triage. They come back with the code that needs them.
@@ -134,12 +164,11 @@
 			<version>${pdfbox.version}</version>
 		</dependency>
 
-		<dependency>
-			<groupId>org.springframework.boot</groupId>
-			<artifactId>spring-boot-devtools</artifactId>
-			<scope>runtime</scope>
-			<optional>true</optional>
-		</dependency>
+		<!--
+			spring-boot-devtools was removed: nothing referenced it, and its restart
+			classloader is an active hazard next to the static, reused Testcontainers
+			in IntegrationTest.
+		-->
 		<dependency>
 			<groupId>org.postgresql</groupId>
 			<artifactId>postgresql</artifactId>
@@ -165,11 +194,12 @@
 			<artifactId>spring-boot-starter-data-redis-test</artifactId>
 			<scope>test</scope>
 		</dependency>
-		<dependency>
-			<groupId>org.springframework.boot</groupId>
-			<artifactId>spring-boot-starter-mail-test</artifactId>
-			<scope>test</scope>
-		</dependency>
+		<!--
+			spring-boot-starter-mail-test was removed: flashseats.notification.enabled
+			is false in the test profile, so EmailDispatcher is not even a bean. The one
+			test that drives the listeners, NotificationListenerIT, records mail with
+			its own RecordingMailSender, so it still needs nothing from the starter.
+		-->
 		<dependency>
 			<groupId>org.springframework.boot</groupId>
 			<artifactId>spring-boot-starter-validation-test</artifactId>
@@ -222,11 +252,11 @@
 			<artifactId>awaitility</artifactId>
 			<scope>test</scope>
 		</dependency>
-		<dependency>
-			<groupId>org.springframework.security</groupId>
-			<artifactId>spring-security-test</artifactId>
-			<scope>test</scope>
-		</dependency>
+		<!--
+			spring-security-test was removed: no @WithMockUser or SecurityMockMvc
+			anywhere. OperatorSurfaceIT authenticates over real HTTP basic auth
+			through BuyerSession, which is the stronger test.
+		-->
 	</dependencies>
 	<dependencyManagement>
 		<dependencies>
@@ -283,6 +313,25 @@
 						<include>**/*Tests.java</include>
 						<include>**/*IT.java</include>
 					</includes>
+					<!--
+						Surefire's default is FILESYSTEM order, which is not stable across machines:
+						two developers can legitimately disagree about whether the suite passes.
+						Pinning it is worth doing for that reason alone.
+
+						It used to be pinned for a second reason, and that reason is now gone. The
+						suite was order-dependent: in some orders every /queue request in the shared
+						context answered a bare 500. The cause was Spring Framework 7 pausing a
+						cached test context when another class switched to a different context
+						(ADR-061). src/test/resources/spring.properties turns that pausing off, and
+						the suite now passes in alphabetical, reversealphabetical and filesystem
+						order. The pin stays because a stable order is worth having anyway.
+
+						It is a property rather than a literal so that claim can be re-checked: a
+						literal here overrides -Dsurefire.runOrder, so the only way to run another
+						order was to edit this file. ./mvnw test -Dtest.runOrder=reversealphabetical
+						(or random) now does it.
+					-->
+					<runOrder>${test.runOrder}</runOrder>
 					<systemPropertyVariables>
 						<!--
 							Docker Engine 29 rejects the API version docker-java negotiates by

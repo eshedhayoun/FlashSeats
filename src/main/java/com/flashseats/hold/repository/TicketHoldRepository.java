@@ -21,23 +21,12 @@ public interface TicketHoldRepository extends JpaRepository<TicketHold, Long> {
 
     /**
      * <strong>The settle-once claim.</strong> Every ending of every hold runs this one statement.
+     * {@code AND status = 'ACTIVE'} is the whole concurrency design: on any number of replicas exactly
+     * one caller sees rowcount 1, and only that caller returns the seats. It is in SQL, not Redis, so a
+     * failed order commit rolls it back (ADR-019).
      *
-     * <p>{@code AND status = 'ACTIVE'} is the entire concurrency design. Consume, release, expiry and
-     * the sweeper may all fire for the same hold at the same moment, on any number of replicas;
-     * PostgreSQL row-locks, and <strong>exactly one caller sees rowcount 1</strong>. That caller —
-     * and only that caller — returns the seats to stock. Everyone else sees 0 and does nothing.
-     *
-     * <p>No distributed lock is involved, and none is needed. An earlier design put this claim in
-     * Redis, which meant consuming a hold mutated Redis inside the order's SQL transaction; Redis
-     * cannot roll back, so a failed commit left the claim spent, the timer gone, no order, and the
-     * seats permanently unsellable. Keeping the claim in SQL removes that failure mode by
-     * construction rather than compensating for it (ADR-019).
-     *
-     * <p><strong>Note the absence of {@code clearAutomatically}.</strong> It must stay off. This
-     * statement runs inside the order transaction, and clearing the persistence context would detach
-     * every other entity the caller is holding — including the {@code Order} it is midway through
-     * updating, whose changes would then be silently discarded at commit. Nothing about the bulk
-     * update makes those entities stale, so there is nothing to clear.
+     * <p>No {@code clearAutomatically}: this runs inside the order transaction, and clearing would detach
+     * the {@code Order} being updated, silently discarding its changes.
      *
      * @return 1 if this caller won the claim, 0 if the hold was already settled
      */

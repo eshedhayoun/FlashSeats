@@ -1,11 +1,12 @@
 package com.flashseats.order.repository;
 
 import com.flashseats.order.model.OutboxEvent;
+import com.flashseats.order.model.OutboxStatus;
 import jakarta.persistence.LockModeType;
 import jakarta.persistence.QueryHint;
 import java.time.Instant;
-import java.util.Collection;
 import java.util.List;
+import java.util.Optional;
 import java.util.UUID;
 import org.springframework.data.domain.Limit;
 import org.springframework.data.jpa.repository.JpaRepository;
@@ -16,6 +17,33 @@ import org.springframework.data.jpa.repository.QueryHints;
 import org.springframework.data.repository.query.Param;
 
 public interface OutboxEventRepository extends JpaRepository<OutboxEvent, UUID> {
+
+    /**
+     * The oldest row in one status, for the fulfilment-lag gauge. Asked per status, never as
+     * {@code <> PROCESSED}: only the per-status form can use the partial indexes from {@code V3}, and the
+     * other form scanned the whole table on every replica every ten seconds (ADR-051's trap, via a
+     * metric). No new index: this table is written on every checkout.
+     */
+    @Query("SELECT MIN(e.createdAt) FROM OutboxEvent e WHERE e.status = :status")
+    Optional<Instant> oldestCreatedAtWithStatus(@Param("status") OutboxStatus status);
+
+    /** Whether a message of this kind was ever queued for an order. */
+    boolean existsByAggregateIdAndEventType(String aggregateId, String eventType);
+
+    /**
+     * The most recent message published for an order, whatever became of it.
+     *
+     * <p>This is what makes an operator resend possible at all. The payload is a complete,
+     * self-contained snapshot of everything needed to render a ticket (ADR-015), and this table is
+     * the only place it durably lives — {@code notification_logs} records that a delivery was
+     * attempted, not what was in it.
+     *
+     * <p>Bounded by {@code flashseats.outbox.purge-after-days}: past that the nightly purge has
+     * removed the row and the message cannot be reconstructed. The resend endpoint says so rather
+     * than inventing one.
+     */
+    Optional<OutboxEvent> findFirstByAggregateIdAndEventTypeOrderByCreatedAtDesc(
+            String aggregateId, String eventType);
 
     /**
      * Takes a batch of pending events for this replica alone.
@@ -38,24 +66,26 @@ public interface OutboxEventRepository extends JpaRepository<OutboxEvent, UUID> 
     List<OutboxEvent> claimPending(Limit limit);
 
     /**
-     * Marks a published batch done.
+     * Marks one published claim done.
      *
-     * <p>{@code AND status = PROCESSING} is not decoration. A relay that stalls past
-     * {@code stale-claim-seconds} has its rows returned to {@code PENDING} and re-published by
-     * someone else; if it then wakes up and finishes, an unguarded {@code WHERE id IN (…)} would
-     * mark rows processed that a <em>different</em> claim now owns — including one still waiting to
-     * be sent. Every other claim in this system carries its precondition in the {@code WHERE}
-     * clause; so does this one.
+     * <p>{@code status = PROCESSING} alone is not enough. A relay may publish a message, die, and
+     * have its claim returned to {@code PENDING}; another relay can then claim the same row before
+     * the first one wakes up. {@code retryCount} is the claim generation: stale-claim recovery
+     * increments it, so an old relay cannot mark the newer relay's claim as processed (ADR-009).
      */
     @Modifying(flushAutomatically = true)
     @Query("""
             UPDATE OutboxEvent e
                SET e.status = com.flashseats.order.model.OutboxStatus.PROCESSED,
                    e.processedAt = :now
-             WHERE e.id IN :ids
+             WHERE e.id = :id
                AND e.status = com.flashseats.order.model.OutboxStatus.PROCESSING
+               AND e.retryCount = :retryCount
             """)
-    int markProcessed(@Param("ids") Collection<UUID> ids, @Param("now") Instant now);
+    int markProcessed(
+            @Param("id") UUID id,
+            @Param("retryCount") int retryCount,
+            @Param("now") Instant now);
 
     /**
      * Returns rows stranded in {@code PROCESSING} to {@code PENDING}.

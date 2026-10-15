@@ -2,9 +2,11 @@ package com.flashseats.catalog;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
-import com.flashseats.flashseats.support.BuyerSession;
-import com.flashseats.flashseats.support.IntegrationTest;
-import com.flashseats.flashseats.support.SaleFixture;
+import com.flashseats.app.support.BuyerSession;
+import com.flashseats.app.support.IntegrationTest;
+import com.flashseats.app.support.SaleFixture;
+import java.util.ArrayList;
+import java.util.List;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
@@ -37,7 +39,7 @@ class CatalogAvailabilityIT extends IntegrationTest {
     @DisplayName("A tier with no counter reads UNKNOWN, never SOLD_OUT")
     void unwarmedTierIsUnknownNotSoldOut() {
         long eventId = fixture.upcomingEvent("Midnight Sessions");
-        fixture.tierWithoutInventory(eventId, "General Admission", 3_000, 200);
+        fixture.tierWithoutCounter(eventId, "General Admission", 3_000, 200);
 
         String availability = new BuyerSession(port)
                 .get("/events/" + eventId)
@@ -45,7 +47,7 @@ class CatalogAvailabilityIT extends IntegrationTest {
                 .get("tiers")
                 .get(0)
                 .get("availability")
-                .asText();
+                .asString();
 
         assertThat(availability)
                 .describedAs(
@@ -65,7 +67,7 @@ class CatalogAvailabilityIT extends IntegrationTest {
         buyer.get("/events/" + eventId);
         fixture.drainTier(tierId);
 
-        assertThat(buyer.get("/events/" + eventId).json().get("tiers").get(0).get("availability").asText())
+        assertThat(buyer.get("/events/" + eventId).json().get("tiers").get(0).get("availability").asString())
                 .isEqualTo("SOLD_OUT");
     }
 
@@ -81,7 +83,29 @@ class CatalogAvailabilityIT extends IntegrationTest {
                         .get("tiers")
                         .get(0)
                         .get("availability")
-                        .asText())
+                        .asString())
                 .isEqualTo("PLENTY");
+    }
+
+    @Test
+    @DisplayName("The event index lists every published sale with its window, by sale start, and nothing else")
+    void theIndexListsPublishedSalesWithTheirWindow() {
+        long closed = fixture.closedEvent("Last Night");
+        long open = fixture.openEvent("Tonight");
+        long upcoming = fixture.upcomingEvent("Tomorrow");
+        long cancelled = fixture.upcomingEvent("Called Off");
+        fixture.setEventStatus(cancelled, "CANCELLED");
+
+        var listed = new BuyerSession(port).get("/events").json();
+
+        List<Long> ids = new ArrayList<>();
+        List<String> windows = new ArrayList<>();
+        listed.forEach(event -> {
+            ids.add(event.get("eventId").asLong());
+            windows.add(event.get("windowStatus").asString());
+        });
+        // A finished sale is still published, so it stays listed as CLOSED; a cancelled one is not.
+        assertThat(ids).containsExactly(closed, open, upcoming);
+        assertThat(windows).containsExactly("CLOSED", "OPEN", "UPCOMING");
     }
 }

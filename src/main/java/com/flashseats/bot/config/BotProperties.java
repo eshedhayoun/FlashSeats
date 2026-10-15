@@ -1,21 +1,32 @@
 package com.flashseats.bot.config;
 
 import java.util.List;
+import lombok.Getter;
+import lombok.Setter;
 import org.springframework.boot.context.properties.ConfigurationProperties;
 
 /**
- * Tunables for session identity and rate limiting.
+ * Tunables for rate limiting.
  *
- * <p>{@code sessionSecret} signs the {@code fsid} cookie. Rotating it invalidates every live
- * session, so it must not be rotated mid-sale.
+ * <p>Session identity is <strong>not</strong> here. {@code sessionSecret} and the cookie settings
+ * moved to {@code flashseats.session.*} in {@code shared}, because identity is what every module's
+ * authorisation rests on and abuse defence is a different concern that merely happens to run in a
+ * filter too.
  */
 @ConfigurationProperties(prefix = "flashseats.bot")
+@Getter
+@Setter
 public class BotProperties {
 
-    private String sessionSecret = "dev-only-change-me";
-    private final Cookie cookie = new Cookie();
     private final Bucket sessionBucket = new Bucket(20, 10);
     private final Bucket ipBucket = new Bucket(300, 150);
+    private final Recaptcha recaptcha = new Recaptcha();
+
+    /**
+     * How long a replica may trust its {@code ip_rules} snapshot. The TTL is the cross-replica
+     * invalidation (ADR-051, ADR-055); ten seconds of a burst is survivable, a per-request query is not.
+     */
+    private long ipRuleCacheTtlMs = 10_000;
 
     /**
      * Peer addresses whose {@code X-Forwarded-For} header is believed (ADR-039).
@@ -28,102 +39,45 @@ public class BotProperties {
      */
     private List<String> trustedProxies = List.of();
 
-    public String getSessionSecret() {
-        return sessionSecret;
-    }
+    /**
+     * The challenge provider, sized around <strong>failing open</strong> (ADR-011): a blank
+     * {@code secret} disables it, and a timeout or non-2xx allows the request. The timeouts are
+     * therefore correctness settings: this call sits on the queue-join path.
+     */
+    @Getter
+    @Setter
+    public static class Recaptcha {
 
-    public void setSessionSecret(String sessionSecret) {
-        this.sessionSecret = sessionSecret;
-    }
+        private String secret = "";
+        private String verifyUrl = "https://www.google.com/recaptcha/api/siteverify";
+        private double minScore = 0.5;
+        private int connectTimeoutMs = 1_000;
+        private int readTimeoutMs = 2_000;
 
-    public List<String> getTrustedProxies() {
-        return trustedProxies;
-    }
-
-    public void setTrustedProxies(List<String> trustedProxies) {
-        this.trustedProxies = trustedProxies;
-    }
-
-    public Cookie getCookie() {
-        return cookie;
-    }
-
-    public Bucket getSessionBucket() {
-        return sessionBucket;
-    }
-
-    public Bucket getIpBucket() {
-        return ipBucket;
-    }
-
-    public static class Cookie {
-        private String name = "fsid";
         /**
-         * A {@code Secure} cookie is dropped over plain HTTP, which would give every request a new
-         * identity and silently break the entire flow. False for local development; true wherever
-         * the app is served over TLS.
+         * How long one verification stands for a session.
+         *
+         * <p>Verified once per session rather than per join: a buyer who rejoins after a dropped
+         * connection has already proved what there is to prove, and re-challenging them mid-sale is
+         * a cost paid entirely by the legitimate.
          */
-        private boolean secure = false;
+        private long verifiedTtlSeconds = 900;
 
-        private String sameSite = "Lax";
-        private int maxAgeSeconds = 86_400;
-
-        public String getName() {
-            return name;
-        }
-
-        public void setName(String name) {
-            this.name = name;
-        }
-
-        public boolean isSecure() {
-            return secure;
-        }
-
-        public void setSecure(boolean secure) {
-            this.secure = secure;
-        }
-
-        public String getSameSite() {
-            return sameSite;
-        }
-
-        public void setSameSite(String sameSite) {
-            this.sameSite = sameSite;
-        }
-
-        public int getMaxAgeSeconds() {
-            return maxAgeSeconds;
-        }
-
-        public void setMaxAgeSeconds(int maxAgeSeconds) {
-            this.maxAgeSeconds = maxAgeSeconds;
+        /** Verification runs only when a secret is configured. Blank is "off", and off is allowed. */
+        public boolean isEnabled() {
+            return secret != null && !secret.isBlank();
         }
     }
 
     /** A token bucket: {@code capacity} tokens, refilled at {@code refillPerSecond}. */
+    @Getter
+    @Setter
     public static class Bucket {
         private long capacity;
         private long refillPerSecond;
 
         Bucket(long capacity, long refillPerSecond) {
             this.capacity = capacity;
-            this.refillPerSecond = refillPerSecond;
-        }
-
-        public long getCapacity() {
-            return capacity;
-        }
-
-        public void setCapacity(long capacity) {
-            this.capacity = capacity;
-        }
-
-        public long getRefillPerSecond() {
-            return refillPerSecond;
-        }
-
-        public void setRefillPerSecond(long refillPerSecond) {
             this.refillPerSecond = refillPerSecond;
         }
     }

@@ -11,8 +11,6 @@ import java.util.Optional;
  */
 public interface OrderFacade {
 
-    Optional<OrderSummary> getOrderSummary(String orderNumber);
-
     /**
      * This session's most recent order for an event, <strong>whatever its status</strong>.
      *

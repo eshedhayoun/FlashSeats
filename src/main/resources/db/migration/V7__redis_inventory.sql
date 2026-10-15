@@ -1,0 +1,35 @@
+-- ============================================================================
+-- catalog — inventory moves to Redis, and `tier_inventory` goes with it
+--
+-- V1 created this table as the live counter, mutated by one row-locked
+-- conditional UPDATE. Redis holds that count now, so the table stopped being
+-- read: pre-warm and rebuild wrote it, and nothing anywhere looked at it again.
+--
+-- A write-only table called `tier_inventory` with a column called `remaining`
+-- is worse than no table. It reads exactly like the source of truth it is not,
+-- and the next person to open the schema would believe it.
+--
+-- Nothing is lost by dropping it. The rebuild that recovers a missing counter
+-- derives the number from the ledger proper --
+--
+--     ticket_tiers.total_capacity
+--       - SUM(order_items.quantity)  WHERE orders.status = 'CONFIRMED'
+--       - SUM(ticket_holds.quantity) WHERE status = 'ACTIVE'
+--
+-- -- and never consulted this table to do it.
+--
+-- What does go is V1's `CHECK (remaining >= 0)`, described there as the
+-- database-level guarantee that overbooking cannot be persisted. It guarded a
+-- number nobody read. The guarantee now lives in `stock_reserve.lua`, which
+-- refuses to decrement below the requested quantity in one atomic step, and is
+-- watched by `flashseats.stock.drift` rather than asserted by a constraint.
+-- That is a real trade and ADR-046 records it: the counter left the database,
+-- so the database can no longer vouch for it.
+--
+-- Every other invariant is untouched -- UNIQUE(hold_token) on orders, the
+-- settle-once claim on ticket_holds, and the one-live-hold-per-session index
+-- all still live in PostgreSQL, which remains the authority for everything
+-- except the count itself.
+-- ============================================================================
+
+DROP TABLE IF EXISTS tier_inventory;

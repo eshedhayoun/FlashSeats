@@ -2,29 +2,32 @@ package com.flashseats.payment.service;
 
 import com.flashseats.payment.config.PaymentProperties;
 import com.flashseats.payment.exception.DuplicatePaymentException;
-import com.flashseats.payment.exception.PaymentGatewayUnavailableException;
+import com.flashseats.payment.exception.PaymentErrors;
 import com.flashseats.payment.facade.AuthorizeCommand;
+import com.flashseats.payment.facade.PaymentFacade;
 import com.flashseats.payment.facade.PaymentResult;
 import com.flashseats.payment.facade.RefundResult;
 import com.flashseats.payment.gateway.GatewayCharge;
 import com.flashseats.payment.gateway.GatewayResult;
 import com.flashseats.payment.gateway.PaymentGateway;
 import com.flashseats.payment.model.PaymentTransaction;
+import io.micrometer.core.instrument.Counter;
+import io.micrometer.core.instrument.MeterRegistry;
 import java.time.Duration;
+import java.util.EnumMap;
+import java.util.Map;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.stereotype.Service;
 
 /**
- * Charging and refunding.
- *
- * <p><strong>No method here is {@code @Transactional}, deliberately.</strong> Each brackets a network
- * call with two short transactions owned by {@link PaymentTransactionStore}, so no pooled connection
- * is ever held across the provider round trip (ADR-023).
+ * Charging and refunding; implements {@link PaymentFacade} (ADR-057). No method is
+ * {@code @Transactional}: each network call is bracketed by two short transactions on
+ * {@link PaymentTransactionStore} (ADR-023).
  */
 @Slf4j
 @Service
-public class PaymentService {
+public class PaymentService implements PaymentFacade {
 
     /** Owned by this module. Nothing else reads or writes this prefix. */
     private static final String INFLIGHT_KEY = "payment:inflight:";
@@ -33,16 +36,31 @@ public class PaymentService {
     private final PaymentTransactionStore store;
     private final StringRedisTemplate redis;
     private final PaymentProperties properties;
+    private final Map<GatewayResult.Outcome, Counter> attemptsByOutcome =
+            new EnumMap<>(GatewayResult.Outcome.class);
 
     public PaymentService(
             PaymentGateway gateway,
             PaymentTransactionStore store,
             StringRedisTemplate redis,
-            PaymentProperties properties) {
+            PaymentProperties properties,
+            MeterRegistry meters) {
         this.gateway = gateway;
         this.store = store;
         this.redis = redis;
         this.properties = properties;
+        /*
+         * One counter tagged by outcome, not a lifetime ratio, which cannot show a spike.
+         * rate(attempts{outcome="declined"}[5m]) / rate(attempts[5m]) is the ratio over any window.
+         */
+        for (GatewayResult.Outcome outcome : GatewayResult.Outcome.values()) {
+            attemptsByOutcome.put(
+                    outcome,
+                    Counter.builder("flashseats.payment.attempts")
+                            .description("Provider charge attempts by outcome")
+                            .tag("outcome", outcome.name().toLowerCase())
+                            .register(meters));
+        }
     }
 
     /**
@@ -59,6 +77,7 @@ public class PaymentService {
      * string is what stops a client that regenerates its key on retry from bypassing the guard
      * entirely.
      */
+    @Override
     public PaymentResult authorize(AuthorizeCommand command) {
         String inflightKey = INFLIGHT_KEY + command.holdToken();
         Boolean acquired = redis.opsForValue()
@@ -68,59 +87,145 @@ public class PaymentService {
                         Duration.ofSeconds(properties.getInflightTtlSeconds()));
 
         if (!Boolean.TRUE.equals(acquired)) {
-            throw new DuplicatePaymentException(command.holdToken());
+            throw new DuplicatePaymentException();
         }
 
         try {
-            PaymentTransaction transaction = store.recordInitiated(command); // tx1, committed
+            // Resume before charging. If this hold was already sent away for 3-D Secure, the only
+            // correct move is to re-read THAT intent: the client reuses one idempotency key for the
+            // life of the hold (FE_SPEC §1), so a second charge would replay the provider's cached
+            // "requires_action" answer for ever — and varying the key per attempt instead would
+            // open a second intent and risk billing twice for one authentication.
+            ChargeAttempt attempt = store.beginAttempt(command); // tx1
 
-            GatewayResult result = gateway.charge(new GatewayCharge( // no transaction open
-                    command.orderNumber(),
-                    command.amountCents(),
-                    command.currency(),
-                    command.paymentMethodId(),
-                    command.clientIdempotencyKey()));
+            if (attempt.settled()) {
+                // This hold was already charged, and the order's commit failed in a way that proved
+                // nothing. Charging again would bill twice for one set of seats (ADR-064).
+                log.info("Hold {} already has a settled charge; returning it instead of charging again",
+                        command.holdToken());
+                return new PaymentResult(
+                        attempt.transactionReference(), true, attempt.gatewayReference(),
+                        null, null, null, false, false);
+            }
 
-            store.recordOutcome(transaction.getTransactionReference(), result); // tx2
+            GatewayResult result = attempt.isResume() // no transaction open
+                    ? gateway.retrieve(attempt.gatewayReference())
+                    : gateway.charge(new GatewayCharge(
+                            command.orderNumber(),
+                            command.holdToken(),
+                            command.amountCents(),
+                            command.currency(),
+                            command.paymentMethodId(),
+                            providerKey(command)));
+
+            store.recordOutcome(attempt.transactionReference(), result); // tx2
+            attemptsByOutcome.get(result.outcome()).increment();
 
             if (result.outcome() == GatewayResult.Outcome.ERROR) {
                 log.warn("Gateway error for order {}: {}", command.orderNumber(), result.failureReason());
-                throw new PaymentGatewayUnavailableException(result.failureReason());
+                throw PaymentErrors.gatewayUnavailable();
             }
 
             return new PaymentResult(
-                    transaction.getTransactionReference(),
+                    attempt.transactionReference(),
                     result.isSuccess(),
                     result.gatewayReference(),
+                    result.clientSecret(),
                     result.failureCode(),
                     result.failureReason(),
                     result.outcome() == GatewayResult.Outcome.DECLINED,
-                    result.outcome() == GatewayResult.Outcome.REQUIRES_ACTION);
+                    result.requiresAction());
         } finally {
             // Released whatever happened. The order row remains the durable guard, so letting go
             // early costs nothing and avoids stranding a buyer behind their own failed attempt.
-            redis.delete(inflightKey);
+            //
+            // Guarded, because a throw from a `finally` REPLACES whatever the block was returning.
+            // An unguarded delete meant that Redis dropping between the charge and this line
+            // discarded a successful result and sent the caller down its catch-all to mark the
+            // order FAILED — money moved, and the order says it did not. The key expires on its own
+            // in `inflight-ttl-seconds`, so failing to release it costs nothing at all.
+            try {
+                redis.delete(inflightKey);
+            } catch (RuntimeException releaseFailed) {
+                log.warn(
+                        "Could not release {}; it expires in {}s",
+                        inflightKey,
+                        properties.getInflightTtlSeconds(),
+                        releaseFailed);
+            }
         }
     }
 
-    /** Compensation for a charge that settled against seats we could not deliver (ADR-012). */
+    /**
+     * The key the provider sees: the client's one key for the hold, scoped to the attempt (ADR-074).
+     *
+     * <p>The client keeps one key for the life of a hold, which is right for a retry of the <em>same</em>
+     * attempt — a re-POST after a dropped response replays the provider's answer instead of charging
+     * twice. But Stripe keeps a key's first answer for 24 hours and refuses the key with different
+     * parameters, so after a decline the buyer's next card got the same decline replayed, or an
+     * idempotency error that read as a provider outage and counted against the breaker. A decline
+     * consumes an attempt, so scoping the key to the attempt gives each new card its own; an outage
+     * consumes none, so its retry keeps the same key.
+     */
+    static String providerKey(AuthorizeCommand command) {
+        String key = command.clientIdempotencyKey();
+        return key == null || key.isBlank() ? null : key + ":" + command.attemptNumber();
+    }
+
+    @Override
+    public boolean hasChargeFor(String holdToken) {
+        return store.hasChargeFor(holdToken);
+    }
+
+    @Override
     public RefundResult refund(String transactionReference, long amountCents, String reason) {
         PaymentTransaction transaction = store.require(transactionReference);
+        /*
+         * Full refunds only, so a ledger already recording this amount means the work is done. This does
+         * NOT cover a crash after the provider refunded but before we recorded it; the idempotency key
+         * StripePaymentGateway.refund sets over (intent, amount) covers that.
+         */
+        if (amountCents > 0 && transaction.getRefundedAmountCents() >= amountCents) {
+            log.info(
+                    "Refund for {} already recorded ({} cents); not calling provider again",
+                    transactionReference,
+                    transaction.getRefundedAmountCents());
+
+            return new RefundResult(
+                    transactionReference,
+                    true,
+                    amountCents,
+                    null);
+        }
 
         GatewayResult result =
-                gateway.refund(transaction.getGatewayReference(), amountCents, reason);
+                gateway.refund(
+                        transaction.getGatewayReference(),
+                        amountCents,
+                        reason);
 
         if (result.isSuccess()) {
             store.recordRefund(transactionReference, amountCents);
-            return new RefundResult(transactionReference, true, amountCents, null);
+
+            return new RefundResult(
+                    transactionReference,
+                    true,
+                    amountCents,
+                    null);
         }
 
-        // A failed refund is money we hold and should not. It cannot be resolved automatically.
+        // A failed refund is money we hold and should not. It cannot be
+        // resolved automatically yet, so keep it visible for reconciliation.
         log.error(
                 "REFUND FAILED for {} ({} cents): {} — manual reconciliation required",
                 transactionReference,
                 amountCents,
                 result.failureReason());
-        return new RefundResult(transactionReference, false, 0, result.failureReason());
+
+        return new RefundResult(
+                transactionReference,
+                false,
+                0,
+                result.failureReason());
     }
 }

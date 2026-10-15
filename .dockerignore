@@ -7,6 +7,7 @@ target/
 
 .idea/
 .vscode/
+.claude/
 *.iml
 
 docs/
@@ -20,6 +21,11 @@ Dockerfile
 .dockerignore
 .env
 .env.*
+
+
+# Dependencies and build output are recreated inside the frontend build stage.
+frontend/node_modules/
+frontend/dist/
 
 **/*.log
 .DS_Store
