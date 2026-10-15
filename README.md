@@ -500,14 +500,14 @@ cross-service integration, and the concurrency guarantees that define the projec
 `./mvnw test` exercises the domain modules, real PostgreSQL and Redis integration, recovery paths,
 queue and hold lifecycles, and the stock concurrency invariant.
 
-![Backend test suite passing](backend_test.png)
+![Backend test suite passing](docs/images/backend-tests.png)
 
 ### Frontend tests
 
 `npm test` verifies routing, state transitions, storage, formatting, checkout errors, countdowns, and
 the user-facing copy for every API error code.
 
-![Frontend unit test suite passing](forntend_test.png)
+![Frontend unit test suite passing](docs/images/frontend-tests.png)
 
 ### End-to-end buyer journey
 
@@ -515,7 +515,7 @@ the user-facing copy for every API error code.
 checking out, recovering after reloads, and handling failure branches across desktop and mobile
 layouts.
 
-![End-to-end Playwright suite passing](test_e2e.png)
+![End-to-end Playwright suite passing](docs/images/e2e-tests.png)
 
 ### Concurrency and system-level result
 
@@ -534,7 +534,7 @@ A successful order creates a PDF ticket asynchronously and sends it through the 
 adapter. The real-email demonstration below proves the external SMTP integration; automated and load
 tests use Mailpit so they remain deterministic and never consume a provider quota.
 
-![Ticket delivered by email](emailtest.png)
+![Ticket delivered by email](docs/images/email-ticket.png)
 
 ## Conclusions
 
