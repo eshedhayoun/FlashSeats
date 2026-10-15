@@ -1,3 +1,11 @@
 /mvnw text eol=lf
 *.cmd text eol=crlf
 docker/**/*.sh text eol=lf
+
+# Read by shell scripts and containers, so a Windows checkout (core.autocrlf=true, Git for
+# Windows' default) must not turn them into CRLF. gen-env.sh compares values such as
+# `dev-only-change-me` and `admin` exactly; with a trailing \r nothing matches, no secret is
+# generated, and SecretsGuard refuses to start the cluster.
+.env.example text eol=lf
+frontend/.env.example text eol=lf
+docker/** text eol=lf
