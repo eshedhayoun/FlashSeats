@@ -2154,7 +2154,9 @@ rather than an archaeology.
   operational material it used to carry moved verbatim, with light tidying, to
   [`08-running-and-development.md`](08-running-and-development.md): environment files, SMTP and
   Resend, the React client, the cluster and drill commands, the Docker layout and the
-  troubleshooting table. Load results appear once, in README §4.3, and the screenshots only in §4.
+  troubleshooting table. Load results appear once, in README §4.3. §4.1 shows the buyer's journey in
+  five screenshots of the React client on the cluster plus the delivered ticket email; the three
+  test-run screenshots were removed, since the results are recorded here.
   No behaviour changed.
 
 ### Pass 15 — submission readiness

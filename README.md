@@ -136,9 +136,9 @@ These hold at all times, and the tests and drills check them:
 5. Stock is restored **exactly once** per hold.
 6. Module dependencies stay acyclic (`ApplicationModules.verify()`).
 
-Invariant 1 is exported as the `flashseats.stock.drift` metric. An alarm fires only on a *sustained*
-non-zero value, because Redis and PostgreSQL are not read in one snapshot and a single sample can
-catch a hold in flight.
+Invariant 1 is exported as the `flashseats.stock.drift` metric. Only a *sustained* non-zero value
+counts as a fault: Redis and PostgreSQL are not read in one snapshot, so a single sample can catch a
+hold in flight.
 
 ### 2.5 Scope and assumptions
 
@@ -289,9 +289,9 @@ as one of 79 Architecture Decision Records (ADRs), most of them naming the defec
 
 | Level | Tool | What it proves |
 | :--- | :--- | :--- |
-| **Backend** (311 tests) | JUnit, Testcontainers | Module logic and the concurrency invariants against real PostgreSQL, Redis and RabbitMQ; module boundaries |
-| **Frontend unit** (58 tests) | Vitest | Routing, state transitions, storage, countdowns, and the copy for every API error code |
-| **Browser end-to-end** (27 specs) | Playwright | The full buyer journey against the real backend, on desktop and mobile layouts |
+| **Backend** | JUnit, Testcontainers | Module logic and the concurrency invariants against real PostgreSQL, Redis and RabbitMQ; module boundaries |
+| **Frontend unit** | Vitest | Routing, state transitions, storage, countdowns, and the copy for every API error code |
+| **Browser end-to-end** | Playwright | The full buyer journey against the real backend, on desktop and mobile layouts |
 | **Cluster checks** | Shell scripts | Promotion fan-out across replicas, expiry restoring seats once, Sentinel failover |
 | **Load drill** | k6 + `sold-count.sh` | Thousands of buyers across concurrent sales, and the stock invariant per tier afterwards |
 
@@ -309,39 +309,68 @@ compose.yaml, Dockerfile   the local stack and the application image
 
 ## 4. Demonstration
 
-### 4.1 Running the demo
+### 4.1 The buyer's journey
 
-`docker/scripts/professor-demo.sh` generates secrets, builds and starts the three-replica
-cluster, waits until it is healthy, and seeds two open sales. It prints the admin password. Then:
+`docker/scripts/professor-demo.sh` generates secrets, builds and starts the three-replica cluster,
+waits until it is healthy, and seeds two open sales. The screenshots below were taken on that
+cluster at http://localhost:8080.
 
-1. Open http://localhost:8080 and choose an open sale.
-2. Join the sale. The waiting room shows your live position until you are promoted.
-3. Choose a tier and quantity. The seats are held for five minutes.
-4. At checkout, the card selector drives every branch with no account:
-   - **success**: the order is confirmed;
-   - **decline**: the payment fails and **your seats are kept** for a retry;
-   - **provider outage**: the payment fails with a retryable error, and the seats are kept;
-   - **3-D Secure**: an authentication step, then confirmation.
-5. The receipt page offers the PDF ticket. The same ticket arrives by email at
-   http://localhost:8025.
+<table>
+  <tr>
+    <td width="50%" valign="top">
+      <img src="docs/images/app-event.png" alt="Event page with the sale open and three ticket tiers">
+      <p><b>1. Event page.</b> The sale is open. Each tier shows its price and a coarse
+      availability label rather than an exact count.</p>
+    </td>
+    <td width="50%" valign="top">
+      <img src="docs/images/app-waiting-room.png" alt="Waiting room showing position 701 in line">
+      <p><b>2. Waiting room.</b> Position #701, behind 1,000 simulated buyers from the load
+      harness. The position updates live over SSE, and closing the page keeps the place.</p>
+    </td>
+  </tr>
+  <tr>
+    <td width="50%" valign="top">
+      <img src="docs/images/app-choose-seats.png" alt="Seat selection with Floor tier and two tickets chosen">
+      <p><b>3. Choosing seats.</b> Once promoted, the buyer has a ten-minute admission session to
+      compare tiers. Reserving places a hold on the seats; nothing is charged yet.</p>
+    </td>
+    <td width="50%" valign="top">
+      <img src="docs/images/app-card-declined.png" alt="Checkout after a declined card, with the seats still held">
+      <p><b>4. A declined card.</b> The seats stay held and the countdown continues, so the buyer
+      can retry. The demo gateway's selector drives success, decline, provider outage and
+      3-D Secure.</p>
+    </td>
+  </tr>
+  <tr>
+    <td width="50%" valign="top">
+      <img src="docs/images/app-confirmation.png" alt="Order confirmation with the PDF ticket download">
+      <p><b>5. Confirmation.</b> The order is confirmed. The PDF ticket can be downloaded here, and
+      the same ticket is sent by email.</p>
+    </td>
+    <td width="50%" valign="top">
+      <img src="docs/images/email-ticket.png" alt="Ticket email with the PDF attached">
+      <p><b>6. The ticket email.</b> Delivered through a real SMTP provider, with the PDF
+      attached. Rendering and sending run asynchronously through RabbitMQ, so a slow mail server
+      never delays checkout.</p>
+    </td>
+  </tr>
+</table>
 
-### 4.2 Test suites
+By default, email goes to the local Mailpit inbox at http://localhost:8025. The automated and load
+tests use it too, so they stay deterministic and never use up a provider's quota.
 
-**Backend:** `./mvnw test` runs the domain modules, real PostgreSQL and Redis integration, recovery
-paths, queue and hold lifecycles, and the stock concurrency invariant.
+### 4.2 Automated tests
 
-![Backend test suite passing](docs/images/backend-tests.png)
+All suites pass, and the backend suite passes in any class order:
 
-**Frontend unit:** `npm test` checks routing, state transitions, storage, formatting, checkout
-errors, countdowns, and the copy for every API error code.
+| Suite | Command | Result |
+| :--- | :--- | :--- |
+| Backend unit and integration | `./mvnw test` | 311 tests passing |
+| Frontend unit | `npm test` | 58 tests passing |
+| Browser end-to-end | `npm run test:e2e` | 27 specs passing, desktop and mobile layouts |
 
-![Frontend unit test suite passing](docs/images/frontend-tests.png)
-
-**End-to-end:** `npm run test:e2e` drives the real backend through joining a sale, waiting,
-choosing tickets, checking out, recovering after reloads, and handling failure branches, on desktop
-and mobile layouts.
-
-![End-to-end Playwright suite passing](docs/images/e2e-tests.png)
+What each level covers is described in [§3.6](#36-testing-strategy); the run log is in
+[`docs/06-mvp-overview.md`](docs/06-mvp-overview.md) §13.
 
 ### 4.3 Load test
 
@@ -384,15 +413,6 @@ that runs against the live cluster:
 A fourth script, `stripe-check.sh`, runs a real Stripe charge, 3-D Secure and a redelivered
 webhook. It needs a Stripe test-account key and is not among the recorded results above; every
 recorded run used the stub gateway.
-
-### 4.5 Ticket fulfilment
-
-A confirmed order writes an outbox row in the same transaction. A relay publishes it to RabbitMQ,
-and a consumer renders the PDF ticket and sends it by email. The screenshot shows real delivery
-through an external SMTP provider; the automated and load tests use Mailpit, so they stay
-deterministic and never use up a provider quota.
-
-![Ticket delivered by email](docs/images/email-ticket.png)
 
 ---
 
