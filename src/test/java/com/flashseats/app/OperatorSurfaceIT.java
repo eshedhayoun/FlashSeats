@@ -96,7 +96,13 @@ class OperatorSurfaceIT extends IntegrationTest {
     @Test
     @DisplayName("Health is open to the load balancer; metrics are the operator's alone")
     void actuatorAccessRules() throws Exception {
-        assertThat(actuator("/actuator/health", null).statusCode()).isEqualTo(200);
+        // What this asserts is the ACCESS rule, so it must not depend on what the aggregate reports. The
+        // aggregate includes RabbitMQ at localhost:5672, which this context does not start: it answered
+        // 503 on a clean machine and 200 only where a dev broker happened to be running, so the suite
+        // passed on a developer's laptop and failed on a fresh clone. Open means "answered without
+        // credentials", UP or DOWN; liveness, which reads no dependency, pins the 200.
+        assertThat(actuator("/actuator/health", null).statusCode()).isIn(200, 503);
+        assertThat(actuator("/actuator/health/liveness", null).statusCode()).isEqualTo(200);
 
         // A live read on how the sale is going — stock, queue depth, pool pressure — is a useful one to
         // anyone attacking it.
