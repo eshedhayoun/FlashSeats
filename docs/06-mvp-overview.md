@@ -2178,6 +2178,11 @@ rather than an archaeology.
 - `.gitattributes` keeps `.env.example`, `frontend/.env.example` and everything under `docker/`
   LF. With Git for Windows' default `core.autocrlf=true`, a CRLF `.env` defeated `gen-env.sh`'s
   exact matches, so no secret was generated and `SecretsGuard` refused the cluster.
+- **`./mvnw test` was 310/311 on a fresh clone.** `OperatorSurfaceIT.actuatorAccessRules` asserted
+  `/actuator/health` answers `200`, but the aggregate includes RabbitMQ at `localhost:5672`, which
+  that context does not start. The test passed only where a developer's dev broker was running.
+  The test checks the access rule, so it now accepts `200` or `503` from the aggregate and pins
+  `200` on `/actuator/health/liveness`, which reads no dependency. Test-only; no behaviour changed.
 
 ### Pass 15 — submission readiness
 
