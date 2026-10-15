@@ -411,9 +411,11 @@ that runs against the live cluster:
 | **Redis failover** | `sentinel-failover-check.sh` | Sentinel promotes a replica, and the old primary rejoins as a replica | Passed |
 | **Selling after a failover** | by hand, against the cluster | A promoted Redis node may have lost writes, so selling must stop until the counters are rebuilt | All three replicas refused to sell with a retryable `503`, not "sold out"; one rebuild resumed selling on all three |
 
-A fourth script, `stripe-check.sh`, runs a real Stripe charge, 3-D Secure and a redelivered
-webhook. It needs a Stripe test-account key and is not among the recorded results above; every
-recorded run used the stub gateway.
+The real payment provider was checked separately, on a fresh clone of this repository with a Stripe
+test-mode key. `stripe-check.sh` passed: a real charge confirmed the order, a 3-D Secure card
+returned a challenge, a webhook was delivered, and its redelivery was dismissed as a duplicate. In a
+browser, the Stripe card form handled a declined card (seats kept), a successful retry, and a
+completed 3-D Secure challenge. All load and cluster runs used the stub gateway.
 
 ---
 
