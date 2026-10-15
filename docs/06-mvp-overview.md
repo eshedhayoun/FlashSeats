@@ -2149,6 +2149,13 @@ rather than an archaeology.
   the default and Resend is documented as an optional real-email demonstration. The template also
   documents the optional memory, load-test, metadata-cache and admission-budget overrides used by
   Compose.
+- **The README is the course report.** It now follows the course's five sections for a system
+  project: introduction, system specification, implementation, demonstration, conclusions. The
+  operational material it used to carry moved verbatim, with light tidying, to
+  [`08-running-and-development.md`](08-running-and-development.md): environment files, SMTP and
+  Resend, the React client, the cluster and drill commands, the Docker layout and the
+  troubleshooting table. Load results appear once, in README §4.3, and the screenshots only in §4.
+  No behaviour changed.
 
 ### Pass 15 — submission readiness
 
