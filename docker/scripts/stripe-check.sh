@@ -84,11 +84,14 @@ echo
 # The whole point is to exercise the real provider. Against the stub every
 # assertion below still passes, and the run would prove nothing at all --
 # exactly the failure mode ADR-047 called out in the load harness.
-if ! docker compose ps --services --filter status=running | grep -qx stripe; then
+# Plain grep, never `grep -q`, on a command's output: -q exits at the first match,
+# the writer dies of SIGPIPE, and `pipefail` then reports the pipeline as failed --
+# a running Stripe gateway was reported as the stub, intermittently.
+if ! docker compose ps --services --filter status=running | grep -x stripe >/dev/null; then
     fail "the 'stripe' service is not running. Start it:
        docker compose --profile cluster --profile stripe up -d"
 fi
-if ! docker compose logs app-1 2>/dev/null | grep -q "Payment gateway: Stripe"; then
+if ! docker compose logs app-1 2>/dev/null | grep "Payment gateway: Stripe" >/dev/null; then
     fail "the app is running the STUB gateway, so this run would prove nothing.
        Set STRIPE_ENABLED=true and recreate: docker compose --profile cluster up -d"
 fi
