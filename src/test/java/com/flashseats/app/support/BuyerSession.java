@@ -83,7 +83,11 @@ public class BuyerSession {
     }
 
     public Response delete(String path) {
-        return send(request(path).DELETE(), Map.of());
+        return delete(path, Map.of());
+    }
+
+    public Response delete(String path, Map<String, String> headers) {
+        return send(request(path).DELETE(), headers);
     }
 
     private HttpRequest.Builder request(String path) {

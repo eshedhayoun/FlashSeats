@@ -16,6 +16,8 @@ import com.flashseats.catalog.facade.EventWindowStatus;
 import com.flashseats.queue.config.QueueProperties;
 import com.flashseats.queue.facade.QueuePhase;
 import com.flashseats.queue.facade.QueueState;
+import com.flashseats.shared.error.ErrorCode;
+import com.flashseats.shared.error.FlashSeatsException;
 import java.time.Clock;
 import java.time.Instant;
 import java.time.ZoneOffset;
@@ -118,5 +120,27 @@ class QueueBroadcasterTest {
 
         verify(emitters, times(1)).broadcast(1L, "sale-resumed", Map.of());
         verify(emitters, times(2)).sendPosition("a", 1L, 3, null);
+    }
+
+    /** An event deleted before its sale opened (ADR-080) closes its streams instead of failing every sweep. */
+    @Test
+    @DisplayName("Streams on a deleted event are closed, not swept for ever")
+    void deletedEventClosesItsStreams() {
+        SseEmitterRegistry emitters = mock(SseEmitterRegistry.class);
+        CatalogFacade catalog = mock(CatalogFacade.class);
+        QueueReplayService replay = mock(QueueReplayService.class);
+        Clock clock = Clock.fixed(Instant.parse("2026-10-16T12:00:00Z"), ZoneOffset.UTC);
+
+        when(emitters.watchedEventIds()).thenReturn(Set.of(7L));
+        when(catalog.getWindowStatus(7L))
+                .thenThrow(new FlashSeatsException(ErrorCode.EVENT_NOT_FOUND, "No event with id 7."));
+
+        new QueueBroadcaster(
+                        emitters, mock(QueueService.class), mock(QueueDrainRateTracker.class), catalog,
+                        mock(StringRedisTemplate.class), clock, replay)
+                .pushPositions();
+
+        verify(emitters).closeAll(7L, "sale-closed", Map.of("closedAt", "2026-10-16T12:00:00Z"));
+        verifyNoInteractions(replay);
     }
 }

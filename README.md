@@ -13,6 +13,7 @@ the images and takes several minutes; give Docker at least 8 GB of memory.
 ```bash
 docker/scripts/professor-demo.sh     # secrets, a three-replica cluster, two open sales; prints the admin password
 open http://localhost:8080           # the React client: event page, waiting room, checkout, PDF ticket
+open http://localhost:8080/admin     # the operator console: sign in as admin with the printed password
 open http://localhost:8025           # the local Mailpit inbox, where the ticket email arrives
 ```
 
@@ -66,8 +67,9 @@ The backend is a Spring Boot modular monolith with nine modules. Each module own
 the module boundaries are verified at build time. PostgreSQL stores the durable ledger: holds,
 orders, payments and the outbox. Redis stores the live stock counters and the waiting room.
 RabbitMQ carries ticket fulfilment off the request path. A React client implements the buyer's
-journey. Payments go through a provider abstraction: an in-process stub by default, with real
-Stripe (including 3-D Secure) behind a single setting. The whole system starts with one command.
+journey, and an operator console creates and runs sales. Payments go through a provider
+abstraction: an in-process stub by default, with real Stripe (including 3-D Secure) behind a single
+setting. The whole system starts with one command.
 
 ---
 
@@ -78,7 +80,7 @@ Stripe (including 3-D Secure) behind a single setting. The whole system starts w
 | Actor | What they do |
 | :--- | :--- |
 | **Buyer** | An anonymous visitor identified by a signed session cookie. Browses events, joins the waiting room, reserves seats, pays, and receives a PDF ticket by email |
-| **Operator** | Authenticated through the admin API. Pre-warms a sale, pauses and resumes it, rebuilds stock counters after a fault, replays failed notifications, manages IP rules |
+| **Operator** | Signs in to the operator console at `/admin`, or calls the admin API directly. Creates and deletes sales, pre-warms them, pauses and resumes them, rebuilds stock counters after a fault; through the API, also replays failed notifications and manages IP rules |
 | **Payment provider** | The stub gateway or Stripe. Charges, refunds, and reports late settlements by webhook |
 
 ### 2.2 Functional requirements: the buyer's journey
@@ -108,8 +110,11 @@ landing (countdown, server clock)
   journey, so a page reload or a lost connection costs nothing.
 - **Fulfilment.** A confirmed order produces a PDF ticket, delivered by email and downloadable from
   the receipt page.
-- **Operations.** An operator can pause a sale without ending it: the line keeps its order, holds
-  wait, and payments in progress complete.
+- **Operations.** An operator creates a sale with all its tiers in one step; it is published and
+  its stock prepared at once. A sale can be deleted until a minute before it opens, and is never
+  edited. A live sale can be paused without ending it: the line keeps its order, holds wait, and
+  payments in progress complete. The console shows each sale's exact stock and warns when a sale
+  would not sell, with the action that fixes it.
 
 The full journey, with every edge case, is in [`docs/03-end-to-end-flow.md`](docs/03-end-to-end-flow.md).
 
@@ -148,7 +153,9 @@ hold in flight.
 - **Email** goes to a local Mailpit inbox by default. Real delivery through any SMTP relay is a
   configuration change, not a code change.
 - **Buyers are anonymous.** Identity is a signed session cookie; there are no buyer accounts.
-- **The operator surface is an authenticated HTTP API.** There is no admin UI.
+- **Operators use a web console** over the same authenticated API, with one operator account.
+  Sales are created and deleted, never edited or cancelled. Failed notifications and IP rules are
+  managed through the API only.
 
 ---
 
@@ -200,7 +207,7 @@ waiting room, and timers. If all of Redis is lost, PostgreSQL plus an operator r
 | Module | Owns | Storage |
 | :--- | :--- | :--- |
 | `bot` | Rate limits, IP rules, the challenge check on join | PG + Redis |
-| `catalog` | Events, tiers, sale windows, **inventory** | PG + Redis |
+| `catalog` | Events, tiers, sale windows, **inventory**, creating and deleting sales | PG + Redis |
 | `queue` | Waiting room, SSE, signed passes, admission control | Redis only |
 | `hold` | Time-bound reservations, settle-once stock restoration | PG + Redis |
 | `payment` | Payment provider, idempotency, webhooks, refunds | PG + Redis |
@@ -284,7 +291,7 @@ We built the system in four phases, each ending with a system that is *correct* 
 Concurrency guarantees were never retrofitted. The design went through four review passes before
 any code, and the built system through fifteen more, each logged in
 [`docs/06-mvp-overview.md`](docs/06-mvp-overview.md) §13. Every non-obvious decision is recorded
-as one of 79 Architecture Decision Records (ADRs), most of them naming the defect they fixed.
+as one of 80 Architecture Decision Records (ADRs), most of them naming the defect they fixed.
 
 ### 3.6 Testing strategy
 
@@ -366,8 +373,8 @@ All suites pass, and the backend suite passes in any class order:
 
 | Suite | Command | Result |
 | :--- | :--- | :--- |
-| Backend unit and integration | `./mvnw test` | 311 tests passing |
-| Frontend unit | `npm test` | 58 tests passing |
+| Backend unit and integration | `./mvnw test` | 320 tests passing |
+| Frontend unit | `npm test` | 78 tests passing |
 | Browser end-to-end | `npm run test:e2e` | 27 specs passing, desktop and mobile layouts |
 
 What each level covers is described in [§3.6](#36-testing-strategy); the run log is in
@@ -417,6 +424,24 @@ returned a challenge, a webhook was delivered, and its redelivery was dismissed 
 browser, the Stripe card form handled a declined card (seats kept), a successful retry, and a
 completed 3-D Secure challenge. All load and cluster runs used the stub gateway.
 
+### 4.5 The operator console
+
+<img src="docs/images/admin-console.png" alt="Operator console listing an upcoming sale, two open sales and an ended one, with their actions" width="720">
+
+`http://localhost:8080/admin`, signed in as `admin` with the password `professor-demo.sh` prints.
+Each sale shows its window, its exact remaining stock per tier, and only the actions the server
+would accept right now:
+
+- **New sale** creates the event and all its tiers in one form. The sale must open at least two
+  minutes later, so its stock can be prepared before buyers arrive.
+- **Pre-warm** appears only for an upcoming sale whose stock is not ready. **Rebuild stock**
+  recounts an open sale from the ledger, for example after a Redis restart, when the console shows
+  "Stock is not trusted".
+- **Pause** and **Resume** stop and restart a sale without losing anyone's place.
+- **Delete** appears only until a minute before the sale opens, when no buyer can be part of it yet.
+
+The login lives in the tab's memory only: a reload or a closed tab signs out.
+
 ---
 
 ## 5. Conclusions
@@ -449,8 +474,9 @@ completed 3-D Secure challenge. All load and cluster runs used the stub gateway.
   This is deliberate: a counter that may have lost writes must not keep selling.
 - **Checkout does not survive a Redis outage.** It fails closed, which is the safe direction for a
   payment.
-- **The operator surface is API-only**, and admin authentication is a single configured account
-  rather than an identity provider.
+- **A sale cannot be edited or cancelled** once created: it can be deleted until a minute before
+  it opens, and paused after that. Operator authentication is a single configured account rather
+  than an identity provider.
 - **Buyers have no accounts.** After the session cookie expires (one day), the emailed receipt link
   is the only way back to an order.
 - The full list, including the security posture, is in
@@ -470,7 +496,7 @@ an invariant the system checks, and a number anyone can reproduce with one comma
 | Document | What it covers |
 | :--- | :--- |
 | [`docs/07-system-on-one-page.md`](docs/07-system-on-one-page.md) | **Read first.** The whole system on one page: journey, module graph, checkout sequence, and what looks removable but is not |
-| [`docs/00-architecture-decisions.md`](docs/00-architecture-decisions.md) | 79 ADRs: every non-obvious decision and the failure it prevents |
+| [`docs/00-architecture-decisions.md`](docs/00-architecture-decisions.md) | 80 ADRs: every non-obvious decision and the failure it prevents |
 | [`docs/01-system-architecture.md`](docs/01-system-architecture.md) | Stack, module map, dependency graph, deployment |
 | [`docs/02-high-level-design.md`](docs/02-high-level-design.md) | Infrastructure and the concurrency model |
 | [`docs/03-end-to-end-flow.md`](docs/03-end-to-end-flow.md) | **The authoritative user journey**, step by step |
@@ -478,7 +504,7 @@ an invariant the system checks, and a number anyone can reproduce with one comma
 | [`docs/05-global-standards.md`](docs/05-global-standards.md) | **Cross-cutting contract**: RFC 7807, error registry, idempotency, transaction and facade rules |
 | [`docs/06-mvp-overview.md`](docs/06-mvp-overview.md) | **What is actually built**: scope, security posture, limitations, the review-pass log |
 | [`docs/08-running-and-development.md`](docs/08-running-and-development.md) | Local setup, environment files, email, the cluster, load drills, Docker layout |
-| [`FE_SPEC.md`](FE_SPEC.md) | **Front-end specification**: view state machine, API map, storage, SSE, timers, copy, the Playwright suite |
+| [`FE_SPEC.md`](FE_SPEC.md) | **Front-end specification**: view state machine, API map, storage, SSE, timers, copy, the Playwright suite, the operator console |
 | [`docs/modules/`](docs/modules/) | One page per module: what it owns, exposes, and must never do |
 
 When a module spec disagrees with an ADR, **the ADR wins** and the module spec is stale.
@@ -493,5 +519,5 @@ cp .env.example .env
 docker/scripts/dev-up.sh                    # infrastructure + a sale that is actually open
 ./mvnw spring-boot:run                      # the API on :8080
 cd frontend && npm install && npm run dev   # the React client on :5173
-./mvnw test                                 # 311 backend tests; needs Docker
+./mvnw test                                 # 320 backend tests; needs Docker
 ```

@@ -77,6 +77,26 @@ class OperatorSurfaceIT extends IntegrationTest {
         assertThat(response.errorCode()).isEqualTo("ADMIN_AUTH_REQUIRED");
     }
 
+    @Test
+    @DisplayName("The console gets a challenge browsers do not prompt for; every other client gets Basic")
+    void consoleRequestsGetANonPromptingChallenge() throws Exception {
+        HttpResponse<String> plain = adminEvents(null);
+        assertThat(plain.statusCode()).isEqualTo(401);
+        assertThat(plain.headers().firstValue("WWW-Authenticate")).hasValueSatisfying(
+                challenge -> assertThat(challenge).startsWith("Basic "));
+
+        // A `Basic` challenge would put the browser's own login dialog over the console's form (ADR-080).
+        HttpResponse<String> console = adminEvents("XMLHttpRequest");
+        assertThat(console.statusCode()).isEqualTo(401);
+        assertThat(console.body()).contains("ADMIN_AUTH_REQUIRED");
+        assertThat(console.headers().firstValue("WWW-Authenticate")).hasValueSatisfying(
+                challenge -> assertThat(challenge).startsWith("FlashSeatsBasic "));
+    }
+
+    private HttpResponse<String> adminEvents(String requestedWith) throws Exception {
+        return rawGet("/api/v1/admin/events", requestedWith == null ? Map.of() : Map.of("X-Requested-With", requestedWith));
+    }
+
     // ------------------------------------------------------- bot audit, actuator
 
     @Test
@@ -117,12 +137,15 @@ class OperatorSurfaceIT extends IntegrationTest {
 
     /** The actuator lives outside {@code /api/v1}, where {@link BuyerSession} points. */
     private HttpResponse<String> actuator(String path, String credentials) throws Exception {
+        return rawGet(path, credentials == null ? Map.of() : Map.of("Authorization", "Basic " + Base64.getEncoder()
+                .encodeToString(credentials.getBytes(StandardCharsets.UTF_8))));
+    }
+
+    /** A plain GET, for what {@link BuyerSession} cannot reach: paths outside {@code /api/v1}, and headers. */
+    private HttpResponse<String> rawGet(String path, Map<String, String> headers) throws Exception {
         HttpRequest.Builder request = HttpRequest.newBuilder(URI.create("http://localhost:" + port + path))
                 .timeout(Duration.ofSeconds(20));
-        if (credentials != null) {
-            request.header("Authorization", "Basic " + Base64.getEncoder()
-                    .encodeToString(credentials.getBytes(StandardCharsets.UTF_8)));
-        }
+        headers.forEach(request::header);
         try (HttpClient http = HttpClient.newHttpClient()) {
             return http.send(request.GET().build(), HttpResponse.BodyHandlers.ofString());
         }

@@ -10,6 +10,7 @@ import com.flashseats.catalog.config.CatalogProperties;
 import com.flashseats.catalog.facade.CatalogFacade;
 import com.flashseats.catalog.repository.EventRepository;
 import com.flashseats.catalog.repository.StockCounterRepository;
+import com.flashseats.catalog.repository.TicketTierRepository;
 import java.time.Clock;
 import java.time.Instant;
 import java.time.ZoneOffset;
@@ -32,6 +33,8 @@ class RemainingForEventTest {
 
     private final CatalogService catalog = new CatalogService(
             events,
+            mock(TicketTierRepository.class),
+            mock(EventStore.class),
             stock,
             epoch,
             metadata,

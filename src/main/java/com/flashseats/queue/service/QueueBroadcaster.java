@@ -5,6 +5,8 @@ import com.flashseats.catalog.facade.EventWindowStatus;
 import com.flashseats.catalog.facade.TierAvailability;
 import com.flashseats.queue.facade.QueuePhase;
 import com.flashseats.queue.facade.QueueState;
+import com.flashseats.shared.error.ErrorCode;
+import com.flashseats.shared.error.FlashSeatsException;
 import java.time.Clock;
 import java.time.Duration;
 import java.util.List;
@@ -125,10 +127,22 @@ public class QueueBroadcaster {
             try {
                 sweep(eventId);
             } catch (RuntimeException failure) {
+                if (failure instanceof FlashSeatsException missing && missing.code() == ErrorCode.EVENT_NOT_FOUND) {
+                    // Deleted before its sale opened (ADR-080). Nothing will ever come for these
+                    // streams, and sweeping them again would fail the same way every interval.
+                    var closed = closedFrame();
+                    emitters.closeAll(eventId, closed.type(), closed.data());
+                    continue;
+                }
                 // One unreadable event must not stop the others from being served.
                 log.warn("Could not sweep queue streams for event {}", eventId, failure);
             }
         }
+    }
+
+    /** The frame that ends a stream for good: a sale that closed, or one deleted before it opened. */
+    private QueueChannelMessage closedFrame() {
+        return QueueChannelMessage.toAll("sale-closed", Map.of("closedAt", clock.instant().toString()));
     }
 
     private void sweep(long eventId) {
@@ -136,7 +150,7 @@ public class QueueBroadcaster {
 
         if (window == EventWindowStatus.CLOSED) {
             pausedEvents.remove(eventId);
-            var closed = QueueChannelMessage.toAll("sale-closed", Map.of("closedAt", clock.instant().toString()));
+            var closed = closedFrame();
             // Announced and retained once, by whichever replica claims it. Every other replica still
             // closes its own streams, so one that connected after the announcement is not left open
             // on a finished sale (ADR-076).

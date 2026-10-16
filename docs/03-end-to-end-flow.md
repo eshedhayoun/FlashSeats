@@ -172,9 +172,11 @@ load balancer you get one replica at random.
 
 ### Step 0 — Pre-sale setup and inventory warming *(admin)*
 
-An administrator creates the event and its tiers. Inventory is warmed either by a scheduled job
-15 minutes before `sale_start_time`, or on demand via
-`POST /api/v1/admin/events/{eventId}/prewarm`:
+An administrator creates the event and all its tiers in one call, `POST /api/v1/admin/events`, at
+least **120 s** before the sale starts; it is published and pre-warmed at once (ADR-080). There is no
+edit: until **60 s** before the sale opens it can be deleted and recreated, after that only paused.
+Inventory is warmed by that call, or again on demand via
+`POST /api/v1/admin/events/{eventId}/prewarm` (a scheduled pre-warm is specified, not built):
 
 ```
 for each tier:
