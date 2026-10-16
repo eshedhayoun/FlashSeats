@@ -1,13 +1,18 @@
+import { lazy, Suspense } from "react";
 import { Route, Routes, useParams } from "react-router-dom";
 import { EventIndexPage } from "../events/EventIndexPage";
 import { NotFoundPage } from "../notfound/NotFoundPage";
 import { ConfirmationPage } from "../orders/ConfirmationPage";
 import { EventPage } from "../sale/EventPage";
+import { LoadingState } from "../ui/LoadingState";
+
+/** Its own chunk: buyers never download the operator console (FE_SPEC §11). */
+const AdminPage = lazy(() => import("../admin/AdminPage"));
 
 /**
- * Three addresses. Inside `/events/:eventId` the view is chosen by the server's state for that sale
- * (FE_SPEC §1), not by the path after it, so a reload, Back or a second tab always lands where the
- * server says the buyer is.
+ * Three buyer addresses, and the operator console. Inside `/events/:eventId` the view is chosen by the
+ * server's state for that sale (FE_SPEC §1), not by the path after it, so a reload, Back or a second
+ * tab always lands where the server says the buyer is.
  */
 export function AppRoutes() {
   return (
@@ -15,6 +20,14 @@ export function AppRoutes() {
       <Route path="/" element={<EventIndexPage />} />
       <Route path="/events/:eventId/*" element={<EventRoute />} />
       <Route path="/orders/:orderNumber" element={<ConfirmationPage />} />
+      <Route
+        path="/admin"
+        element={
+          <Suspense fallback={<LoadingState label="Loading the operator console" />}>
+            <AdminPage />
+          </Suspense>
+        }
+      />
       <Route path="*" element={<NotFoundPage />} />
     </Routes>
   );

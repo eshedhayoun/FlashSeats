@@ -1031,3 +1031,42 @@ status number, never "sold out" for a fault, never an accusation for a rate limi
 Keyboard reaches everything in DOM order; dialogs trap focus and return it. Colour never carries
 meaning alone. Layouts are designed at 375 px first; checkout becomes two columns from `md`, with the
 order summary beside the form. No view scrolls sideways on a phone (`mobile.spec`).
+
+---
+
+## 11. Operator console
+
+**Route:** `/admin`, outside the buyer's view state machine (§1). A lazily loaded chunk, so a buyer
+never downloads it. It uses only the operator endpoints in §2 (ADR-080).
+
+**Sign-in.** A username and password form, checked by calling `GET /admin/events`; `401` or `403`
+says "Wrong username or password." Every call sends `Authorization: Basic …` and
+`X-Requested-With: XMLHttpRequest`, so the browser never shows its own login dialog. The credentials
+live in the page's memory only — no storage, no cookie — so a reload or a closed tab signs out, and
+any later `401`/`403` returns to the form.
+
+**The list.** One card per sale, latest sale first, refreshed every 5 s while the tab is visible and
+after every action: title, venue and id, the window status (a non-live status such as `CANCELLED` is
+shown as itself), sale and event times, a link to the buyer page, and each tier's price and exact
+`remaining / capacity`. `remaining: null` reads "unknown", never 0 (ADR-040).
+
+**Readiness.** Shown only when `prewarmed` is false: before the sale, "Not pre-warmed: it will not
+sell when it opens"; during it, "Stock is not trusted: holds are refused until you rebuild it."
+
+**Actions** — a button appears only when the server would accept it; the server still decides:
+
+| Action | Shown when | Confirmation |
+| :--- | :--- | :--- |
+| Pre-warm | `UPCOMING` and not `prewarmed` | — |
+| Pause | `status = PUBLISHED`, window not `CLOSED` | — |
+| Resume | `status = PAUSED`, window not `CLOSED` | — |
+| Rebuild stock | window `OPEN` or `PAUSED` | yes — it recounts every tier from orders and holds |
+| Delete | `deletable` | yes, destructive |
+
+**New sale.** One dialog: title, venue, description, sale opens / closes, event starts (the
+operator's time zone, sent as instants), and 1–10 tiers of name, price in dollars, capacity and
+tickets per order (1–6). The defaults pass every check, opening in 10 minutes. The form repeats the
+server's checks for fast feedback and shows the server's `detail` and `violations` when it refuses.
+The submit button is disabled while a create is in flight, because a create is not idempotent. The
+form says plainly that a sale cannot be edited afterwards, and that ticket PDFs print Latin
+characters only.

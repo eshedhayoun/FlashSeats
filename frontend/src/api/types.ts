@@ -21,6 +21,8 @@ export type Problem = {
   expiresAt?: string;
   retryAfterSeconds?: number;
   clientSecret?: string;
+  /** Per-field reasons on `VALIDATION_FAILED`, when the request body failed bean validation. */
+  violations?: { field: string; message: string }[];
 };
 
 export type EventTier = {
