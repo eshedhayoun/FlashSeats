@@ -9,7 +9,7 @@ import AddRounded from "@mui/icons-material/AddRounded";
 import RefreshRounded from "@mui/icons-material/RefreshRounded";
 import { useCallback, useEffect, useRef, useState, type FormEvent } from "react";
 import { asApiError, type ApiError } from "../api/errors";
-import { formatTime } from "../format/dates";
+import { formatDateTime } from "../format/dates";
 import { ConfirmDialog } from "../ui/ConfirmDialog";
 import { LoadingState } from "../ui/LoadingState";
 import { Notice } from "../ui/Notice";
@@ -128,7 +128,7 @@ function Console({ credentials, onSignOut }: { credentials: Credentials; onSignO
   const [confirm, setConfirm] = useState<{ event: AdminEvent; action: "rebuild" | "delete" } | null>(null);
   const [flash, setFlash] = useState<Flash | null>(null);
   const [creating, setCreating] = useState(false);
-  const loading = useRef(false);
+  const latest = useRef(0);
 
   /** Every call goes through here, so expired or changed credentials end the session wherever they surface. */
   const call = useCallback(
@@ -144,18 +144,21 @@ function Console({ credentials, onSignOut }: { credentials: Credentials; onSignO
     [credentials, onSignOut]
   );
 
+  /**
+   * Only the newest refresh may write. A poll that started before an action can answer after it, and
+   * showing that answer would put back a sale the operator just deleted.
+   */
   const refresh = useCallback(async () => {
-    if (loading.current) return;
-    loading.current = true;
+    const ticket = ++latest.current;
     try {
-      setEvents(await call(listEvents));
+      const list = await call(listEvents);
+      if (ticket !== latest.current) return;
+      setEvents(list);
       setUpdatedAt(new Date());
       setLoadError(null);
     } catch (cause) {
       // The last list stays on screen; the error says it is stale.
-      setLoadError(asApiError(cause));
-    } finally {
-      loading.current = false;
+      if (ticket === latest.current) setLoadError(asApiError(cause));
     }
   }, [call]);
 
@@ -186,7 +189,7 @@ function Console({ credentials, onSignOut }: { credentials: Credentials; onSignO
     const created = await call((c) => createEvent(c, request));
     setFlash(
       created.prewarmed
-        ? { severity: "success", text: `Created “${created.title}”. It opens ${formatTime(created.saleStartTime)}.` }
+        ? { severity: "success", text: `Created “${created.title}”. It opens ${formatDateTime(created.saleStartTime)}.` }
         : { severity: "warning", text: `Created “${created.title}”, but it is not pre-warmed yet. Pre-warm it before it opens.` }
     );
     await refresh();

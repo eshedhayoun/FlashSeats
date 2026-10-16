@@ -81,12 +81,14 @@ export function runAction(credentials: Credentials, eventId: number, action: Eve
  * server stays the authority; this only keeps buttons that cannot work off the screen.
  */
 export function actionsFor(event: AdminEvent): EventAction[] {
-  const live = event.windowStatus !== "CLOSED";
+  // Each rule names the states it admits, so a status added later is offered nothing until someone
+  // decides it should be (ADR-066).
+  const window = event.windowStatus;
   const actions: EventAction[] = [];
-  if (event.windowStatus === "UPCOMING" && !event.prewarmed) actions.push("prewarm");
-  if (event.status === "PUBLISHED" && live) actions.push("pause");
-  if (event.status === "PAUSED" && live) actions.push("resume");
-  if (event.windowStatus === "OPEN" || event.windowStatus === "PAUSED") actions.push("rebuild");
+  if (window === "UPCOMING" && !event.prewarmed) actions.push("prewarm");
+  if (event.status === "PUBLISHED" && (window === "UPCOMING" || window === "OPEN")) actions.push("pause");
+  if (event.status === "PAUSED" && (window === "UPCOMING" || window === "PAUSED")) actions.push("resume");
+  if (window === "OPEN" || window === "PAUSED") actions.push("rebuild");
   if (event.deletable) actions.push("delete");
   return actions;
 }

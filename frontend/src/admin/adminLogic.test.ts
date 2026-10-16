@@ -95,6 +95,15 @@ describe("actionsFor", () => {
   it("does nothing to a cancelled sale", () => {
     expect(actionsFor(event({ status: "CANCELLED", windowStatus: "CLOSED", deletable: false }))).toEqual([]);
   });
+
+  it("lets a sale paused before it opens be resumed", () => {
+    expect(actionsFor(event({ status: "PAUSED", deletable: false }))).toEqual(["resume"]);
+  });
+
+  it("offers nothing to a window status it has never heard of", () => {
+    const unknown = event({ windowStatus: "SOMETHING_NEW" as AdminEvent["windowStatus"], deletable: false });
+    expect(actionsFor(unknown)).toEqual([]);
+  });
 });
 
 describe("readiness", () => {

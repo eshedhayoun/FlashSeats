@@ -10,7 +10,7 @@ import TextField from "@mui/material/TextField";
 import Typography from "@mui/material/Typography";
 import AddRounded from "@mui/icons-material/AddRounded";
 import DeleteOutlineRounded from "@mui/icons-material/DeleteOutlineRounded";
-import { useState, type FormEvent } from "react";
+import { useEffect, useState, type FormEvent } from "react";
 import { asApiError } from "../api/errors";
 import { Notice } from "../ui/Notice";
 import type { CreateEventRequest } from "./adminApi";
@@ -41,6 +41,15 @@ export function CreateEventDialog({
   const [error, setError] = useState<string[] | null>(null);
   const [busy, setBusy] = useState(false);
 
+  // Fresh defaults on every open: the dialog stays mounted, and defaults computed at sign-in would
+  // fail the "at least 2 minutes ahead" check once the console has been open that long.
+  useEffect(() => {
+    if (open) {
+      setForm(defaultForm(new Date()));
+      setError(null);
+    }
+  }, [open]);
+
   const set = (field: keyof Omit<EventForm, "tiers">) => (value: string) =>
     setForm((current) => ({ ...current, [field]: value }));
   const setTier = (index: number, field: keyof TierForm) => (value: string) =>
@@ -50,10 +59,7 @@ export function CreateEventDialog({
     }));
 
   const close = () => {
-    if (busy) return;
-    setError(null);
-    setForm(defaultForm(new Date()));
-    onClose();
+    if (!busy) onClose();
   };
 
   async function submit(event: FormEvent) {
@@ -68,7 +74,6 @@ export function CreateEventDialog({
     setError(null);
     try {
       await onSubmit(result.request);
-      setForm(defaultForm(new Date()));
       onClose();
     } catch (cause) {
       const problem = asApiError(cause).problem;
