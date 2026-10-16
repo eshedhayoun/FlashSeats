@@ -444,6 +444,23 @@ will ever see it. **`BOT_VERIFICATION_FAILED` is reachable on join only, and onl
 provider is configured**: the provider actively scored the browser below the threshold. Without a
 provider, or when it is unreachable, the join goes ahead (§5, ADR-055).
 
+### Operator endpoints
+
+`Authorization: Basic …` on every call; without it `401 ADMIN_AUTH_REQUIRED`, with non-operator
+credentials `403 ADMIN_FORBIDDEN`. Times are ISO-8601 instants.
+
+| Method | Path | Body | Success | Error codes |
+| :--- | :--- | :--- | :--- | :--- |
+| `GET` | `/admin/events` | — | `200` — array of `{eventId, title, description, venueName, eventStartTime, saleStartTime, saleEndTime, status, windowStatus, prewarmed, deletable, tiers: [{tierId, tierName, priceCents, currency, totalCapacity, maxPerOrder, remaining}]}`, latest sale first. `remaining` is `null` when the tier has no counter — unknown, never zero. `prewarmed` is false unless the sale will sell: every counter present and vouched by the running Redis — pre-warm fixes it while `UPCOMING`, rebuild once open | — |
+| `POST` | `/admin/events` | `{title, description?, venueName, eventStartTime, saleStartTime, saleEndTime, tiers: [{tierName, priceCents, totalCapacity, maxPerOrder}]}` — 1–10 tiers; title and venue ≤ 255, description ≤ 2,000, tier name ≤ 100; price 50–10,000,000 cents (Stripe's USD minimum), capacity 1–100,000, max per order 1–6 (the hold limit). The sale starts ≥ 120 s from now and ends after it starts; the event starts after its sale does; both within five years | `201` — the event, shaped as one list item | `VALIDATION_FAILED` |
+| `DELETE` | `/admin/events/{eventId}` | — | `204` | `EVENT_NOT_DELETABLE` (the sale is within 60 s of opening, or open: pause it instead), `EVENT_NOT_FOUND` |
+| `POST` | `/admin/events/{eventId}/prewarm` | — | `200` `{eventId, tiersSeeded}` | `PREWARM_WINDOW_CLOSED`, `EVENT_NOT_FOUND` |
+| `POST` | `/admin/events/{eventId}/pause` · `/resume` | — | `200` `{eventId, status}` | `EVENT_NOT_PAUSABLE`, `EVENT_NOT_FOUND` |
+| `POST` | `/admin/events/{eventId}/rebuild-stock` | — | `200` `{eventId, remainingByTier}` | `STOCK_REBUILD_IN_PROGRESS` |
+
+There is no update: a sale's price, tiers and capacity are fixed at creation. Delete and recreate
+before it opens (ADR-080).
+
 ### Error envelope — RFC 7807
 
 Every error is `application/problem+json`. There is no `ApiResponse<T>` wrapper (ADR-021).

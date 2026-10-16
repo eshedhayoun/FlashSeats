@@ -132,6 +132,11 @@ public enum ErrorCode {
     /** Pause or resume asked for on an event that is neither published nor paused. Admin only. */
     EVENT_NOT_PAUSABLE(HttpStatus.CONFLICT),
     /**
+     * Delete asked for on an event whose sale opens within a minute, or already has. Past that point a
+     * buyer may hold seats or an order may name it, so an operator pauses instead (ADR-080). Admin only.
+     */
+    EVENT_NOT_DELETABLE(HttpStatus.CONFLICT),
+    /**
      * A resend was asked for but the original message is gone: {@code outbox_events} keeps payloads
      * for {@code flashseats.outbox.purge-after-days} and this order is past it. {@code 410}, not
      * {@code 404}: the order and its message both existed, they have simply aged out, and a

@@ -69,4 +69,16 @@ public final class CatalogErrors {
                 "Event " + eventId + " is " + status + "; only a PUBLISHED or PAUSED sale can be"
                         + " paused or resumed.");
     }
+
+    /** Delete refused: the sale opens within the cutoff or already has (ADR-080). */
+    public static FlashSeatsException eventNotDeletable(long eventId) {
+        return new FlashSeatsException(
+                ErrorCode.EVENT_NOT_DELETABLE,
+                "Event " + eventId + " opens within a minute or already has; pause it instead.");
+    }
+
+    /** A create request whose fields are each valid but do not fit together (ADR-080). */
+    public static FlashSeatsException invalidEvent(String detail) {
+        return new FlashSeatsException(ErrorCode.VALIDATION_FAILED, detail);
+    }
 }

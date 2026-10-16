@@ -178,6 +178,19 @@ public class SaleFixture {
         redis.opsForValue().set("catalog:vouch:" + eventId, "a-previous-redis-incarnation");
     }
 
+    /** Whether anything has vouched for this event's counters (ADR-046). */
+    public boolean hasVouch(long eventId) {
+        return Boolean.TRUE.equals(redis.hasKey("catalog:vouch:" + eventId));
+    }
+
+    public int countEvents() {
+        return jdbc.queryForObject("SELECT count(*) FROM events", Integer.class);
+    }
+
+    public int countTiers(long eventId) {
+        return jdbc.queryForObject("SELECT count(*) FROM ticket_tiers WHERE event_id = ?", Integer.class, eventId);
+    }
+
     /** The live stock counter as Redis holds it, or {@code -1} when the key does not exist. */
     public int stockCounter(long eventId, long tierId) {
         String value = redis.opsForValue().get("catalog:stock:" + eventId + ":" + tierId);

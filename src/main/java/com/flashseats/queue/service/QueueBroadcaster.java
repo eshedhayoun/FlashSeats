@@ -5,6 +5,8 @@ import com.flashseats.catalog.facade.EventWindowStatus;
 import com.flashseats.catalog.facade.TierAvailability;
 import com.flashseats.queue.facade.QueuePhase;
 import com.flashseats.queue.facade.QueueState;
+import com.flashseats.shared.error.ErrorCode;
+import com.flashseats.shared.error.FlashSeatsException;
 import java.time.Clock;
 import java.time.Duration;
 import java.util.List;
@@ -125,6 +127,12 @@ public class QueueBroadcaster {
             try {
                 sweep(eventId);
             } catch (RuntimeException failure) {
+                if (failure instanceof FlashSeatsException missing && missing.code() == ErrorCode.EVENT_NOT_FOUND) {
+                    // Deleted before its sale opened (ADR-080). Nothing will ever come for these
+                    // streams, and sweeping them again would fail the same way every interval.
+                    emitters.closeAll(eventId, "sale-closed", Map.of("closedAt", clock.instant().toString()));
+                    continue;
+                }
                 // One unreadable event must not stop the others from being served.
                 log.warn("Could not sweep queue streams for event {}", eventId, failure);
             }
