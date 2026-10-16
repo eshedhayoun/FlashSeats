@@ -128,17 +128,32 @@ fi
 echo "Seeding the Coldplay and Arctic Monkeys demonstration sales..."
 bash docker/seed/seed-demo.sh
 
+# Say which gateway the stack is really running: telling a reviewer who set
+# STRIPE_ENABLED=true to pick "pm_card_declined" points at a selector that is not there.
+STRIPE_ON="${STRIPE_ENABLED:-}"
+if [[ -z "$STRIPE_ON" && -f .env ]]; then
+    STRIPE_ON="$(grep -E '^STRIPE_ENABLED=' .env | tail -1 | cut -d= -f2-)" || STRIPE_ON=""
+fi
+if [[ "$STRIPE_ON" == "true" ]]; then
+    PAYMENTS="Payments go through Stripe in test mode. In the card form use 4242 4242 4242 4242
+to succeed, 4000 0000 0000 0002 for a decline that keeps the seats, or
+4000 0027 6000 3184 for a 3-D Secure challenge (any future expiry, any CVC)."
+else
+    PAYMENTS="Payments use the in-process stub, so no Stripe account or key is needed. Pick
+\"Card that's declined\" for a decline that keeps the seats, or the card that
+succeeds to receive a PDF ticket."
+fi
+
 cat <<EOF
 
 FlashSeats is ready:
-  Demo:    http://localhost:${HTTP_PORT}
-  Mailpit: http://localhost:8025
+  Demo:     http://localhost:${HTTP_PORT}
+  Operator: http://localhost:${HTTP_PORT}/admin  (user admin, the operator password printed
+            when the secrets were generated)
+  Mailpit:  http://localhost:8025
   RabbitMQ: http://localhost:15672
 
-The browser demo is the packaged React client and uses the in-process payment
-stub, so no Node.js, Stripe account or API key is needed. Use pm_card_declined
-to demonstrate a declined payment that keeps the seats, or the normal success
-path to receive a PDF ticket.
+${PAYMENTS}
 
 To stop without deleting data:
   docker compose --profile cluster down

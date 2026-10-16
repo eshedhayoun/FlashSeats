@@ -6,6 +6,7 @@ import java.time.Instant;
 import java.util.Collection;
 import java.util.List;
 import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.data.jpa.repository.Modifying;
 import org.springframework.data.jpa.repository.Query;
 import org.springframework.data.repository.query.Param;
 
@@ -36,4 +37,16 @@ public interface EventRepository extends JpaRepository<Event, Long> {
                AND e.saleEndTime   >  :now
             """)
     List<Long> findManagedEventIds(@Param("now") Instant now);
+
+    List<Event> findTop200ByOrderBySaleStartTimeDesc();
+
+    /**
+     * Deletes the event only if its sale starts after {@code cutoff}: the guard and the delete in one
+     * statement, so two operators racing cannot both pass a check (ADR-080).
+     *
+     * @return 1 if deleted, 0 if absent or too close to its sale
+     */
+    @Modifying
+    @Query("DELETE FROM Event e WHERE e.id = :eventId AND e.saleStartTime > :cutoff")
+    int deleteIfSaleStartsAfter(@Param("eventId") long eventId, @Param("cutoff") Instant cutoff);
 }

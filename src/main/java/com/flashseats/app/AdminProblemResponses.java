@@ -20,6 +20,8 @@ import tools.jackson.databind.ObjectMapper;
 public class AdminProblemResponses {
 
     private static final String REALM = "flashseats";
+    private static final String CONSOLE_MARKER = "XMLHttpRequest";
+    private static final String CONSOLE_SCHEME = "FlashSeatsBasic";
 
     private final ObjectMapper json;
 
@@ -32,8 +34,11 @@ public class AdminProblemResponses {
         return (request, response, authException) -> {
             // Replacing BasicAuthenticationEntryPoint means replacing the challenge it sent. RFC 7235
             // says a 401 MUST carry WWW-Authenticate, and without it a client has been refused with
-            // no statement of how to authenticate at all.
-            response.setHeader("WWW-Authenticate", "Basic realm=\"" + REALM + "\", charset=\"UTF-8\"");
+            // no statement of how to authenticate at all. The operator console marks its requests,
+            // and gets a scheme browsers do not prompt for: a `Basic` challenge would put the
+            // browser's own login dialog over the console's form (ADR-080).
+            String scheme = CONSOLE_MARKER.equals(request.getHeader("X-Requested-With")) ? CONSOLE_SCHEME : "Basic";
+            response.setHeader("WWW-Authenticate", scheme + " realm=\"" + REALM + "\", charset=\"UTF-8\"");
             write(
                     response,
                     ErrorCode.ADMIN_AUTH_REQUIRED,

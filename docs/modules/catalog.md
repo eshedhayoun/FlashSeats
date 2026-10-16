@@ -58,6 +58,9 @@ policy, and evicting a live counter is the worst failure this system has.
 | :--- | :--- | :--- |
 | `GET` | `/api/v1/events` | public — published and paused events, each with its window status |
 | `GET` | `/api/v1/events/{eventId}` | public — the landing page |
+| `GET` | `/api/v1/admin/events` | `ROLE_ADMIN` — every event in any status, with exact live stock and whether it will sell (counters present and vouched), uncached, one `MGET` (ADR-080) |
+| `POST` | `/api/v1/admin/events` | `ROLE_ADMIN` — creates the event and all its tiers, published, then pre-warms (ADR-080) |
+| `DELETE` | `/api/v1/admin/events/{eventId}` | `ROLE_ADMIN` — only while the sale is more than 60 s away; removes the rows, then the counters and vouch (ADR-080) |
 | `POST` | `/api/v1/admin/events/{eventId}/prewarm` | `ROLE_ADMIN` |
 | `POST` | `/api/v1/admin/events/{eventId}/pause` | `ROLE_ADMIN` |
 | `POST` | `/api/v1/admin/events/{eventId}/resume` | `ROLE_ADMIN` |
@@ -146,8 +149,8 @@ conclusion independently, and a rebuild performed on one releases the event on a
 
 | Gap | Detail |
 | :--- | :--- |
-| **No cross-replica cache invalidation** | Pause takes effect on the replica that served it immediately and on the others when their cached row expires — 1 s (ADR-051). A Redis invalidation channel would buy a fraction of a second on a control measured in seconds, and adds a failure mode a TTL does not have. It becomes worth building when an operator can *edit* an event, which is the gap below |
-| **No create-event endpoint** | Events are seeded by a `dev`-profile seeder or by `docker/seed/seed.sql`. An operator cannot create a sale through the API |
+| **No cross-replica cache invalidation** | Pause takes effect on the replica that served it immediately and on the others when their cached row expires — 1 s (ADR-051). A Redis invalidation channel would buy a fraction of a second on a control measured in seconds, and adds a failure mode a TTL does not have. It becomes worth building if an operator can ever *edit* an event |
+| **No edit, no cancel** | Deliberate (ADR-080). A sale's price, tiers and capacity are what checkout and the counters were built from. Delete and recreate before the sale opens; pause a live one |
 
 ---
 
@@ -162,6 +165,11 @@ conclusion independently, and a rebuild performed on one releases the event on a
   answering `0` makes the promotion worker mark it exhausted — permanently, since that marker clears
   only when `remaining > 0`. Every event exists before its tiers do, so this is on the normal path.
 - Move stock inside a SQL transaction.
+- **Delete an event a buyer could already be part of.** Only while its sale is more than 60 s away,
+  and with the guard inside the `DELETE` itself. Ticket PDFs read the event live, and other modules'
+  rows name it with no foreign key to stop them (ADR-080).
+- **Update a tier, or create an event without one.** Price, capacity and the tier list are what
+  checkout and the counters were built from (ADR-080).
 - **Cache a window status, or anything else derived from the clock.** Cache the row; derive on read.
 - **Cache a miss.** Rows are inserted out of band by the seed scripts, so a remembered "no such event"
   outlives the insert that created it.

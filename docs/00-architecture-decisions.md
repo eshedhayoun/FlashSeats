@@ -89,6 +89,7 @@
 | [077](#adr-077--what-the-rebuilt-client-needed-from-the-server-a-way-out-of-the-line-and-quiet-disconnects) | What the rebuilt client needed from the server: a way out of the line, and quiet disconnects |
 | [078](#adr-078--the-browser-suite-uses-the-api-a-buyer-and-an-operator-use-and-nothing-else) | The browser suite uses the API a buyer and an operator use, and nothing else |
 | [079](#adr-079--ten-thousand-buyers-what-the-hot-path-was-paying-for-that-nobody-asked-for) | Ten thousand buyers: what the hot path was paying for that nobody asked for |
+| [080](#adr-080--operators-create-list-and-delete-sales--and-never-edit-one) | Operators create, list and delete sales — and never edit one |
 
 ---
 
@@ -3446,3 +3447,93 @@ than the laptop needs the load generator on another machine.
   share. Status p99 fell to 7 s, but checkout p99 rose to 11.8 s and its median to 2.4 s: a replica
   that cannot burst queues its checkouts behind its polls.
 - **A connection pool**, for the reasons in 1.
+
+---
+
+## ADR-080 — Operators create, list and delete sales — and never edit one
+
+**Status:** accepted, Pass 17. Closes the "no create-event endpoint" gap in `catalog.md` §6.
+
+**Context.** A sale could only be created with SQL — `docker/seed/seed.sh` through
+`docker compose exec postgres`, or the `dev` seeder. An operator with the API and nothing else could
+pause, resume and rebuild a sale but could not make one. The obvious fix is full CRUD, and most of it
+is unsafe once a sale has buyers:
+
+- **Price** is read at checkout, not when the seats were held, so a change mid-sale charges a buyer
+  holding seats an amount they never saw.
+- **A new tier** has no counter, so the whole event reads as unknowable stock: promotion stops and
+  every hold answers `503`. The other replicas also keep the old tier list for up to 60 s (ADR-051).
+- **Capacity** reaches Redis only through pre-warm's `SET NX`, so a changed capacity never reaches the
+  counter and the drift gauge fires; lowering it below what is sold and held breaks invariant 1.
+- **Cancelling a live sale** needs a window status that checkout refuses: `CLOSED` passes checkout
+  until the sale's end plus grace, and a cancelled sale keeps a future end. Then everyone who paid
+  needs a refund — a resumable batch over the payment path.
+- **Hard-deleting a sale that sold anything** breaks every ticket: the PDF reads the event's title,
+  venue and date live from `catalog`, and `ticket_holds`, `orders` and `order_items` name the event
+  with no foreign key, because they belong to other modules.
+
+**Decision.**
+
+1. **Create, list, delete. No update, no cancel.** `POST /api/v1/admin/events` takes the event and
+   all its tiers in one request; `GET` lists every event in any status with exact live stock;
+   `DELETE /{id}` removes one. To fix a mistake, delete and recreate before the sale opens. To stop a
+   live sale, pause it (ADR-066).
+2. **Create publishes and pre-warms.** There is no draft step. The rows commit first and the counters
+   follow (ADR-023). If pre-warm fails the sale is still created, `prewarmed=false` says so, and
+   pre-warm is safe to repeat until the sale opens.
+3. **The sale must start at least 120 s after creation.** Pre-warm refuses any window but `UPCOMING`
+   (ADR-004), so a sale created on the edge of its window could open with no counters. Also required:
+   at least one tier (a tier-less event is unknowable stock — `catalog.md` §7), the sale ends after
+   it starts, the event starts after its sale does, and both are within five years (beyond
+   PostgreSQL's range the insert would answer `500`). Currency is USD and is not in the request.
+   **A price is at least 50 cents**, Stripe's USD minimum: below it every charge is an invalid request,
+   which the gateway counts against the breaker every sale shares (ADR-052). **Max per order is at
+   most 6**, the hold's own limit (ADR-017), so what the operator sets is what a buyer gets.
+4. **Delete only while the sale is more than 60 s away.** Joining needs `OPEN` or `PAUSED` and a hold
+   needs `OPEN`, so before the sale opens no hold, order, pass or queue entry can name the event. The
+   margin covers replica clock skew and the 1 s event cache. The guard is the `DELETE`'s own
+   condition (`sale_start_time > now + 60 s`), so two operators or a clock edge cannot slip between a
+   check and the write; a refusal rolls the tier delete back with it. The counters and the vouch go
+   after the commit; if that fails they are keys of an event that no longer exists, which nothing
+   reads.
+5. **The list is uncached.** An operator acts on what it says, so it reads PostgreSQL and Redis
+   directly, bounded to the latest 200 sales. Exact counts are fine here; the public API still shows
+   buckets (ADR-027). Every counter and vouch is read in **one** `MGET`, so an unreachable Redis costs
+   one timeout, not one per event. If it cannot be read, every tier shows `remaining: null` rather
+   than the call failing: the view is most needed during an outage. **`prewarmed` means "will
+   sell"**: every tier has a counter *and* no other Redis instance vouched for them — the verdict
+   `StockEpoch` reaches at open (ADR-046). Pre-warm repairs either while the sale is `UPCOMING`; a
+   rebuild once it is open.
+6. **The console logs in with the same HTTP Basic, and sends `X-Requested-With: XMLHttpRequest`.**
+   A `401` to such a request carries `WWW-Authenticate: FlashSeatsBasic …` instead of `Basic`:
+   browsers prompt only for schemes they know, so the browser's own login dialog never covers the
+   console's form. Every other client still gets `Basic`, and the header is still present (RFC 7235).
+   The credentials live in the tab's memory, never in a cookie — a cookie would make admin calls
+   ambient and reopen the CSRF path ADR-060 closed. One operator account stays (ADR-043's "replace
+   the in-memory user" waits for a second operator).
+7. **A missing price is refused, not read as zero.** The tier fields are boxed and `@NotNull`, so a
+   client that forgets `priceCents` gets `400`, not a free tier.
+
+**Consequences.** `catalog` gains endpoints; no new module edge and no new Redis key. `queue` closes
+a deleted event's open streams with `sale-closed` instead of failing to sweep them every 2 s — a
+stream can be opened before a sale does. `TierRow`'s "nothing updates a tier after creation" stays
+true. A sale's details are fixed once its deletion cutoff passes; a typo found later stays on the
+tickets.
+
+**Accepted.**
+
+- **Create is not idempotent.** A retry after a timeout makes a second sale. It is visible on the
+  list and deletable for at least a minute (the 120 s lead minus the 60 s cutoff), and the console
+  disables the button while a create is in flight. An idempotency key would be a table and a
+  protocol for a one-operator surface.
+- **A pre-warm racing a delete** can write the counters back after the delete removed them: keys of
+  an event that no longer exists, a few bytes each, which nothing reads.
+
+**Rejected.**
+
+- **Full CRUD** — for the reasons in Context. Each edit is a small feature with its own failure mode,
+  and none is needed to run a sale.
+- **A draft status with an explicit publish.** One more state and button for no new capability:
+  creation *is* the publish, and delete is the undo.
+- **Migrating `seed.sh` to the new endpoint.** The SQL seeds also open sales immediately, which this
+  endpoint deliberately refuses.

@@ -1,6 +1,7 @@
 package com.flashseats.catalog.repository;
 
 import com.flashseats.catalog.facade.ReserveResult;
+import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -88,16 +89,10 @@ public class StockCounterRepository {
         if (tierIds.isEmpty()) {
             return remaining;
         }
-        List<String> keys = tierIds.stream().map(tierId -> key(eventId, tierId)).toList();
-        List<String> values = redis.opsForValue().multiGet(keys);
-        if (values == null) {
-            return remaining;
-        }
-        for (int i = 0; i < tierIds.size(); i++) {
-            String value = values.get(i);
-            if (value != null) {
-                remaining.put(tierIds.get(i), Integer.parseInt(value));
-            }
+        List<String> values =
+                redis.opsForValue().multiGet(tierIds.stream().map(tierId -> key(eventId, tierId)).toList());
+        if (values != null) {
+            putPresent(remaining, tierIds, values, 0);
         }
         return remaining;
     }
@@ -124,6 +119,64 @@ public class StockCounterRepository {
      */
     public void overwrite(long eventId, long tierId, int remaining) {
         redis.opsForValue().set(key(eventId, tierId), String.valueOf(remaining));
+    }
+
+    /** One event's counters (absent tier = no counter) and who vouched for them (null = nobody). */
+    public record EventStock(Map<Long, Integer> remainingByTier, String vouchedRunId) {}
+
+    /**
+     * Every listed event's counters and vouch in one {@code MGET}, for the operator's view (ADR-080):
+     * one round trip, and one timeout rather than one per event when Redis is unreachable.
+     */
+    public Map<Long, EventStock> readEvents(Map<Long, List<Long>> tierIdsByEvent) {
+        Map<Long, EventStock> stock = new HashMap<>();
+        if (tierIdsByEvent.isEmpty()) {
+            return stock;
+        }
+        List<String> keys = new ArrayList<>();
+        tierIdsByEvent.forEach((eventId, tierIds) -> keys.addAll(eventKeys(eventId, tierIds)));
+        List<String> values = redis.opsForValue().multiGet(keys);
+        if (values == null) {
+            return stock;
+        }
+        int next = 0;
+        for (Map.Entry<Long, List<Long>> event : tierIdsByEvent.entrySet()) {
+            Map<Long, Integer> remaining = new HashMap<>();
+            putPresent(remaining, event.getValue(), values, next);
+            next += event.getValue().size();
+            stock.put(event.getKey(), new EventStock(remaining, values.get(next++)));
+        }
+        return stock;
+    }
+
+    /**
+     * Removes a deleted event's counters and its vouch. Only for an event that never opened, so no
+     * hold or order can be counting on these keys (ADR-080).
+     */
+    public void deleteEvent(long eventId, List<Long> tierIds) {
+        redis.delete(eventKeys(eventId, tierIds));
+    }
+
+    /** Every key catalog holds for one event: its tiers' counters, then its vouch. */
+    private static List<String> eventKeys(long eventId, List<Long> tierIds) {
+        List<String> keys = new ArrayList<>();
+        tierIds.forEach(tierId -> keys.add(key(eventId, tierId)));
+        keys.add(VOUCH_PREFIX + eventId);
+        return keys;
+    }
+
+    /**
+     * Reads {@code tierIds.size()} counters from {@code values} starting at {@code offset}. A tier with
+     * no counter is left out, never put in as zero (ADR-035, ADR-040).
+     */
+    private static void putPresent(
+            Map<Long, Integer> remaining, List<Long> tierIds, List<String> values, int offset) {
+        for (int i = 0; i < tierIds.size(); i++) {
+            String value = values.get(offset + i);
+            if (value != null) {
+                remaining.put(tierIds.get(i), Integer.parseInt(value));
+            }
+        }
     }
 
     // ------------------------------------------------------------------- epoch

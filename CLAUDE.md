@@ -6,13 +6,13 @@ Guidance for Claude Code when working in this repository.
 
 FlashSeats — a high-concurrency ticket flash-sale engine. Modular monolith, Java 21, Spring Boot
 4.1.1. The **MVP is built and running**: all nine modules, the full journey from landing page to emailed
-PDF ticket, 311 tests green in any class order. **Inventory lives in Redis** (Stage 1, ADR-046): `catalog:stock:{e}:{t}`
+PDF ticket, 320 tests green in any class order. **Inventory lives in Redis** (Stage 1, ADR-046): `catalog:stock:{e}:{t}`
 is the live count and PostgreSQL keeps no copy of it. **Payment is real** (Stage 2, ADR-052-054) —
 but `flashseats.payment.stripe.enabled` is **false by default**, so `dev`, `test`, the load harness
 and every drill still run the in-process stub through the complete journey, 3-D Secure included.
 
 **Read [`docs/00-architecture-decisions.md`](docs/00-architecture-decisions.md) before changing
-anything.** It contains 79 ADRs. Most record a defect and its fix — 034-039 come from the first
+anything.** It contains 80 ADRs. Most record a defect and its fix — 034-039 come from the first
 review pass over the built code, 040-042 from the second — and several look like over-engineering
 until you read the failure they prevent. 043-045 are the exception: forward-looking decisions about
 the operator surface, buyer accounts and what health should report, with nothing built against them
@@ -54,6 +54,8 @@ backend's integration tests and the client's unit tests. **079** is the 10,000-b
 opens a Redis connection per call (the status read and the promotion writes are scripts, not
 pipelines), scripts are read once, two unread observations are off, rate-limit buckets expire,
 `EXHAUSTED` is derived from stock alone, and the harness drives buyers rather than one k6 VU each.
+**080**: operators create, list and delete sales through the API, and never edit one; a delete is
+refused from 60 s before the sale opens.
 
 **The operating envelope is 3–10 concurrent sales**, not one
 ([`03-end-to-end-flow.md`](docs/03-end-to-end-flow.md) §2). Every capacity number written before
@@ -72,7 +74,7 @@ security posture, next stages, and the review-pass log. It is the doc to update 
 ## Document precedence
 
 ```
-00-architecture-decisions.md      ← highest authority (79 ADRs)
+00-architecture-decisions.md      ← highest authority (80 ADRs)
 05-global-standards.md            ← cross-cutting contract; module docs conform to it
 FE_SPEC.md                        ← client contract (repo root)
 03-end-to-end-flow.md             ← the authoritative user journey AND the operating envelope
@@ -437,6 +439,8 @@ docker/scripts/redis-master-cli.sh               # redis-cli against whichever n
 # The evaluator's one command: secrets, cluster build, health wait, two seeded
 # and pre-warmed sales (9101, 9102). Needs only Docker and a POSIX shell.
 docker/scripts/professor-demo.sh                 # --reset wipes the volumes first (ADR-068)
+                                                 # operator console: http://localhost:8080/admin,
+                                                 # user admin + the password gen-env.sh printed (ADR-080)
 
 # The SPA. The cluster's nginx image builds it and serves it at :8080 (ADR-068);
 # for development run it on its own:
@@ -453,9 +457,12 @@ cd frontend && npm run test:e2e                  # the FE_SPEC §8 Playwright su
 # -- so none of it can tell you whether Stripe agrees (ADR-052).
 export STRIPE_API_KEY=sk_test_... STRIPE_ENABLED=true
 docker compose --profile cluster --profile stripe up -d --build
-docker compose logs stripe | grep whsec_         # PER SESSION, not per account. Put it in
+docker compose --profile cluster --profile stripe logs stripe | grep whsec_
+                                                 # PER SESSION, not per account. Put it in
                                                  # STRIPE_WEBHOOK_SECRET and recreate the app, or
-                                                 # every delivery 400s and looks like no traffic
+                                                 # every delivery 400s and looks like no traffic.
+                                                 # Both profiles: without them `logs stripe` fails
+                                                 # with "no such service: nginx"
 docker/scripts/stripe-check.sh                   # real charge, real 3-DS, real redelivered webhook
 docker compose --profile loadtest run --rm k6    # the load run; VUS=n to scale it down
 docker/scripts/sse-cadence.sh 60                 # run DURING a load run: is QueueBroadcaster's

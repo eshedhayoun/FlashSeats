@@ -1,6 +1,8 @@
 package com.flashseats.catalog.service;
 
 import com.flashseats.catalog.config.CatalogProperties;
+import com.flashseats.catalog.dto.AdminEventResponse;
+import com.flashseats.catalog.dto.CreateEventRequest;
 import com.flashseats.catalog.dto.EventDetailResponse;
 import com.flashseats.catalog.dto.EventListItemResponse;
 import com.flashseats.catalog.dto.TierResponse;
@@ -16,13 +18,18 @@ import com.flashseats.catalog.model.Event;
 import com.flashseats.catalog.model.EventStatus;
 import com.flashseats.catalog.repository.EventRepository;
 import com.flashseats.catalog.repository.StockCounterRepository;
+import com.flashseats.catalog.repository.TicketTierRepository;
 import java.time.Clock;
+import java.time.Duration;
 import java.time.Instant;
+import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.stream.Collectors;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.context.ApplicationEventPublisher;
+import org.springframework.dao.DataAccessException;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
@@ -34,7 +41,19 @@ import org.springframework.transaction.annotation.Transactional;
 @Service
 public class CatalogService implements CatalogFacade {
 
+    /**
+     * How far ahead a new sale must start. Pre-warm runs only while a sale is {@code UPCOMING}, so one
+     * created on the edge of its window could open with no counters and answer every hold {@code 503}
+     * (ADR-004, ADR-080).
+     */
+    private static final Duration MIN_CREATE_LEAD = Duration.ofSeconds(120);
+
+    /** How far ahead a sale may be dated: inside PostgreSQL's range, and past any real on-sale (ADR-080). */
+    private static final Duration MAX_CREATE_HORIZON = Duration.ofDays(5 * 365);
+
     private final EventRepository events;
+    private final TicketTierRepository tiers;
+    private final EventStore store;
     private final StockCounterRepository stock;
     private final StockEpoch epoch;
     private final CatalogMetadata metadata;
@@ -44,6 +63,8 @@ public class CatalogService implements CatalogFacade {
 
     public CatalogService(
             EventRepository events,
+            TicketTierRepository tiers,
+            EventStore store,
             StockCounterRepository stock,
             StockEpoch epoch,
             CatalogMetadata metadata,
@@ -51,6 +72,8 @@ public class CatalogService implements CatalogFacade {
             CatalogProperties properties,
             Clock clock) {
         this.events = events;
+        this.tiers = tiers;
+        this.store = store;
         this.stock = stock;
         this.epoch = epoch;
         this.metadata = metadata;
@@ -345,6 +368,142 @@ public class CatalogService implements CatalogFacade {
 
         log.info("Pre-warmed event {}: {} tier counters seeded", eventId, seeded);
         return seeded;
+    }
+
+    // ------------------------------------------------------- operator: events
+
+    /**
+     * Creates and publishes a sale, then pre-warms it (ADR-080). The rows commit first and the counters
+     * follow, because a Redis write cannot roll back with them (ADR-023). If pre-warm fails the sale is
+     * published without counters: the operator's list shows {@code prewarmed=false}, and pre-warm is
+     * safe to repeat until the sale opens.
+     */
+    public AdminEventResponse createEvent(CreateEventRequest request) {
+        Instant now = clock.instant();
+        Instant horizon = now.plus(MAX_CREATE_HORIZON);
+        if (request.saleStartTime().isBefore(now.plus(MIN_CREATE_LEAD))) {
+            throw CatalogErrors.invalidEvent(
+                    "The sale must start at least " + MIN_CREATE_LEAD.toMinutes() + " minutes from now.");
+        }
+        if (!request.saleEndTime().isAfter(request.saleStartTime())) {
+            throw CatalogErrors.invalidEvent("The sale must end after it starts.");
+        }
+        if (!request.eventStartTime().isAfter(request.saleStartTime())) {
+            throw CatalogErrors.invalidEvent("The event must start after its sale does.");
+        }
+        if (request.saleEndTime().isAfter(horizon) || request.eventStartTime().isAfter(horizon)) {
+            throw CatalogErrors.invalidEvent("Dates must be within five years from now.");
+        }
+
+        long eventId = store.insert(request);
+        log.info("Event {} created by an operator", eventId);
+        try {
+            prewarm(eventId);
+        } catch (DataAccessException failed) {
+            log.error("Event {} was created but not pre-warmed; pre-warm it before the sale opens", eventId, failed);
+        }
+        return adminView(List.of(requireEvent(eventId))).getFirst();
+    }
+
+    /**
+     * Every event in any status, latest sale first, with exact live stock. Read past the metadata cache:
+     * an operator acts on what this says (ADR-080).
+     */
+    public List<AdminEventResponse> listEventsForAdmin() {
+        return adminView(events.findTop200ByOrderBySaleStartTimeDesc());
+    }
+
+    /**
+     * Deletes a sale that has not opened (ADR-080). The rows go first; the counters and vouch follow
+     * once that has committed. If removing them fails they are keys of an event that no longer exists,
+     * which nothing reads.
+     */
+    public void deleteEvent(long eventId) {
+        List<Long> tierIds = store.delete(eventId, clock.instant());
+        log.warn("Event {} deleted by an operator", eventId);
+        try {
+            stock.deleteEvent(eventId, tierIds);
+        } catch (DataAccessException failed) {
+            log.warn("Event {} is deleted but its stock keys remain; they are unreferenced", eventId, failed);
+        }
+    }
+
+    /**
+     * One SQL read for the tiers and one Redis read for every counter and vouch, however many events.
+     *
+     * <p>If Redis cannot be read, every tier shows as unknown, never zero (ADR-040), and nothing is
+     * ready. The view must still load during a Redis outage — that is when it is needed — and a create
+     * that committed must not answer an error over a failed read, or the retry makes a second sale.
+     *
+     * <p>{@code prewarmed} means "will sell": every tier has a counter and no other Redis instance
+     * vouched for them, the same verdict {@link StockEpoch} reaches at open. Pre-warm fixes either
+     * while the sale is {@code UPCOMING}; a rebuild once it is open.
+     */
+    private List<AdminEventResponse> adminView(List<Event> rows) {
+        Instant now = clock.instant();
+        Map<Long, List<TierRow>> tiersByEvent =
+                tiers.findByEventIdInOrderByPriceCentsDesc(rows.stream().map(Event::getId).toList()).stream()
+                        .map(TierRow::of)
+                        .collect(Collectors.groupingBy(TierRow::eventId));
+
+        Map<Long, StockCounterRepository.EventStock> stockByEvent = Map.of();
+        String runId = null;
+        try {
+            stockByEvent = stock.readEvents(tiersByEvent.entrySet().stream()
+                    .collect(Collectors.toMap(
+                            Map.Entry::getKey, entry -> entry.getValue().stream().map(TierRow::id).toList())));
+            runId = stock.serverRunId();
+        } catch (DataAccessException unreadable) {
+            log.warn("Cannot read stock counters for the operator's view; showing them as unknown", unreadable);
+        }
+
+        List<AdminEventResponse> view = new ArrayList<>();
+        for (Event row : rows) {
+            view.add(toAdminResponse(
+                    EventRow.of(row),
+                    tiersByEvent.getOrDefault(row.getId(), List.of()),
+                    stockByEvent.get(row.getId()),
+                    runId,
+                    now));
+        }
+        return view;
+    }
+
+    private static AdminEventResponse toAdminResponse(
+            EventRow event,
+            List<TierRow> eventTiers,
+            StockCounterRepository.EventStock eventStock,
+            String runId,
+            Instant now) {
+        Map<Long, Integer> remaining = eventStock == null ? Map.of() : eventStock.remainingByTier();
+        boolean prewarmed = eventStock != null
+                && runId != null
+                && !eventTiers.isEmpty()
+                && remaining.size() == eventTiers.size()
+                && StockEpoch.trusts(eventStock.vouchedRunId(), runId);
+
+        return new AdminEventResponse(
+                event.id(),
+                event.title(),
+                event.description(),
+                event.venueName(),
+                event.eventStartTime(),
+                event.saleStartTime(),
+                event.saleEndTime(),
+                event.status(),
+                event.windowStatus(now),
+                prewarmed,
+                event.isDeletable(now),
+                eventTiers.stream()
+                        .map(tier -> new AdminEventResponse.Tier(
+                                tier.id(),
+                                tier.tierName(),
+                                tier.priceCents(),
+                                tier.currency(),
+                                tier.totalCapacity(),
+                                tier.maxPerOrder(),
+                                remaining.get(tier.id())))
+                        .toList());
     }
 
     // ----------------------------------------------------------------- rebuild

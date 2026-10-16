@@ -3,6 +3,7 @@ package com.flashseats.catalog.service;
 import com.flashseats.catalog.facade.EventWindowStatus;
 import com.flashseats.catalog.model.Event;
 import com.flashseats.catalog.model.EventStatus;
+import java.time.Duration;
 import java.time.Instant;
 
 /**
@@ -27,6 +28,13 @@ public record EventRow(
         EventStatus status) {
 
     /**
+     * How close to its sale an event may still be deleted. Before the sale opens nobody can join or
+     * hold, so nothing refers to the event; the margin covers replica clock skew and the 1 s event
+     * cache, through which every gate reads the window (ADR-080).
+     */
+    public static final Duration DELETE_CUTOFF = Duration.ofSeconds(60);
+
+    /**
      * The sale window, derived from the clock on every call and never cached (ADR-051). There is one
      * implementation because four gates depend on it (landing page, queue join, hold, checkout), and
      * a second one that rounded a boundary differently would open a sale to one and not another.
@@ -41,6 +49,10 @@ public record EventRow(
             return EventWindowStatus.UPCOMING;
         }
         return status == EventStatus.PAUSED ? EventWindowStatus.PAUSED : EventWindowStatus.OPEN;
+    }
+
+    public boolean isDeletable(Instant now) {
+        return now.plus(DELETE_CUTOFF).isBefore(saleStartTime);
     }
 
     /** The one place an entity becomes a snapshot, cached or not. */
