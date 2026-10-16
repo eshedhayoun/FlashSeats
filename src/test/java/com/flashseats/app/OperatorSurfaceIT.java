@@ -77,6 +77,34 @@ class OperatorSurfaceIT extends IntegrationTest {
         assertThat(response.errorCode()).isEqualTo("ADMIN_AUTH_REQUIRED");
     }
 
+    @Test
+    @DisplayName("The console gets a challenge browsers do not prompt for; every other client gets Basic")
+    void consoleRequestsGetANonPromptingChallenge() throws Exception {
+        HttpResponse<String> plain = adminEvents(null);
+        assertThat(plain.statusCode()).isEqualTo(401);
+        assertThat(plain.headers().firstValue("WWW-Authenticate")).hasValueSatisfying(
+                challenge -> assertThat(challenge).startsWith("Basic "));
+
+        // A `Basic` challenge would put the browser's own login dialog over the console's form (ADR-080).
+        HttpResponse<String> console = adminEvents("XMLHttpRequest");
+        assertThat(console.statusCode()).isEqualTo(401);
+        assertThat(console.body()).contains("ADMIN_AUTH_REQUIRED");
+        assertThat(console.headers().firstValue("WWW-Authenticate")).hasValueSatisfying(
+                challenge -> assertThat(challenge).startsWith("FlashSeatsBasic "));
+    }
+
+    private HttpResponse<String> adminEvents(String requestedWith) throws Exception {
+        HttpRequest.Builder request = HttpRequest.newBuilder(
+                        URI.create("http://localhost:" + port + "/api/v1/admin/events"))
+                .timeout(Duration.ofSeconds(20));
+        if (requestedWith != null) {
+            request.header("X-Requested-With", requestedWith);
+        }
+        try (HttpClient http = HttpClient.newHttpClient()) {
+            return http.send(request.GET().build(), HttpResponse.BodyHandlers.ofString());
+        }
+    }
+
     // ------------------------------------------------------- bot audit, actuator
 
     @Test

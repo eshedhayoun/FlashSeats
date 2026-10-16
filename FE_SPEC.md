@@ -447,7 +447,9 @@ provider, or when it is unreachable, the join goes ahead (§5, ADR-055).
 ### Operator endpoints
 
 `Authorization: Basic …` on every call; without it `401 ADMIN_AUTH_REQUIRED`, with non-operator
-credentials `403 ADMIN_FORBIDDEN`. Times are ISO-8601 instants.
+credentials `403 ADMIN_FORBIDDEN`. Times are ISO-8601 instants. The console also sends
+`X-Requested-With: XMLHttpRequest`, so a `401` challenges with `FlashSeatsBasic` rather than `Basic`
+and the browser shows no login dialog of its own (ADR-080). It keeps the credentials in memory only.
 
 | Method | Path | Body | Success | Error codes |
 | :--- | :--- | :--- | :--- | :--- |

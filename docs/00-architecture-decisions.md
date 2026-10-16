@@ -3504,7 +3504,14 @@ is unsafe once a sale has buyers:
    sell"**: every tier has a counter *and* no other Redis instance vouched for them — the verdict
    `StockEpoch` reaches at open (ADR-046). Pre-warm repairs either while the sale is `UPCOMING`; a
    rebuild once it is open.
-6. **A missing price is refused, not read as zero.** The tier fields are boxed and `@NotNull`, so a
+6. **The console logs in with the same HTTP Basic, and sends `X-Requested-With: XMLHttpRequest`.**
+   A `401` to such a request carries `WWW-Authenticate: FlashSeatsBasic …` instead of `Basic`:
+   browsers prompt only for schemes they know, so the browser's own login dialog never covers the
+   console's form. Every other client still gets `Basic`, and the header is still present (RFC 7235).
+   The credentials live in the tab's memory, never in a cookie — a cookie would make admin calls
+   ambient and reopen the CSRF path ADR-060 closed. One operator account stays (ADR-043's "replace
+   the in-memory user" waits for a second operator).
+7. **A missing price is refused, not read as zero.** The tier fields are boxed and `@NotNull`, so a
    client that forgets `priceCents` gets `400`, not a free tier.
 
 **Consequences.** `catalog` gains endpoints; no new module edge and no new Redis key. `queue` closes
