@@ -94,15 +94,7 @@ class OperatorSurfaceIT extends IntegrationTest {
     }
 
     private HttpResponse<String> adminEvents(String requestedWith) throws Exception {
-        HttpRequest.Builder request = HttpRequest.newBuilder(
-                        URI.create("http://localhost:" + port + "/api/v1/admin/events"))
-                .timeout(Duration.ofSeconds(20));
-        if (requestedWith != null) {
-            request.header("X-Requested-With", requestedWith);
-        }
-        try (HttpClient http = HttpClient.newHttpClient()) {
-            return http.send(request.GET().build(), HttpResponse.BodyHandlers.ofString());
-        }
+        return rawGet("/api/v1/admin/events", requestedWith == null ? Map.of() : Map.of("X-Requested-With", requestedWith));
     }
 
     // ------------------------------------------------------- bot audit, actuator
@@ -145,12 +137,15 @@ class OperatorSurfaceIT extends IntegrationTest {
 
     /** The actuator lives outside {@code /api/v1}, where {@link BuyerSession} points. */
     private HttpResponse<String> actuator(String path, String credentials) throws Exception {
+        return rawGet(path, credentials == null ? Map.of() : Map.of("Authorization", "Basic " + Base64.getEncoder()
+                .encodeToString(credentials.getBytes(StandardCharsets.UTF_8))));
+    }
+
+    /** A plain GET, for what {@link BuyerSession} cannot reach: paths outside {@code /api/v1}, and headers. */
+    private HttpResponse<String> rawGet(String path, Map<String, String> headers) throws Exception {
         HttpRequest.Builder request = HttpRequest.newBuilder(URI.create("http://localhost:" + port + path))
                 .timeout(Duration.ofSeconds(20));
-        if (credentials != null) {
-            request.header("Authorization", "Basic " + Base64.getEncoder()
-                    .encodeToString(credentials.getBytes(StandardCharsets.UTF_8)));
-        }
+        headers.forEach(request::header);
         try (HttpClient http = HttpClient.newHttpClient()) {
             return http.send(request.GET().build(), HttpResponse.BodyHandlers.ofString());
         }

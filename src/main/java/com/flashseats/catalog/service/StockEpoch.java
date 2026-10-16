@@ -72,6 +72,15 @@ public class StockEpoch {
         }
     }
 
+    /**
+     * The one trust rule: counters nobody has vouched for are adopted, and vouched ones must have been
+     * vouched for by the running Redis. Shared with the operator's readiness view, so the console and
+     * the reserve path cannot disagree (ADR-046, ADR-080).
+     */
+    static boolean trusts(String vouchedRunId, String currentRunId) {
+        return vouchedRunId == null || vouchedRunId.equals(currentRunId);
+    }
+
     @Scheduled(
             fixedDelayString = "${flashseats.catalog.epoch-check-interval-ms}",
             initialDelayString = "${flashseats.catalog.epoch-check-interval-ms}")
@@ -94,7 +103,7 @@ public class StockEpoch {
                 // run after this guard existed. Adopt it rather than halt a sale that is healthy as
                 // far as anyone knows.
                 stock.vouch(eventId, current);
-            } else if (!vouched.equals(current)) {
+            } else if (!trusts(vouched, current)) {
                 doubtful.add(eventId);
             }
         }

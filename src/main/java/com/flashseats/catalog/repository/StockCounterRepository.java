@@ -89,16 +89,10 @@ public class StockCounterRepository {
         if (tierIds.isEmpty()) {
             return remaining;
         }
-        List<String> keys = tierIds.stream().map(tierId -> key(eventId, tierId)).toList();
-        List<String> values = redis.opsForValue().multiGet(keys);
-        if (values == null) {
-            return remaining;
-        }
-        for (int i = 0; i < tierIds.size(); i++) {
-            String value = values.get(i);
-            if (value != null) {
-                remaining.put(tierIds.get(i), Integer.parseInt(value));
-            }
+        List<String> values =
+                redis.opsForValue().multiGet(tierIds.stream().map(tierId -> key(eventId, tierId)).toList());
+        if (values != null) {
+            putPresent(remaining, tierIds, values, 0);
         }
         return remaining;
     }
@@ -135,15 +129,12 @@ public class StockCounterRepository {
      * one round trip, and one timeout rather than one per event when Redis is unreachable.
      */
     public Map<Long, EventStock> readEvents(Map<Long, List<Long>> tierIdsByEvent) {
-        List<String> keys = new ArrayList<>();
-        tierIdsByEvent.forEach((eventId, tierIds) -> {
-            tierIds.forEach(tierId -> keys.add(key(eventId, tierId)));
-            keys.add(VOUCH_PREFIX + eventId);
-        });
         Map<Long, EventStock> stock = new HashMap<>();
-        if (keys.isEmpty()) {
+        if (tierIdsByEvent.isEmpty()) {
             return stock;
         }
+        List<String> keys = new ArrayList<>();
+        tierIdsByEvent.forEach((eventId, tierIds) -> keys.addAll(eventKeys(eventId, tierIds)));
         List<String> values = redis.opsForValue().multiGet(keys);
         if (values == null) {
             return stock;
@@ -151,12 +142,8 @@ public class StockCounterRepository {
         int next = 0;
         for (Map.Entry<Long, List<Long>> event : tierIdsByEvent.entrySet()) {
             Map<Long, Integer> remaining = new HashMap<>();
-            for (long tierId : event.getValue()) {
-                String value = values.get(next++);
-                if (value != null) {
-                    remaining.put(tierId, Integer.parseInt(value));
-                }
-            }
+            putPresent(remaining, event.getValue(), values, next);
+            next += event.getValue().size();
             stock.put(event.getKey(), new EventStock(remaining, values.get(next++)));
         }
         return stock;
@@ -167,10 +154,29 @@ public class StockCounterRepository {
      * hold or order can be counting on these keys (ADR-080).
      */
     public void deleteEvent(long eventId, List<Long> tierIds) {
+        redis.delete(eventKeys(eventId, tierIds));
+    }
+
+    /** Every key catalog holds for one event: its tiers' counters, then its vouch. */
+    private static List<String> eventKeys(long eventId, List<Long> tierIds) {
         List<String> keys = new ArrayList<>();
         tierIds.forEach(tierId -> keys.add(key(eventId, tierId)));
         keys.add(VOUCH_PREFIX + eventId);
-        redis.delete(keys);
+        return keys;
+    }
+
+    /**
+     * Reads {@code tierIds.size()} counters from {@code values} starting at {@code offset}. A tier with
+     * no counter is left out, never put in as zero (ADR-035, ADR-040).
+     */
+    private static void putPresent(
+            Map<Long, Integer> remaining, List<Long> tierIds, List<String> values, int offset) {
+        for (int i = 0; i < tierIds.size(); i++) {
+            String value = values.get(offset + i);
+            if (value != null) {
+                remaining.put(tierIds.get(i), Integer.parseInt(value));
+            }
+        }
     }
 
     // ------------------------------------------------------------------- epoch

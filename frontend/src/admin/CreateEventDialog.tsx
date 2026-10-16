@@ -24,6 +24,13 @@ import {
   type TierForm
 } from "./eventForm";
 
+const TIER_FIELDS: { field: keyof TierForm; label: string; inputMode?: "decimal" | "numeric"; maxLength?: number }[] = [
+  { field: "tierName", label: "Name", maxLength: 100 },
+  { field: "price", label: "Price (USD)", inputMode: "decimal" },
+  { field: "totalCapacity", label: "Capacity", inputMode: "numeric" },
+  { field: "maxPerOrder", label: `Per order (1–${MAX_PER_ORDER})`, inputMode: "numeric" }
+];
+
 /**
  * Creates a sale: the event and every tier at once, published and pre-warmed by the server. There is
  * no edit afterwards, so the form says what it cannot change later (ADR-080).
@@ -144,39 +151,18 @@ export function CreateEventDialog({
             </Typography>
             {form.tiers.map((tier, index) => (
               <Stack key={index} direction={{ xs: "column", sm: "row" }} spacing={1.5} sx={{ alignItems: "center" }}>
-                <TextField
-                  label="Name"
-                  size="small"
-                  required
-                  fullWidth
-                  value={tier.tierName}
-                  onChange={(e) => setTier(index, "tierName")(e.target.value)}
-                  slotProps={{ htmlInput: { maxLength: 100 } }}
-                />
-                <TextField
-                  label="Price (USD)"
-                  size="small"
-                  required
-                  value={tier.price}
-                  onChange={(e) => setTier(index, "price")(e.target.value)}
-                  slotProps={{ htmlInput: { inputMode: "decimal" } }}
-                />
-                <TextField
-                  label="Capacity"
-                  size="small"
-                  required
-                  value={tier.totalCapacity}
-                  onChange={(e) => setTier(index, "totalCapacity")(e.target.value)}
-                  slotProps={{ htmlInput: { inputMode: "numeric" } }}
-                />
-                <TextField
-                  label={`Per order (1–${MAX_PER_ORDER})`}
-                  size="small"
-                  required
-                  value={tier.maxPerOrder}
-                  onChange={(e) => setTier(index, "maxPerOrder")(e.target.value)}
-                  slotProps={{ htmlInput: { inputMode: "numeric" } }}
-                />
+                {TIER_FIELDS.map(({ field, label, inputMode, maxLength }) => (
+                  <TextField
+                    key={field}
+                    label={label}
+                    size="small"
+                    required
+                    fullWidth={field === "tierName"}
+                    value={tier[field]}
+                    onChange={(e) => setTier(index, field)(e.target.value)}
+                    slotProps={{ htmlInput: { inputMode, maxLength } }}
+                  />
+                ))}
                 <IconButton
                   aria-label={`Remove tier ${index + 1}`}
                   disabled={form.tiers.length === 1}

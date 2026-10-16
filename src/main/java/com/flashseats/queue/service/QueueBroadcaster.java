@@ -130,7 +130,8 @@ public class QueueBroadcaster {
                 if (failure instanceof FlashSeatsException missing && missing.code() == ErrorCode.EVENT_NOT_FOUND) {
                     // Deleted before its sale opened (ADR-080). Nothing will ever come for these
                     // streams, and sweeping them again would fail the same way every interval.
-                    emitters.closeAll(eventId, "sale-closed", Map.of("closedAt", clock.instant().toString()));
+                    var closed = closedFrame();
+                    emitters.closeAll(eventId, closed.type(), closed.data());
                     continue;
                 }
                 // One unreadable event must not stop the others from being served.
@@ -139,12 +140,17 @@ public class QueueBroadcaster {
         }
     }
 
+    /** The frame that ends a stream for good: a sale that closed, or one deleted before it opened. */
+    private QueueChannelMessage closedFrame() {
+        return QueueChannelMessage.toAll("sale-closed", Map.of("closedAt", clock.instant().toString()));
+    }
+
     private void sweep(long eventId) {
         EventWindowStatus window = catalog.getWindowStatus(eventId);
 
         if (window == EventWindowStatus.CLOSED) {
             pausedEvents.remove(eventId);
-            var closed = QueueChannelMessage.toAll("sale-closed", Map.of("closedAt", clock.instant().toString()));
+            var closed = closedFrame();
             // Announced and retained once, by whichever replica claims it. Every other replica still
             // closes its own streams, so one that connected after the announcement is not left open
             // on a finished sale (ADR-076).

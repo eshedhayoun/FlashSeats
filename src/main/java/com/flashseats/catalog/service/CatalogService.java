@@ -46,10 +46,10 @@ public class CatalogService implements CatalogFacade {
      * created on the edge of its window could open with no counters and answer every hold {@code 503}
      * (ADR-004, ADR-080).
      */
-    static final Duration MIN_CREATE_LEAD = Duration.ofSeconds(120);
+    private static final Duration MIN_CREATE_LEAD = Duration.ofSeconds(120);
 
     /** How far ahead a sale may be dated: inside PostgreSQL's range, and past any real on-sale (ADR-080). */
-    static final Duration MAX_CREATE_HORIZON = Duration.ofDays(5 * 365);
+    private static final Duration MAX_CREATE_HORIZON = Duration.ofDays(5 * 365);
 
     private final EventRepository events;
     private final TicketTierRepository tiers;
@@ -449,10 +449,9 @@ public class CatalogService implements CatalogFacade {
         Map<Long, StockCounterRepository.EventStock> stockByEvent = Map.of();
         String runId = null;
         try {
-            Map<Long, List<Long>> tierIdsByEvent = new HashMap<>();
-            tiersByEvent.forEach((eventId, eventTiers) ->
-                    tierIdsByEvent.put(eventId, eventTiers.stream().map(TierRow::id).toList()));
-            stockByEvent = stock.readEvents(tierIdsByEvent);
+            stockByEvent = stock.readEvents(tiersByEvent.entrySet().stream()
+                    .collect(Collectors.toMap(
+                            Map.Entry::getKey, entry -> entry.getValue().stream().map(TierRow::id).toList())));
             runId = stock.serverRunId();
         } catch (DataAccessException unreadable) {
             log.warn("Cannot read stock counters for the operator's view; showing them as unknown", unreadable);
@@ -460,38 +459,51 @@ public class CatalogService implements CatalogFacade {
 
         List<AdminEventResponse> view = new ArrayList<>();
         for (Event row : rows) {
-            EventRow event = EventRow.of(row);
-            List<TierRow> eventTiers = tiersByEvent.getOrDefault(event.id(), List.of());
-            StockCounterRepository.EventStock eventStock = stockByEvent.get(event.id());
-            Map<Long, Integer> remaining = eventStock == null ? Map.of() : eventStock.remainingByTier();
-            boolean vouched = eventStock != null
-                    && runId != null
-                    && (eventStock.vouchedRunId() == null || eventStock.vouchedRunId().equals(runId));
-
-            view.add(new AdminEventResponse(
-                    event.id(),
-                    event.title(),
-                    event.description(),
-                    event.venueName(),
-                    event.eventStartTime(),
-                    event.saleStartTime(),
-                    event.saleEndTime(),
-                    event.status(),
-                    event.windowStatus(now),
-                    !eventTiers.isEmpty() && remaining.size() == eventTiers.size() && vouched,
-                    event.isDeletable(now),
-                    eventTiers.stream()
-                            .map(tier -> new AdminEventResponse.Tier(
-                                    tier.id(),
-                                    tier.tierName(),
-                                    tier.priceCents(),
-                                    tier.currency(),
-                                    tier.totalCapacity(),
-                                    tier.maxPerOrder(),
-                                    remaining.get(tier.id())))
-                            .toList()));
+            view.add(toAdminResponse(
+                    EventRow.of(row),
+                    tiersByEvent.getOrDefault(row.getId(), List.of()),
+                    stockByEvent.get(row.getId()),
+                    runId,
+                    now));
         }
         return view;
+    }
+
+    private static AdminEventResponse toAdminResponse(
+            EventRow event,
+            List<TierRow> eventTiers,
+            StockCounterRepository.EventStock eventStock,
+            String runId,
+            Instant now) {
+        Map<Long, Integer> remaining = eventStock == null ? Map.of() : eventStock.remainingByTier();
+        boolean prewarmed = eventStock != null
+                && runId != null
+                && !eventTiers.isEmpty()
+                && remaining.size() == eventTiers.size()
+                && StockEpoch.trusts(eventStock.vouchedRunId(), runId);
+
+        return new AdminEventResponse(
+                event.id(),
+                event.title(),
+                event.description(),
+                event.venueName(),
+                event.eventStartTime(),
+                event.saleStartTime(),
+                event.saleEndTime(),
+                event.status(),
+                event.windowStatus(now),
+                prewarmed,
+                event.isDeletable(now),
+                eventTiers.stream()
+                        .map(tier -> new AdminEventResponse.Tier(
+                                tier.id(),
+                                tier.tierName(),
+                                tier.priceCents(),
+                                tier.currency(),
+                                tier.totalCapacity(),
+                                tier.maxPerOrder(),
+                                remaining.get(tier.id())))
+                        .toList());
     }
 
     // ----------------------------------------------------------------- rebuild

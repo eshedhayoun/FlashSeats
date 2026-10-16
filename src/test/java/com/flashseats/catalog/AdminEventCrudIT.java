@@ -95,7 +95,7 @@ class AdminEventCrudIT extends IntegrationTest {
         belowStripeMinimum.put("tiers", List.of(tier("GA", 49, 50)));
 
         Map<String, Object> pastHoldLimit = validSale();
-        pastHoldLimit.put("tiers", List.of(Map.of("tierName", "GA", "priceCents", 1_000, "totalCapacity", 50, "maxPerOrder", 7)));
+        pastHoldLimit.put("tiers", List.of(tier("GA", 1_000, 50, 7)));
 
         Map<String, Object> tooFarAhead = validSale();
         tooFarAhead.put("saleEndTime", now.plus(Duration.ofDays(6 * 365)).toString());
@@ -221,7 +221,11 @@ class AdminEventCrudIT extends IntegrationTest {
     }
 
     private static Map<String, Object> tier(String name, long priceCents, int capacity) {
-        return Map.of("tierName", name, "priceCents", priceCents, "totalCapacity", capacity, "maxPerOrder", 4);
+        return tier(name, priceCents, capacity, 4);
+    }
+
+    private static Map<String, Object> tier(String name, long priceCents, int capacity, int maxPerOrder) {
+        return Map.of("tierName", name, "priceCents", priceCents, "totalCapacity", capacity, "maxPerOrder", maxPerOrder);
     }
 
     private static JsonNode byId(JsonNode list, long eventId) {

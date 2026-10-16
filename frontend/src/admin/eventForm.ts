@@ -21,6 +21,7 @@ const MIN_LEAD_MS = 2 * 60_000;
 const HORIZON_MS = 5 * 365 * 24 * 3_600_000;
 const MIN_PRICE_CENTS = 50;
 const MAX_PRICE_CENTS = 10_000_000;
+const MAX_CAPACITY = 100_000;
 
 const pad = (value: number) => String(value).padStart(2, "0");
 
@@ -86,21 +87,21 @@ export function toCreateRequest(form: EventForm, now: Date): { request: CreateEv
   if (form.tiers.length > MAX_TIERS) return { error: `At most ${MAX_TIERS} tiers.` };
   const tiers: CreateEventRequest["tiers"] = [];
   for (const [index, tier] of form.tiers.entries()) {
-    const label = tier.tierName.trim() || `Tier ${index + 1}`;
-    if (!tier.tierName.trim()) return { error: `Name tier ${index + 1}.` };
+    const label = tier.tierName.trim();
+    if (!label) return { error: `Name tier ${index + 1}.` };
     const priceCents = toCents(tier.price);
     if (priceCents === null || priceCents < MIN_PRICE_CENTS || priceCents > MAX_PRICE_CENTS) {
       return { error: `${label}: the price must be between $0.50 and $100,000, in dollars and cents.` };
     }
     const totalCapacity = wholeNumber(tier.totalCapacity);
-    if (totalCapacity === null || totalCapacity < 1 || totalCapacity > 100_000) {
-      return { error: `${label}: capacity must be between 1 and 100,000.` };
+    if (totalCapacity === null || totalCapacity < 1 || totalCapacity > MAX_CAPACITY) {
+      return { error: `${label}: capacity must be between 1 and ${MAX_CAPACITY.toLocaleString("en-US")}.` };
     }
     const maxPerOrder = wholeNumber(tier.maxPerOrder);
     if (maxPerOrder === null || maxPerOrder < 1 || maxPerOrder > MAX_PER_ORDER) {
       return { error: `${label}: tickets per order must be between 1 and ${MAX_PER_ORDER}.` };
     }
-    tiers.push({ tierName: tier.tierName.trim(), priceCents, totalCapacity, maxPerOrder });
+    tiers.push({ tierName: label, priceCents, totalCapacity, maxPerOrder });
   }
 
   return {

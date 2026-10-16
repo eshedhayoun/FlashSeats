@@ -13,15 +13,7 @@ import { formatDateTime } from "../format/dates";
 import { formatMoney } from "../format/money";
 import { Notice } from "../ui/Notice";
 import { WindowChip } from "../ui/StatusChip";
-import { actionsFor, readiness, type AdminEvent, type EventAction } from "./adminApi";
-
-export const ACTION_LABELS: Record<EventAction, string> = {
-  prewarm: "Pre-warm",
-  pause: "Pause",
-  resume: "Resume",
-  rebuild: "Rebuild stock",
-  delete: "Delete"
-};
+import { ACTION_LABELS, actionsFor, readiness, type AdminEvent, type EventAction } from "./adminApi";
 
 /** One sale as the operator sees it: its window, exact stock, whether it will sell, what can be done. */
 export function EventCard({

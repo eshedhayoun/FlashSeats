@@ -67,6 +67,14 @@ export const createEvent = (credentials: Credentials, request: CreateEventReques
 
 export type EventAction = "prewarm" | "pause" | "resume" | "rebuild" | "delete";
 
+export const ACTION_LABELS: Record<EventAction, string> = {
+  prewarm: "Pre-warm",
+  pause: "Pause",
+  resume: "Resume",
+  rebuild: "Rebuild stock",
+  delete: "Delete"
+};
+
 /** Runs one action on one sale. The server re-checks everything the console decided to show. */
 export function runAction(credentials: Credentials, eventId: number, action: EventAction): Promise<unknown> {
   if (action === "delete") {
