@@ -6,8 +6,8 @@
 > A **Review passes** log at the bottom records every pass over this MVP. Append to it; do not
 > rewrite history.
 
-**Status:** built and running — Stages 1–4 and fifteen review passes deep. **311 backend tests**
-green in any class order, **58** frontend unit tests and **27** browser specs. Payment is real
+**Status:** built and running — Stages 1–4 and seventeen review passes deep. **320 backend tests**
+green in any class order, **78** frontend unit tests and **27** browser specs. Payment is real
 behind a stub default (ADR-052), Sentinel is built (ADR-058), and 10,000 buyers sell out five
 concurrent sales on the dev laptop (ADR-079).
 
@@ -51,6 +51,7 @@ Running the jar directly therefore requires a profile, which is the intended fai
 | Where | What |
 | :--- | :--- |
 | `http://localhost:8080` | Under the cluster, the React client served by nginx (ADR-068). Under `spring-boot:run`, a minimal API demo page — the React client is then on `:5173` |
+| `http://localhost:8080/admin` | Under the cluster, the operator console (ADR-080): user `admin`, the password `gen-env.sh` printed. Under development it is `:5173/admin`, `admin` / `admin` |
 | `http://localhost:8025` | Mailpit — local-only ticket inbox; preview/production uses the configured SMTP relay |
 | [`FE_SPEC.md`](../FE_SPEC.md) §2 | The API contract. There is no generated `/docs` page — springdoc described the shapes and none of the meaning |
 | `http://localhost:15672` | RabbitMQ (`flashseats` / `flashseats`) |
@@ -223,7 +224,7 @@ Findings that cost real time and would cost it again.
 ## 8. Verification
 
 ```bash
-./mvnw test        # 311 tests: unit, modularity, concurrency, journey, recovery, queue lifecycle,
+./mvnw test        # 320 tests: unit, modularity, concurrency, journey, recovery, queue lifecycle,
                    #             pre-warm, stock rebuild, drift, Redis-restart guard, the metadata
                    #             cache's five rules, the cluster admission allowance, payment and
                    #             webhooks, bot defence, and fulfilment through a real broker.
@@ -234,6 +235,7 @@ Findings that cost real time and would cost it again.
 | :--- | :--- |
 | `StockReserveConcurrencyIT` | 50 threads for the last seat → exactly one wins. **1,000 concurrent buyers against 100 seats → exactly 100.** Four-seat requests against ten remaining → two win, and no partial reservation. A tier whose counter is gone reports a fault, not a sell-out. |
 | `CatalogPrewarmIT` | Pre-warm creates the counter, is a no-op the second time, and leaves Redis untouched when it refuses an open sale. |
+| `AdminEventCrudIT` | A created sale is published, pre-warmed and vouched; every invalid request is `400` and stores nothing; the list shows every status, and a missing counter as unknown; a sale vouched for by another Redis is not ready until pre-warm runs again; a delete removes the rows and keys of a sale that has not opened, and refuses a live one with nothing removed (ADR-080). |
 | `StockRebuildIT` | A counter that never existed, one left too high by a restart, and one left too low by a lost restore are all rebuilt to the ledger's number. Drift reads zero when they agree and reports the gap when they do not; a missing counter is counted separately. |
 | `StockEpochIT` | A Redis restart refuses to sell rather than overselling; a rebuild releases that sale and only that sale; noticing the restart does not consume it; a sale created afterwards is never in doubt. |
 | `HoldLifecycleIT` | Double consume → `409`. Ten concurrent releases restore **once**. The sweeper reclaims an abandoned hold and does not keep restoring it. One hold per session. A missing counter is `503`, never "sold out". |
@@ -638,6 +640,7 @@ to read every other module's internals. Full account in **ADR-048**.
 | `GET /admin/orders/{orderNumber}` | `order` | a distinct DTO that withholds `receiptToken` |
 | `POST /admin/events/{id}/rebuild-stock` | `order` | shipped in Stage 1 |
 | `POST /admin/events/{id}/prewarm` | `catalog` | shipped in the MVP |
+| `GET` · `POST /admin/events`, `DELETE /admin/events/{id}` | `catalog` | Pass 17: list every sale with exact stock and readiness; create one with its tiers, published and pre-warmed; delete one until a minute before it opens. No edit, no cancel (ADR-080) |
 
 Three things worth carrying forward as design, not trivia:
 
@@ -654,7 +657,8 @@ Three things worth carrying forward as design, not trivia:
   surface. What was wrong — plaintext storage — is fixed, and `SecretsGuard` now refuses any
   `{noop}` value rather than one known string. 401/403 finally carry a registry `code`.
 
-A console is presentation and can wait. The endpoints are the capability.
+A console is presentation and can wait. The endpoints are the capability. It came last, in Pass 17
+(ADR-080): `/admin` in the React client, over exactly these endpoints.
 
 ### Stage 4b — Fulfilment and client polish
 
@@ -2134,6 +2138,30 @@ too bad, and by asking which layer produced it.
 unevenly. Pass 9's ADR-057 was right, and branches that forked before it re-added exactly what it
 removed. Writing the rules as a checklist (§11) is what makes the next reviewer's job a comparison
 rather than an archaeology.
+
+### Pass 17 — creating sales, and the operator console
+
+- **Scope:** an operator could pause, resume, pre-warm and rebuild a sale but not make one; every
+  sale came from SQL. This pass adds the smallest safe surface for that, and a web console over the
+  whole operator API, then three review rounds over the result (ADR-080).
+
+**Changed:**
+
+| Change | Effect |
+| :--- | :--- |
+| **Create, list, delete — never edit** (ADR-080) | `POST /admin/events` takes the event and all its tiers, publishes it and pre-warms it after the rows commit. The sale must start at least 120 s ahead so pre-warm can run, and every limit a tier has elsewhere is enforced here: Stripe's 50-cent minimum, the hold's six per order, dates PostgreSQL can store. `DELETE` works only while the sale is more than 60 s away, with the guard inside the `DELETE` itself; the counters and vouch go after the commit. Update and cancel are deliberately absent: price, tiers and capacity are what checkout and the counters were built from, and a cancel needs refunds |
+| **The operator's list** | Every sale in any status, read past the metadata cache, with exact stock from **one** `MGET` and `prewarmed` meaning "will sell" — counters present and trusted by the same rule `StockEpoch` applies at open, now one shared method. A Redis outage shows every tier as unknown instead of failing the view |
+| **The console at `/admin`** | A lazily loaded chunk the buyer never downloads. Sign-in checks the credentials against the list; they live in memory only. One card per sale with its window, stock, a readiness warning that names the fix, and only the buttons the server would accept — each rule naming the states it admits. Rebuild and delete confirm first. Polls every 5 s, one request at a time, and an older answer never overwrites a newer one |
+| **No browser login dialog** | A `401` to a request marked `X-Requested-With` challenges with `FlashSeatsBasic`, which browsers do not prompt for; every other client still gets `Basic` |
+| **A deleted sale's streams are closed** | A stream can be opened before a sale opens; after a delete the broadcaster failed to sweep it every 2 s on every replica. It now sends `sale-closed` and stops |
+| **The demo says what it runs** | `professor-demo.sh` names the console and, with `STRIPE_ENABLED=true`, the Stripe test cards instead of the stub's selector. The documented `docker compose logs stripe` failed with "no such service: nginx"; it needs both profiles |
+
+**Verified:** 320/320 backend and 78 vitest; a browser run of the console against the dev stack and
+again through nginx on the cluster (wrong password inline with no browser dialog, sign-in, create,
+delete, pause, resume, rebuild clearing a real "not trusted" warning, sign-out on reload); and the
+reviewer's path from an anonymous clone of the branch with the Stripe test keys —
+`professor-demo.sh`, `stripe-check.sh` passing, a browser purchase with a declined and then a
+successful real test card, and the ticket in Mailpit.
 
 ### Pass 16 — email and environment readiness
 

@@ -3452,7 +3452,7 @@ than the laptop needs the load generator on another machine.
 
 ## ADR-080 — Operators create, list and delete sales — and never edit one
 
-**Status:** accepted, Pass 16. Closes the "no create-event endpoint" gap in `catalog.md` §6.
+**Status:** accepted, Pass 17. Closes the "no create-event endpoint" gap in `catalog.md` §6.
 
 **Context.** A sale could only be created with SQL — `docker/seed/seed.sh` through
 `docker compose exec postgres`, or the `dev` seeder. An operator with the API and nothing else could

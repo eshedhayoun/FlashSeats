@@ -4,7 +4,8 @@
 #
 #   export STRIPE_API_KEY=sk_test_... STRIPE_ENABLED=true
 #   docker compose --profile cluster --profile stripe up -d --build
-#   docker compose logs stripe | grep whsec_      # put it in .env, then recreate app
+#   docker compose --profile cluster --profile stripe logs stripe | grep whsec_
+#                                                 # put it in .env, then recreate app
 #   docker/seed/seed.sh
 #   docker/scripts/stripe-check.sh
 #
@@ -148,7 +149,7 @@ for _ in $(seq 1 20); do
 done
 [[ "$DELIVERED" -gt 0 ]] || fail "no webhook was recorded after 20s.
        Almost always the secret: compare STRIPE_WEBHOOK_SECRET with
-       'docker compose logs stripe | grep whsec_'. A mismatch rejects every
+       'docker compose --profile cluster --profile stripe logs stripe | grep whsec_'. A mismatch rejects every
        delivery with a 400 and looks exactly like no traffic."
 
 EVENT_KEY="$(psql_q "SELECT stripe_event_id FROM webhook_events ORDER BY received_at DESC LIMIT 1")"

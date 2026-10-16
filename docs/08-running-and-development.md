@@ -28,6 +28,7 @@ your seats**, and `pm_card_error` fails the provider. The email lands in Mailpit
 | Service | Where | Credentials |
 | :--- | :--- | :--- |
 | App | http://localhost:8080 | — |
+| Operator console | http://localhost:5173/admin in development, http://localhost:8080/admin under the cluster | `admin` / `admin` on `dev`; under the cluster, the password `gen-env.sh` printed |
 | PostgreSQL | `localhost:5432` | `flashseats` / `flashseats` |
 | Redis | `localhost:6379` | no auth (dev) |
 | RabbitMQ UI | http://localhost:15672 | `flashseats` / `flashseats` |
@@ -76,7 +77,9 @@ Run these steps once per machine, in this order:
    (ADR-039), which is why the cluster will not come up without this step.
 3. **`export FLASHSEATS_ADMIN_PLAINTEXT='…'`** sets the password step 2 printed. The admin-facing
    scripts (`seed.sh`, `seed-concurrent.sh`, `pool-pressure.sh`) read it, because `.env` no longer
-   holds anything they can log in with. Keep it in your shell, not in a file.
+   holds anything they can log in with. Keep it in your shell, not in a file. The same username
+   (`admin`) and password sign in to the **operator console** at `/admin` (ADR-080); on the `dev`
+   profile it is `admin` / `admin`.
 4. **`cp frontend/.env.example frontend/.env.local`** is needed only if you run the React client.
    Leave the Stripe key blank to use the stub gateway, which is what the backend runs by default.
 
@@ -173,7 +176,7 @@ browser. To drive the real provider, set a `pk_test_` key and start the backend 
 ## 5. Backend tests
 
 ```bash
-./mvnw test                         # 311 tests, green in any class order (ADR-061). Needs Docker:
+./mvnw test                         # 320 tests, green in any class order (ADR-061). Needs Docker:
                                     # every integration test runs real PostgreSQL, Redis and,
                                     # for fulfilment, RabbitMQ containers
 ```

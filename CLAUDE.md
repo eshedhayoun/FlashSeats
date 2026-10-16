@@ -6,7 +6,7 @@ Guidance for Claude Code when working in this repository.
 
 FlashSeats — a high-concurrency ticket flash-sale engine. Modular monolith, Java 21, Spring Boot
 4.1.1. The **MVP is built and running**: all nine modules, the full journey from landing page to emailed
-PDF ticket, 311 tests green in any class order. **Inventory lives in Redis** (Stage 1, ADR-046): `catalog:stock:{e}:{t}`
+PDF ticket, 320 tests green in any class order. **Inventory lives in Redis** (Stage 1, ADR-046): `catalog:stock:{e}:{t}`
 is the live count and PostgreSQL keeps no copy of it. **Payment is real** (Stage 2, ADR-052-054) —
 but `flashseats.payment.stripe.enabled` is **false by default**, so `dev`, `test`, the load harness
 and every drill still run the in-process stub through the complete journey, 3-D Secure included.
@@ -439,6 +439,8 @@ docker/scripts/redis-master-cli.sh               # redis-cli against whichever n
 # The evaluator's one command: secrets, cluster build, health wait, two seeded
 # and pre-warmed sales (9101, 9102). Needs only Docker and a POSIX shell.
 docker/scripts/professor-demo.sh                 # --reset wipes the volumes first (ADR-068)
+                                                 # operator console: http://localhost:8080/admin,
+                                                 # user admin + the password gen-env.sh printed (ADR-080)
 
 # The SPA. The cluster's nginx image builds it and serves it at :8080 (ADR-068);
 # for development run it on its own:
@@ -455,9 +457,12 @@ cd frontend && npm run test:e2e                  # the FE_SPEC §8 Playwright su
 # -- so none of it can tell you whether Stripe agrees (ADR-052).
 export STRIPE_API_KEY=sk_test_... STRIPE_ENABLED=true
 docker compose --profile cluster --profile stripe up -d --build
-docker compose logs stripe | grep whsec_         # PER SESSION, not per account. Put it in
+docker compose --profile cluster --profile stripe logs stripe | grep whsec_
+                                                 # PER SESSION, not per account. Put it in
                                                  # STRIPE_WEBHOOK_SECRET and recreate the app, or
-                                                 # every delivery 400s and looks like no traffic
+                                                 # every delivery 400s and looks like no traffic.
+                                                 # Both profiles: without them `logs stripe` fails
+                                                 # with "no such service: nginx"
 docker/scripts/stripe-check.sh                   # real charge, real 3-DS, real redelivered webhook
 docker compose --profile loadtest run --rm k6    # the load run; VUS=n to scale it down
 docker/scripts/sse-cadence.sh 60                 # run DURING a load run: is QueueBroadcaster's
