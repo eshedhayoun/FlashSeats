@@ -195,41 +195,18 @@ removed.
 
 ```mermaid
 flowchart TB
-    browser["Browser<br/>React client and operator console"]
-    nginx["nginx<br/>least_conn, unbuffered SSE"]
-
-    subgraph apps["Application tier: three stateless replicas, Java 21 virtual threads"]
-        direction LR
-        app1["app 1"]
-        app2["app 2"]
-        app3["app 3"]
-    end
-
-    subgraph state["Shared state"]
-        direction LR
-        redis[("Redis 7<br/>primary, 2 replicas, 3 Sentinels<br/>stock, waiting room, timers")]
-        postgres[("PostgreSQL 16<br/>holds, orders, payments, outbox")]
-        rabbit[["RabbitMQ<br/>ticket messages, dead letters"]]
-    end
-
-    subgraph external["External services"]
-        direction LR
-        stripe["Stripe<br/>or the in-process stub"]
-        smtp["SMTP relay<br/>Mailpit locally"]
-    end
-
-    browser -->|HTTP and SSE| nginx
-    nginx --> app1 & app2 & app3
-    apps -->|Lua scripts, pub/sub| redis
-    apps -->|SQL| postgres
-    apps -->|outbox relay, then consumed back| rabbit
-    apps -->|charges and refunds| stripe
-    stripe -.->|webhooks| nginx
-    apps -->|PDF ticket by email| smtp
+    browser["Browser"] -->|HTTP and SSE| nginx["nginx · least_conn"]
+    nginx --> apps["3 stateless app replicas<br/>Java 21, virtual threads"]
+    apps --> redis[("Redis + Sentinel<br/>stock · line · timers")]
+    apps --> postgres[("PostgreSQL<br/>holds · orders · outbox")]
+    apps --> rabbit[["RabbitMQ<br/>ticket messages"]]
+    apps --> stripe["Stripe<br/>or stub"]
+    apps --> smtp["SMTP<br/>Mailpit locally"]
 ```
 
-*Figure 2. Deployment. Any replica can serve any request; promotions reach the replica holding a
-buyer's live connection through Redis pub/sub.*
+*Figure 2. Deployment. Any of the three replicas can serve any request. Promotions reach the
+replica holding a buyer's live connection through Redis pub/sub, and Stripe's webhooks come back in
+through nginx like any other request.*
 
 The application replicas hold no state between requests. PostgreSQL is the authority for every
 lifecycle: holds, orders, payments. Redis holds fast, reconstructible state: the stock counters, the
