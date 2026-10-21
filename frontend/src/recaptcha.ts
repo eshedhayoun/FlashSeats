@@ -1,5 +1,5 @@
 /*
- * reCAPTCHA v3 on "Join the sale", and nowhere else (FE_SPEC §5, ADR-055).
+ * reCAPTCHA v3 on "Join the sale", and nowhere else (ADR-055).
  *
  * Executed on the press, never on page load: tokens are short-lived, so one minted early is stale for
  * anyone who reads the page first. And everything here FAILS OPEN: no key configured, a script that

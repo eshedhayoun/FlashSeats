@@ -6,8 +6,7 @@ import java.util.Map;
 import org.springframework.http.ProblemDetail;
 
 /**
- * Builds RFC 7807 {@code application/problem+json} responses in the one shape the whole API uses
- * (global standards §1).
+ * Builds RFC 7807 {@code application/problem+json} responses in the one shape the whole API uses.
  *
  * <p>There is deliberately <strong>no {@code ApiResponse<T>} envelope</strong> (ADR-021): an
  * envelope decouples the payload from the status code, breaks caching and conditional requests, and

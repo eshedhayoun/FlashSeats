@@ -11,7 +11,7 @@ const DEGRADED_POLL_MS = 5_000;
 
 /**
  * The server could not read part of the sale (`partial`). Absent and unreadable are different facts,
- * so this never guesses that the place or the seats are gone (FE_SPEC §3) — it keeps asking.
+ * so this never guesses that the place or the seats are gone — it keeps asking.
  */
 export function DegradedView({ onRefresh }: { onRefresh: () => Promise<void> }) {
   useEffect(() => {

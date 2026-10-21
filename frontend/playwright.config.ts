@@ -1,7 +1,7 @@
 import { defineConfig, devices } from "@playwright/test";
 
 /**
- * The FE_SPEC §8 suite. It drives the real backend — start it first:
+ * The browser suite. It drives the real backend — start it first:
  *
  *   docker/scripts/dev-up.sh && ./mvnw spring-boot:run      (from the repo root)
  *

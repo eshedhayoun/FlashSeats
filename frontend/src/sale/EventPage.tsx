@@ -21,7 +21,7 @@ import { SaleNoticeBanner } from "./SaleNoticeBanner";
 import { DegradedView, OpeningOrderView, TurnView } from "./StatusViews";
 import { useSaleState } from "./useSaleState";
 
-/** "It's your turn" stays up at least this long: an instant flip reads as an error (FE_SPEC V2). */
+/** "It's your turn" stays up at least this long: an instant flip reads as an error (view V2). */
 const TURN_MIN_MS = 600;
 /** Transient failures exchanging a pass are retried this many times before the pass is given up on. */
 const ADMIT_RETRIES = 3;
@@ -29,7 +29,7 @@ const ADMIT_RETRIES = 3;
 const sleep = (ms: number) => new Promise((resolve) => window.setTimeout(resolve, ms));
 
 /**
- * One sale, rendered from the server's state for it (FE_SPEC §1). The view is `routeFor(state)`, never
+ * One sale, rendered from the server's state for it. The view is `routeFor(state)`, never
  * navigation history, so a reload, Back or a second tab lands where the server says the buyer is.
  */
 export function EventPage({ eventId }: { eventId: number }) {
@@ -45,7 +45,6 @@ export function EventPage({ eventId }: { eventId: number }) {
   const [notice, setNotice] = useState<{ kind: SaleNoticeKind; orderNumber?: string } | null>(null);
   const pendingNotice = useRef<SaleNoticeKind | null>(null);
   // Remembered across a reload, so "your reservation ended while you were away" survives one
-  // (FE_SPEC §3, "V4, hold expired while away").
   const previousView = useRef<SaleView | null>(getSaleValue(eventId, "view") as SaleView | null);
 
   useEffect(() => {
@@ -107,7 +106,7 @@ export function EventPage({ eventId }: { eventId: number }) {
           }
           // Not retried in place. Another tab of this buyer may have spent the pass, and the refresh
           // below says so; a pass the server still offers after failing is never tried again, so a
-          // bad pass cannot loop between here and the router (FE_SPEC §3, U-5).
+          // bad pass cannot loop between here and the router.
           failedPasses.current.add(passToken);
           break;
         }
@@ -129,7 +128,7 @@ export function EventPage({ eventId }: { eventId: number }) {
     (receipt: OrderReceipt) => {
       rememberOrder(receipt, event.event?.title ?? "FlashSeats event");
       // Replace, so Back from the receipt goes where the buyer came from, not into a page that
-      // would only redirect to the receipt again. No receipt token in this URL (FE_SPEC §3.1).
+      // would only redirect to the receipt again. No receipt token in this URL.
       navigate(`/orders/${encodeURIComponent(receipt.orderNumber)}`, { replace: true });
     },
     [event.event?.title, navigate]

@@ -6,7 +6,7 @@ export type SaleView = SaleRoute["view"];
 /**
  * What just happened to the buyer, said on the next screen. Without these, a reservation that ran out
  * or a turn that ended looked like the page had simply reset — the buyer was never told whether they
- * had been charged (FE_SPEC V6: "Nothing was charged" is not optional).
+ * had been charged (view V6: "Nothing was charged" is not optional).
  */
 export type SaleNoticeKind =
   | "EXPIRED"

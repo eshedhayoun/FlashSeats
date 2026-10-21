@@ -1,6 +1,6 @@
 import { expect, joinAndGetTurn, reserve, test } from "../support/fixtures";
 
-/** FE_SPEC §0 rule 1: every countdown runs on the server's clock, whatever the device says. */
+/** Client rule 1: every countdown runs on the server's clock, whatever the device says. */
 test("a device clock four minutes fast still sees the whole reservation", async ({ page, sale }) => {
   const realNow = Date.now();
   await page.clock.install({ time: new Date(realNow + 4 * 60_000) });

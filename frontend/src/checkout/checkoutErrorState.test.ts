@@ -6,7 +6,7 @@ function error(code: string, extra: Record<string, unknown> = {}) {
   return new ApiError({ type: "about:blank", title: "Checkout error", status: 409, detail: "detail", code, ...extra });
 }
 
-/** FE_SPEC §3 "Checkout error handling — one rule per code": the Pay button and the seats. */
+/** Checkout error handling, one rule per code: the Pay button and the seats. */
 describe("checkoutErrorState", () => {
   it("keeps seats and Pay after a decline, and says how many attempts are left", () => {
     const state = checkoutErrorState(error("PAYMENT_DECLINED", { attemptsRemaining: 2 }));

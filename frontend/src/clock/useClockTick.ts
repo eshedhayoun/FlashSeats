@@ -2,7 +2,7 @@ import { useSyncExternalStore } from "react";
 import { serverClock } from "./serverClock";
 
 /*
- * ONE app-wide 1 Hz tick for every countdown (FE_SPEC §6): a timeout to the next second, then a
+ * ONE app-wide 1 Hz tick for every countdown: a timeout to the next second, then a
  * requestAnimationFrame, so it pauses with the tab instead of piling up. Every countdown recomputes
  * from `expiresAt` on each tick — nothing decrements a local counter, so a throttled background tab
  * is right again on the first tick after it wakes.

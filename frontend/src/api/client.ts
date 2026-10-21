@@ -7,7 +7,7 @@ export type RequestOptions = RequestInit & {
   /**
    * How many times to repeat the request on back-pressure (`SERVICE_BUSY`, `RATE_LIMITED`, a dropped
    * connection) before surfacing it. A handful at most, never a loop: ten thousand clients retrying
-   * forever is the thundering herd the waiting room exists to prevent (FE_SPEC §5).
+   * forever is the thundering herd the waiting room exists to prevent.
    */
   retries?: number;
 };
@@ -98,7 +98,7 @@ export async function api<T>(path: string, options: RequestOptions = {}): Promis
 
 export async function downloadPdf(path: string): Promise<Blob> {
   // Asking for the PDF alone would make every failure here unnegotiable: a 406 instead of the
-  // problem document that says why (FE_SPEC V5).
+  // problem document that says why (view V5).
   const response = await send(path, {
     headers: { Accept: "application/pdf, application/problem+json" }
   });

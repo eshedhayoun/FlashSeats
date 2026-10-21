@@ -12,8 +12,7 @@ import org.springframework.stereotype.Component;
  * Drains the outbox: claim, publish, mark.
  *
  * <p>Runs on every replica, which is safe because the claim uses {@code FOR UPDATE SKIP LOCKED} —
- * idempotent by claim, the first of the two shapes a scheduled job is allowed to take (global
- * standards §7).
+ * idempotent by claim, the first of the two shapes a scheduled job is allowed to take.
  *
  * <p>A crash between publish and mark re-publishes on a later sweep. That is at-least-once, and it
  * is the right trade: the consumer's unique constraint absorbs a duplicate, whereas a lost ticket

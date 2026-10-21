@@ -13,7 +13,7 @@ import tools.jackson.databind.ObjectMapper;
 /**
  * Makes the admin surface answer like the rest of the API. Spring Security rejects inside the
  * filter chain, before any {@code @RestControllerAdvice}, so without this the endpoints that can
- * pause a sale answered Boot's body with no {@code code} (global standards §1). Written here for the
+ * pause a sale answered Boot's body with no {@code code}. Written here for the
  * same reason {@code RateLimitFilter} writes its own.
  */
 @Component

@@ -49,7 +49,7 @@ function saveBlob(blob: Blob, filename: string) {
 }
 
 /**
- * V5 — the order (FE_SPEC V5). Reached right after paying (session cookie) or from the email link
+ * V5 — the order (view V5). Reached right after paying (session cookie) or from the email link
  * (`?receiptToken=`, a bearer capability that stays in this one URL and nowhere else). The ticket
  * download is not a convenience: it is the recovery path for a mistyped email address (ADR-050).
  */

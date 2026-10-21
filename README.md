@@ -24,9 +24,9 @@ The hard problems, and where each one is solved and tested:
 | A confirmed order must always produce a ticket | Transactional outbox drained with `FOR UPDATE SKIP LOCKED`, RabbitMQ with dead-lettering, and an insert-then-send dedupe on the consumer | [`OutboxRelay`](src/main/java/com/flashseats/order/service/OutboxRelay.java), [`NotificationLogRepository`](src/main/java/com/flashseats/notification/repository/NotificationLogRepository.java) | [`OutboxRecoveryIT`](src/test/java/com/flashseats/order/OutboxRecoveryIT.java) |
 | Nine modules must not tangle | Facade-only calls between modules, verified at build time by Spring Modulith | [`ModularityTests`](src/test/java/com/flashseats/app/ModularityTests.java) | `./mvnw test` |
 
-Every non-obvious decision, and the defect it prevents, is one of 81 [Architecture Decision
-Records](docs/00-architecture-decisions.md). [`docs/07-system-on-one-page.md`](docs/07-system-on-one-page.md)
-is the shortest tour of the whole system.
+The design is in [`docs/architecture.md`](docs/architecture.md), the API in
+[`docs/api.md`](docs/api.md), and running and load-testing it in
+[`docs/operations.md`](docs/operations.md).
 
 **Quick start.** You need only Docker and a POSIX shell (Git Bash on Windows). The first run builds
 the images and takes several minutes; give Docker at least 8 GB of memory.
@@ -148,7 +148,7 @@ stateDiagram-v2
 (600 s) in which a buyer can compare tiers, release a hold and choose again, and the hold itself
 (300 s, extended once while a payment is in progress).*
 
-The full journey, with every edge case, is in [`docs/03-end-to-end-flow.md`](docs/03-end-to-end-flow.md).
+Each step's endpoint and error codes are in [`docs/api.md`](docs/api.md).
 
 ### 2.3 Non-functional requirements
 
@@ -365,8 +365,8 @@ sequenceDiagram
 *Figure 5. Checkout. Money moves before the hold is consumed and outside any database transaction;
 the order row decides how a charge ends.*
 
-The reasoning behind each of these, and the defect it prevents, is recorded in
-[`docs/00-architecture-decisions.md`](docs/00-architecture-decisions.md).
+Every mechanism, the Redis key map and the failure behaviour are in
+[`docs/architecture.md`](docs/architecture.md).
 
 ### 3.5 Development process
 
@@ -379,9 +379,9 @@ We built the system in four phases, each ending with a system that is *correct* 
 4. Asynchronous fulfilment and scale.
 
 Concurrency guarantees were never retrofitted. The design went through four review passes before
-any code, and the built system through seventeen more, each logged in
-[`docs/06-mvp-overview.md`](docs/06-mvp-overview.md) §13. Every non-obvious decision is recorded
-as one of 81 Architecture Decision Records (ADRs), most of them naming the defect they fixed.
+any code, and the built system through seventeen more. Each non-obvious decision was recorded as
+an Architecture Decision Record naming the defect it fixed; code comments cite them as `ADR-NNN`,
+and the records are kept at the `adr-archive` git tag.
 
 ### 3.6 Testing strategy
 
@@ -399,7 +399,7 @@ as one of 81 Architecture Decision Records (ADRs), most of them naming the defec
 pom.xml, mvnw, src/        the backend: one Maven project, at the root by Maven convention
 frontend/                  the React client (Vite + TypeScript)
 docker/                    infrastructure: redis/nginx config, seeds, secrets, k6, drill scripts
-docs/                      ADRs, standards, journey, per-module specs
+docs/                      architecture, API, operations
 compose.yaml, Dockerfile   the local stack and the application image
 ```
 
@@ -467,8 +467,7 @@ All suites pass, and the backend suite passes in any class order:
 | Frontend unit | `npm test` | 78 tests passing |
 | Browser end-to-end | `npm run test:e2e` | 27 specs passing, desktop and mobile layouts |
 
-What each level covers is described in [§3.6](#36-testing-strategy); the run log is in
-[`docs/06-mvp-overview.md`](docs/06-mvp-overview.md) §13.
+What each level covers is described in [§3.6](#36-testing-strategy).
 
 ### 4.3 Load test
 
@@ -566,8 +565,9 @@ safe direction for a payment.
 On the product side, a sale cannot be edited or cancelled once created. It can be deleted until a
 minute before it opens and paused after that. Operator authentication is a single configured
 account rather than an identity provider, and buyers have no accounts: once the session cookie
-expires after a day, the emailed receipt link is the only way back to an order. The full list,
-including the security posture, is in [`docs/06-mvp-overview.md`](docs/06-mvp-overview.md) §9–§10.
+expires after a day, the emailed receipt link is the only way back to an order. The full list
+is in [`docs/operations.md`](docs/operations.md) §8, and the security posture in
+[`docs/architecture.md`](docs/architecture.md) §7.
 
 ### 5.3 Summary
 
@@ -582,24 +582,15 @@ an invariant the system checks, and a number anyone can reproduce with one comma
 
 | Document | What it covers |
 | :--- | :--- |
-| [`docs/07-system-on-one-page.md`](docs/07-system-on-one-page.md) | **Read first.** The whole system on one page: journey, module graph, checkout sequence, and what looks removable but is not |
-| [`docs/00-architecture-decisions.md`](docs/00-architecture-decisions.md) | 81 ADRs: every non-obvious decision and the failure it prevents |
-| [`docs/01-system-architecture.md`](docs/01-system-architecture.md) | Stack, module map, dependency graph, deployment |
-| [`docs/02-high-level-design.md`](docs/02-high-level-design.md) | Infrastructure and the concurrency model |
-| [`docs/03-end-to-end-flow.md`](docs/03-end-to-end-flow.md) | **The authoritative user journey**, step by step |
-| [`docs/04-implementation-roadmap.md`](docs/04-implementation-roadmap.md) | The four phases, each with exit criteria |
-| [`docs/05-global-standards.md`](docs/05-global-standards.md) | **Cross-cutting contract**: RFC 7807, error registry, idempotency, transaction and facade rules |
-| [`docs/06-mvp-overview.md`](docs/06-mvp-overview.md) | **What is actually built**: scope, security posture, limitations, the review-pass log |
-| [`docs/08-running-and-development.md`](docs/08-running-and-development.md) | Local setup, environment files, email, the cluster, load drills, Docker layout |
-| [`FE_SPEC.md`](FE_SPEC.md) | **Front-end specification**: view state machine, API map, storage, SSE, timers, copy, the Playwright suite, the operator console |
-| [`docs/modules/`](docs/modules/) | One page per module: what it owns, exposes, and must never do |
-
-When a module spec disagrees with an ADR, **the ADR wins** and the module spec is stale.
+| [`docs/architecture.md`](docs/architecture.md) | Deployment, modules and what each owns, the Redis key map, how inventory, holds, the waiting room, checkout and fulfilment work, invariants, failure behaviour, security, code conventions |
+| [`docs/api.md`](docs/api.md) | Every endpoint, the SSE events, and the error codes |
+| [`docs/operations.md`](docs/operations.md) | Running, configuration, tests, load testing, monitoring, the operator runbook, known limitations |
+| [`frontend/README.md`](frontend/README.md) | The React client: its rules, views and tests |
 
 ## Appendix B: Running and Development
 
 The [Quick start](#flashseats) at the top is all the demo needs. For development, see
-[`docs/08-running-and-development.md`](docs/08-running-and-development.md):
+[`docs/operations.md`](docs/operations.md):
 
 ```bash
 cp .env.example .env

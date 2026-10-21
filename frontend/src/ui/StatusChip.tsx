@@ -28,7 +28,7 @@ const AVAILABILITY: Record<Availability, { label: string; tone: Tone }> = {
 
 /**
  * A tier's availability, as a bucket and never a number (ADR-027). Any value this client does not
- * recognise falls through to "Checking…", never to "Sold out" (FE_SPEC V1).
+ * recognise falls through to "Checking…", never to "Sold out" (view V1).
  */
 export function AvailabilityChip({ level }: { level: Availability | string }) {
   const known = AVAILABILITY[level as Availability] ?? AVAILABILITY.UNKNOWN;

@@ -16,7 +16,7 @@ import org.springframework.security.web.SecurityFilterChain;
  * Application-wide HTTP security. Without an explicit chain, Boot would lock every endpoint behind a
  * generated password. {@code /api/v1/admin/**} and {@code /actuator/**} (except health) require
  * {@code ROLE_ADMIN}; everything else is open. Stateless: identity is the signed {@code fsid} cookie,
- * so servlet sessions and CSRF are off (§10 S6; ADR-060 closes the one CSRF path that mattered).
+ * so servlet sessions and CSRF are off (ADR-060 closes the one CSRF path that mattered).
  */
 @Configuration
 public class SecurityConfig {
@@ -58,7 +58,7 @@ public class SecurityConfig {
 
     /**
      * The single operator account, stored bcrypt-hashed. It is in memory on purpose: one identity needs
-     * no user-management surface. Replace this bean when a second operator appears (§10 S12).
+     * no user-management surface. Replace this bean when a second operator appears.
      */
     @Bean
     public UserDetailsService adminUser(

@@ -8,7 +8,7 @@ export type ProblemCopy = {
 };
 
 /**
- * What the buyer is told for every code they can meet (`05` §2, FE_SPEC §7). Calm, in the buyer's
+ * What the buyer is told for every code they can meet (docs/api.md). Calm, in the buyer's
  * terms, and honest about the two things they care about: their seats and their money.
  *
  * Switch on `code` only. The server's `detail` is copy that will change; it is the fallback for a

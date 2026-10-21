@@ -7,8 +7,7 @@ import com.flashseats.shared.error.FlashSeatsException;
  * A charge for this hold is already in flight.
  *
  * <p>{@code 409}, never a wait: blocking a request until a concurrent duplicate finishes ties up a
- * connection and tells the client nothing useful. The client polls the sale state instead (global
- * standards §3).
+ * connection and tells the client nothing useful. The client polls the sale state instead.
  */
 public class DuplicatePaymentException extends FlashSeatsException {
 

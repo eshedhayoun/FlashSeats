@@ -1,13 +1,11 @@
 # FlashSeats web client
 
-The React client for the buyer journey in [`FE_SPEC.md`](../FE_SPEC.md): the event index, an event's
-page, the waiting room, seat selection, checkout (the stub gateway or Stripe), the receipt and the PDF
-ticket. React 18, MUI 6, Vite, TypeScript.
+The React client for the buyer journey and the operator console: the event list, an event's page,
+the waiting room, seat selection, checkout (stub gateway or Stripe), the receipt and the PDF ticket.
+React 18, MUI 6, Vite, TypeScript. The API it calls is in [`docs/api.md`](../docs/api.md).
 
-Under `--profile cluster` the nginx image builds it and serves it at `:8080` (ADR-068), and
-`docker/scripts/demo.sh` starts that whole stack in one command. For development it runs on
-its own dev server, below. The backend's `src/main/resources/static/index.html` is a minimal API demo,
-not this client.
+Under `--profile cluster` the nginx image builds it and serves it at `:8080`. The backend's
+`src/main/resources/static/index.html` is a minimal API demo, not this client.
 
 ## Run it
 
@@ -20,40 +18,61 @@ cp .env.example .env.local     # leave VITE_STRIPE_PUBLISHABLE_KEY blank to driv
 npm run dev                    # http://localhost:5173, proxies /api to http://localhost:8080
 ```
 
-With the key blank, checkout offers the stub gateway's outcomes — success, decline, provider outage
-and 3-D Secure — so every branch is walkable with no account. A `pk_test_...` key drives real Stripe,
-and the backend must then run with `STRIPE_ENABLED=true` and the matching secret key. An optional
-`VITE_RECAPTCHA_SITE_KEY` turns on reCAPTCHA v3 for joining the line; without it the join is sent with
-no token and the server falls back to rate limits (ADR-055).
+With the key blank, checkout offers the stub's outcomes: success, decline, provider outage and 3-D
+Secure. A `pk_test_...` key drives real Stripe; the backend then needs `STRIPE_ENABLED=true` and the
+matching secret key. `VITE_RECAPTCHA_SITE_KEY` turns on reCAPTCHA for joining the line.
+
+## Rules
+
+1. **The server owns the clock.** Every countdown derives from `serverTime`, never `Date.now()` alone.
+2. **The server owns the limits.** Max per order, TTLs and attempts come from the API.
+3. **Rehydrate, never assume.** Every mount and reconnect calls `GET /sale/{eventId}/state`; local
+   storage is only a hint for the first paint.
+4. **A timer at zero is a prompt to ask**, not a conclusion: call the API and let it decide.
+5. **All state is scoped by event.** A buyer can be in several sales at once, so every storage key is
+   `fs.{eventId}.{name}` and each sale has its own `EventSource`.
+
+## Views
+
+`/events/:eventId` renders one view, chosen from the server's state for that sale by `routeFor`, in
+this order (first match wins):
+
+| # | Condition | View |
+| :--- | :--- | :--- |
+| 1 | A hold exists | **V4** Checkout |
+| 2 | Queue `ADMITTED` | **V3** Seat selection |
+| 3 | Queue `PROMOTED` | Admit automatically, then V3 |
+| 4 | Queue `WAITING` | **V2** Waiting room |
+| 5 | Latest order `CONFIRMED` | **V5** Confirmation |
+| 6 | Queue `EXHAUSTED` | **V6** Sold out |
+| 7 | Sale `CLOSED` | **V6** Sale ended |
+| 8 | Otherwise | **V1** Event page |
+
+A paused sale is never shown as ended. `UNKNOWN` availability is shown as "Checking…", never as sold
+out. The receipt token is a bearer capability: it appears only inside a link, never as text.
 
 ## Layout
 
 | Folder | Holds |
 | :--- | :--- |
-| `app` | the shell, theme (light and dark), routes, error boundary |
-| `sale` | `/sale/{id}/state`, the router that picks the view (`routeFor`), per-sale storage, the notices that say what just happened |
-| `events`, `landing`, `queue`, `selection`, `checkout`, `orders`, `terminal`, `notfound` | one folder per view of the FE_SPEC state machine |
-| `api` | the typed client: RFC 7807 problems, `Retry-After`, bounded retries on back-pressure |
-| `clock` | the server's clock and the one app-wide tick every countdown runs on |
-| `copy` | what the buyer is told for every error code |
-| `format` | money, dates, durations, queue positions |
-| `ui` | the shared components — FE_SPEC §10 |
+| `app` | Shell, theme (light and dark), routes, error boundary |
+| `sale` | `/sale/{id}/state`, the view router, per-sale storage, notices |
+| `events`, `landing`, `queue`, `selection`, `checkout`, `orders`, `terminal`, `notfound` | One folder per view |
+| `admin` | The operator console |
+| `api` | Typed client: RFC 7807 problems, `Retry-After`, bounded retries |
+| `clock` | The server's clock and the one app-wide tick |
+| `copy` | What the buyer is told for every error code |
+| `format` | Money, dates, durations, queue positions |
+| `ui` | Shared components |
 
 ## Tests
 
-| Command | What it checks | Needs |
+| Command | Checks | Needs |
 | :--- | :--- | :--- |
-| `npm test` | Vitest unit tests: view routing, notices, the checkout error matrix, copy for every error code, storage, formatting, polling cadence | nothing |
-| `npm run build` | `tsc -b` type check, then the production bundle | nothing |
-| `npm run test:e2e` | **The FE_SPEC §8 suite**: 27 Playwright specs driving the real backend through the journey, the checkout failures the stub gateway can produce, reloads, the stream, two tabs, two sales, a skewed clock, back-off and a phone layout. Starts `npm run dev` itself | the backend on `:8080` with an **open sale** (`docker/scripts/dev-up.sh`) |
-| `npm run typecheck:e2e` | type-checks the suite | nothing |
+| `npm test` | Vitest unit tests: routing, notices, the checkout error matrix, error copy, storage, formatting | — |
+| `npm run build` | Type check and production bundle | — |
+| `npm run test:e2e` | 27 Playwright specs against the real backend: the journey, checkout failures, reloads, the stream, two tabs, two sales, a skewed clock, a phone layout | Backend on `:8080` with an open sale (`docker/scripts/dev-up.sh`) |
 
-The suite uses only the API buyers and operators use — never SQL, never Redis, no test-only endpoints
-(ADR-078). It finds an open sale through `GET /events`, makes a fresh buyer per test with a new browser
-context, and pauses and resumes through the operator endpoints (admin / admin on the `dev` profile).
-States no API can create — a sale ending mid-test, a hold expiring, a lost counter, a sell-out — are
-covered by the backend's integration tests and this folder's unit tests. Each run buys a few tickets.
-`E2E_API`, `E2E_ADMIN` and `E2E_BASE_URL` point it elsewhere.
-
-Playwright writes `playwright-report/` and `test-results/`; both are ignored, and
-`npm run clean:playwright` removes them before every run.
+The e2e suite uses only the API buyers and operators use: no SQL, no Redis, no test-only endpoints.
+States no API can create (a hold expiring, a lost counter, a sell-out) are covered by the backend's
+integration tests. `E2E_API`, `E2E_ADMIN` and `E2E_BASE_URL` point it elsewhere.

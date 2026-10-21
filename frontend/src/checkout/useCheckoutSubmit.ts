@@ -31,7 +31,7 @@ export type PaymentDriver = {
 
 /**
  * - `ready` — the form is the buyer's.
- * - `paying` — a payment is on its way; Pay is disabled, never debounced (FE_SPEC §6).
+ * - `paying` — a payment is on its way; Pay is disabled, never debounced.
  * - `verifying` — the bank's challenge is open. Still in flight: the expiry branch stays frozen.
  * - `finishing` — a payment may be completing elsewhere (a duplicate, or a reload mid-charge).
  */
@@ -39,7 +39,7 @@ export type CheckoutPhase = "ready" | "paying" | "verifying" | "finishing";
 
 export type CheckoutMessage = { severity: "error" | "warning" | "info"; title: string; text: string };
 
-/** Checked for shape only: it catches `foo@@bar`, never `jhon@gmial.com` (FE_SPEC V4). */
+/** Checked for shape only: it catches `foo@@bar`, never `jhon@gmial.com` (view V4). */
 const EMAIL_SHAPE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 const DUPLICATE_POLL_MS = 2_000;
 /** How long a payment that may be finishing is waited for before the buyer may try again. */
@@ -121,7 +121,7 @@ export function useCheckoutSubmit({
   const emailValid = isEmailShaped(email);
 
   const submit = useCallback(async () => {
-    if (inFlight.current) return; // disabled on click, never debounced (FE_SPEC §6)
+    if (inFlight.current) return; // disabled on click, never debounced
     if (!emailValid) {
       setEmailTouched(true);
       return;
@@ -145,7 +145,7 @@ export function useCheckoutSubmit({
         return;
       }
 
-      // ONE idempotency key per hold, reused by every retry of it (FE_SPEC V4, ADR-054).
+      // ONE idempotency key per hold, reused by every retry of it (view V4, ADR-054).
       const request: CheckoutRequest = {
         holdToken,
         userEmail: email.trim(),
@@ -163,7 +163,7 @@ export function useCheckoutSubmit({
         if (error.code !== "PAYMENT_ACTION_REQUIRED" || !clientSecret) throw error;
 
         // 3-D Secure: still in flight for the whole challenge, so the expiry branch stays frozen,
-        // and no attempt is used (FE_SPEC V4).
+        // and no attempt is used (view V4).
         if (error.problem.expiresAt) setExpiresAt(error.problem.expiresAt);
         setPhase("verifying");
         const challenge = await driver.authenticate(clientSecret);

@@ -1,10 +1,10 @@
 const OFFSET_KEY = "fs.clockOffsetMs";
 
 /**
- * The server's clock, as an offset from the device's (FE_SPEC §0 rule 1). Every countdown derives from
+ * The server's clock, as an offset from the device's (client rule 1). Every countdown derives from
  * it, so a device four minutes fast still sees a reservation last as long as the server says.
  *
- * The offset is the one deliberately global session key (FE_SPEC §3): there is a single server
+ * The offset is the one deliberately global session key: there is a single server
  * clock, and every `serverTime` from any sale refreshes the same value. It is kept so the first
  * paint after a reload already runs on server time.
  */

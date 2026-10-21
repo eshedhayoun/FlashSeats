@@ -13,7 +13,7 @@ import org.junit.jupiter.api.Test;
 import org.springframework.boot.test.web.server.LocalServerPort;
 
 /**
- * {@code POST /session/reset} cannot be triggered by a cross-site form (ADR-060, §10 S13).
+ * {@code POST /session/reset} cannot be triggered by a cross-site form (ADR-060).
  *
  * <p>The endpoint expires the {@code fsid} cookie, and the session <em>is</em> the buyer's queue
  * position and their only authority over their hold. With CSRF disabled, a hidden form on any page

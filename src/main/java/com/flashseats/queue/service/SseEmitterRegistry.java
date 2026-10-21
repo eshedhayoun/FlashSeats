@@ -22,7 +22,7 @@ import tools.jackson.databind.ObjectMapper;
  *
  * <p><strong>One stream per tab, not per session</strong> (ADR-070). Streams are kept per event and
  * per session, and a session may hold several: one buyer with two tabs on a sale, or queued in two
- * sales at once — a supported state (FE_SPEC rule 5). Keying by session alone made every new tab
+ * sales at once — a supported state (client rule 5). Keying by session alone made every new tab
  * complete the previous one, so two tabs kicked each other off on every reconnect, and a promotion for
  * one sale was delivered to whichever sale's stream the session happened to hold last.
  */
@@ -123,7 +123,7 @@ public class SseEmitterRegistry {
     boolean sendPosition(Connection connection, int position, Integer estWaitSeconds) {
         int displayed = connection.clampPosition(position);
 
-        // An unknown estimate is null, not a -1 sentinel. QueueStatusResponse and FE_SPEC §4 both
+        // An unknown estimate is null, not a -1 sentinel. QueueStatusResponse and the stream both
         // use null, and a client that forgot to translate the sentinel would render "-1 seconds".
         Map<String, Object> frame = new LinkedHashMap<>();
         frame.put("position", displayed);
@@ -239,7 +239,7 @@ public class SseEmitterRegistry {
      *
      * <p>The clamp is an atomic rather than guarded by a lock. On JDK 21 a virtual thread that
      * blocks inside {@code synchronized} pins its carrier, and under a flash-sale spike that presents
-     * as a throughput collapse which looks like a Redis outage (global standards §7). Lock-free is
+     * as a throughput collapse which looks like a Redis outage. Lock-free is
      * simpler here anyway. Identity equality on purpose: two tabs are two connections.
      */
     static final class Connection {

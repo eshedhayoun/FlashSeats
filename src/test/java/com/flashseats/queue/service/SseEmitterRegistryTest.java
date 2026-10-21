@@ -25,7 +25,7 @@ class SseEmitterRegistryTest {
     }
 
     /**
-     * Queued in two sales at once is a supported state (FE_SPEC rule 5). Keyed by session alone, the
+     * Queued in two sales at once is a supported state (client rule 5). Keyed by session alone, the
      * second stream completed the first, and the two tabs reconnected over each other for ever (ADR-070).
      */
     @Test

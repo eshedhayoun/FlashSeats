@@ -1,7 +1,7 @@
 import { buy, expect, test } from "../support/fixtures";
 
 /*
- * FE_SPEC §1: the router is an ordered list. The rows reachable through the public API are here; the
+ * The router is an ordered list (frontend/README.md, Views). The rows reachable through the public API are here; the
  * rest of the order — a hold outranking a closed window, sold out above closed — is pinned by
  * routeFor.test.ts, and the server's half by QueueLifecycleIT and SalePauseIT.
  */

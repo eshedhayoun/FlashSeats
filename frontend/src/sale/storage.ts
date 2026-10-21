@@ -9,14 +9,14 @@ export type RecentOrder = {
 const RECENT_ORDERS_KEY = "fs.recentOrders";
 const RECENT_ORDERS_LIMIT = 20;
 
-/** Every per-sale key is `fs.{eventId}.{name}`: there is no "current event" (FE_SPEC §0 rule 5). */
+/** Every per-sale key is `fs.{eventId}.{name}`: there is no "current event" (client rule 5). */
 export function saleStorageKey(eventId: number, name: string) {
   return `fs.${eventId}.${name}`;
 }
 
 /*
  * Storage can throw — private browsing, a full quota, a sandboxed frame. Every value here is a hint
- * that speeds the next paint; the server is the truth (FE_SPEC §0 rule 3), so a failed read is simply
+ * that speeds the next paint; the server is the truth (client rule 3), so a failed read is simply
  * "no hint".
  */
 function read(storage: Storage, key: string): string | null {
@@ -107,7 +107,7 @@ export function removeQueueStart(eventId: number): void {
 }
 
 /**
- * ONE idempotency key per hold, reused by every retry of it (FE_SPEC V4). A fresh key per attempt
+ * ONE idempotency key per hold, reused by every retry of it (view V4). A fresh key per attempt
  * would open a second payment for one authentication (ADR-054).
  */
 export function getIdempotencyKey(eventId: number, holdToken: string): string {
@@ -132,7 +132,7 @@ export function setCheckoutEmail(eventId: number, holdToken: string, email: stri
 /**
  * Set before a payment is sent and cleared when any answer comes back. Still set after a reload means
  * the page went away mid-charge, which is when the buyer must be told a payment may be finishing —
- * never that nothing happened (FE_SPEC §3, the "V4, mid-charge" row).
+ * never that nothing happened.
  */
 export function markPaymentInFlight(eventId: number, holdToken: string): void {
   setSaleValue(eventId, `paying.${holdToken}`, String(Date.now()));
@@ -146,7 +146,7 @@ export function wasPaymentInFlight(eventId: number, holdToken: string): boolean 
   return getSaleValue(eventId, `paying.${holdToken}`) !== null;
 }
 
-/** Everything this tab kept for a hold that is over: settled, released or gone (FE_SPEC V5). */
+/** Everything this tab kept for a hold that is over: settled, released or gone (view V5). */
 export function clearHoldStorage(eventId: number, holdToken: string): void {
   if (getHoldToken(eventId) === holdToken) {
     removeSaleValue(eventId, "holdToken");
@@ -171,7 +171,7 @@ export function getRecentOrders(): RecentOrder[] {
 
 /**
  * The one list meant to outlive a tab: how a buyer finds every ticket across sales. The receipt token
- * in it is a bearer capability (FE_SPEC §3.1), so it is rendered only inside a link the buyer chooses
+ * in it is a bearer capability, so it is rendered only inside a link the buyer chooses
  * to open, never as text.
  */
 export function rememberOrder(

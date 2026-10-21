@@ -16,7 +16,7 @@ import org.springframework.web.filter.OncePerRequestFilter;
  * Assigns every request a W3C trace id, so the {@code traceId} on an error response and the trace id
  * in the logs are the same string.
  *
- * <p>Global standards §1 puts {@code traceId} on <em>every</em> problem response — it is what a
+ * <p>Every problem response carries {@code traceId} — <em>every</em> problem response — it is what a
  * support conversation starts from, and it is worthless if it cannot be found in the logs. An
  * inbound {@code traceparent} header is honoured when present so a trace crossing the proxy stays
  * whole.

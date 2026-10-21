@@ -1,7 +1,7 @@
 import { pause, resume } from "../support/backend";
 import { buy, expect, joinAndGetTurn, reserve, test } from "../support/fixtures";
 
-/** FE_SPEC §3, the recovery matrix: every reload point lands where the server says the buyer is. */
+/** The recovery matrix: every reload point lands where the server says the buyer is. */
 test.describe("Reloading at every step", () => {
   test("in line: the same place, still connected", async ({ newBuyer, sale }) => {
     await pause(sale.eventId); // nobody is let in, so the line holds still while it is measured

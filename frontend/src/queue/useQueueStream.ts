@@ -6,7 +6,7 @@ import type { ConnectionState } from "../ui/ConnectionIndicator";
 
 export type QueueStreamState = {
   connection: ConnectionState;
-  /** The latest position heard, clamped so it never rises (FE_SPEC V2). */
+  /** The latest position heard, clamped so it never rises (view V2). */
   position: number | null;
   estWaitSeconds: number | null;
   /** Per-tier availability heard since connecting, by tier id. Seed from the event, update from this. */
@@ -14,7 +14,7 @@ export type QueueStreamState = {
   paused: boolean;
 };
 
-/** Failed connection attempts before polling `/queue/status` starts alongside the retries (FE_SPEC §4). */
+/** Failed connection attempts before polling `/queue/status` starts alongside the retries. */
 const POLL_AFTER_FAILURES = 3;
 const POLL_INTERVAL_MS = 5_000;
 
@@ -27,7 +27,7 @@ function parse<T>(event: Event): T | null {
 }
 
 /**
- * One `EventSource` for one sale, closed when the view unmounts (FE_SPEC §0 rule 5, §4).
+ * One `EventSource` for one sale, closed when the view unmounts (client rule 5).
  *
  * Anything that changes which view the buyer belongs on — a promotion, the sale selling out or ending —
  * is answered by `onRefresh`, so the view is always the server's verdict and never this hook's guess.
@@ -132,7 +132,7 @@ export function useQueueStream(
           ...current,
           position: clampPosition(current.position, update.position),
           estWaitSeconds: update.estWaitSeconds,
-          // Positions only move while the sale runs, so one is also a resume (FE_SPEC V6).
+          // Positions only move while the sale runs, so one is also a resume (view V6).
           paused: false
         }));
       });
@@ -173,7 +173,7 @@ export function useQueueStream(
       connect();
     };
 
-    // The previous backoff measured a dead network, not a busy server (FE_SPEC §4).
+    // The previous backoff measured a dead network, not a busy server.
     const onOnline = () => reconnectNow();
     const onOffline = () => setState((current) => ({ ...current, connection: "reconnecting" }));
     const onVisible = () => {

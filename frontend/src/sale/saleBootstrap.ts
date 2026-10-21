@@ -8,7 +8,7 @@ export type BootstrappedSale = {
   route: SaleRoute;
 };
 
-/** The recovery protocol (FE_SPEC §3): ask the server, align the tab's hints with it, route. */
+/** The recovery protocol: ask the server, align the tab's hints with it, route. */
 export async function bootstrapSale(
   eventId: number,
   options: { buyMore?: boolean } = {}
@@ -24,7 +24,7 @@ export async function bootstrapSale(
 
 /**
  * Drops what the server says is over, and only that. A section the server could not read is left
- * alone: "no hold" and "could not read holds" are different facts (FE_SPEC §3, `partial`).
+ * alone: "no hold" and "could not read holds" are different facts, reported in `partial`.
  */
 function synchronizeStorage(eventId: number, state: SaleState): void {
   if (!state.partial.includes("hold")) {

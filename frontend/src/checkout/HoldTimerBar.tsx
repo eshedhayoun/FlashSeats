@@ -9,7 +9,7 @@ import { useClockTick } from "../clock/useClockTick";
 import { Countdown, countdownTone } from "../ui/Countdown";
 
 /**
- * The hold, always in view (FE_SPEC V4): sticky, and urgent in words as well as colour. It re-renders
+ * The hold, always in view (view V4): sticky, and urgent in words as well as colour. It re-renders
  * itself every second and nothing else — the payment form below must never remount mid-entry.
  */
 export const HoldTimerBar = memo(function HoldTimerBar({
