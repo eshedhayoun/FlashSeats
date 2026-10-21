@@ -30,7 +30,7 @@ version that never oversells but cannot be walked proves nothing to anyone.
 
 ```bash
 # The whole demo, as an evaluator runs it: secrets, the three-replica cluster, two seeded sales
-docker/scripts/professor-demo.sh          # then open http://localhost:8080 — the React client
+docker/scripts/demo.sh          # then open http://localhost:8080 — the React client
 
 # Development
 cp .env.example .env
@@ -677,7 +677,7 @@ A console is presentation and can wait. The endpoints are the capability. It cam
   to `:8080`. All six views, per-event namespaced storage, `serverTime`-derived countdowns and a
   keyless stub-payment mode so decline, outage and 3-D Secure are walkable in a browser (ADR-058).
   **Wired into the cluster in Pass 15** (ADR-068): the nginx image builds it, and
-  `docker/scripts/professor-demo.sh` starts the whole stack with two seeded sales in one command.
+  `docker/scripts/demo.sh` starts the whole stack with two seeded sales in one command.
 - ~~**The Playwright suite specified in `FE_SPEC.md` §8.**~~ **Built in Pass 15:** 27 specs in
   `frontend/e2e` drive the real backend through the journey, the stub's checkout failures, the reload
   points, the stream, two tabs, two sales, a skewed clock, back-off and a phone layout, using only the
@@ -2158,13 +2158,13 @@ rather than an archaeology.
 | **The console at `/admin`** | A lazily loaded chunk the buyer never downloads. Sign-in checks the credentials against the list; they live in memory only. One card per sale with its window, stock, a readiness warning that names the fix, and only the buttons the server would accept — each rule naming the states it admits. Rebuild and delete confirm first. Polls every 5 s, one request at a time, and an older answer never overwrites a newer one |
 | **No browser login dialog** | A `401` to a request marked `X-Requested-With` challenges with `FlashSeatsBasic`, which browsers do not prompt for; every other client still gets `Basic` |
 | **A deleted sale's streams are closed** | A stream can be opened before a sale opens; after a delete the broadcaster failed to sweep it every 2 s on every replica. It now sends `sale-closed` and stops |
-| **The demo says what it runs** | `professor-demo.sh` names the console and, with `STRIPE_ENABLED=true`, the Stripe test cards instead of the stub's selector. The documented `docker compose logs stripe` failed with "no such service: nginx"; it needs both profiles |
+| **The demo says what it runs** | `demo.sh` names the console and, with `STRIPE_ENABLED=true`, the Stripe test cards instead of the stub's selector. The documented `docker compose logs stripe` failed with "no such service: nginx"; it needs both profiles |
 
 **Verified:** 320/320 backend and 78 vitest; a browser run of the console against the dev stack and
 again through nginx on the cluster (wrong password inline with no browser dialog, sign-in, create,
 delete, pause, resume, rebuild clearing a real "not trusted" warning, sign-out on reload); and the
 reviewer's path from an anonymous clone of the branch with the Stripe test keys —
-`professor-demo.sh`, `stripe-check.sh` passing, a browser purchase with a declined and then a
+`demo.sh`, `stripe-check.sh` passing, a browser purchase with a declined and then a
 successful real test card, and the ticket in Mailpit.
 
 ### Pass 16 — email and environment readiness
@@ -2176,7 +2176,7 @@ successful real test card, and the ticket in Mailpit.
   development sink.
 - **A clean checkout is self-describing.** The required SMTP variables are now in `.env.example`
   and the README states which values must be replaced before preview deployment. The private `.env`
-  remains ignored and is not required as a source of configuration. `professor-demo.sh` creates the
+  remains ignored and is not required as a source of configuration. `demo.sh` creates the
   ignored file automatically on a fresh clone, then generates the cluster secrets; Mailpit remains
   the default and Resend is documented as an optional real-email demonstration. The template also
   documents the optional memory, load-test, metadata-cache and admission-budget overrides used by
@@ -2192,7 +2192,7 @@ successful real test card, and the ticket in Mailpit.
   No behaviour changed.
 - **A fresh clone runs, on the stub and on real Stripe (15 Oct 2026).** Cloned `main` anonymously
   from GitHub, isolated Compose project, nothing pre-existing:
-  - `professor-demo.sh` exits 0 and opens both sales. A full purchase through nginx works:
+  - `demo.sh` exits 0 and opens both sales. A full purchase through nginx works:
     declined card `402` with the hold intact, confirmed order, PDF download, and the ticket email in
     Mailpit with the PDF attached.
   - With the reviewer's Stripe test keys applied as the credentials sheet instructs, the gateway
@@ -2238,12 +2238,12 @@ successful real test card, and the ticket in Mailpit.
 | **Promotion writes in one pipeline; a metadata miss loads once** (ADR-065) | Ported from the teammate's branch. The promotion tick no longer makes three Redis round trips per buyer, and a waiting room polling one event no longer spikes the pool each time the cached row expires. The waiting-room drill is a `loadtest` service; its unredeemed-pass ceiling and the branch's unusable ~9k figure are recorded in §11 |
 | **k6 keys are unique per run** | The stub ignores the checkout idempotency key, but Stripe keeps one for 24 hours and would answer a reused key with the previous run's response. The waiting-room drill also parks each VU after its one journey (a fix from the teammate's last commit), so it measures arrivals rather than a request loop |
 | **Failures are classified by what they prove** (ADR-067) | A reserve whose hold transaction never began — a pool timeout, the common failure under pressure — now gives its seats back instead of hiding them until a rebuild. An unknown path is `404 NOT_FOUND`, not `500`. The rate limiter fails open (counted in `flashseats.bot.limiter.unavailable`) instead of answering every call a bare `500` when Redis is down. Request fields are bounded by their columns, and only the hold-token constraint reads as a concurrent checkout |
-| **The cluster serves the React client; one command starts the demo** (ADR-068) | Ported from the teammate's final commits. The nginx image builds the SPA and serves it at `:8080` with a deep-link fallback, replacing nginx's own 404. `docker/scripts/professor-demo.sh` needs only Docker: secrets, build, health, and two seeded, pre-warmed sales |
+| **The cluster serves the React client; one command starts the demo** (ADR-068) | Ported from the teammate's final commits. The nginx image builds the SPA and serves it at `:8080` with a deep-link fallback, replacing nginx's own 404. `docker/scripts/demo.sh` needs only Docker: secrets, build, health, and two seeded, pre-warmed sales |
 | **The client, finished and redesigned** (Step 9) | Every FE_SPEC view rebuilt on a new design system — light and dark themes, AA-checked; a shell with a skip link and "My tickets"; skeletons; one `Notice`, `ErrorState` and copy table for every error code. Behaviour fixed on the way: refreshes happen behind the content instead of wiping it (the typed email survives one, and a reload mid-charge says a payment may be finishing); the buyer is told what happened to their seats and money after an expiry, a release, a refund or a lost turn — even across a reload; the grace extension shows on the timer; the pre-sale page opens itself at T-0; a failed pass cannot loop; back-pressure is retried a bounded number of times on `Retry-After`; no request is ever made for `/events/NaN`. A sold-out sale says so on the event page. The static page is labelled a minimal API demo, with real keyboard-selectable tiers, per-event storage, a working "Leave queue", an event picker and AA contrast in dark mode |
 | **Leaving the line, and quiet disconnects** (ADR-077) | `POST /queue/leave` takes a buyer out of the line and drops an unspent pass — FE_SPEC's "Leave queue" had nothing to call. A client that goes away mid-stream is now a debug line: the `Exception` backstop had logged every closed waiting-room tab as an `ERROR` with two stack traces, then failed again writing to the dead socket. Two server messages rewritten to FE_SPEC §7's tone |
 | **The browser suite** (ADR-078) | 27 Playwright specs replace the scaffold, driving only the API buyers and operators use: the journey to a downloaded ticket, every stub-reachable checkout failure, the reload points, pause and resume on the stream, the polling fallback, leaving the line, two tabs, two sales, a skewed clock, back-off, dead links and a phone layout. A first draft seeded with SQL and `redis-cli`; what no API can create is proven by the backend's integration tests and the client's unit tests instead. `dev-up.sh` also now names any open sale whose counters an earlier Redis vouched for, with the rebuild that repairs it, instead of calling it walkable |
 | **Ten thousand buyers** (ADR-079) | The concurrent-sales drill at 10,000 buyers sold 22–28 % and the load generator was OOM-killed. Nothing errored; the hot path was paying for things nobody asked for. Every status poll opened two TCP connections — a Lettuce pipeline cannot share the multiplexed connection and no pool is configured — so the status read and the promotion writes are now Lua scripts on the shared connection (201 reads opened 201 connections; now none). Every script call re-read its file's timestamp out of the jar under a lock; scripts are read once. Spring Security's per-filter and Lettuce's per-command observations, read by nobody, are off. Rate-limit buckets expire (one drill left 1.1 million keys under `noeviction`). "Sold out" is told when stock is gone, not up to ten minutes later when the last admission lapses. The harness drives ten buyers per k6 VU, stays in line when told sold out, takes one seat when two are not there, and polls at the client's 5 s. Result: 10,000 buyers, 2,500 / 2,500 sold; 2,000 buyers, checkout p99 195 ms (was 6.1 s) |
-| **The evaluator's one command, on a clean machine** | Run from a fresh clone for the first time, `professor-demo.sh` failed twice before doing anything useful. It read `HTTP_PORT` from a `.env` that does not exist yet, and under `set -euo pipefail` the failed `grep` ended it on its first line, with exit 2 and no output. Past that, it took the generated operator password one column too far and dropped its first character, so seeding the demo sales answered `401`. Both fixed; from a fresh clone it now builds, seeds both sales, and sells a ticket whose PDF lands in Mailpit |
+| **The evaluator's one command, on a clean machine** | Run from a fresh clone for the first time, `demo.sh` failed twice before doing anything useful. It read `HTTP_PORT` from a `.env` that does not exist yet, and under `set -euo pipefail` the failed `grep` ended it on its first line, with exit 2 and no output. Past that, it took the generated operator password one column too far and dropped its first character, so seeding the demo sales answered `401`. Both fixed; from a fresh clone it now builds, seeds both sales, and sells a ticket whose PDF lands in Mailpit |
 | **Confirming holds the order row; a second charge goes back** (ADR-075) | A retry that resumed a stranded order moved its version, and `confirm` treated that as losing: a valid purchase went to the refund claim — which succeeded, the order being still unresolved — and the retry then charged again. `confirm` now locks the row it checks. And two checkouts for one hold, possible once the in-flight guards expire, left the second charge with no ending; every resolved order now names its charge, and any other settled charge for the hold is refunded and counted in `flashseats.payment.charge.stray` |
 | **Small gaps** (ADR-076) | An early hold timer was re-armed inside its read transaction; it waits for the commit now. Each availability change reached every stream once per replica and was retained as many times; one replica announces it, via `queue:availability:{e}`, and `sale-closed` is retained once via `queue:closed:{e}`. nginx no longer logs query strings, which carried 90-day receipt tokens. `SecretsGuard` refuses short or shared signing keys and any admin password that is not an adaptive hash — the compose default `admin` used to start cleanly and fail every login |
 | **The provider path, fixed where the stub cannot see** (ADR-074) | The client's one idempotency key went to Stripe unchanged on every new charge, so a second card after a decline got the first decline replayed or an idempotency error counted as an outage; it is now scoped to the attempt. Finishing 3-D Secure close to expiry is no longer refused as a new charge. A charge settled by webhook is recorded as `SUCCEEDED` on the ledger instead of staying `PROCESSING`. Still wants a run of `stripe-check.sh` with a real test key |

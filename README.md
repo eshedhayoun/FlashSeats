@@ -7,11 +7,32 @@ they all arrive in the same second.** Exactly 500 must sell, nobody may be charg
 did not get, and the 9,500 who miss out must find out quickly. The system is built as a modular
 monolith on Java 21 and Spring Boot 4, runs as three replicas behind nginx, and has a React client.
 
+**Measured:** 10,000 simulated buyers across five concurrent sales sold 2,500 of 2,500 seats, with
+zero oversold and the stock invariant exact on every tier ([§4.3](#43-load-test)).
+
+## Highlights
+
+The hard problems, and where each one is solved and tested:
+
+| Problem | Solution | Code | Proof |
+| :--- | :--- | :--- | :--- |
+| Thousands of buyers race for the last seat | One Redis Lua script reads, compares and decrements atomically. "Sold out" and "counter missing" are different return codes, so a lost key never reads as sold out | [`stock_reserve.lua`](src/main/resources/redis/stock_reserve.lua) | [`StockReserveConcurrencyIT`](src/test/java/com/flashseats/catalog/StockReserveConcurrencyIT.java) |
+| Three replicas all see the same hold expire | A conditional `UPDATE … WHERE status = 'ACTIVE'` in PostgreSQL; only the caller with rowcount 1 returns the seats, and only after its commit | [`TicketHoldRepository`](src/main/java/com/flashseats/hold/repository/TicketHoldRepository.java) | [`HoldLifecycleIT`](src/test/java/com/flashseats/hold/HoldLifecycleIT.java), [`hold-expiry-check.sh`](docker/scripts/hold-expiry-check.sh) |
+| Checkout and the payment webhook settle the same charge | Every order transition is a compare-and-set on the `orders` row; a refund is claimed on that row before any money moves | [`OrderRepository`](src/main/java/com/flashseats/order/repository/OrderRepository.java), [`OrderCommitService`](src/main/java/com/flashseats/order/service/OrderCommitService.java) | [`SettlementArbiterIT`](src/test/java/com/flashseats/order/SettlementArbiterIT.java) |
+| 10,000 buyers would exhaust the connection pool | A waiting room in a Redis sorted set; one promotion tick across the cluster spends a shared, atomic admission allowance | [`PromotionWorker`](src/main/java/com/flashseats/queue/service/PromotionWorker.java), [`promotion_budget.lua`](src/main/resources/redis/promotion_budget.lua) | [`GlobalPromotionBudgetIT`](src/test/java/com/flashseats/queue/GlobalPromotionBudgetIT.java) |
+| A buyer's live connection is on another replica | Server-Sent Events, with promotions fanned out over Redis pub/sub | [`QueueBroadcaster`](src/main/java/com/flashseats/queue/service/QueueBroadcaster.java), [`QueuePubSubListener`](src/main/java/com/flashseats/queue/service/QueuePubSubListener.java) | [`fanout-check.sh`](docker/scripts/fanout-check.sh) |
+| A confirmed order must always produce a ticket | Transactional outbox drained with `FOR UPDATE SKIP LOCKED`, RabbitMQ with dead-lettering, and an insert-then-send dedupe on the consumer | [`OutboxRelay`](src/main/java/com/flashseats/order/service/OutboxRelay.java), [`NotificationLogRepository`](src/main/java/com/flashseats/notification/repository/NotificationLogRepository.java) | [`OutboxRecoveryIT`](src/test/java/com/flashseats/order/OutboxRecoveryIT.java) |
+| Nine modules must not tangle | Facade-only calls between modules, verified at build time by Spring Modulith | [`ModularityTests`](src/test/java/com/flashseats/app/ModularityTests.java) | `./mvnw test` |
+
+Every non-obvious decision, and the defect it prevents, is one of 81 [Architecture Decision
+Records](docs/00-architecture-decisions.md). [`docs/07-system-on-one-page.md`](docs/07-system-on-one-page.md)
+is the shortest tour of the whole system.
+
 **Quick start.** You need only Docker and a POSIX shell (Git Bash on Windows). The first run builds
 the images and takes several minutes; give Docker at least 8 GB of memory.
 
 ```bash
-docker/scripts/professor-demo.sh     # secrets, a three-replica cluster, two open sales; prints the admin password
+docker/scripts/demo.sh     # secrets, a three-replica cluster, two open sales; prints the admin password
 open http://localhost:8080           # the React client: event page, waiting room, checkout, PDF ticket
 open http://localhost:8080/admin     # the operator console: sign in as admin with the printed password
 open http://localhost:8025           # the local Mailpit inbox, where the ticket email arrives
@@ -360,7 +381,7 @@ We built the system in four phases, each ending with a system that is *correct* 
 Concurrency guarantees were never retrofitted. The design went through four review passes before
 any code, and the built system through seventeen more, each logged in
 [`docs/06-mvp-overview.md`](docs/06-mvp-overview.md) §13. Every non-obvious decision is recorded
-as one of 80 Architecture Decision Records (ADRs), most of them naming the defect they fixed.
+as one of 81 Architecture Decision Records (ADRs), most of them naming the defect they fixed.
 
 ### 3.6 Testing strategy
 
@@ -388,7 +409,7 @@ compose.yaml, Dockerfile   the local stack and the application image
 
 ### 4.1 The buyer's journey
 
-`docker/scripts/professor-demo.sh` generates secrets, builds and starts the three-replica cluster,
+`docker/scripts/demo.sh` generates secrets, builds and starts the three-replica cluster,
 waits until it is healthy, and seeds two open sales. The screenshots below were taken on that
 cluster at http://localhost:8080.
 
@@ -497,7 +518,7 @@ completed 3-D Secure challenge. All load and cluster runs used the stub gateway.
 
 <img src="docs/images/admin-console.png" alt="Operator console listing an upcoming sale, two open sales and an ended one, with their actions" width="720">
 
-`http://localhost:8080/admin`, signed in as `admin` with the password `professor-demo.sh` prints.
+`http://localhost:8080/admin`, signed in as `admin` with the password `demo.sh` prints.
 Each sale shows its window, its exact remaining stock per tier, and only the actions the server
 would accept right now:
 
@@ -587,3 +608,7 @@ docker/scripts/dev-up.sh                    # infrastructure + a sale that is ac
 cd frontend && npm install && npm run dev   # the React client on :5173
 ./mvnw test                                 # 320 backend tests; needs Docker
 ```
+
+## License
+
+[MIT](LICENSE).

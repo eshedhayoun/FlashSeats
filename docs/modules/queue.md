@@ -1,8 +1,7 @@
 # Module: `queue`
 
 > **Describes what is built.** Where something is planned rather than built it says so. No class
-> names: a class list drifts silently, owned state and exposed contract do not
-> ([`../../CLAUDE.md`](../../CLAUDE.md), "Updating the docs is part of the change").
+> names: a class list drifts silently, while owned state and the exposed contract do not.
 
 **Package:** `com.flashseats.queue` · **Storage:** Redis only · **Depends on:** `catalog`, `shared`
 
