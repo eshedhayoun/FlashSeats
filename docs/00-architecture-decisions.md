@@ -3537,3 +3537,47 @@ tickets.
   creation *is* the publish, and delete is the undo.
 - **Migrating `seed.sh` to the new endpoint.** The SQL seeds also open sales immediately, which this
   endpoint deliberately refuses.
+
+---
+
+## ADR-081 — The ticket is laid out as a ticket, and carries no barcode until something scans it
+
+**Status:** accepted. Changes only `TicketPdfRenderer`'s layout; no contract, edge or key changes.
+
+**Context.** The PDF was seven left-aligned lines on a blank A4 page: no frame, no labels, nothing a
+door steward would recognise as a ticket. A long event title ran off the right edge, because nothing
+measured it. Dates were formatted in the JVM's default locale, so the bytes depended on which replica
+rendered them, and the time was UTC with nothing saying so.
+
+Print-at-home practice from ticketing vendors and venue forums is consistent: mirror the layout of a
+paper ticket so staff find fields quickly; make the ticket number prominent, because it is what staff
+type in when a scan fails; keep the ticket clear of the folds a letter-folded A4 sheet gets; use
+system fonts and keep the file small for email.
+
+**Decision.**
+
+1. **A bordered ticket with a tear-off stub**, wholly inside the top third of the page so neither
+   letter fold crosses it. The main panel has the title, venue and labelled fields (date, start
+   time, tier, admits); the stub repeats the admit count and the tier, with the order number large.
+   A brand band on top says which ticket of the order the page is ("TICKET 1 OF 2").
+2. **Everything an operator types is measured.** The title takes the largest size from 24 pt to
+   17 pt that fits one line, else wraps to two lines at 18 pt and elides the rest. Every other field
+   elides to its column. Nothing the operator enters can push text off the page.
+3. **Dates are formatted in English and labelled UTC.** The bytes no longer depend on a replica's
+   locale, and the buyer is told what zone the time is in. A venue time zone would be better; the
+   catalog does not have one.
+4. **Below the ticket, plain notes**: what this page admits, to bring every page of a multi-ticket
+   order, to keep the file private, and where to download it again (ADR-050).
+5. **Standard-14 fonts stay** (ADR-029, ADR-042). The page is drawn with vector paths and two fonts,
+   about 3 KB for two tickets.
+
+**Rejected.**
+
+- **A barcode or QR code.** It is the first thing every vendor puts on a ticket, and it is what a
+  scanner validates. Nothing here validates one: there is no per-ticket credential and no check-in
+  endpoint. Encoding the order number would print a sequential, guessable value
+  (`06-mvp-overview.md` §10, S7) dressed as a credential, and suggest a check that does not happen. A real one needs a signed per-ticket token
+  (a new `SignedToken` kind) and a redeem-once check-in endpoint. Until then the order number,
+  printed large, is the honest identifier.
+- **An embedded Unicode font.** Still the real fix for non-Latin titles (ADR-042), and still a
+  separate change: it adds a font file to the jar and size to every email.

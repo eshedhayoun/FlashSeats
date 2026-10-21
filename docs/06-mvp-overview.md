@@ -414,6 +414,10 @@ Honest list. None of these is hidden behind a passing test.
   cluster-wide. See §11 Stage 4c item 5 for why making it a singleton would make it worse.
 - ~~**There is no way to retrieve a ticket.**~~ **Fixed:** `GET /orders/{orderNumber}/ticket.pdf`
   serves the same renderer used by notification, authorised by matching session or receipt token.
+- **The ticket has no barcode** (ADR-081). Nothing validates one: there is no per-ticket credential
+  and no check-in endpoint, so a code would only dress the sequential order number up as a
+  credential. Door staff read the order number, printed large on the stub. Times are printed in
+  UTC because the catalog has no venue time zone.
 - ~~**Dead facade surface.**~~ **Fixed:** the unused order summary and hold release facade paths are
   gone; the remaining facades are the module contracts production uses.
 - ~~**Session identity spans `bot` and `shared`.**~~ **Fixed:** identity lives under

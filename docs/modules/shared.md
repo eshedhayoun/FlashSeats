@@ -91,6 +91,9 @@ payload into the shape and calls a function. It is deliberately narrower than ei
 carrying no email, no receipt token and no amount, so a renderer cannot print a bearer capability
 onto a page by accident.
 
+The renderer draws with the standard-14 fonts only and formats dates in a fixed locale, so its output
+does not depend on the replica that produced it. Its layout is ADR-081; it prints no barcode.
+
 ---
 
 ## 5. Known gaps

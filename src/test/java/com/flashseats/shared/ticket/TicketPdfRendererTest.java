@@ -5,6 +5,9 @@ import static org.assertj.core.api.Assertions.assertThatCode;
 
 import java.time.Instant;
 import java.util.List;
+import org.apache.pdfbox.Loader;
+import org.apache.pdfbox.pdmodel.PDDocument;
+import org.apache.pdfbox.text.PDFTextStripper;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 
@@ -58,7 +61,22 @@ class TicketPdfRendererTest {
     @Test
     @DisplayName("One page per line item, so a multi-tier order is not one wrong ticket")
     void multiTierOrderRendersEveryItem() throws Exception {
-        assertThat(renderer.render(payloadTitled("Aurora Fest"))).isNotEmpty();
+        try (PDDocument pdf = Loader.loadPDF(renderer.render(payloadTitled("Aurora Fest")))) {
+            assertThat(pdf.getNumberOfPages()).isEqualTo(2);
+            String text = new PDFTextStripper().getText(pdf);
+            assertThat(text).contains("TK-00001", "VIP", "Floor", "TICKET 1 OF 2", "TICKET 2 OF 2");
+        }
+    }
+
+    @Test
+    @DisplayName("A title longer than the ticket is wrapped and elided, not drawn off the page")
+    void longTitleStillRenders() throws Exception {
+        String title = "The Extraordinarily Long Farewell World Tour of a Band With a Very Long Name "
+                + "Featuring Special Guests and an Orchestra";
+
+        try (PDDocument pdf = Loader.loadPDF(renderer.render(payloadTitled(title)))) {
+            assertThat(new PDFTextStripper().getText(pdf)).contains("The Extraordinarily").contains("…");
+        }
     }
 
     private TicketDocument payloadTitled(String title) {

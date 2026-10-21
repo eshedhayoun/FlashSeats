@@ -562,7 +562,7 @@ an invariant the system checks, and a number anyone can reproduce with one comma
 | Document | What it covers |
 | :--- | :--- |
 | [`docs/07-system-on-one-page.md`](docs/07-system-on-one-page.md) | **Read first.** The whole system on one page: journey, module graph, checkout sequence, and what looks removable but is not |
-| [`docs/00-architecture-decisions.md`](docs/00-architecture-decisions.md) | 80 ADRs: every non-obvious decision and the failure it prevents |
+| [`docs/00-architecture-decisions.md`](docs/00-architecture-decisions.md) | 81 ADRs: every non-obvious decision and the failure it prevents |
 | [`docs/01-system-architecture.md`](docs/01-system-architecture.md) | Stack, module map, dependency graph, deployment |
 | [`docs/02-high-level-design.md`](docs/02-high-level-design.md) | Infrastructure and the concurrency model |
 | [`docs/03-end-to-end-flow.md`](docs/03-end-to-end-flow.md) | **The authoritative user journey**, step by step |
