@@ -1,7 +1,7 @@
 # Module: `order`
 
-> **Describes what is built.** No class names — see [`../../CLAUDE.md`](../../CLAUDE.md), "Updating
-> the docs is part of the change".
+> **Describes what is built.** No class names: a class list drifts silently, while owned state and the
+> exposed contract do not.
 
 **Package:** `com.flashseats.order` · **Storage:** PostgreSQL only
 **Depends on:** `hold`, `catalog`, `payment`, `queue`, `shared`

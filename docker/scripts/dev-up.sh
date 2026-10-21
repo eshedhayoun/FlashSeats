@@ -29,10 +29,10 @@
 #      gives you a browse list of CLOSED events and no journey at all.
 #
 # WHAT THIS SCRIPT WILL NOT DO. It never writes a stock counter. Seeding a
-# counter from `total_capacity` is the first trap in CLAUDE.md's table: it
-# resurrects every sold ticket. Where counters are missing it says so and points
-# at the two legal recoveries (a clean reset, or the rebuild endpoint), because
-# only those two derive the number from something that knows it (ADR-004).
+# counter from `total_capacity` resurrects every sold ticket. Where counters
+# are missing it says so and points at the two legal recoveries (a clean reset,
+# or the rebuild endpoint), because only those two derive the number from
+# something that knows it (ADR-004).
 
 set -euo pipefail
 

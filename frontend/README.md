@@ -5,7 +5,7 @@ page, the waiting room, seat selection, checkout (the stub gateway or Stripe), t
 ticket. React 18, MUI 6, Vite, TypeScript.
 
 Under `--profile cluster` the nginx image builds it and serves it at `:8080` (ADR-068), and
-`docker/scripts/professor-demo.sh` starts that whole stack in one command. For development it runs on
+`docker/scripts/demo.sh` starts that whole stack in one command. For development it runs on
 its own dev server, below. The backend's `src/main/resources/static/index.html` is a minimal API demo,
 not this client.
 

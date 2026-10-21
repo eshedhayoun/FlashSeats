@@ -71,6 +71,37 @@ under 200 ms.
 **k6 harness** fires 10,000+ virtual users at Nginx to prove zero overbooking under real
 contention — the only way to know the concurrency design actually works.
 
+### Every Redis key
+
+The whole Redis surface in one table, so a change can be weighed against all of it rather than one
+module's corner:
+
+| Key | Module | Type | TTL | Purpose |
+| :--- | :--- | :--- | :--- | :--- |
+| `catalog:stock:{e}:{t}` | `catalog` | String | none | **the live inventory count**; `noeviction` is mandatory |
+| `catalog:vouch:{e}` | `catalog` | String | none | which Redis instance last derived this event's counters (ADR-046) |
+| `queue:waiting:{e}` | `queue` | ZSET | sale end | the waiting room; score is arrival, so rank is position. Never deleted (ADR-035) |
+| `queue:pass:{e}:{sid}` | `queue` | String | 120 s | the single-use promotion pass |
+| `queue:passes:{e}` | `queue` | ZSET | sale end | live passes, scored by expiry, so a count is one `ZCOUNT` |
+| `queue:admit:{e}:{sid}` | `queue` | String | 600 s | proof of admission into the sale (ADR-020) |
+| `queue:admissions:{e}` | `queue` | ZSET | sale end | live admissions, same trick as `passes` |
+| `queue:events:{e}` | `queue` | Pub/Sub | — | promotion fan-out to whichever replica holds the SSE connection (ADR-007) |
+| `queue:replay:{e}` | `queue` | ZSET | sale end | the last 256 **broadcast** frames, scored by sequence, so a reconnect can be handed what it missed. A session-targeted frame is never retained here (ADR-058) |
+| `queue:replay-seq:{e}` | `queue` | String | sale end | the monotonic sequence behind those frames; the only SSE `id` the system issues |
+| `queue:availability:{e}` | `queue` | String | retention | the last `tier-availability` frame announced, swapped with `SET … GET` so one replica announces a change rather than each (ADR-076) |
+| `queue:closed:{e}` | `queue` | String | retention | claimed with `SET NX` by the one replica that announces `sale-closed` (ADR-076) |
+| `queue:promote:{e}` | `queue` | String | 900 ms | makes the promotion tick a singleton across replicas (ADR-032) |
+| `queue:budget` | `queue` | String | one tick | **the cluster-wide admission allowance**, shared by every open sale; the one key deliberately not scoped by event (ADR-049) |
+| `queue:exhausted:{e}` | `queue` | String | sale end | derived sold-out marker; deleted the moment stock returns (ADR-035) |
+| `payment:inflight:{holdToken}` | `payment` | String | 90 s | duplicate-charge guard, anchored to the hold (ADR-014) |
+| `bot:rate:*` | `bot` | Bucket4j | until full again + 10 s | session-first rate limiting, IP as a coarse backstop (ADR-011, ADR-079) |
+| `bot:verified:{sid}` | `bot` | String | 900 s | one challenge verification, remembered per session (ADR-055) |
+| `hold:{token}` | `hold` | String | hold TTL | expiry timer. A **hint, never an authority**: the listener re-reads the row, and the settle-once claim makes three replicas restore once (ADR-048) |
+
+Two rules over that table: a module touches only its own prefix, and **no key is ever the authority
+for anything**. Lose the lot and `ticket_holds` plus the rebuild reconstruct the state; that is what
+makes `noeviction` a correctness setting rather than a tuning one.
+
 ---
 
 ## 3. The concurrency model

@@ -2,7 +2,7 @@
 
 > How to run FlashSeats locally, configure it, and drive the multi-replica cluster and load drills.
 > The project report is the [`README`](../README.md); this page holds the operational detail it links
-> to. For the one-command demo, `docker/scripts/professor-demo.sh` is all that is needed.
+> to. For the one-command demo, `docker/scripts/demo.sh` is all that is needed.
 
 ---
 
@@ -164,7 +164,7 @@ The cluster's nginx image builds the client from `frontend/`, so it **includes**
 `frontend/.env.local`: a publishable key there is baked into the client served at `:8080`. The
 backend's payment mode is set in the root `.env`: `STRIPE_ENABLED=false` for the deterministic stub,
 `true` for real Stripe. Set both sides together. To return to the stub, blank the key, set
-`STRIPE_ENABLED=false`, and rerun `professor-demo.sh`, which rebuilds the image.
+`STRIPE_ENABLED=false`, and rerun `demo.sh`, which rebuilds the image.
 
 With no `VITE_STRIPE_PUBLISHABLE_KEY`, the checkout offers the stub's outcomes directly: succeed,
 decline, gateway outage, 3-D Secure. This is the easiest way to walk the failure branches in a
@@ -232,7 +232,7 @@ docker/seed/                    seed.sh (one sale) · seed-concurrent.sh (five, 
 docker/k6/flash-sale.js         load harness; asserts zero overbooking
 docker/k6/concurrent-sales.js   E sales at once (ADR-049); pair with pool-pressure.sh
 docker/k6/waiting-room.js       the waiting room alone: join and poll, no checkout
-docker/scripts/professor-demo.sh   the evaluator's one command (ADR-068)
+docker/scripts/demo.sh   the evaluator's one command (ADR-068)
 docker/scripts/dev-up.sh        the local development entry point
 docker/scripts/fanout-check.sh  promotion fan-out across replicas, 30/30 or it fails
 docker/scripts/hold-expiry-check.sh   expiry restores seats once, across replicas

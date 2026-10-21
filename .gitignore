@@ -79,3 +79,10 @@ cp.txt
 # commands that were approved, and one of them exported the admin plaintext, so
 # `git add .` would have committed a live credential.
 .claude/
+
+# Claude Code's project instructions. Kept locally for the assistant; not part of the
+# published repository (the Redis key map it carried is in docs/02-high-level-design.md §2).
+CLAUDE.md
+
+# Playwright's raw JSON report, written by a local e2e run.
+frontend/test-results-raw.json

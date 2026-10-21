@@ -2991,7 +2991,7 @@ one of which fails silently if skipped.
    the SSE stream and health keep their own, more specific locations, and the client calls them on
    the same origin — no CORS, no proxy. The build sets no Stripe key, so the packaged client drives
    the stub gateway, which is what the backend runs by default.
-2. **`docker/scripts/professor-demo.sh` is the evaluator's one command.** It needs only Docker and a
+2. **`docker/scripts/demo.sh` is the evaluator's one command** (named `professor-demo.sh` until the project became a portfolio piece). It needs only Docker and a
    POSIX shell: it generates secrets (and a fresh admin password if it cannot otherwise read one),
    builds and starts the cluster, waits for health through nginx, and runs `docker/seed/seed-demo.sh`,
    which seeds two sales (events 9101 and 9102), pre-warms them while `UPCOMING`, and waits for both

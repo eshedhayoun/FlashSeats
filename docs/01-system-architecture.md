@@ -34,7 +34,7 @@ replica's heap, which is why queue promotions fan out over Redis Pub/Sub (ADR-00
 | **Spring Boot** | **4.1.1** | Framework for all modules: REST, DI, data access. |
 | **Spring Modulith** | **2.1.1** | Compile-time enforcement of the module boundaries this document asserts. |
 | **PostgreSQL** | 16 | ACID ledger: orders, order items, outbox, hold audit, payments, notification logs, bot rules. |
-| **Redis** | 7 | **The live stock counters**, queue ZSET, rate-limit buckets, idempotency, promotion pub/sub. `noeviction` is a correctness setting: see `CLAUDE.md` for the complete key map. |
+| **Redis** | 7 | **The live stock counters**, queue ZSET, rate-limit buckets, idempotency, promotion pub/sub. `noeviction` is a correctness setting: the complete key map is in [`02-high-level-design.md`](02-high-level-design.md) §2. |
 | **RabbitMQ** | 3.13 | Async fulfilment between `order` and `notification`. |
 | **Actuator + Micrometer** | managed | `/actuator/health` is the container healthcheck; Prometheus scrape for the metric set in `05-global-standards.md` §9. |
 | **Flyway** | managed | Schema migrations. `ddl-auto=validate` means the schema has to come from somewhere. |

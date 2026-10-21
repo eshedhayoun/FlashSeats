@@ -1,7 +1,7 @@
 # Module: `notification`
 
-> **Describes what is built.** No class names — see [`../../CLAUDE.md`](../../CLAUDE.md), "Updating
-> the docs is part of the change".
+> **Describes what is built.** No class names: a class list drifts silently, while owned state and the
+> exposed contract do not.
 
 **Package:** `com.flashseats.notification` · **Storage:** PostgreSQL · **Depends on:** nothing
 

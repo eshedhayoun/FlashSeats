@@ -13,9 +13,9 @@
 # `AND status = 'ACTIVE'`, which exactly one replica wins — and a listener that
 # skipped it and restored stock directly would return the seats THREE TIMES.
 #
-# That is the second entry in CLAUDE.md's table of traps, and it is invisible on
-# one instance: a single replica restores once whether or not the claim is there.
-# So the check is a cluster check or it is nothing.
+# That trap is invisible on one instance: a single replica restores once
+# whether or not the claim is there. So the check is a cluster check or it is
+# nothing.
 #
 # It also measures LATENCY, because that is the listener's entire reason to
 # exist. HoldReconciliationSweeper already reclaims every expired hold on a

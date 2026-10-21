@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 #
-# FlashSeats — one-command evaluator demo.
+# FlashSeats — one-command demo.
 #
-#   docker/scripts/professor-demo.sh
-#   docker/scripts/professor-demo.sh --reset
+#   docker/scripts/demo.sh
+#   docker/scripts/demo.sh --reset
 #
-# The evaluator needs Docker and a POSIX shell (Git Bash on Windows). Java,
+# It needs Docker and a POSIX shell (Git Bash on Windows). Java,
 # Maven, Node and local database clients are not required: the application,
 # database, Redis, RabbitMQ, Mailpit and nginx all run in Compose.
 
@@ -108,7 +108,7 @@ if [[ -z "${FLASHSEATS_ADMIN_PLAINTEXT:-}" ]]; then
     rm -f "$tmp_env"
 fi
 
-echo "Building and starting the evaluator stack..."
+echo "Building and starting the demo stack..."
 docker compose --profile cluster up -d --build
 
 echo "Waiting for the demo to become healthy..."
@@ -159,5 +159,5 @@ To stop without deleting data:
   docker compose --profile cluster down
 
 To start clean next time:
-  docker/scripts/professor-demo.sh --reset
+  docker/scripts/demo.sh --reset
 EOF

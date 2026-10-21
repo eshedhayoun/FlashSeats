@@ -46,7 +46,7 @@ import org.testcontainers.utility.DockerImageName;
  *
  * <p>The test profile turns {@code flashseats.notification.enabled} off, which removes the topology,
  * both consumers and {@code EmailDispatcher} — so until this class, every guarantee below was
- * asserted in prose and exercised by nothing. {@code CLAUDE.md} names that as a trap: disabling a
+ * asserted in prose and exercised by nothing. ADR-051 names that as a trap: disabling a
  * feature in the test profile leaves the configuration production runs with no coverage. The seam is
  * this class turning it back on, against its own broker.
  *
