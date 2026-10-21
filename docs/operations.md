@@ -103,6 +103,20 @@ replica and broken on three:
 | `docker/scripts/sentinel-failover-check.sh` | Sentinel promotes a replica and the old primary rejoins |
 | `docker/scripts/stripe-check.sh` | A real charge, a 3-D Secure challenge and a redelivered webhook |
 
+### Published images
+
+Every commit on `main` that passes CI is published by
+[`.github/workflows/release.yml`](../.github/workflows/release.yml) to GitHub Container Registry:
+
+| Image | Contents |
+| :--- | :--- |
+| `ghcr.io/eshedhayoun/flashseats-app` | The Spring Boot application |
+| `ghcr.io/eshedhayoun/flashseats-web` | nginx with the built React client; `compose.yaml` mounts its config |
+
+Each is tagged `sha-<commit>` and `latest`. Pushing a version tag (`git tag v1.0.0 && git push origin
+v1.0.0`) on a published commit adds the tag `1.0.0` to the images already built for it; nothing is
+rebuilt.
+
 ## 5. Load testing
 
 ```bash
