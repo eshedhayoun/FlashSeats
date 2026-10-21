@@ -83,34 +83,6 @@ setting. The whole system starts with one command.
 | **Operator** | Signs in to the operator console at `/admin`, or calls the admin API directly. Creates and deletes sales, pre-warms them, pauses and resumes them, rebuilds stock counters after a fault; through the API, also replays failed notifications and manages IP rules |
 | **Payment provider** | The stub gateway or Stripe. Charges, refunds, and reports late settlements by webhook |
 
-Figure 1 shows what each actor does with the system. The labels refer to the functional
-requirements in §2.2.
-
-```mermaid
-flowchart LR
-    buyer(("Buyer"))
-    operator(("Operator"))
-    provider(("Payment<br/>provider"))
-
-    subgraph sys["FlashSeats"]
-        direction TB
-        fr1(["FR-1 Browse sales and their countdowns"])
-        fr2(["FR-2 Wait in a fair, live line"])
-        fr3(["FR-3 Choose and hold seats"])
-        fr4(["FR-4 Pay, and retry after a decline"])
-        fr5(["FR-5 Receive a PDF ticket by email"])
-        fr6(["FR-6 Resume after a reload"])
-        fr7(["FR-7 Create, delete and prepare sales"])
-        fr8(["FR-8 Pause, resume and repair a live sale"])
-    end
-
-    buyer --- fr1 & fr2 & fr3 & fr4 & fr5 & fr6
-    operator --- fr7 & fr8
-    fr4 --- provider
-```
-
-*Figure 1. Actors and the use cases each one takes part in.*
-
 ### 2.2 Functional requirements
 
 | ID | Requirement | How it is met |
@@ -124,7 +96,7 @@ flowchart LR
 | **FR-7** | An operator creates and prepares sales | One form creates the event and its tiers, published and with stock prepared; a sale can be deleted until a minute before it opens, and is never edited |
 | **FR-8** | An operator controls a live sale | Pause keeps every place in line; rebuild recounts the stock from the ledger after a fault; the console shows exact stock and warns when a sale would not sell |
 
-Figure 2 follows one buyer through FR-1 to FR-5, including the paths a buyer takes when things do
+Figure 1 follows one buyer through FR-1 to FR-5, including the paths a buyer takes when things do
 not simply succeed.
 
 ```mermaid
@@ -151,7 +123,7 @@ stateDiagram-v2
     SoldOut --> [*]
 ```
 
-*Figure 2. The buyer's journey. Three timers bound it: the pass (120 s), the admission session
+*Figure 1. The buyer's journey. Three timers bound it: the pass (120 s), the admission session
 (600 s) in which a buyer can compare tiers, release a hold and choose again, and the hold itself
 (300 s, extended once while a payment is in progress).*
 
@@ -256,7 +228,7 @@ flowchart TB
     apps -->|PDF ticket by email| smtp
 ```
 
-*Figure 3. Deployment. Any replica can serve any request; promotions reach the replica holding a
+*Figure 2. Deployment. Any replica can serve any request; promotions reach the replica holding a
 buyer's live connection through Redis pub/sub.*
 
 The application replicas hold no state between requests. PostgreSQL is the authority for every
@@ -308,7 +280,7 @@ flowchart TB
     saleflow --> catalog
 ```
 
-*Figure 4. Module dependencies. Solid arrows are facade calls; the dashed ones are not. One is a
+*Figure 3. Module dependencies. Solid arrows are facade calls; the dashed ones are not. One is a
 Spring event and the other a message RabbitMQ delivers. As facade calls, either would close a
 cycle, which the build forbids.*
 
@@ -346,7 +318,7 @@ stateDiagram-v2
     EXPIRED --> [*] : seats restored after commit
 ```
 
-*Figure 5. The hold lifecycle. Every exit from `ACTIVE` is the conditional update above, so
+*Figure 4. The hold lifecycle. Every exit from `ACTIVE` is the conditional update above, so
 however many replicas see the same ending, the seats come back once.*
 
 **3. A missing stock counter is a fault, not a cache miss.**
@@ -374,35 +346,25 @@ sequenceDiagram
     actor Buyer
     participant Order as order
     participant Hold as hold
-    participant Catalog as catalog
     participant Payment as payment
     participant Provider as Stripe or stub
 
     Buyer->>Order: POST /orders/checkout
-    Order->>Hold: is the hold live and this buyer's?
-    Order->>Catalog: price the tier on the server
-    Order->>Order: find or create the order, PENDING
-    Order->>Hold: extend the hold once for payment
+    Order->>Hold: check the hold, extend it once for payment
+    Order->>Order: price on the server, create the order as PENDING
     Order->>Payment: authorize, outside any transaction
     Payment->>Provider: charge
     Provider-->>Payment: result
-    alt card declined
-        Order-->>Buyer: 402, seats still held, retry allowed
-    else 3-D Secure required
-        Order-->>Buyer: 402 with a challenge, then the same request again
+    alt declined, or 3-D Secure required
+        Order-->>Buyer: 402, seats still held, the buyer retries
     else charge succeeded
         Order->>Order: one transaction: consume hold, CONFIRMED, outbox row
-        alt hold was lost meanwhile
-            Order->>Payment: claim the refund on the order row, then refund
-            Order-->>Buyer: refunded, or the receipt if the webhook confirmed it
-        else hold consumed
-            Order-->>Buyer: 201 receipt
-        end
+        Order-->>Buyer: 201 receipt, or a refund if the hold was lost meanwhile
     end
     Note over Order: after commit, the outbox relay sends the ticket through RabbitMQ
 ```
 
-*Figure 6. Checkout. Money moves before the hold is consumed and outside any database transaction;
+*Figure 5. Checkout. Money moves before the hold is consumed and outside any database transaction;
 the order row decides how a charge ends.*
 
 The reasoning behind each of these, and the defect it prevents, is recorded in
