@@ -83,6 +83,10 @@ All in `src/main/resources/application.properties`.
 
 ## 4. Tests
 
+CI ([`.github/workflows/ci.yml`](../.github/workflows/ci.yml)) runs the backend and frontend unit
+suites, the frontend build and the browser suite's type check on every pull request and on pushes to
+`main` and `preview`. A pull request cannot merge until both jobs pass.
+
 | Suite | Command | Count | Needs |
 | :--- | :--- | :--- | :--- |
 | Backend unit and integration | `./mvnw test` | 320 | Docker (Testcontainers runs PostgreSQL, Redis, RabbitMQ) |

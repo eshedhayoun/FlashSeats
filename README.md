@@ -1,5 +1,7 @@
 # FlashSeats
 
+[![CI](https://github.com/eshedhayoun/FlashSeats/actions/workflows/ci.yml/badge.svg)](https://github.com/eshedhayoun/FlashSeats/actions/workflows/ci.yml)
+
 **Author:** Eshed Hayoun
 
 FlashSeats is a high-concurrency ticket flash-sale engine. **10,000 people want 500 tickets, and
