@@ -10,8 +10,7 @@ import org.springframework.scheduling.annotation.EnableScheduling;
  * scanning cover every module without widening, and each direct sub-package is a Modulith module.
  *
  * <p>{@code @EnableScheduling} is load-bearing: the sweepers, the outbox relay, the broadcaster and
- * the promotion worker are {@code @Scheduled}, each safe to run on every replica at once
- * (global standards §7).
+ * the promotion worker are {@code @Scheduled}, each safe to run on every replica at once.
  */
 @SpringBootApplication
 @ConfigurationPropertiesScan

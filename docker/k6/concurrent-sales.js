@@ -57,7 +57,7 @@ const CAPACITY  = parseInt(__ENV.CAPACITY || '500', 10);
 const BUYERS_PER_VU = Math.max(1, parseInt(__ENV.BUYERS_PER_VU || '10', 10));
 // How often a waiting buyer asks for its place. The browser does not poll at all
 // while its stream is up; it falls back to GET /queue/status every 5 s after
-// three failed reconnects (FE_SPEC §4), so 5 s is the most any real client asks.
+// three failed reconnects, so 5 s is the most any real client asks.
 // This polled every 1-2 s: 6,667 requests a second at 10,000 buyers, more than a
 // ten-core host can generate while also serving them (ADR-079). Lower it to
 // stress the front door on a bigger host.
@@ -142,7 +142,7 @@ export default async function () {
  *
  * A buyer belongs to ONE sale. Bouncing between events every journey would
  * exercise a thing no human does and would quietly hide the bug rule 5 of
- * FE_SPEC is about, where per-event state collides.
+ * the client is built for, where per-event state collides.
  */
 function saleFor(buyer) {
   const index = buyer % EVENTS;

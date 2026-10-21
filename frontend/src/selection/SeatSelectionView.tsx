@@ -29,7 +29,7 @@ const PAUSED_POLL_MS = 5_000;
 const sleep = (ms: number) => new Promise((resolve) => window.setTimeout(resolve, ms));
 
 /**
- * V3 — the buyer's turn: a tier, a quantity, a reservation (FE_SPEC V3). The timer here is the
+ * V3 — the buyer's turn: a tier, a quantity, a reservation (view V3). The timer here is the
  * admission, and it is calm: running out costs a place in line, not money.
  */
 export function SeatSelectionView({

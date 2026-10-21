@@ -23,7 +23,7 @@ import { QueuePosition } from "../ui/QueuePosition";
 import { useQueueStream } from "./useQueueStream";
 
 /**
- * V2 — the waiting room (FE_SPEC V2). Built to lower anxiety: the position only ever goes down, the
+ * V2 — the waiting room (view V2). Built to lower anxiety: the position only ever goes down, the
  * estimate is honest about not knowing, a dropped connection says the place is safe, and there is no
  * refresh button to hammer — the page updates itself.
  */

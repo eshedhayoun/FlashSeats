@@ -242,7 +242,7 @@ const state = {
   admitFailed: false,
 };
 
-/* Every key is scoped by event: a buyer may be in several sales at once (FE_SPEC rule 5).
+/* Every key is scoped by event: a buyer may be in several sales at once (client rule 5).
    The admission lives in localStorage because it belongs to the session cookie every tab shares;
    kept per tab, a second tab would be admitted on the server and refused at /holds for ever. */
 const key = (name) => `fs.${state.eventId}.${name}`;
@@ -327,7 +327,7 @@ async function bootstrap() {
   await route();
 }
 
-/* The §1 view table: the server says where we are, and we render that.
+/* The view table (frontend/README.md, Views): the server says where we are, and we render that.
 
    PRECEDENCE, most-live-first. The order is the rule, and each step earns its
    place:
@@ -431,7 +431,7 @@ function renderPosition(position, estWaitSeconds) {
   state.displayedPosition = Math.min(state.displayedPosition, position);
   const p = state.displayedPosition;
 
-  // Position 1 is the front of the line: "You're next", never "#1" or "#0" (FE_SPEC V2).
+  // Position 1 is the front of the line: "You're next", never "#1" or "#0" (view V2).
   $("q-position").textContent = p > 1000 ? "1,000+" : p <= 1 ? "You're next" : `#${p}`;
   if (state.startDepth === null) state.startDepth = p;
   $("q-bar").style.width = `${Math.max(0, Math.min(100, (1 - p / Math.max(state.startDepth, 1)) * 100))}%`;

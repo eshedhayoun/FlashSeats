@@ -129,8 +129,7 @@ public class OrderQueryService implements OrderFacade {
      * <p>Checked at the very start of checkout. A successful purchase consumes its hold, so by the
      * time a client resubmits, the hold no longer exists — validating it first would answer a
      * duplicate submission with "your reservation expired" when in fact the buyer already owns the
-     * seats. Replaying a completed operation must return its original result, not an error (global
-     * standards §3).
+     * seats. Replaying a completed operation must return its original result, not an error.
      */
     @Transactional(readOnly = true)
     public Optional<OrderReceiptResponse> findConfirmedReceiptFor(String holdToken) {

@@ -291,7 +291,7 @@ class CheckoutRecoveryIT extends IntegrationTest {
         assertThat(mine.text("holdToken")).isEqualTo(holdToken);
         assertThat(mine.number("quantity")).isEqualTo(2);
         assertThat(mine.json().get("ttlRemainingSeconds").asLong()).isBetween(1L, 300L);
-        // Both clocks travel with the hold, so the client counts down against the server's (FE_SPEC §4).
+        // Both clocks travel with the hold, so the client counts down against the server's.
         assertThat(Instant.parse(mine.text("expiresAt"))).isAfter(Instant.parse(mine.text("serverTime")));
 
         // Another session's token answers exactly like one that never existed: tokens cannot be probed.

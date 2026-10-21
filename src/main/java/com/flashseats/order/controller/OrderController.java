@@ -41,7 +41,7 @@ public class OrderController {
      *
      * <p>{@code 201} for a new purchase, {@code 200} when an already-completed checkout is replayed —
      * a client that submits twice gets its receipt back rather than an error, because the operation
-     * genuinely completed (global standards §3).
+     * genuinely completed.
      */
     @PostMapping("/checkout")
     public ResponseEntity<OrderReceiptResponse> checkout(

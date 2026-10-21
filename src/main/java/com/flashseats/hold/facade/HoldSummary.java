@@ -6,7 +6,7 @@ import java.time.Instant;
  * A hold as other modules see it — a record, never the JPA entity.
  *
  * <p>Handing an entity across a boundary would leak a lazy-loading proxy and a persistence mapping
- * into a module that is supposed to know neither (global standards §5).
+ * into a module that is supposed to know neither.
  *
  * <p>There is deliberately no {@code status} field. Every facade method that returns a
  * {@code HoldSummary} guarantees the hold was {@code ACTIVE} at that moment, and the failure modes

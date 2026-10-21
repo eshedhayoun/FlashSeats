@@ -27,7 +27,7 @@ import org.junit.jupiter.api.TestMethodOrder;
 /**
  * The defences that run before any business logic does.
  *
- * <p>Both halves of §10 S5. Session identity is free to mint, so the per-session bucket does not
+ * <p>Both halves of the rate-limit design. Session identity is free to mint, so the per-session bucket does not
  * constrain a determined attacker; the IP bucket is deliberately loose so carrier-grade NAT
  * populations are not blocked during exactly the spike this system exists to serve. A manual block
  * and a challenge score are what is left.

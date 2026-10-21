@@ -6,7 +6,7 @@ import java.util.Map;
 /**
  * Base type for every exception raised to the HTTP layer. Carrying the {@link ErrorCode} lets one
  * {@link GlobalExceptionHandler} serve every module without importing their types (ADR-033).
- * {@code extensions} carries the RFC 7807 members that vary by failure (global standards §1).
+ * {@code extensions} carries the RFC 7807 members that vary by failure.
  *
  * <p>Most failures come from a module's {@code <Module>Errors} factory. A subclass exists only
  * where a {@code catch} names it (ADR-057, ADR-063).

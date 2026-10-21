@@ -26,7 +26,7 @@ public class SessionController {
      *
      * <p><strong>JSON only, and that is the security control, not a formality</strong> (ADR-060).
      * The session is the buyer's queue position and their only authority over their hold, and CSRF
-     * is disabled (§10 S6) — so a hidden form on any site could otherwise throw a waiting buyer out
+     * is disabled — so a hidden form on any site could otherwise throw a waiting buyer out
      * of the line. A form can send only {@code urlencoded}, {@code multipart} or {@code text/plain};
      * a cross-origin {@code fetch} with {@code application/json} needs a CORS preflight that nothing
      * here grants. Anything else answers {@code 415} before this method runs.

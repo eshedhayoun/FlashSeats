@@ -3,7 +3,7 @@ import { alpha, createTheme, responsiveFontSizes, type Theme } from "@mui/materi
 export type ColorMode = "light" | "dark";
 
 /**
- * The design tokens (Step 9a, FE_SPEC §10). Every text/background pair is WCAG AA: body text ≥ 4.5:1
+ * The design tokens. Every text/background pair is WCAG AA: body text ≥ 4.5:1
  * on every surface it sits on, the chips ≥ 6:1, white on every stop of the hero gradient ≥ 6:1.
  */
 const tokens = {

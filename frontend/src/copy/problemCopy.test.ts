@@ -5,7 +5,7 @@ import { BUYER_CODES, problemCopy, supportReference } from "./problemCopy";
 const error = (code: string, status = 409, extra: Record<string, unknown> = {}) =>
   new ApiError({ type: "about:blank", title: "T", status, detail: "server detail", code, ...extra });
 
-/** Every registry code a buyer's browser can receive (`05` §2), minus the admin- and provider-only ones. */
+/** Every registry code a buyer's browser can receive (docs/api.md), minus the admin- and provider-only ones. */
 const REACHABLE = [
   "VALIDATION_FAILED", "INTERNAL_ERROR", "SERVICE_BUSY", "NOT_FOUND", "RATE_LIMITED",
   "BOT_VERIFICATION_FAILED", "IP_BLOCKED", "SESSION_INVALID", "EVENT_NOT_FOUND", "TIER_NOT_FOUND",

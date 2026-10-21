@@ -37,7 +37,7 @@ const VUS      = parseInt(__ENV.VUS      || '10000', 10);   // buyers
 const CAPACITY = parseInt(__ENV.CAPACITY || '500', 10);
 const BUYERS_PER_VU = Math.max(1, parseInt(__ENV.BUYERS_PER_VU || '10', 10));
 const K6_VUS   = Math.ceil(VUS / BUYERS_PER_VU);
-// The client's own fallback cadence (FE_SPEC §4); see concurrent-sales.js.
+// The client's own fallback cadence; see concurrent-sales.js.
 const POLL_SECONDS = parseFloat(__ENV.POLL_SECONDS || '5');
 // The ramp and the hold: no buyer starts a new journey after this.
 const LOAD_SECONDS = 10 + 180;
@@ -73,7 +73,7 @@ export const options = {
     // A 503 from the reserve path means a stock counter went missing (ADR-004).
     'inventory_faults_503':  ['count == 0'],
     'http_req_failed':       ['rate < 0.01'],
-    // The Phase 4 exit criterion is p99 < 200 ms (04-implementation-roadmap.md).
+    // The latency target is p99 < 200 ms.
     // This used to read 2000, which would have passed a run an order of
     // magnitude outside the number the roadmap actually commits to.
     'checkout_duration_ms':  ['p(99) < 200'],

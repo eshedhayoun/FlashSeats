@@ -19,7 +19,7 @@ import org.springframework.boot.test.web.server.LocalServerPort;
  *
  * <p>The retry mechanism is the ordinary one: re-POST the same {@code /orders/checkout} body. There
  * is no resume endpoint and there must not be one — a second retry path would have its own
- * idempotency story, and this system's whole guarantee is that there is only one (FE_SPEC §2).
+ * idempotency story, and this system's whole guarantee is that there is only one.
  *
  * <p>The two things that go wrong here are both silent. Charging again on the resume bills the buyer
  * twice for one authentication; spending one of their three card attempts on a challenge their bank
@@ -113,7 +113,7 @@ class ThreeDSecureIT extends IntegrationTest {
         assertThat(intentBeforeChallenge).isNotBlank();
 
         // The buyer completed the challenge in their browser and the client re-POSTs, unchanged —
-        // same hold, same card, same idempotency key, exactly as FE_SPEC prescribes.
+        // same hold, same card, same idempotency key, exactly as the client does.
         var completed = buyer.post("/orders/checkout", checkout(holdToken, CHALLENGE_CARD));
 
         assertThat(completed.status()).isEqualTo(201);
@@ -161,7 +161,7 @@ class ThreeDSecureIT extends IntegrationTest {
                 .text("holdToken");
     }
 
-    /** One idempotency key per hold, reused on every retry — the client contract (FE_SPEC §1). */
+    /** One idempotency key per hold, reused on every retry — the client contract. */
     private Map<String, Object> checkout(String holdToken, String paymentMethodId) {
         return Map.of(
                 "holdToken", holdToken,

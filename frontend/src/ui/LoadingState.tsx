@@ -4,7 +4,7 @@ import { VisuallyHidden } from "./VisuallyHidden";
 
 /**
  * A skeleton in the shape of what is coming, so nothing jumps when it arrives. Shown only before
- * the first answer; refreshes after that happen behind the content (FE_SPEC §3).
+ * the first answer; refreshes after that happen behind the content.
  */
 export function LoadingState({ label, shape = "panel" }: { label: string; shape?: "panel" | "list" | "event" }) {
   return (

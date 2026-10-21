@@ -16,7 +16,7 @@ public interface PaymentGateway {
      * Re-reads an intent the buyer was sent away to authenticate (3-D Secure).
      *
      * <p><strong>The resume path must retrieve, never re-charge.</strong> The client mints one
-     * idempotency key per hold and reuses it on every retry (FE_SPEC §1), so a second
+     * idempotency key per hold and reuses it on every retry, so a second
      * {@link #charge} would replay the provider's cached {@code requires_action} response for ever;
      * varying the key per attempt instead would create a <em>second</em> intent and risk billing the
      * buyer twice for one authentication.

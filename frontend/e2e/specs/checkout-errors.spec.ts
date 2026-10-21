@@ -1,7 +1,7 @@
 import { STUB, expect, joinAndGetTurn, pay, reserve, test } from "../support/fixtures";
 
 /*
- * FE_SPEC §3, "Checkout error handling — one rule per code": the Pay button and the seats, for every
+ * Checkout error handling, one rule per code: the Pay button and the seats, for every
  * row the stub gateway can produce. The rows that need a hold's clock moved — too little time left, an
  * expiry while away — are unit-tested in checkoutErrorState.test.ts and notices.test.ts, and the server
  * side of them in HoldExpiryTimerIT and CheckoutServiceTest.

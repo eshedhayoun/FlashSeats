@@ -16,7 +16,7 @@ import lombok.extern.slf4j.Slf4j;
 
 /**
  * Stripe, behind the interface the stub already satisfied. Server-confirmed PaymentIntents keep the
- * {@code FE_SPEC} §2 checkout body and ADR-001's ordering unchanged.
+ * checkout request body and ADR-001's ordering unchanged.
  *
  * <p>Load-bearing details: {@code holdToken} in metadata (ADR-014); {@code maxNetworkRetries(0)},
  * because re-POSTing the checkout body is already the retry; {@code allowRedirects(NEVER)}, because

@@ -19,7 +19,7 @@ import { TierRow } from "../ui/TierOption";
 import { EventHero } from "./EventHero";
 
 /**
- * V1 — the event, its tiers, and the way in (FE_SPEC V1).
+ * V1 — the event, its tiers, and the way in (view V1).
  *
  * At T-0 the button unlocks on the server's clock with no reload, and nothing joins by itself: a
  * self-firing join from every open tab at exactly t=0 is indistinguishable from a bot.

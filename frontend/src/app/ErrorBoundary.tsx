@@ -8,7 +8,7 @@ type State = { failed: boolean };
 
 /**
  * A render failure becomes a page that says so and offers a reload, rather than a white screen. A
- * reload is safe at every point of the journey: the client rehydrates from the server (FE_SPEC §0
+ * reload is safe at every point of the journey: the client rehydrates from the server (client
  * rule 3), and nothing the buyer has is held only in this page.
  */
 export class ErrorBoundary extends Component<{ children: ReactNode }, State> {

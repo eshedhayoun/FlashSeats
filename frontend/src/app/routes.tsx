@@ -6,12 +6,12 @@ import { ConfirmationPage } from "../orders/ConfirmationPage";
 import { EventPage } from "../sale/EventPage";
 import { LoadingState } from "../ui/LoadingState";
 
-/** Its own chunk: buyers never download the operator console (FE_SPEC §11). */
+/** Its own chunk: buyers never download the operator console. */
 const AdminPage = lazy(() => import("../admin/AdminPage"));
 
 /**
  * Three buyer addresses, and the operator console. Inside `/events/:eventId` the view is chosen by the
- * server's state for that sale (FE_SPEC §1), not by the path after it, so a reload, Back or a second
+ * server's state for that sale, not by the path after it, so a reload, Back or a second
  * tab always lands where the server says the buyer is.
  */
 export function AppRoutes() {
@@ -40,6 +40,6 @@ function EventRoute() {
     // Never a request for /events/NaN.
     return <NotFoundPage what="event" />;
   }
-  // Keyed, so moving between two sales starts each one's state afresh (FE_SPEC §0 rule 5).
+  // Keyed, so moving between two sales starts each one's state afresh (client rule 5).
   return <EventPage key={eventId} eventId={eventId} />;
 }

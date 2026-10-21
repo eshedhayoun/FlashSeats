@@ -93,7 +93,7 @@ public class PaymentService implements PaymentFacade {
         try {
             // Resume before charging. If this hold was already sent away for 3-D Secure, the only
             // correct move is to re-read THAT intent: the client reuses one idempotency key for the
-            // life of the hold (FE_SPEC §1), so a second charge would replay the provider's cached
+            // life of the hold, so a second charge would replay the provider's cached
             // "requires_action" answer for ever — and varying the key per attempt instead would
             // open a second intent and risk billing twice for one authentication.
             ChargeAttempt attempt = store.beginAttempt(command); // tx1

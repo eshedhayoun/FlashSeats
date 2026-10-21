@@ -1,6 +1,6 @@
 import { STUB, expect, joinAndGetTurn, pay, reserve, test } from "../support/fixtures";
 
-/** FE_SPEC §0 rule 5: there is no "current event". Two sales, one buyer, nothing shared but the cookie. */
+/** Client rule 5: there is no "current event". Two sales, one buyer, nothing shared but the cookie. */
 test.describe("Two sales at once", () => {
   test("holding seats in one sale and choosing in another, in two tabs, corrupts neither", async ({ page, twoSales }) => {
     const [first, second] = twoSales;

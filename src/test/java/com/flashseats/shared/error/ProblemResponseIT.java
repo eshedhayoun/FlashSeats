@@ -10,7 +10,7 @@ import org.junit.jupiter.api.Test;
 import org.springframework.boot.test.web.server.LocalServerPort;
 
 /**
- * Every failure is RFC 7807 with a registry {@code code} (global standards §1–§2).
+ * Every failure is RFC 7807 with a registry {@code code}.
  *
  * <p>The interesting cases are the ones Spring MVC rejects <em>before</em> a handler runs.
  * {@code ExceptionHandlerExceptionResolver} runs ahead of {@code DefaultHandlerExceptionResolver},

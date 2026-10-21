@@ -16,7 +16,7 @@ export type UseSaleStateResult = {
 const BACKGROUND_RETRY_MS = [3_000, 6_000, 12_000, 24_000];
 
 /**
- * One sale's server state (FE_SPEC §3). Fetched on mount, on `visibilitychange` → visible, on
+ * One sale's server state. Fetched on mount, on `visibilitychange` → visible, on
  * `online`, and whenever a view asks — after a stream frame, a 409 or a 410.
  *
  * Refreshes overlap constantly (a frame, a timer and a tab switch can all ask at once), so they are

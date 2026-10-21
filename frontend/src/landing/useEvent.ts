@@ -13,7 +13,7 @@ export type UseEventResult = {
 };
 
 /**
- * How long to wait before asking again while the sale has not opened (FE_SPEC V1): every 30 s, every
+ * How long to wait before asking again while the sale has not opened (view V1): every 30 s, every
  * 10 s in the final minute, then just after the opening instant, then every 2 s until the server agrees.
  */
 export function upcomingPollDelayMs(remainingMs: number): number {

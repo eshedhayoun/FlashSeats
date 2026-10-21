@@ -31,7 +31,7 @@
 		<!-- Surefire run order; see the surefire block. Override with -Dtest.runOrder=reversealphabetical or random -->
 		<test.runOrder>alphabetical</test.runOrder>
 		<spring-modulith.version>2.1.1</spring-modulith.version>
-		<!-- Third-party libraries not managed by the Spring Boot BOM. See docs/01-system-architecture.md -->
+		<!-- Third-party libraries not managed by the Spring Boot BOM. See docs/architecture.md -->
 		<bucket4j.version>8.14.0</bucket4j.version>
 		<testcontainers.version>1.21.3</testcontainers.version>
 		<pdfbox.version>3.0.7</pdfbox.version>
@@ -67,7 +67,7 @@
 			springdoc-openapi was removed. It served an OpenAPI document derived
 			entirely from request mappings: the codebase contains zero @Operation,
 			@Tag, @Schema or OpenAPI beans, so /docs described the shapes and none
-			of the meaning. FE_SPEC.md is the client contract and says what the
+			of the meaning. docs/api.md is the API contract and says what the
 			generated page could not. Re-add it with annotations, or not at all.
 		-->
 		<dependency>
