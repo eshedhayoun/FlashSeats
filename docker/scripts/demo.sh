@@ -2,12 +2,13 @@
 #
 # FlashSeats — one-command demo.
 #
-#   docker/scripts/demo.sh
-#   docker/scripts/demo.sh --reset
+#   docker/scripts/demo.sh            pull the published images, or build if that fails
+#   docker/scripts/demo.sh --build    build the images from this working copy
+#   docker/scripts/demo.sh --reset    start from empty volumes (combines with --build)
 #
-# It needs Docker and a POSIX shell (Git Bash on Windows). Java,
-# Maven, Node and local database clients are not required: the application,
-# database, Redis, RabbitMQ, Mailpit and nginx all run in Compose.
+# It needs Docker and a POSIX shell (Git Bash on Windows). Java, Maven, Node and
+# local database clients are not required: everything runs in Compose.
+# FLASHSEATS_TAG picks a published release (default: latest).
 
 set -euo pipefail
 
@@ -22,11 +23,13 @@ HTTP_PORT="${HTTP_PORT:-8080}"
 export HTTP_PORT
 
 RESET=0
+BUILD=0
 for arg in "$@"; do
     case "$arg" in
         --reset) RESET=1 ;;
+        --build) BUILD=1 ;;
         -h|--help)
-            sed -n '2,10p' "$0"
+            sed -n '2,11p' "$0"
             exit 0
             ;;
         *)
@@ -108,8 +111,33 @@ if [[ -z "${FLASHSEATS_ADMIN_PLAINTEXT:-}" ]]; then
     rm -f "$tmp_env"
 fi
 
-echo "Building and starting the demo stack..."
-docker compose --profile cluster up -d --build
+# Say which gateway the stack is really running: telling a reviewer who set
+# STRIPE_ENABLED=true to pick "pm_card_declined" points at a selector that is not there.
+STRIPE_ON="${STRIPE_ENABLED:-}"
+if [[ -z "$STRIPE_ON" && -f .env ]]; then
+    STRIPE_ON="$(grep -E '^STRIPE_ENABLED=' .env | tail -1 | cut -d= -f2-)" || STRIPE_ON=""
+fi
+
+# The published web image carries no Stripe publishable key, so Stripe needs a local build.
+if [[ "$STRIPE_ON" == "true" ]]; then
+    BUILD=1
+fi
+
+if (( ! BUILD )); then
+    echo "Pulling the published images (ghcr.io, tag ${FLASHSEATS_TAG:-latest})..."
+    if docker compose --profile cluster pull --quiet app-1 app-2 app-3 nginx; then
+        echo "Starting the demo stack..."
+        docker compose --profile cluster up -d --no-build
+    else
+        echo "The published images are unavailable; building them locally instead (several minutes)."
+        BUILD=1
+    fi
+fi
+
+if (( BUILD )); then
+    echo "Building and starting the demo stack..."
+    docker compose --profile cluster up -d --build
+fi
 
 echo "Waiting for the demo to become healthy..."
 for _ in $(seq 1 90); do
@@ -128,12 +156,6 @@ fi
 echo "Seeding the Coldplay and Arctic Monkeys demonstration sales..."
 bash docker/seed/seed-demo.sh
 
-# Say which gateway the stack is really running: telling a reviewer who set
-# STRIPE_ENABLED=true to pick "pm_card_declined" points at a selector that is not there.
-STRIPE_ON="${STRIPE_ENABLED:-}"
-if [[ -z "$STRIPE_ON" && -f .env ]]; then
-    STRIPE_ON="$(grep -E '^STRIPE_ENABLED=' .env | tail -1 | cut -d= -f2-)" || STRIPE_ON=""
-fi
 if [[ "$STRIPE_ON" == "true" ]]; then
     PAYMENTS="Payments go through Stripe in test mode. In the card form use 4242 4242 4242 4242
 to succeed, 4000 0000 0000 0002 for a decline that keeps the seats, or

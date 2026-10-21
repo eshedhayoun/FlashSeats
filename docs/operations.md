@@ -10,7 +10,14 @@ Needs only Docker (give it 8 GB) and a POSIX shell.
 ```bash
 docker/scripts/demo.sh            # secrets, 3-replica cluster, two open sales; prints the admin password
 docker/scripts/demo.sh --reset    # the same, from empty volumes
+docker/scripts/demo.sh --build    # build the images from your working copy instead of pulling them
 ```
+
+The demo pulls the images CI published for `main` (`FLASHSEATS_TAG` picks a release; default
+`latest`) and builds them locally only if the pull fails or Stripe is enabled, since the published
+client has no Stripe key. A pulled image is `main`, not your working copy: after changing code, use
+`--build`, and in general start the cluster with `up -d --build` rather than a bare `up -d`, which
+runs whichever image the name last held.
 
 | Service | Where | Credentials |
 | :--- | :--- | :--- |
