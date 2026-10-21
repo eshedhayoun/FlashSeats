@@ -8,7 +8,7 @@ import org.springframework.stereotype.Service;
 
 /**
  * The challenge check {@code queue} runs on join, and the audit row each verdict earns. It
- * implements {@link BotFacade} (ADR-057) and orchestrates the verdict (global standards §5).
+ * implements {@link BotFacade} (ADR-057) and orchestrates the verdict.
  */
 @Slf4j
 @Service

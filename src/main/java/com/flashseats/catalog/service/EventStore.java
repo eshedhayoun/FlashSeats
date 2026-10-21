@@ -16,7 +16,7 @@ import org.springframework.transaction.annotation.Transactional;
 /**
  * The SQL halves of creating and deleting an event. Their own bean so each commits before
  * {@link CatalogService} touches Redis: a counter written inside the transaction would survive its
- * rollback (ADR-023, §11 rule 4).
+ * rollback (ADR-023).
  */
 @Component
 class EventStore {

@@ -47,7 +47,7 @@ public class QueueController {
 
     /**
      * Steps out of the line. Idempotent, and joining again starts at the back, which is what leaving
-     * means (FE_SPEC V2).
+     * means (view V2).
      */
     @PostMapping("/leave")
     @ResponseStatus(HttpStatus.NO_CONTENT)
@@ -60,7 +60,7 @@ public class QueueController {
         return queue.status(session.value(), eventId);
     }
 
-    /** Exchanges the single-use pass for an admission. {@code eventId} is in the body (FE_SPEC §2). */
+    /** Exchanges the single-use pass for an admission. {@code eventId} is in the body. */
     @PostMapping("/admit")
     public AdmitResponse admit(
             @Valid @RequestBody AdmitRequest request,

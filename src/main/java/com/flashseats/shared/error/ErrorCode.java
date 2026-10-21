@@ -3,7 +3,7 @@ package com.flashseats.shared.error;
 import org.springframework.http.HttpStatus;
 
 /**
- * The canonical error-code registry (global standards §2). These values are <strong>stable API
+ * The canonical error-code registry. These values are <strong>stable API
  * contract</strong>: the SPA switches on {@code code}, so renaming one is a breaking change. Each
  * constant carries its HTTP status, and the RFC 7807 {@code type} URI is derived from the name.
  *
@@ -119,7 +119,7 @@ public enum ErrorCode {
      * {@code DispatcherServlet} — so {@code GlobalExceptionHandler} never sees it and cannot supply
      * this. {@code AdminProblemResponses} wires it in at the entry point instead. Without that, the
      * admin surface was the one part of this API answering with a body that carried no {@code code}
-     * at all (global standards §1).
+     * at all.
      */
     ADMIN_AUTH_REQUIRED(HttpStatus.UNAUTHORIZED),
     /** Authenticated, but not an operator. Same filter-chain origin as the code above. */

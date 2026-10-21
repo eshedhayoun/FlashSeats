@@ -9,8 +9,8 @@ import { getRecentOrders } from "../sale/storage";
 import { EmptyState } from "../ui/EmptyState";
 
 /**
- * Every ticket bought in this browser, across sales (FE_SPEC §3). The receipt token is a bearer
- * capability: it appears only inside a link the buyer chooses to open, never as text (FE_SPEC §3.1).
+ * Every ticket bought in this browser, across sales. The receipt token is a bearer
+ * capability: it appears only inside a link the buyer chooses to open, never as text.
  */
 export function RecentOrders() {
   const orders = getRecentOrders();

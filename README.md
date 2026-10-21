@@ -1,17 +1,40 @@
 # FlashSeats
 
-**Team members:** Eshed Hayoun · Adar Gerbi · Shoham Sherer
+[![CI](https://github.com/eshedhayoun/FlashSeats/actions/workflows/ci.yml/badge.svg)](https://github.com/eshedhayoun/FlashSeats/actions/workflows/ci.yml)
+
+**Author:** Eshed Hayoun
 
 FlashSeats is a high-concurrency ticket flash-sale engine. **10,000 people want 500 tickets, and
 they all arrive in the same second.** Exactly 500 must sell, nobody may be charged for a seat they
 did not get, and the 9,500 who miss out must find out quickly. The system is built as a modular
 monolith on Java 21 and Spring Boot 4, runs as three replicas behind nginx, and has a React client.
 
-**Quick start.** You need only Docker and a POSIX shell (Git Bash on Windows). The first run builds
-the images and takes several minutes; give Docker at least 8 GB of memory.
+**Measured:** 10,000 simulated buyers across five concurrent sales sold 2,500 of 2,500 seats, with
+zero oversold and the stock invariant exact on every tier ([§4.3](#43-load-test)).
+
+## Highlights
+
+The hard problems, and where each one is solved and tested:
+
+| Problem | Solution | Code | Proof |
+| :--- | :--- | :--- | :--- |
+| Thousands of buyers race for the last seat | One Redis Lua script reads, compares and decrements atomically. "Sold out" and "counter missing" are different return codes, so a lost key never reads as sold out | [`stock_reserve.lua`](src/main/resources/redis/stock_reserve.lua) | [`StockReserveConcurrencyIT`](src/test/java/com/flashseats/catalog/StockReserveConcurrencyIT.java) |
+| Three replicas all see the same hold expire | A conditional `UPDATE … WHERE status = 'ACTIVE'` in PostgreSQL; only the caller with rowcount 1 returns the seats, and only after its commit | [`TicketHoldRepository`](src/main/java/com/flashseats/hold/repository/TicketHoldRepository.java) | [`HoldLifecycleIT`](src/test/java/com/flashseats/hold/HoldLifecycleIT.java), [`hold-expiry-check.sh`](docker/scripts/hold-expiry-check.sh) |
+| Checkout and the payment webhook settle the same charge | Every order transition is a compare-and-set on the `orders` row; a refund is claimed on that row before any money moves | [`OrderRepository`](src/main/java/com/flashseats/order/repository/OrderRepository.java), [`OrderCommitService`](src/main/java/com/flashseats/order/service/OrderCommitService.java) | [`SettlementArbiterIT`](src/test/java/com/flashseats/order/SettlementArbiterIT.java) |
+| 10,000 buyers would exhaust the connection pool | A waiting room in a Redis sorted set; one promotion tick across the cluster spends a shared, atomic admission allowance | [`PromotionWorker`](src/main/java/com/flashseats/queue/service/PromotionWorker.java), [`promotion_budget.lua`](src/main/resources/redis/promotion_budget.lua) | [`GlobalPromotionBudgetIT`](src/test/java/com/flashseats/queue/GlobalPromotionBudgetIT.java) |
+| A buyer's live connection is on another replica | Server-Sent Events, with promotions fanned out over Redis pub/sub | [`QueueBroadcaster`](src/main/java/com/flashseats/queue/service/QueueBroadcaster.java), [`QueuePubSubListener`](src/main/java/com/flashseats/queue/service/QueuePubSubListener.java) | [`fanout-check.sh`](docker/scripts/fanout-check.sh) |
+| A confirmed order must always produce a ticket | Transactional outbox drained with `FOR UPDATE SKIP LOCKED`, RabbitMQ with dead-lettering, and an insert-then-send dedupe on the consumer | [`OutboxRelay`](src/main/java/com/flashseats/order/service/OutboxRelay.java), [`NotificationLogRepository`](src/main/java/com/flashseats/notification/repository/NotificationLogRepository.java) | [`OutboxRecoveryIT`](src/test/java/com/flashseats/order/OutboxRecoveryIT.java) |
+| Nine modules must not tangle | Facade-only calls between modules, verified at build time by Spring Modulith | [`ModularityTests`](src/test/java/com/flashseats/app/ModularityTests.java) | `./mvnw test` |
+
+The design is in [`docs/architecture.md`](docs/architecture.md), the API in
+[`docs/api.md`](docs/api.md), and running and load-testing it in
+[`docs/operations.md`](docs/operations.md).
+
+**Quick start.** You need only Docker and a POSIX shell (Git Bash on Windows). The demo pulls the
+images CI published (or builds them if it cannot); give Docker at least 8 GB of memory.
 
 ```bash
-docker/scripts/professor-demo.sh     # secrets, a three-replica cluster, two open sales; prints the admin password
+docker/scripts/demo.sh     # secrets, a three-replica cluster, two open sales; prints the admin password
 open http://localhost:8080           # the React client: event page, waiting room, checkout, PDF ticket
 open http://localhost:8080/admin     # the operator console: sign in as admin with the printed password
 open http://localhost:8025           # the local Mailpit inbox, where the ticket email arrives
@@ -40,17 +63,17 @@ either slows down until nobody can buy, or, worse, keeps selling after the ticke
 
 ### 1.2 Why it is hard
 
-- **Overselling.** Thousands of requests read "1 seat left" at the same moment. Unless the reserve
-  is a single atomic step, more than one of them succeeds.
-- **Charging without delivering.** A payment can succeed while the order fails to save, or a buyer
-  can retry and be charged twice. Every path that moves money has to end exactly one way:
-  confirmed or refunded.
-- **The stampede.** If 10,000 buyers reach checkout at once, the database connection pool is gone
-  in milliseconds and nobody completes a purchase. Admission has to be paced.
-- **Many servers, one truth.** Several application replicas serve the same sale. Timers, waiting-room
-  notifications and seat restoration must happen exactly once, not once per replica.
-- **Bots and abuse.** Scripts try to jump the line, and rate limits must stop them without
-  blocking a whole university behind one NAT address.
+The first difficulty is **overselling**. Thousands of requests read "1 seat left" at the same
+moment, and unless the reservation is a single atomic step, more than one of them succeeds. The
+second is **money**: a payment can succeed while the order fails to save, or a buyer can retry and
+be charged twice, so every path that moves money has to end exactly one way, confirmed or refunded.
+
+The third is the **stampede** itself. If 10,000 buyers reach checkout at once, the database
+connection pool is exhausted in milliseconds and nobody completes a purchase, so admission has to
+be paced. Pacing has to work across **several servers at once**: replicas share one sale, so
+timers, waiting-room notifications and seat restoration must each happen exactly once, not once per
+replica. Finally, **bots** try to jump the line, and the rate limits that stop them must not block a
+whole university sitting behind one NAT address.
 
 ### 1.3 Project goals
 
@@ -83,40 +106,51 @@ setting. The whole system starts with one command.
 | **Operator** | Signs in to the operator console at `/admin`, or calls the admin API directly. Creates and deletes sales, pre-warms them, pauses and resumes them, rebuilds stock counters after a fault; through the API, also replays failed notifications and manages IP rules |
 | **Payment provider** | The stub gateway or Stripe. Charges, refunds, and reports late settlements by webhook |
 
-### 2.2 Functional requirements: the buyer's journey
+### 2.2 Functional requirements
 
+| ID | Requirement | How it is met |
+| :--- | :--- | :--- |
+| **FR-1** | A buyer sees every sale and when it opens | The event list and a countdown driven by the server's clock, not the device's |
+| **FR-2** | Waiting is fair and visible | Joining is idempotent, so a refresh keeps the buyer's place; the position updates live over Server-Sent Events (SSE), with polling as a fallback |
+| **FR-3** | An admitted buyer chooses seats without racing anyone | A single-use pass (120 s) becomes an admission session (600 s); a hold (300 s) reserves the seats with one atomic step |
+| **FR-4** | Paying is safe to retry | The price is computed on the server. A declined card keeps the seats for up to three attempts, 3-D Secure is supported, and a charge that lands after the seats are lost is refunded |
+| **FR-5** | A purchase produces a ticket | A confirmed order is rendered as a PDF and emailed, and can be downloaded from the receipt page |
+| **FR-6** | A reload or lost connection costs nothing | `GET /api/v1/sale/{eventId}/state` returns the buyer's exact position in the journey |
+| **FR-7** | An operator creates and prepares sales | One form creates the event and its tiers, published and with stock prepared; a sale can be deleted until a minute before it opens, and is never edited |
+| **FR-8** | An operator controls a live sale | Pause keeps every place in line; rebuild recounts the stock from the ledger after a fault; the console shows exact stock and warns when a sale would not sell |
+
+Figure 1 follows one buyer through FR-1 to FR-5, including the paths a buyer takes when things do
+not simply succeed.
+
+```mermaid
+stateDiagram-v2
+    state "Event page" as Landing
+    state "Waiting room" as Waiting
+    state "Choosing seats" as Choosing
+    state "Paying" as Paying
+    state "Confirmed" as Confirmed
+    state "Ticket emailed" as Ticketed
+    state "Sold out" as SoldOut
+
+    [*] --> Landing
+    Landing --> Waiting : join, after the bot check
+    Waiting --> Waiting : refresh or pause keeps the place
+    Waiting --> Choosing : promoted, pass redeemed
+    Waiting --> SoldOut : stock gone
+    Choosing --> Paying : seats held, 300 s
+    Paying --> Paying : card declined, seats kept
+    Paying --> Choosing : hold released or expired
+    Paying --> Confirmed : charge succeeds
+    Confirmed --> Ticketed : PDF and email, asynchronously
+    Ticketed --> [*]
+    SoldOut --> [*]
 ```
-landing (countdown, server clock)
-   └─► join sale ──► bot gate (captcha + rate limits)
-          └─► waiting room  ── live positions (SSE) ──► promoted
-                 └─► queue pass (120 s, single-use)
-                        └─► admission session (600 s — browse freely)
-                               └─► select tier ──► hold (300 s, atomic decrement)
-                                      └─► checkout ──► charge ──► confirm order
-                                             └─► receipt
-                                                    └─► async: RabbitMQ → PDF → email
-```
 
-- **Waiting room.** Joining is idempotent: refreshing the page keeps the buyer's place. The
-  position updates live over Server-Sent Events (SSE), with polling as a fallback.
-- **Three nested timers.** A *queue pass* (120 s) lets a promoted buyer in once. It becomes an
-  *admission session* (600 s), in which the buyer can compare tiers, reload the page, or release a
-  hold and choose again without losing their place. A *hold* (300 s) reserves specific seats while
-  the buyer pays.
-- **Checkout.** The price is computed on the server. A declined card **keeps the seats**, so the
-  buyer can retry with another card. If the seats are lost after a successful charge, the charge is
-  refunded.
-- **Recovery.** `GET /api/v1/sale/{eventId}/state` returns the buyer's exact position in the
-  journey, so a page reload or a lost connection costs nothing.
-- **Fulfilment.** A confirmed order produces a PDF ticket, delivered by email and downloadable from
-  the receipt page.
-- **Operations.** An operator creates a sale with all its tiers in one step; it is published and
-  its stock prepared at once. A sale can be deleted until a minute before it opens, and is never
-  edited. A live sale can be paused without ending it: the line keeps its order, holds wait, and
-  payments in progress complete. The console shows each sale's exact stock and warns when a sale
-  would not sell, with the action that fixes it.
+*Figure 1. The buyer's journey. Three timers bound it: the pass (120 s), the admission session
+(600 s) in which a buyer can compare tiers, release a hold and choose again, and the hold itself
+(300 s, extended once while a payment is in progress).*
 
-The full journey, with every edge case, is in [`docs/03-end-to-end-flow.md`](docs/03-end-to-end-flow.md).
+Each step's endpoint and error codes are in [`docs/api.md`](docs/api.md).
 
 ### 2.3 Non-functional requirements
 
@@ -148,14 +182,15 @@ hold in flight.
 
 ### 2.5 Scope and assumptions
 
-- **Payments** use the in-process stub by default, which drives every branch: success, decline,
-  provider outage, and 3-D Secure. Real Stripe runs in test mode behind `STRIPE_ENABLED=true`.
-- **Email** goes to a local Mailpit inbox by default. Real delivery through any SMTP relay is a
-  configuration change, not a code change.
-- **Buyers are anonymous.** Identity is a signed session cookie; there are no buyer accounts.
-- **Operators use a web console** over the same authenticated API, with one operator account.
-  Sales are created and deleted, never edited or cancelled. Failed notifications and IP rules are
-  managed through the API only.
+Payments use an in-process stub by default, which drives every branch a real provider can take:
+success, decline, provider outage and 3-D Secure. Real Stripe runs in test mode behind a single
+setting, `STRIPE_ENABLED=true`. Email goes to a local Mailpit inbox by default; delivery through a
+real SMTP relay is a configuration change, not a code change.
+
+Buyers are anonymous: their identity is a signed session cookie, and there are no buyer accounts.
+Operators use a web console over the same authenticated API as the scripts, with one operator
+account. Sales are created and deleted but never edited or cancelled, and failed notifications and
+IP rules are managed through the API only.
 
 ---
 
@@ -181,22 +216,20 @@ removed.
 
 ### 3.2 Architecture
 
+```mermaid
+flowchart TB
+    browser["Browser"] -->|HTTP and SSE| nginx["nginx · least_conn"]
+    nginx --> apps["3 stateless app replicas<br/>Java 21, virtual threads"]
+    apps --> redis[("Redis + Sentinel<br/>stock · line · timers")]
+    apps --> postgres[("PostgreSQL<br/>holds · orders · outbox")]
+    apps --> rabbit[["RabbitMQ<br/>ticket messages"]]
+    apps --> stripe["Stripe<br/>or stub"]
+    apps --> smtp["SMTP<br/>Mailpit locally"]
 ```
-                              [ browser ]
-                                   │
-                         [ Nginx · least_conn ]
-                          proxy_buffering off
-                                   │
-              ┌────────────────────┼────────────────────┐
-         [ app 1 ]            [ app 2 ]            [ app 3 ]
-                    stateless · Java 21 virtual threads
-              └────────────────────┼────────────────────┘
-              ┌────────────────────┼────────────────────┐
-        [ Redis 7 ]        [ PostgreSQL 16 ]      [ RabbitMQ ]
-     primary + Sentinel      AOF everysec        DLX + DLQ
-     stock · queue ·         orders · outbox     PDF + email
-     holds · buckets         audit ledgers
-```
+
+*Figure 2. Deployment. Any of the three replicas can serve any request. Promotions reach the
+replica holding a buyer's live connection through Redis pub/sub, and Stripe's webhooks come back in
+through nginx like any other request.*
 
 The application replicas hold no state between requests. PostgreSQL is the authority for every
 lifecycle: holds, orders, payments. Redis holds fast, reconstructible state: the stock counters, the
@@ -219,20 +252,37 @@ waiting room, and timers. If all of Redis is lost, PostgreSQL plus an operator r
 Modules call each other only through a facade interface, and each module reads only its own tables
 and Redis keys. The dependency graph is acyclic, and the build verifies it:
 
-```
-                    shared        ← open module; everyone may depend on it
+```mermaid
+flowchart TB
+    saleflow["saleflow<br/>read-only leaf"]
+    order["order"]
+    payment["payment"]
+    notification["notification"]
+    hold["hold"]
+    queue["queue"]
+    bot["bot"]
+    catalog["catalog"]
+    shared[["shared<br/>open module, used by all"]]
 
-bot      ──► shared only
-queue    ──► catalog, bot         ← `bot` only on join
-hold     ──► queue, catalog
-order    ──► hold, catalog, payment, queue
-saleflow ──► queue, hold, order, catalog     ← read-only leaf
-payment  ──( PaymentSettledEvent · webhook path only )──► order
-order    ──( outbox → RabbitMQ )──► notification
+    saleflow --> order
+    order --> payment
+    order -.->|outbox, then RabbitMQ| notification
+    payment -.->|PaymentSettledEvent| order
+    order --> hold
+    saleflow --> hold
+    hold --> queue
+    order --> queue
+    saleflow --> queue
+    queue -->|join only| bot
+    queue --> catalog
+    hold --> catalog
+    order --> catalog
+    saleflow --> catalog
 ```
 
-The last two arrows are **not** facade calls. One is a Spring event, the other a message that
-RabbitMQ delivers. As facade calls, either would close a cycle, so neither is one.
+*Figure 3. Module dependencies. Solid arrows are facade calls; the dashed ones are not. One is a
+Spring event and the other a message RabbitMQ delivers. As facade calls, either would close a
+cycle, which the build forbids.*
 
 ### 3.4 Key mechanisms
 
@@ -256,6 +306,21 @@ UPDATE ticket_holds SET status = ?, settled_at = now()
 The stock is returned to Redis only **after** this claim commits. If the transaction rolls back,
 the seats stay held rather than appearing twice.
 
+```mermaid
+stateDiagram-v2
+    direction LR
+    [*] --> ACTIVE : Lua script takes the seats, then the row is written
+    ACTIVE --> CONSUMED : order confirmed
+    ACTIVE --> RELEASED : buyer releases
+    ACTIVE --> EXPIRED : timer or sweeper
+    CONSUMED --> [*] : seats sold
+    RELEASED --> [*] : seats restored after commit
+    EXPIRED --> [*] : seats restored after commit
+```
+
+*Figure 4. The hold lifecycle. Every exit from `ACTIVE` is the conditional update above, so
+however many replicas see the same ending, the seats come back once.*
+
 **3. A missing stock counter is a fault, not a cache miss.**
 Repopulating a counter from `total_capacity` after a Redis failure would silently resurrect every
 ticket already sold. Instead, the reserve script returns a distinct code, the API answers `503`, an
@@ -275,8 +340,35 @@ layers stop a double charge: the client's idempotency key, a per-hold in-flight 
 the same charge. Both paths finish with a compare-and-set on the `orders` row. That row decides
 whether the charge ends confirmed or refunded, and the two paths can never both win.
 
-The reasoning behind each of these, and the defect it prevents, is recorded in
-[`docs/00-architecture-decisions.md`](docs/00-architecture-decisions.md).
+```mermaid
+sequenceDiagram
+    autonumber
+    actor Buyer
+    participant Order as order
+    participant Hold as hold
+    participant Payment as payment
+    participant Provider as Stripe or stub
+
+    Buyer->>Order: POST /orders/checkout
+    Order->>Hold: check the hold, extend it once for payment
+    Order->>Order: price on the server, create the order as PENDING
+    Order->>Payment: authorize, outside any transaction
+    Payment->>Provider: charge
+    Provider-->>Payment: result
+    alt declined, or 3-D Secure required
+        Order-->>Buyer: 402, seats still held, the buyer retries
+    else charge succeeded
+        Order->>Order: one transaction: consume hold, CONFIRMED, outbox row
+        Order-->>Buyer: 201 receipt, or a refund if the hold was lost meanwhile
+    end
+    Note over Order: after commit, the outbox relay sends the ticket through RabbitMQ
+```
+
+*Figure 5. Checkout. Money moves before the hold is consumed and outside any database transaction;
+the order row decides how a charge ends.*
+
+Every mechanism, the Redis key map and the failure behaviour are in
+[`docs/architecture.md`](docs/architecture.md).
 
 ### 3.5 Development process
 
@@ -289,9 +381,9 @@ We built the system in four phases, each ending with a system that is *correct* 
 4. Asynchronous fulfilment and scale.
 
 Concurrency guarantees were never retrofitted. The design went through four review passes before
-any code, and the built system through fifteen more, each logged in
-[`docs/06-mvp-overview.md`](docs/06-mvp-overview.md) §13. Every non-obvious decision is recorded
-as one of 80 Architecture Decision Records (ADRs), most of them naming the defect they fixed.
+any code, and the built system through seventeen more. Each non-obvious decision was recorded as
+an Architecture Decision Record naming the defect it fixed; code comments cite them as `ADR-NNN`,
+and the records are kept at the `adr-archive` git tag.
 
 ### 3.6 Testing strategy
 
@@ -309,7 +401,7 @@ as one of 80 Architecture Decision Records (ADRs), most of them naming the defec
 pom.xml, mvnw, src/        the backend: one Maven project, at the root by Maven convention
 frontend/                  the React client (Vite + TypeScript)
 docker/                    infrastructure: redis/nginx config, seeds, secrets, k6, drill scripts
-docs/                      ADRs, standards, journey, per-module specs
+docs/                      architecture, API, operations
 compose.yaml, Dockerfile   the local stack and the application image
 ```
 
@@ -319,7 +411,7 @@ compose.yaml, Dockerfile   the local stack and the application image
 
 ### 4.1 The buyer's journey
 
-`docker/scripts/professor-demo.sh` generates secrets, builds and starts the three-replica cluster,
+`docker/scripts/demo.sh` generates secrets, builds and starts the three-replica cluster,
 waits until it is healthy, and seeds two open sales. The screenshots below were taken on that
 cluster at http://localhost:8080.
 
@@ -377,8 +469,7 @@ All suites pass, and the backend suite passes in any class order:
 | Frontend unit | `npm test` | 78 tests passing |
 | Browser end-to-end | `npm run test:e2e` | 27 specs passing, desktop and mobile layouts |
 
-What each level covers is described in [§3.6](#36-testing-strategy); the run log is in
-[`docs/06-mvp-overview.md`](docs/06-mvp-overview.md) §13.
+What each level covers is described in [§3.6](#36-testing-strategy).
 
 ### 4.3 Load test
 
@@ -428,19 +519,17 @@ completed 3-D Secure challenge. All load and cluster runs used the stub gateway.
 
 <img src="docs/images/admin-console.png" alt="Operator console listing an upcoming sale, two open sales and an ended one, with their actions" width="720">
 
-`http://localhost:8080/admin`, signed in as `admin` with the password `professor-demo.sh` prints.
+`http://localhost:8080/admin`, signed in as `admin` with the password `demo.sh` prints.
 Each sale shows its window, its exact remaining stock per tier, and only the actions the server
 would accept right now:
 
-- **New sale** creates the event and all its tiers in one form. The sale must open at least two
-  minutes later, so its stock can be prepared before buyers arrive.
-- **Pre-warm** appears only for an upcoming sale whose stock is not ready. **Rebuild stock**
-  recounts an open sale from the ledger, for example after a Redis restart, when the console shows
-  "Stock is not trusted".
-- **Pause** and **Resume** stop and restart a sale without losing anyone's place.
-- **Delete** appears only until a minute before the sale opens, when no buyer can be part of it yet.
-
-The login lives in the tab's memory only: a reload or a closed tab signs out.
+**New sale** creates the event and all its tiers in one form; the sale must open at least two
+minutes later, so that its stock can be prepared before buyers arrive. **Pre-warm** appears only
+for an upcoming sale whose stock is not ready, and **Rebuild stock** recounts an open sale from the
+ledger when the console reports "Stock is not trusted", for example after a Redis restart. **Pause**
+and **Resume** stop and restart a sale without losing anyone's place. **Delete** appears only until
+a minute before the sale opens, when no buyer can be part of it yet. The login lives in the tab's
+memory only, so a reload or a closed tab signs out.
 
 ---
 
@@ -448,39 +537,39 @@ The login lives in the tab's memory only: a reload or a closed tab signs out.
 
 ### 5.1 Findings
 
-- **Correctness belongs in the data layer, not in the flow.** The queue reduces load, but the only
-  thing that prevents an oversell is a single atomic operation on a single owner's counter. Every
-  guarantee we trust is a constraint, a conditional update or an atomic script, rather than
-  discipline at the call sites.
-- **Correctness and performance are separate claims.** At 10,000 buyers the stock result was exact
-  while checkout latency rose to seconds. A system that fails under load has to fail slow, never
-  wrong.
-- **Measure before tuning.** Before our last round of optimisation, the 10,000-buyer drill sold
-  only 22–28 % of the seats. The cause was not the database: the most-called endpoint opened two
-  new TCP connections per request, and per-request instrumentation that nobody read accounted for a
-  quarter of the CPU samples. Fixing both took the same drill to 100 %. An earlier admission limit
-  derived from a formula capped sales at 76 % while the connection pool sat 89 % idle.
-- **One replica hides the hardest bugs.** Waiting-room notifications and seat restoration were
-  correct on one instance and broken on three. Only multi-replica tests revealed it.
-- **Each test level answers a different question.** Integration tests proved the invariants,
-  browser tests found journey defects unit tests could not, and only the load drill showed where
-  the time actually went.
+**Correctness belongs in the data layer, not in the flow.** The queue reduces load, but the only
+thing that prevents an oversell is a single atomic operation on a single owner's counter. Every
+guarantee we trust is a constraint, a conditional update or an atomic script, rather than
+discipline at the call sites. It follows that **correctness and performance are separate claims**:
+at 10,000 buyers the stock result was exact while checkout latency rose to seconds. A system under
+too much load has to fail slow, never wrong.
+
+**Measure before tuning.** Before the last round of optimisation, the 10,000-buyer drill sold only
+22–28 % of the seats. The cause was not the database: the most-called endpoint opened two new TCP
+connections per request, and per-request instrumentation that nobody read took a quarter of the CPU
+samples. Fixing both took the same drill to 100 %. Earlier, an admission limit derived from a
+formula had capped sales at 76 % while the connection pool sat 89 % idle.
+
+**One replica hides the hardest bugs.** Waiting-room notifications and seat restoration were
+correct on one instance and broken on three, and only multi-replica tests revealed it. More
+generally, **each test level answers a different question**: integration tests proved the
+invariants, browser tests found journey defects that unit tests could not, and only the load drill
+showed where the time actually went.
 
 ### 5.2 Limitations
 
-- **Latency at 10,000 buyers was measured on a shared laptop** and reflects its CPU. The system's
-  own ceiling is unmeasured.
-- **A Redis restart or failover stops affected sales** until an operator rebuilds the counters.
-  This is deliberate: a counter that may have lost writes must not keep selling.
-- **Checkout does not survive a Redis outage.** It fails closed, which is the safe direction for a
-  payment.
-- **A sale cannot be edited or cancelled** once created: it can be deleted until a minute before
-  it opens, and paused after that. Operator authentication is a single configured account rather
-  than an identity provider.
-- **Buyers have no accounts.** After the session cookie expires (one day), the emailed receipt link
-  is the only way back to an order.
-- The full list, including the security posture, is in
-  [`docs/06-mvp-overview.md`](docs/06-mvp-overview.md) §9–§10.
+Latency at 10,000 buyers was measured on a shared laptop and reflects its CPU, so the system's own
+ceiling remains unmeasured. A Redis restart or failover stops the affected sales until an operator
+rebuilds their counters; this is deliberate, because a counter that may have lost writes must not
+keep selling. For the same reason, checkout does not survive a Redis outage: it fails closed, the
+safe direction for a payment.
+
+On the product side, a sale cannot be edited or cancelled once created. It can be deleted until a
+minute before it opens and paused after that. Operator authentication is a single configured
+account rather than an identity provider, and buyers have no accounts: once the session cookie
+expires after a day, the emailed receipt link is the only way back to an order. The full list
+is in [`docs/operations.md`](docs/operations.md) §8, and the security posture in
+[`docs/architecture.md`](docs/architecture.md) §7.
 
 ### 5.3 Summary
 
@@ -495,24 +584,15 @@ an invariant the system checks, and a number anyone can reproduce with one comma
 
 | Document | What it covers |
 | :--- | :--- |
-| [`docs/07-system-on-one-page.md`](docs/07-system-on-one-page.md) | **Read first.** The whole system on one page: journey, module graph, checkout sequence, and what looks removable but is not |
-| [`docs/00-architecture-decisions.md`](docs/00-architecture-decisions.md) | 80 ADRs: every non-obvious decision and the failure it prevents |
-| [`docs/01-system-architecture.md`](docs/01-system-architecture.md) | Stack, module map, dependency graph, deployment |
-| [`docs/02-high-level-design.md`](docs/02-high-level-design.md) | Infrastructure and the concurrency model |
-| [`docs/03-end-to-end-flow.md`](docs/03-end-to-end-flow.md) | **The authoritative user journey**, step by step |
-| [`docs/04-implementation-roadmap.md`](docs/04-implementation-roadmap.md) | The four phases, each with exit criteria |
-| [`docs/05-global-standards.md`](docs/05-global-standards.md) | **Cross-cutting contract**: RFC 7807, error registry, idempotency, transaction and facade rules |
-| [`docs/06-mvp-overview.md`](docs/06-mvp-overview.md) | **What is actually built**: scope, security posture, limitations, the review-pass log |
-| [`docs/08-running-and-development.md`](docs/08-running-and-development.md) | Local setup, environment files, email, the cluster, load drills, Docker layout |
-| [`FE_SPEC.md`](FE_SPEC.md) | **Front-end specification**: view state machine, API map, storage, SSE, timers, copy, the Playwright suite, the operator console |
-| [`docs/modules/`](docs/modules/) | One page per module: what it owns, exposes, and must never do |
-
-When a module spec disagrees with an ADR, **the ADR wins** and the module spec is stale.
+| [`docs/architecture.md`](docs/architecture.md) | Deployment, modules and what each owns, the Redis key map, how inventory, holds, the waiting room, checkout and fulfilment work, invariants, failure behaviour, security, code conventions |
+| [`docs/api.md`](docs/api.md) | Every endpoint, the SSE events, and the error codes |
+| [`docs/operations.md`](docs/operations.md) | Running, configuration, tests, load testing, monitoring, the operator runbook, known limitations |
+| [`frontend/README.md`](frontend/README.md) | The React client: its rules, views and tests |
 
 ## Appendix B: Running and Development
 
 The [Quick start](#flashseats) at the top is all the demo needs. For development, see
-[`docs/08-running-and-development.md`](docs/08-running-and-development.md):
+[`docs/operations.md`](docs/operations.md):
 
 ```bash
 cp .env.example .env
@@ -521,3 +601,7 @@ docker/scripts/dev-up.sh                    # infrastructure + a sale that is ac
 cd frontend && npm install && npm run dev   # the React client on :5173
 ./mvnw test                                 # 320 backend tests; needs Docker
 ```
+
+## License
+
+[MIT](LICENSE).

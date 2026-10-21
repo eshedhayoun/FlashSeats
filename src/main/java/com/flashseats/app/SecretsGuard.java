@@ -132,7 +132,7 @@ public class SecretsGuard {
                   docker run --rm httpd:alpine htpasswd -bnBC 12 "" 'your-password' | tr -d ':\\n'
 
                 and store it as {bcrypt}$2y$12$... — or just run docker/secrets/gen-env.sh, which \
-                does both. See docs/06-mvp-overview.md section 10."""
+                does both. See docs/operations.md, Configuration."""
                         .formatted(
                                 String.join(", ", environment.getActiveProfiles()),
                                 String.join("\n  - ", offenders),

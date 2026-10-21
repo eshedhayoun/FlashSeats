@@ -42,7 +42,7 @@ type CheckoutProps = {
 };
 
 /**
- * V4 — the highest-stakes screen (FE_SPEC V4). The gateway is the server's decision and the client
+ * V4 — the highest-stakes screen (view V4). The gateway is the server's decision and the client
  * follows it: with no publishable key the server's stub is what answers, so offering a card form
  * would be a lie about where the money goes (ADR-058).
  */
@@ -396,7 +396,7 @@ function PayButton({
 }) {
   useClockTick();
   const waitMs = retryAt === null ? 0 : retryAt - Date.now();
-  // At 00:00 Pay waits while the server is asked (FE_SPEC §6's double-submit guard).
+  // At 00:00 Pay waits while the server is asked (the double-submit guard).
   const holdOver = serverClock.remainingMs(expiresAt) <= 0 && phase === "ready";
 
   let label: ReactNode = `Pay ${total}`;

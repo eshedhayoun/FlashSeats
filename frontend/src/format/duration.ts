@@ -1,7 +1,7 @@
 /**
  * `M:SS`, or `H:MM:SS` from an hour up. Partial seconds round up, so a live second is never shown
  * as gone, and a negative remainder is zero: a timer reaching the end is a prompt to ask the server,
- * never a value to display below zero (FE_SPEC §0 rule 4).
+ * never a value to display below zero (client rule 4).
  */
 export function formatDuration(remainingMs: number): string {
   const totalSeconds = Math.max(0, Math.ceil(remainingMs / 1000));

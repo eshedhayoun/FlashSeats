@@ -1,4 +1,4 @@
-/** Above this, an exact position only invites refresh-hammering (FE_SPEC V2). */
+/** Above this, an exact position only invites refresh-hammering (view V2). */
 export const EXACT_POSITION_LIMIT = 1_000;
 
 const count = new Intl.NumberFormat();

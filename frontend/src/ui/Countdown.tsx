@@ -7,8 +7,8 @@ import { describeDuration, formatDuration } from "../format/duration";
 import { visuallyHidden } from "./VisuallyHidden";
 
 /**
- * - `hold` — the checkout reservation: the anxiety surface (FE_SPEC V4).
- * - `admission` — the turn to choose seats: low-anxiety, amber only in the last minute (FE_SPEC V3).
+ * - `hold` — the checkout reservation: the anxiety surface (view V4).
+ * - `admission` — the turn to choose seats: low-anxiety, amber only in the last minute (view V3).
  * - `presale` — time until the sale opens: never urgent.
  */
 export type CountdownVariant = "hold" | "admission" | "presale";
@@ -24,7 +24,7 @@ export function countdownTone(variant: CountdownVariant, remainingMs: number): C
   return "neutral";
 }
 
-/** The threshold crossings worth saying out loud, and nothing in between (FE_SPEC §6). */
+/** The threshold crossings worth saying out loud, and nothing in between. */
 const ANNOUNCEMENTS: Record<CountdownVariant, Array<{ belowMs: number; text: string; urgent: boolean }>> = {
   hold: [
     { belowMs: 120_000, text: "Two minutes left to complete your purchase.", urgent: false },
@@ -47,7 +47,7 @@ type CountdownProps = {
 };
 
 /**
- * Time left until `expiresAt`, on the server's clock (FE_SPEC §0 rule 1). Memoised and driven by the
+ * Time left until `expiresAt`, on the server's clock (client rule 1). Memoised and driven by the
  * one app-wide tick, so it re-renders itself every second and nothing around it.
  */
 export const Countdown = memo(function Countdown({ expiresAt, variant, onExpire }: CountdownProps) {

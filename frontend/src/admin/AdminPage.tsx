@@ -51,7 +51,7 @@ const CONFIRM = {
 } as const;
 
 /**
- * The operator console (FE_SPEC §11). Credentials live in this component's state and nowhere else:
+ * The operator console. Credentials live in this component's state and nowhere else:
  * no storage, no cookie, so a reload or a closed tab signs out (ADR-080).
  */
 export default function AdminPage() {

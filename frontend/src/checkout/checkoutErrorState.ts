@@ -3,7 +3,7 @@ import { problemCopy, type ProblemCopy } from "../copy/problemCopy";
 import type { SaleNoticeKind } from "../sale/notices";
 
 /**
- * What one checkout failure means for the screen. Every row answers the two questions FE_SPEC §3 asks
+ * What one checkout failure means for the screen. Every row answers the two questions every checkout failure raises
  * of each code: may the buyer press Pay again, and do they still have their seats.
  */
 export type CheckoutErrorState = {
@@ -58,7 +58,7 @@ export function checkoutErrorState(error: ApiError): CheckoutErrorState {
       return { ...base, copy, severity: "info", pay: "disabled", duplicatePayment: true };
 
     // The seats are still held; the server refuses to START a charge it could not finish in time.
-    // Re-routing would land the buyer straight back here, so the way out is release (FE_SPEC §3).
+    // Re-routing would land the buyer straight back here, so the way out is release.
     case "INSUFFICIENT_TIME_REMAINING":
     case "CHECKOUT_WINDOW_CLOSED":
       return { ...base, copy, severity: "warning", pay: "disabled", offerRelease: true };

@@ -19,7 +19,7 @@ test.describe("The journey", () => {
     await expect(page.getByTestId("checkout-total")).toHaveText(total);
     await pay(page, STUB.ok, "buyer@example.com");
 
-    await expect(page).toHaveURL(/\/orders\/TK-[^?]+$/); // no receipt token in a URL the app chose (FE_SPEC §3.1)
+    await expect(page).toHaveURL(/\/orders\/TK-[^?]+$/); // no receipt token in a URL the app chose
     await expect(page.getByRole("heading", { level: 1 })).toContainText(sale.title);
     await expect(page.getByTestId("order-email")).toHaveText("buyer@example.com");
 

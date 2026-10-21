@@ -6,7 +6,9 @@
 # ---------------------------------------------------------------------------
 # Stage 1 — build
 # ---------------------------------------------------------------------------
-FROM eclipse-temurin:21-jdk-alpine AS build
+# On the build machine's own platform: the jar is the same for every target, so a
+# multi-platform release compiles once and only the runtime stage is per platform.
+FROM --platform=$BUILDPLATFORM eclipse-temurin:21-jdk-alpine AS build
 WORKDIR /build
 
 # Dependency layer: invalidated only when the POM changes.
@@ -47,8 +49,8 @@ EXPOSE 8080
 # thousands of virtual threads. The 1.5 GiB limit crosses that line, so leaving
 # it to ergonomics would have swapped collectors without anyone noticing. An
 # earlier version of this line asked for ZGC, but compose.yaml overrode the whole
-# variable, so ZGC never ran in the cluster: every measurement in 06 section 11 is
-# G1. G1 is kept so that those numbers stay comparable.
+# variable, so ZGC never ran in the cluster: every load result in docs/operations.md
+# is G1. G1 is kept so that those numbers stay comparable.
 #
 # No thread-pool tuning: Java 21 virtual threads (spring.threads.virtual.enabled)
 # are what carry concurrent requests and the long-lived SSE connections.

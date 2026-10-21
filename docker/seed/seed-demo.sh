@@ -10,7 +10,7 @@ REDIS_CLI="./docker/scripts/redis-master-cli.sh"
 BASE_URL="${BASE_URL:-http://localhost:${HTTP_PORT:-8080}}"
 
 if [[ ! -f .env ]]; then
-    echo "error: .env not found. Run docker/scripts/professor-demo.sh first." >&2
+    echo "error: .env not found. Run docker/scripts/demo.sh first." >&2
     exit 1
 fi
 

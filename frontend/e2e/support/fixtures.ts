@@ -8,7 +8,7 @@ type Fixtures = {
   twoSales: [Sale, Sale];
   /**
    * Another buyer: a new browser context, so a new `fsid` cookie and a new identity (ADR-010). Two
-   * pages in one context are two tabs of ONE buyer; conflating them tests neither (FE_SPEC §8).
+   * pages in one context are two tabs of ONE buyer; conflating them tests neither.
    */
   newBuyer: () => Promise<Page>;
 };

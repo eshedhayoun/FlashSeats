@@ -18,7 +18,7 @@ import { PageTitle } from "../ui/PageTitle";
 const SOLD_OUT_POLL_MS = 15_000;
 
 /**
- * V6 — the sale has nothing for this buyer right now (FE_SPEC V6). "Sold out" and "ended" are
+ * V6 — the sale has nothing for this buyer right now (view V6). "Sold out" and "ended" are
  * different facts and each gets its own words. Sold out never dead-ends: a reservation that runs out
  * puts seats back, and this page notices by itself.
  */

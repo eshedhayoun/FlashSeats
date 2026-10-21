@@ -139,7 +139,7 @@ public class CheckoutService {
             // 3-D Secure. Thrown, so the catch-all below marks the order FAILED — resumable on the
             // same order number, with NO attempt consumed (ADR-034). The buyer completes the
             // challenge and re-POSTs this same body; there is no resume endpoint, and adding one
-            // would be a second retry mechanism (FE_SPEC §2). The grace extension granted at step 5
+            // would be a second retry mechanism. The grace extension granted at step 5
             // is what pays for the challenge window (ADR-030).
             if (payment.requiresAction()) {
                 throw PaymentErrors.actionRequired(payment.clientSecret(), expiresAt);

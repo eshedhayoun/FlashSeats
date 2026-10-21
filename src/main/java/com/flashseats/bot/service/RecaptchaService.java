@@ -26,7 +26,7 @@ import lombok.extern.slf4j.Slf4j;
  * Asks the challenge provider whether a visitor looks human, and <strong>fails open</strong>: only a
  * low score refuses (ADR-011, ADR-055). Timeouts, errors, malformed answers and an open circuit all
  * produce {@link Verdict#DEGRADED} and allow the request. It is the compensating control for
- * free-to-mint sessions (§10 S5). Verification is cached per session.
+ * free-to-mint sessions. Verification is cached per session.
  */
 @Slf4j
 @Service

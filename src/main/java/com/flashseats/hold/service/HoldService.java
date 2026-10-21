@@ -285,8 +285,7 @@ public class HoldService implements HoldFacade {
     //
     // Everything below is what other modules may call. The methods above return the JPA entity and
     // are this module's own; these return records, because handing an entity across a boundary
-    // leaks a lazy-loading proxy and a persistence mapping into a module that must know neither
-    // (global standards §5).
+    // leaks a lazy-loading proxy and a persistence mapping into a module that must know neither.
 
     /**
      * {@inheritDoc}

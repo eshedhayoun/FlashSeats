@@ -4,7 +4,7 @@ import Typography from "@mui/material/Typography";
 import AddRounded from "@mui/icons-material/AddRounded";
 import RemoveRounded from "@mui/icons-material/RemoveRounded";
 
-/** 1 … `max`, where `max` is the tier's own limit from the API — never a number of ours (FE_SPEC §0 rule 2). */
+/** 1 … `max`, where `max` is the tier's own limit from the API — never a number of ours (client rule 2). */
 export function QuantityStepper({
   value,
   max,

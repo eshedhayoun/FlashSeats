@@ -10,7 +10,7 @@ import { HERO_GRADIENT } from "../app/theme";
 import { formatDateTime } from "../format/dates";
 import { PageTitle } from "../ui/PageTitle";
 
-/** The event, large, on the brand gradient. The landing view's header (FE_SPEC V1). */
+/** The event, large, on the brand gradient. The landing view's header (view V1). */
 export function EventHero({ event, eyebrow }: { event: EventDetails; eyebrow?: ReactNode }) {
   return (
     <Box sx={{ background: HERO_GRADIENT, color: "#FFFFFF", py: { xs: 5, sm: 7 } }}>

@@ -8,7 +8,7 @@ import java.util.Map;
  * window, inventory movement), {@code queue} (window and remaining stock), {@code order} (pricing,
  * rebuild) and {@code saleflow}. {@code catalog} depends on nothing, so every edge is acyclic.
  *
- * <p>No method opens its own transaction (global standards §5). {@link #tryReserve} and
+ * <p>No method opens its own transaction. {@link #tryReserve} and
  * {@link #restore} are Redis writes and must be called <strong>outside</strong> one (ADR-046).
  */
 public interface CatalogFacade {
