@@ -12,7 +12,7 @@ but `flashseats.payment.stripe.enabled` is **false by default**, so `dev`, `test
 and every drill still run the in-process stub through the complete journey, 3-D Secure included.
 
 **Read [`docs/00-architecture-decisions.md`](docs/00-architecture-decisions.md) before changing
-anything.** It contains 80 ADRs. Most record a defect and its fix — 034-039 come from the first
+anything.** It contains 81 ADRs. Most record a defect and its fix — 034-039 come from the first
 review pass over the built code, 040-042 from the second — and several look like over-engineering
 until you read the failure they prevent. 043-045 are the exception: forward-looking decisions about
 the operator surface, buyer accounts and what health should report, with nothing built against them
@@ -55,7 +55,8 @@ opens a Redis connection per call (the status read and the promotion writes are 
 pipelines), scripts are read once, two unread observations are off, rate-limit buckets expire,
 `EXHAUSTED` is derived from stock alone, and the harness drives buyers rather than one k6 VU each.
 **080**: operators create, list and delete sales through the API, and never edit one; a delete is
-refused from 60 s before the sale opens.
+refused from 60 s before the sale opens. **081**: the ticket PDF is laid out as a print-at-home ticket
+with a stub, inside the top third of the page; it carries no barcode until something scans one.
 
 **The operating envelope is 3–10 concurrent sales**, not one
 ([`03-end-to-end-flow.md`](docs/03-end-to-end-flow.md) §2). Every capacity number written before
@@ -74,7 +75,7 @@ security posture, next stages, and the review-pass log. It is the doc to update 
 ## Document precedence
 
 ```
-00-architecture-decisions.md      ← highest authority (80 ADRs)
+00-architecture-decisions.md      ← highest authority (81 ADRs)
 05-global-standards.md            ← cross-cutting contract; module docs conform to it
 FE_SPEC.md                        ← client contract (repo root)
 03-end-to-end-flow.md             ← the authoritative user journey AND the operating envelope
