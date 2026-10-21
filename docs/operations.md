@@ -10,7 +10,14 @@ Needs only Docker (give it 8 GB) and a POSIX shell.
 ```bash
 docker/scripts/demo.sh            # secrets, 3-replica cluster, two open sales; prints the admin password
 docker/scripts/demo.sh --reset    # the same, from empty volumes
+docker/scripts/demo.sh --build    # build the images from your working copy instead of pulling them
 ```
+
+The demo pulls the images CI published for `main` (`FLASHSEATS_TAG` picks a release; default
+`latest`) and builds them locally only if the pull fails or Stripe is enabled, since the published
+client has no Stripe key. A pulled image is `main`, not your working copy: after changing code, use
+`--build`, and in general start the cluster with `up -d --build` rather than a bare `up -d`, which
+runs whichever image the name last held.
 
 | Service | Where | Credentials |
 | :--- | :--- | :--- |
@@ -102,6 +109,20 @@ replica and broken on three:
 | `docker/scripts/hold-expiry-check.sh` | An expired hold returns its seats exactly once |
 | `docker/scripts/sentinel-failover-check.sh` | Sentinel promotes a replica and the old primary rejoins |
 | `docker/scripts/stripe-check.sh` | A real charge, a 3-D Secure challenge and a redelivered webhook |
+
+### Published images
+
+Every commit on `main` that passes CI is published by
+[`.github/workflows/release.yml`](../.github/workflows/release.yml) to GitHub Container Registry:
+
+| Image | Contents |
+| :--- | :--- |
+| `ghcr.io/eshedhayoun/flashseats-app` | The Spring Boot application |
+| `ghcr.io/eshedhayoun/flashseats-web` | nginx with the built React client; `compose.yaml` mounts its config |
+
+Each is tagged `sha-<commit>` and `latest`. Pushing a version tag (`git tag v1.0.0 && git push origin
+v1.0.0`) on a published commit adds the tag `1.0.0` to the images already built for it; nothing is
+rebuilt.
 
 ## 5. Load testing
 

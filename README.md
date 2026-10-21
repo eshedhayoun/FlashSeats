@@ -30,8 +30,8 @@ The design is in [`docs/architecture.md`](docs/architecture.md), the API in
 [`docs/api.md`](docs/api.md), and running and load-testing it in
 [`docs/operations.md`](docs/operations.md).
 
-**Quick start.** You need only Docker and a POSIX shell (Git Bash on Windows). The first run builds
-the images and takes several minutes; give Docker at least 8 GB of memory.
+**Quick start.** You need only Docker and a POSIX shell (Git Bash on Windows). The demo pulls the
+images CI published (or builds them if it cannot); give Docker at least 8 GB of memory.
 
 ```bash
 docker/scripts/demo.sh     # secrets, a three-replica cluster, two open sales; prints the admin password

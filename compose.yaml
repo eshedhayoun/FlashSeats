@@ -13,6 +13,9 @@
 name: flashseats
 
 x-app: &app
+  # Published by .github/workflows/release.yml. `up --build` builds it locally under
+  # the same name instead; a bare `up -d` runs whatever image that name last held.
+  image: ghcr.io/eshedhayoun/flashseats-app:${FLASHSEATS_TAG:-latest}
   build:
     context: .
     dockerfile: Dockerfile
@@ -332,6 +335,7 @@ services:
   app-3: { <<: *app, container_name: flashseats-app-3 }
 
   nginx:
+    image: ghcr.io/eshedhayoun/flashseats-web:${FLASHSEATS_TAG:-latest}
     build:
       context: .
       dockerfile: docker/nginx/Dockerfile
