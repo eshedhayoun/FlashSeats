@@ -147,7 +147,7 @@ the `k6` service runs a single sale; `k6-waiting-room` exercises only join and p
 
 ### Recorded results
 
-Everything, k6 included, ran on one ten-core laptop with three application replicas.
+Everything, k6 included, ran on a single 10-core host with three application replicas.
 
 **One sale of 500 seats** (`k6`, 300 and 2,000 buyers): exactly 500 sold, zero oversold, zero
 inventory errors, zero rate-limited requests, and zero stock drift on every replica.
@@ -213,7 +213,7 @@ the sale) and rebuild (from the ledger) set counters.
 
 ## 8. Known limitations
 
-- **Latency at 10,000 buyers is the laptop's**, not a measured ceiling of the system; that needs a
+- **Latency at 10,000 buyers reflects the shared test host**, not a measured ceiling of the system; that needs a
   separate load-generating host.
 - **A Redis restart or failover stops affected sales** until an operator rebuilds them: a counter
   that may have lost writes must not keep selling.
