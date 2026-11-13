@@ -166,6 +166,12 @@ gave up waiting. Checkout p99 stayed under 200 ms up to 2,000 buyers. At 10,000 
 the limit was the host, not the connection pool, so the system's own ceiling needs a separate
 load-generating host to measure.
 
+**What profiling found.** An earlier build sold only 22–28 % of the seats at 10,000 buyers. The
+most-called endpoint opened two new TCP connections per request, and per-request instrumentation
+that nobody read took a quarter of the CPU samples. Fixing both brought the same drill to 100 %.
+Separately, an admission limit derived from a formula had capped sales at 76 % while the
+connection pool sat 89 % idle.
+
 ## 6. Monitoring
 
 Metrics are at `/actuator/prometheus` on each replica (operator credentials). Scrape replicas

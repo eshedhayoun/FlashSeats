@@ -85,6 +85,17 @@ code. Buyers are anonymous (a signed session cookie, no accounts). Operators sha
 use the console over the same authenticated API as the scripts. Sales are created and deleted but
 never edited or cancelled; failed notifications and IP rules are managed through the API only.
 
+### Design principles
+
+- **Correctness lives in the data layer.** The queue manages load; correctness comes from
+  constraints, conditional updates and atomic scripts, never from call-site discipline.
+- **Overload degrades latency, never correctness.** At 10,000 buyers latency rose to seconds while
+  inventory stayed exact.
+- **Fail closed on money and stock, fail open on load shedding.** A Redis restart pauses affected
+  sales until counters are rebuilt from the ledger; an unreachable reCAPTCHA lets buyers through.
+- **Distributed behaviour is tested distributed.** Notification fan-out and seat restoration are
+  verified against a live three-replica cluster, which single-node tests cannot reach.
+
 ## 2. Deployment
 
 ```mermaid
@@ -187,6 +198,16 @@ anything**: lose all of Redis and PostgreSQL plus an operator rebuild restore it
 | `bot:verified:{sid}` | String | 900 s | A passed challenge, remembered per session |
 
 ## 4. How it works
+
+| Problem | Solution | Verified by |
+| :--- | :--- | :--- |
+| Thousands of buyers race for the last seat | One Redis Lua script reads, compares and decrements atomically ([`stock_reserve.lua`](../src/main/resources/redis/stock_reserve.lua)) | [`StockReserveConcurrencyIT`](../src/test/java/com/flashseats/catalog/StockReserveConcurrencyIT.java) |
+| Every replica sees the same hold expire | A conditional `UPDATE … WHERE status = 'ACTIVE'`; only the winner restores the seats, after commit ([`TicketHoldRepository`](../src/main/java/com/flashseats/hold/repository/TicketHoldRepository.java)) | [`HoldLifecycleIT`](../src/test/java/com/flashseats/hold/HoldLifecycleIT.java), [`hold-expiry-check.sh`](../docker/scripts/hold-expiry-check.sh) |
+| Checkout and the webhook settle the same charge | Every order transition is a compare-and-set on the `orders` row ([`OrderRepository`](../src/main/java/com/flashseats/order/repository/OrderRepository.java), [`OrderCommitService`](../src/main/java/com/flashseats/order/service/OrderCommitService.java)) | [`SettlementArbiterIT`](../src/test/java/com/flashseats/order/SettlementArbiterIT.java) |
+| A traffic spike would exhaust the connection pool | A Redis sorted-set waiting room drawing on one cluster-wide admission allowance ([`PromotionWorker`](../src/main/java/com/flashseats/queue/service/PromotionWorker.java), [`promotion_budget.lua`](../src/main/resources/redis/promotion_budget.lua)) | [`GlobalPromotionBudgetIT`](../src/test/java/com/flashseats/queue/GlobalPromotionBudgetIT.java) |
+| A buyer's live connection is on another replica | SSE, with promotions fanned out over Redis pub/sub ([`QueueBroadcaster`](../src/main/java/com/flashseats/queue/service/QueueBroadcaster.java), [`QueuePubSubListener`](../src/main/java/com/flashseats/queue/service/QueuePubSubListener.java)) | [`fanout-check.sh`](../docker/scripts/fanout-check.sh) |
+| A confirmed order must always produce a ticket | Transactional outbox (`FOR UPDATE SKIP LOCKED`) to RabbitMQ, with insert-then-send deduplication ([`OutboxRelay`](../src/main/java/com/flashseats/order/service/OutboxRelay.java), [`NotificationLogRepository`](../src/main/java/com/flashseats/notification/repository/NotificationLogRepository.java)) | [`OutboxRecoveryIT`](../src/test/java/com/flashseats/order/OutboxRecoveryIT.java) |
+| Nine modules must stay decoupled | Facade-only calls, verified by Spring Modulith | [`ModularityTests`](../src/test/java/com/flashseats/app/ModularityTests.java) |
 
 ### Inventory: an atomic reserve
 
