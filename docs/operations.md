@@ -64,7 +64,9 @@ copy the `whsec_` secret from `docker compose --profile cluster --profile stripe
 webhook silently. `docker/scripts/stripe-check.sh` verifies the setup end to end.
 
 **Email.** Mailpit catches all mail locally. To send real mail, set the `SMTP_*` variables in `.env`
-(host, port, username, password, `SMTP_AUTH`, `SMTP_STARTTLS`, `SMTP_FROM`) and restart.
+(host, port, username, password, `SMTP_AUTH`, `SMTP_STARTTLS`, `SMTP_FROM`) and restart. The
+automated and load tests always use Mailpit, so they stay deterministic and never use up a
+provider's quota.
 
 **Bot defence.** reCAPTCHA is off until `RECAPTCHA_SECRET` and `VITE_RECAPTCHA_SITE_KEY` are set; it
 fails open if the provider is unreachable. `FLASHSEATS_TRUSTED_PROXIES` lists the proxies whose
@@ -94,21 +96,25 @@ CI ([`.github/workflows/ci.yml`](../.github/workflows/ci.yml)) runs the backend 
 suites, the frontend build and the browser suite's type check on every pull request and on pushes to
 `main` and `preview`. A pull request cannot merge until both jobs pass.
 
-| Suite | Command | Count | Needs |
-| :--- | :--- | :--- | :--- |
-| Backend unit and integration | `./mvnw test` | 320 | Docker (Testcontainers runs PostgreSQL, Redis, RabbitMQ) |
-| Frontend unit | `cd frontend && npm test` | 78 | — |
-| Browser end-to-end | `cd frontend && npm run test:e2e` | 27 | Backend on `:8080` with an open sale (`dev-up.sh`) |
+| Suite | Command | Count | Proves | Needs |
+| :--- | :--- | :--- | :--- | :--- |
+| Backend unit and integration | `./mvnw test` | 320 | Module logic and the concurrency invariants against real PostgreSQL, Redis and RabbitMQ; module boundaries. Passes in any class order | Docker (Testcontainers) |
+| Frontend unit | `cd frontend && npm test` | 78 | Routing, state transitions, storage, countdowns, and the copy for every API error code | — |
+| Browser end-to-end | `cd frontend && npm run test:e2e` | 27 | The full buyer journey against the real backend, desktop and mobile layouts | Backend on `:8080` with an open sale (`dev-up.sh`) |
 
 Cluster checks run against `--profile cluster`, because several behaviours are correct on one
 replica and broken on three:
 
-| Script | Proves |
-| :--- | :--- |
-| `docker/scripts/fanout-check.sh` | A promotion reaches the buyer whichever replica holds their stream |
-| `docker/scripts/hold-expiry-check.sh` | An expired hold returns its seats exactly once |
-| `docker/scripts/sentinel-failover-check.sh` | Sentinel promotes a replica and the old primary rejoins |
-| `docker/scripts/stripe-check.sh` | A real charge, a 3-D Secure challenge and a redelivered webhook |
+| Script | Proves | Recorded result |
+| :--- | :--- | :--- |
+| `docker/scripts/fanout-check.sh` | A promotion reaches the buyer whichever replica holds their stream | 30 of 30 buyers promoted, spread 10/10/10 across the replicas |
+| `docker/scripts/hold-expiry-check.sh` | An expired hold returns its seats exactly once, although every replica receives the expiry | Restored exactly once, in 669–749 ms |
+| `docker/scripts/sentinel-failover-check.sh` | Sentinel promotes a replica and the old primary rejoins | Passed |
+| by hand, after a failover | A promoted node may have lost writes, so selling must stop until the counters are rebuilt | All three replicas refused with a retryable `503`, not "sold out"; one rebuild resumed all three |
+| `docker/scripts/stripe-check.sh` | A real charge, a 3-D Secure challenge and a redelivered webhook | Passed on a fresh clone with a test-mode key; the redelivery was dismissed as a duplicate |
+
+In a browser, the Stripe card form also handled a declined card (seats kept), a successful retry
+and a completed 3-D Secure challenge. All load and cluster runs used the stub gateway.
 
 ### Published images
 
@@ -139,16 +145,26 @@ cadence. `sold-count.sh` is the correctness verdict: k6 reports what the client 
 reports what sold. Discard the first run after a restart (JIT warm-up). `docker/seed/seed.sh` with
 the `k6` service runs a single sale; `k6-waiting-room` exercises only join and poll.
 
-Results on one ten-core laptop, five concurrent sales of 500 seats:
+### Recorded results
 
-| Buyers | Sold | Oversold | Checkout p50 / p99 |
-| :--- | :--- | :--- | :--- |
-| 300 | 2,500 / 2,500 | 0 | 10 ms / 70 ms |
-| 2,000 | 2,500 / 2,500 | 0 | 14 ms / 195 ms |
-| 10,000 | 2,500 / 2,500 | 0 | 1.2 s / 7.6 s |
+Everything, k6 included, ran on one ten-core laptop with three application replicas.
 
-At 10,000 the limit was the host CPU, shared with k6, not the connection pool
-(`hikaricp_connections_pending` stayed at zero).
+**One sale of 500 seats** (`k6`, 300 and 2,000 buyers): exactly 500 sold, zero oversold, zero
+inventory errors, zero rate-limited requests, and zero stock drift on every replica.
+
+**Five concurrent sales of 500 seats** (`k6-concurrent`):
+
+| Buyers | Sold | Oversold | Stock drift | Checkout p50 / p99 | Status p50 / p99 |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| 300 | 2,500 / 2,500 | 0 | 0 | 10 ms / 70 ms | 2 ms / 11 ms |
+| 2,000 | 2,500 / 2,500 | 0 | 0 | 14 ms / 195 ms | 1 ms / 18 ms |
+| 10,000 | 2,500 / 2,500 | 0 | 0 | 1.2 s / 7.6 s | 45 ms / 5.1 s |
+
+Correctness held at every load: every seat sold, the invariant was exact on every tier, and no buyer
+gave up waiting. Checkout p99 stayed under 200 ms up to 2,000 buyers. At 10,000 the CPU averaged
+93 % and k6 alone used 2–3.5 of the ten cores, while `hikaricp_connections_pending` stayed at zero:
+the limit was the host, not the connection pool, so the system's own ceiling needs a separate
+load-generating host to measure.
 
 ## 6. Monitoring
 
@@ -170,6 +186,19 @@ or dashboard ships with the stack.
 | `resilience4j_circuitbreaker_state` | `open`: checkouts are failing fast |
 
 ## 7. Operator runbook
+
+The console at `/admin` lists each sale with its window and exact remaining stock per tier, and
+offers only the actions the server would accept right now:
+
+- **New sale** creates the event and all its tiers in one form. It must open at least two minutes
+  later, so its stock can be prepared before buyers arrive.
+- **Pre-warm** appears only for an upcoming sale whose stock is not ready.
+- **Rebuild stock** recounts an open sale from the ledger when the console reports "Stock is not
+  trusted".
+- **Pause** and **Resume** stop and restart a sale without losing anyone's place.
+- **Delete** appears only until a minute before the sale opens, when no buyer can be part of it.
+
+The login lives in the tab's memory only, so a reload or a closed tab signs out.
 
 | Situation | Action |
 | :--- | :--- |
